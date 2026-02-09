@@ -127,3 +127,28 @@ export interface PendingTokenEntry {
   baseUrl: string;
   amount: number;
 }
+
+/**
+ * Provider information from /v1/info endpoint
+ */
+export interface ProviderInfo {
+  mints?: string[];
+  [key: string]: any;
+}
+
+/**
+ * Model discovery result
+ */
+export interface ModelDiscoveryResult {
+  models: Model[];
+  bestById: Map<string, { model: Model; base: string }>;
+  totalProcessed: number;
+}
+
+/**
+ * Mint discovery result
+ */
+export interface MintDiscoveryResult {
+  mintsFromProviders: Record<string, string[]>;
+  infoFromProviders: Record<string, ProviderInfo>;
+}

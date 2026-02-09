@@ -158,7 +158,7 @@ export class CashuSpender {
     );
 
     // Check if we need to refund pending tokens to free up balance
-    if (totalBalance < adjustedAmount && totalPending > 0 && retryCount < 1) {
+    if (totalBalance < adjustedAmount && totalPending > 0 && (retryCount ?? 0) < 1) {
       return await this._refundAndRetry(options);
     }
 

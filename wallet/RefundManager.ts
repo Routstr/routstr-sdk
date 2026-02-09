@@ -48,34 +48,36 @@ export class RefundManager {
       return { success: true, message: "No API key to refund" };
     }
 
+    let fetchResult: { success: boolean; token?: string; requestId?: string; error?: string } | undefined;
+
     try {
       // Fetch refund token from provider
-      const refundResult = await this._fetchRefundToken(baseUrl, storedToken);
+      fetchResult = await this._fetchRefundToken(baseUrl, storedToken);
 
-      if (!refundResult.success) {
+      if (!fetchResult.success) {
         return {
           success: false,
-          message: refundResult.error || "Refund failed",
-          requestId: refundResult.requestId,
+          message: fetchResult.error || "Refund failed",
+          requestId: fetchResult.requestId,
         };
       }
 
-      if (!refundResult.token) {
+      if (!fetchResult.token) {
         return {
           success: false,
           message: "No token received from refund",
-          requestId: refundResult.requestId,
+          requestId: fetchResult.requestId,
         };
       }
 
       // Check if this is a "no balance to refund" case
-      if (refundResult.error === "No balance to refund") {
+      if (fetchResult.error === "No balance to refund") {
         this.storageAdapter.removeToken(baseUrl);
         return { success: true, message: "No balance to refund" };
       }
 
       // Receive the refunded token
-      const proofs = await this.walletAdapter.receiveToken(refundResult.token);
+      const proofs = await this.walletAdapter.receiveToken(fetchResult.token);
 
       // Calculate total amount received
       const totalAmount = proofs.reduce((sum, p: any) => sum + p.amount, 0);
@@ -88,10 +90,10 @@ export class RefundManager {
       return {
         success: true,
         refundedAmount: totalAmount,
-        requestId: refundResult.requestId,
+        requestId: fetchResult.requestId,
       };
     } catch (error) {
-      return this._handleRefundError(error, mintUrl, refundResult?.requestId);
+      return this._handleRefundError(error, mintUrl, fetchResult?.requestId);
     }
   }
 

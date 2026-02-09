@@ -8,6 +8,14 @@
 // Core types and errors
 export * from "./core";
 
+// Discovery module (model and mint discovery)
+export {
+  type DiscoveryAdapter,
+  ModelManager,
+  type ModelManagerConfig,
+  MintDiscovery,
+} from "./discovery";
+
 // Wallet interfaces
 export * from "./wallet";
 

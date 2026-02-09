@@ -4,16 +4,8 @@
  */
 
 import type { Message, TransactionHistory } from "@/types/chat";
-import type { Model } from "@/types/models";
-
-/**
- * Provider information returned from /v1/info endpoint
- */
-export interface ProviderInfo {
-  version?: string;
-  mints?: string[];
-  [key: string]: unknown;
-}
+import type { Model, ProviderInfo } from "@/sdk/core";
+export { ProviderInfo };
 
 /**
  * WalletAdapter - Abstracts wallet operations (NIP-60 or legacy)

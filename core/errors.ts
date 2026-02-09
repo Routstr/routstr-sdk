@@ -107,3 +107,41 @@ export class ModelNotFoundError extends Error {
     this.name = "ModelNotFoundError";
   }
 }
+
+/**
+ * Error thrown when provider bootstrap fails
+ */
+export class ProviderBootstrapError extends Error {
+  constructor(
+    public failedProviders: string[],
+    message?: string
+  ) {
+    super(
+      message || `Failed to bootstrap providers. Tried: ${failedProviders.join(", ")}`
+    );
+    this.name = "ProviderBootstrapError";
+  }
+}
+
+/**
+ * Error thrown when no providers are available
+ */
+export class NoProvidersAvailableError extends Error {
+  constructor() {
+    super("No providers are available for model discovery");
+    this.name = "NoProvidersAvailableError";
+  }
+}
+
+/**
+ * Error thrown when mint discovery fails
+ */
+export class MintDiscoveryError extends Error {
+  constructor(
+    public baseUrl: string,
+    message?: string
+  ) {
+    super(message || `Failed to discover mints from provider ${baseUrl}`);
+    this.name = "MintDiscoveryError";
+  }
+}
