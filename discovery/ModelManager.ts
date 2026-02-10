@@ -140,17 +140,13 @@ export class ModelManager {
 
         if (!forceRefresh) {
           const lastUpdate = this.adapter.getProviderLastUpdate(base);
-          const cacheValid = lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+          const cacheValid =
+            lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
 
           if (cacheValid) {
             const cachedModels = this.adapter.getCachedModels();
             const cachedList = cachedModels[base] || [];
-            if (cachedList.length > 0) {
-              list = cachedList;
-            } else {
-              // Cache exists but empty, fetch fresh
-              list = await this.fetchModelsFromProvider(base);
-            }
+            list = cachedList;
           } else {
             // Cache expired or doesn't exist, fetch fresh
             list = await this.fetchModelsFromProvider(base);
@@ -188,6 +184,7 @@ export class ModelManager {
         return { success: true, base, list };
       } catch (error) {
         console.warn(`Failed to fetch models from ${base}:`, error);
+        this.adapter.setProviderLastUpdate(base, Date.now());
         return { success: false, base };
       }
     });
@@ -300,10 +297,7 @@ export class ModelManager {
    * @param torMode Whether in Tor context
    * @returns Array of endpoint URLs
    */
-  private getProviderEndpoints(
-    provider: any,
-    torMode: boolean
-  ): string[] {
+  private getProviderEndpoints(provider: any, torMode: boolean): string[] {
     const endpoints: string[] = [];
 
     if (torMode && provider.onion_url) {
