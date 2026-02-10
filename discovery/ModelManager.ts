@@ -25,6 +25,14 @@ export interface ModelManagerConfig {
   productionHostname?: string;
 }
 
+export interface ModelProviderPrice {
+  baseUrl: string;
+  model: Model;
+  promptPerMillion: number;
+  completionPerMillion: number;
+  totalPerMillion: number;
+}
+
 /**
  * ModelManager handles all model discovery and caching logic
  * Abstracts away storage details via DiscoveryAdapter
@@ -257,6 +265,57 @@ export class ModelManager {
   }
 
   /**
+   * Get providers for a model sorted by prompt+completion pricing
+   */
+  getProviderPriceRankingForModel(
+    modelId: string,
+    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+  ): ModelProviderPrice[] {
+    const normalizedId = this.normalizeModelId(modelId);
+    const includeDisabled = options.includeDisabled ?? false;
+    const torMode = options.torMode ?? false;
+    const disabledProviders = new Set(this.adapter.getDisabledProviders());
+    const allModels = this.adapter.getCachedModels();
+    const results: ModelProviderPrice[] = [];
+
+    for (const [baseUrl, models] of Object.entries(allModels)) {
+      if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
+      if (torMode && !baseUrl.includes(".onion")) continue;
+      if (!torMode && baseUrl.includes(".onion")) continue;
+
+      const match = models.find(
+        (model) => this.normalizeModelId(model.id) === normalizedId
+      );
+      if (!match?.sats_pricing) continue;
+
+      const prompt = match.sats_pricing.prompt;
+      const completion = match.sats_pricing.completion;
+      if (typeof prompt !== "number" || typeof completion !== "number") {
+        continue;
+      }
+
+      const promptPerMillion = prompt * 1_000_000;
+      const completionPerMillion = completion * 1_000_000;
+      const totalPerMillion = promptPerMillion + completionPerMillion;
+
+      results.push({
+        baseUrl,
+        model: match,
+        promptPerMillion,
+        completionPerMillion,
+        totalPerMillion,
+      });
+    }
+
+    return results.sort((a, b) => {
+      if (a.totalPerMillion !== b.totalPerMillion) {
+        return a.totalPerMillion - b.totalPerMillion;
+      }
+      return a.baseUrl.localeCompare(b.baseUrl);
+    });
+  }
+
+  /**
    * Clear cache for a specific provider
    * @param baseUrl Provider base URL
    */
@@ -319,5 +378,11 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  private normalizeModelId(modelId: string): string {
+    return modelId.includes("/")
+      ? modelId.split("/").pop() || modelId
+      : modelId;
   }
 }
