@@ -24,3 +24,6 @@ export * from "./client";
 
 // Utilities
 export * from "./utils";
+
+// Storage (default adapters + drivers)
+export * from "./storage";
