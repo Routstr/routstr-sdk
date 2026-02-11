@@ -28,7 +28,11 @@ export interface WalletAdapter {
    * @param p2pkPubkey Optional P2PK public key
    * @returns Encoded cashu token string
    */
-  sendToken(mintUrl: string, amount: number, p2pkPubkey?: string): Promise<string>;
+  sendToken(
+    mintUrl: string,
+    amount: number,
+    p2pkPubkey?: string
+  ): Promise<string>;
 
   /**
    * Receive/store a cashu token
@@ -61,6 +65,9 @@ export interface StorageAdapter {
 
   /** Get the last update timestamp for a provider */
   getProviderLastUpdate(baseUrl: string): number | null;
+
+  /** Save base URLs list last update timestamp */
+  setBaseUrlsLastUpdate(timestamp: number): void;
 
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;

@@ -23,10 +23,6 @@ export interface ModelManagerConfig {
   excludeProviderUrls?: string[];
   /** Cache TTL in milliseconds (default: 21 minutes) */
   cacheTTL?: number;
-  /** Include localhost in dev mode */
-  includeLocalhost?: boolean;
-  /** Production hostname for filtering staging providers */
-  productionHostname?: string;
 }
 
 export interface ModelProviderPrice {
@@ -44,8 +40,6 @@ export interface ModelProviderPrice {
 export class ModelManager {
   private readonly cacheTTL: number;
   private readonly providerDirectoryUrl: string;
-  private readonly includeLocalhost: boolean;
-  private readonly productionHostname: string;
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
 
@@ -56,8 +50,6 @@ export class ModelManager {
     this.providerDirectoryUrl =
       config.providerDirectoryUrl || "https://api.routstr.com/v1/providers/";
     this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
-    this.includeLocalhost = config.includeLocalhost ?? true;
-    this.productionHostname = config.productionHostname || "chat.routstr.com";
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
@@ -74,7 +66,12 @@ export class ModelManager {
       // First check if we already have cached providers
       const cachedUrls = this.adapter.getBaseUrlsList();
       if (cachedUrls.length > 0) {
-        return this.filterBaseUrlsForTor(cachedUrls, torMode);
+        const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
+        const cacheValid =
+          lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+        if (cacheValid) {
+          return this.filterBaseUrlsForTor(cachedUrls, torMode);
+        }
       }
 
       // Fetch from provider directory
@@ -103,23 +100,18 @@ export class ModelManager {
         }
       }
 
-      // Filter out staging providers on production
-      const isProduction =
-        typeof window !== "undefined" &&
-        window.location.hostname === this.productionHostname;
-
       const excluded = new Set(
         this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
       );
 
       const list = Array.from(bases).filter((base) => {
-        if (isProduction && base.includes("staging")) return false;
         if (excluded.has(base)) return false;
         return true;
       });
 
       if (list.length > 0) {
         this.adapter.setBaseUrlsList(list);
+        this.adapter.setBaseUrlsLastUpdate(Date.now());
       }
 
       return list;

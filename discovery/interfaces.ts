@@ -98,8 +98,20 @@ export interface DiscoveryAdapter {
   getBaseUrlsList(): string[];
 
   /**
+   * Get base URLs list last update timestamp
+   * @returns Timestamp in milliseconds or null if never updated
+   */
+  getBaseUrlsLastUpdate(): number | null;
+
+  /**
    * Save list of provider base URLs
    * @param urls Array of provider base URLs
    */
   setBaseUrlsList(urls: string[]): void;
+
+  /**
+   * Set base URLs list last update timestamp
+   * @param timestamp Timestamp in milliseconds
+   */
+  setBaseUrlsLastUpdate(timestamp: number): void;
 }

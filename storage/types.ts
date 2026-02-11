@@ -13,5 +13,6 @@ export interface SdkStorageState {
   mintsFromAllProviders: Record<string, string[]>;
   infoFromAllProviders: Record<string, import("../core").ProviderInfo>;
   lastModelsUpdate: Record<string, number>;
+  lastBaseUrlsUpdate: number | null;
   localCashuTokens: Array<{ baseUrl: string; token: string }>;
 }

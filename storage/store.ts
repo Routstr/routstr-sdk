@@ -18,6 +18,7 @@ export interface SdkStorageStore extends SdkStorageState {
   setModelProviderMap: (value: Record<string, string>) => void;
   setLastUsedModel: (value: string | null) => void;
   setBaseUrlsList: (value: string[]) => void;
+  setBaseUrlsLastUpdate: (value: number | null) => void;
   setDisabledProviders: (value: string[]) => void;
   setMintsFromAllProviders: (value: Record<string, string[]>) => void;
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
@@ -48,6 +49,10 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
     baseUrlsList: driver
       .getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, [])
       .map((url) => normalizeBaseUrl(url)),
+    lastBaseUrlsUpdate: driver.getItem<number | null>(
+      SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE,
+      null
+    ),
     disabledProviders: driver
       .getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, [])
       .map((url) => normalizeBaseUrl(url)),
@@ -106,6 +111,10 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       const normalized = value.map((url) => normalizeBaseUrl(url));
       driver.setItem(SDK_STORAGE_KEYS.BASE_URLS_LIST, normalized);
       set({ baseUrlsList: normalized });
+    },
+    setBaseUrlsLastUpdate: (value) => {
+      driver.setItem(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, value);
+      set({ lastBaseUrlsUpdate: value });
     },
     setDisabledProviders: (value) => {
       const normalized = value.map((url) => normalizeBaseUrl(url));
@@ -184,6 +193,9 @@ export const createDiscoveryAdapterFromStore = (
   getDisabledProviders: () => store.getState().disabledProviders,
   getBaseUrlsList: () => store.getState().baseUrlsList,
   setBaseUrlsList: (urls) => store.getState().setBaseUrlsList(urls),
+  getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
+  setBaseUrlsLastUpdate: (timestamp) =>
+    store.getState().setBaseUrlsLastUpdate(timestamp),
 });
 
 export const createStorageAdapterFromStore = (
@@ -247,6 +259,8 @@ export const createStorageAdapterFromStore = (
     const timestamps = store.getState().lastModelsUpdate;
     return timestamps[normalized] || null;
   },
+  setBaseUrlsLastUpdate: (timestamp) =>
+    store.getState().setBaseUrlsLastUpdate(timestamp),
   saveProviderInfo: (baseUrl, info) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const next = { ...store.getState().infoFromAllProviders };

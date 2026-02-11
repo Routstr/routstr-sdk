@@ -7,6 +7,7 @@ export const SDK_STORAGE_KEYS = {
   MINTS_FROM_ALL_PROVIDERS: "mints_from_all_providers",
   INFO_FROM_ALL_PROVIDERS: "info_from_all_providers",
   LAST_MODELS_UPDATE: "lastModelsUpdate",
+  LAST_BASE_URLS_UPDATE: "lastBaseUrlsUpdate",
   LOCAL_CASHU_TOKENS: "local_cashu_tokens",
 } as const;
 
