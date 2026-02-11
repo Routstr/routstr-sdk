@@ -17,6 +17,10 @@ import {
 export interface ModelManagerConfig {
   /** URL to fetch provider directory from */
   providerDirectoryUrl?: string;
+  /** Additional provider base URLs to include */
+  includeProviderUrls?: string[];
+  /** Provider base URLs to exclude */
+  excludeProviderUrls?: string[];
   /** Cache TTL in milliseconds (default: 21 minutes) */
   cacheTTL?: number;
   /** Include localhost in dev mode */
@@ -42,6 +46,8 @@ export class ModelManager {
   private readonly providerDirectoryUrl: string;
   private readonly includeLocalhost: boolean;
   private readonly productionHostname: string;
+  private readonly includeProviderUrls: string[];
+  private readonly excludeProviderUrls: string[];
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -52,6 +58,8 @@ export class ModelManager {
     this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
     this.includeLocalhost = config.includeLocalhost ?? true;
     this.productionHostname = config.productionHostname || "chat.routstr.com";
+    this.includeProviderUrls = config.includeProviderUrls || [];
+    this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
 
   /**
@@ -78,13 +86,6 @@ export class ModelManager {
       const data = await res.json();
       const providers = Array.isArray(data?.providers) ? data.providers : [];
 
-      // Add localhost in dev mode
-      if (this.includeLocalhost && typeof window !== "undefined") {
-        if (window.location.hostname === "localhost") {
-          providers.push({ endpoint_url: "http://localhost:8000/" });
-        }
-      }
-
       // Extract endpoints from providers
       const bases = new Set<string>();
       for (const p of providers) {
@@ -94,13 +95,26 @@ export class ModelManager {
         }
       }
 
+      // Add additional configured providers
+      for (const url of this.includeProviderUrls) {
+        const normalized = this.normalizeUrl(url);
+        if (!torMode || normalized.includes(".onion")) {
+          bases.add(normalized);
+        }
+      }
+
       // Filter out staging providers on production
       const isProduction =
         typeof window !== "undefined" &&
         window.location.hostname === this.productionHostname;
 
+      const excluded = new Set(
+        this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
+      );
+
       const list = Array.from(bases).filter((base) => {
         if (isProduction && base.includes("staging")) return false;
+        if (excluded.has(base)) return false;
         return true;
       });
 
