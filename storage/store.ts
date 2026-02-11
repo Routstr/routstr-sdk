@@ -254,13 +254,6 @@ export const createStorageAdapterFromStore = (
       .map(([baseUrl, amt]) => ({ baseUrl, amount: Math.round(amt) }))
       .sort((a, b) => b.amount - a.amount);
   },
-  getProviderLastUpdate: (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const timestamps = store.getState().lastModelsUpdate;
-    return timestamps[normalized] || null;
-  },
-  setBaseUrlsLastUpdate: (timestamp) =>
-    store.getState().setBaseUrlsLastUpdate(timestamp),
   saveProviderInfo: (baseUrl, info) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const next = { ...store.getState().infoFromAllProviders };

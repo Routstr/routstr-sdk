@@ -54,6 +54,19 @@ export class ModelManager {
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
 
+  static async init(
+    adapter: DiscoveryAdapter,
+    config: ModelManagerConfig = {},
+    options: { torMode?: boolean; forceRefresh?: boolean } = {}
+  ): Promise<ModelManager> {
+    const manager = new ModelManager(adapter, config);
+    const torMode = options.torMode ?? false;
+    const forceRefresh = options.forceRefresh ?? false;
+    const providers = await manager.bootstrapProviders(torMode);
+    await manager.fetchModels(providers, forceRefresh);
+    return manager;
+  }
+
   /**
    * Bootstrap provider list from the provider directory
    * Fetches available providers and caches their base URLs

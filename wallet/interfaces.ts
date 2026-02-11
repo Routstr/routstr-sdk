@@ -63,12 +63,6 @@ export interface StorageAdapter {
   /** Get all stored tokens as distribution (baseUrl -> amount in sats) */
   getPendingTokenDistribution(): Array<{ baseUrl: string; amount: number }>;
 
-  /** Get the last update timestamp for a provider */
-  getProviderLastUpdate(baseUrl: string): number | null;
-
-  /** Save base URLs list last update timestamp */
-  setBaseUrlsLastUpdate(timestamp: number): void;
-
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
 
