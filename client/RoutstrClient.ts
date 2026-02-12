@@ -122,6 +122,7 @@ export class RoutstrClient {
     try {
       // Spend tokens
       callbacks.onPaymentProcessing?.(true);
+      console.log("Sending token worth: ", requiredSats);
 
       const spendResult = await this.cashuSpender.spend({
         mintUrl,
@@ -192,8 +193,7 @@ export class RoutstrClient {
         if (streamingResult.finish_reason === "content_filter") {
           callbacks.onMessageAppend({
             role: "assistant",
-            content:
-              "Your request was denied due to content filtering.",
+            content: "Your request was denied due to content filtering.",
           });
         } else if (
           streamingResult.content ||
@@ -249,8 +249,14 @@ export class RoutstrClient {
     token: string;
     requiredSats: number;
   }): Promise<Response> {
-    const { apiMessages, selectedModel, baseUrl, mintUrl, token, requiredSats } =
-      params;
+    const {
+      apiMessages,
+      selectedModel,
+      baseUrl,
+      mintUrl,
+      token,
+      requiredSats,
+    } = params;
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -258,7 +264,10 @@ export class RoutstrClient {
     };
 
     // Dev-only mock controls
-    if (typeof window !== "undefined" && process.env.NODE_ENV === "development") {
+    if (
+      typeof window !== "undefined" &&
+      process.env.NODE_ENV === "development"
+    ) {
       try {
         const scenario = window.localStorage.getItem("msw:scenario");
         const latency = window.localStorage.getItem("msw:latency");
@@ -302,11 +311,7 @@ export class RoutstrClient {
       (response as any).baseUrl = baseUrl;
 
       if (!response.ok) {
-        return await this._handleErrorResponse(
-          response,
-          params,
-          token
-        );
+        return await this._handleErrorResponse(response, params, token);
       }
 
       return response;
@@ -539,7 +544,9 @@ export class RoutstrClient {
       callbacks.onBalanceUpdate(newBalance);
     } else {
       // Refund failed
-      if (refundResult.message?.includes("Refund request failed with status 401")) {
+      if (
+        refundResult.message?.includes("Refund request failed with status 401")
+      ) {
         this.storageAdapter.removeToken(baseUrl);
       }
       satsSpent = tokenBalanceInSats;
