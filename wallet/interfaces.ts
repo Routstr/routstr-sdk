@@ -38,9 +38,9 @@ export interface WalletAdapter {
    * Receive/store a cashu token
    * Handles both NIP-60 and legacy storage internally
    * @param token Encoded cashu token string
-   * @returns Array of proofs received
+   * @returns Result with success flag and amount received
    */
-  receiveToken(token: string): Promise<any[]>;
+  receiveToken(token: string): Promise<{ success: boolean; amount: number }>;
 
   /** Check if using NIP-60 wallet (for unit conversion decisions) */
   isUsingNip60(): boolean;

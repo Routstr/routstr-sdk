@@ -210,7 +210,11 @@ export class ModelManager {
 
         return { success: true, base, list };
       } catch (error) {
-        console.warn(`Failed to fetch models from ${base}:`, error);
+        if (this.isProviderDownError(error)) {
+          console.warn(`Provider ${base} is down right now.`);
+        } else {
+          console.warn(`Failed to fetch models from ${base}:`, error);
+        }
         this.adapter.setProviderLastUpdate(base, Date.now());
         return { success: false, base };
       }
@@ -263,6 +267,17 @@ export class ModelManager {
       : [];
 
     return list;
+  }
+
+  private isProviderDownError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    if (msg.includes("fetch failed")) return true;
+    if (msg.includes("502")) return true;
+    if (msg.includes("503")) return true;
+    if (msg.includes("504")) return true;
+    const cause = error.cause as { code?: string } | undefined;
+    return cause?.code === "ENOTFOUND";
   }
 
   /**

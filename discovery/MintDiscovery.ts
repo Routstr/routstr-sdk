@@ -4,7 +4,6 @@
  */
 
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
-import { MintDiscoveryError } from "@/sdk/core/errors";
 
 /**
  * Configuration for MintDiscovery
@@ -95,12 +94,13 @@ export class MintDiscovery {
 
         return { success: true, base, mints: normalizedMints, info: json };
       } catch (error) {
-        console.warn(`Failed to fetch mints from ${base}:`, error);
         this.adapter.setProviderLastUpdate(base, Date.now());
-        throw new MintDiscoveryError(
-          base,
-          `Failed to discover mints: ${error}`
-        );
+        if (this.isProviderDownError(error)) {
+          console.warn(`Provider ${base} is down right now.`);
+        } else {
+          console.warn(`Failed to fetch mints from ${base}:`, error);
+        }
+        return { success: false, base, mints: [], info: null };
       }
     });
 
@@ -195,5 +195,17 @@ export class MintDiscovery {
   clearAllCache(): void {
     this.adapter.setCachedMints({});
     this.adapter.setCachedProviderInfo({});
+  }
+
+  private isProviderDownError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    if (msg.includes("fetch failed")) return true;
+    if (msg.includes("502")) return true;
+    if (msg.includes("503")) return true;
+    if (msg.includes("504")) return true;
+    const cause = error.cause as { code?: string } | undefined;
+    if (cause?.code === "ENOTFOUND") return true;
+    return false;
   }
 }

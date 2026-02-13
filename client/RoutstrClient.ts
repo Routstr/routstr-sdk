@@ -505,7 +505,6 @@ export class RoutstrClient {
       selectedModel,
       streamingResult,
       callbacks,
-      transactionHistory,
     } = params;
 
     const tokenBalanceInSats =
@@ -527,6 +526,14 @@ export class RoutstrClient {
       mintUrl,
       baseUrl,
     });
+
+    if (refundResult.success) {
+      const refundedSats =
+        refundResult.refundedAmount !== undefined
+          ? refundResult.refundedAmount / 1000
+          : 0;
+      console.log("Refunded sats:", refundedSats, refundResult);
+    }
 
     let satsSpent: number;
 
