@@ -7,11 +7,26 @@ import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import { MintDiscoveryError } from "@/sdk/core/errors";
 
 /**
+ * Configuration for MintDiscovery
+ */
+export interface MintDiscoveryConfig {
+  /** Cache TTL in milliseconds (default: 21 minutes) */
+  cacheTTL?: number;
+}
+
+/**
  * MintDiscovery handles mint and provider info discovery
  * Abstracts away storage details via DiscoveryAdapter
  */
 export class MintDiscovery {
-  constructor(private adapter: DiscoveryAdapter) {}
+  private readonly cacheTTL: number;
+
+  constructor(
+    private adapter: DiscoveryAdapter,
+    config: MintDiscoveryConfig = {}
+  ) {
+    this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
+  }
 
   /**
    * Fetch mints from all providers via their /v1/info endpoints
@@ -20,19 +35,44 @@ export class MintDiscovery {
    * @returns Object with mints and provider info from all providers
    */
   async discoverMints(
-    baseUrls: string[]
-  ): Promise<{ mintsFromProviders: Record<string, string[]>; infoFromProviders: Record<string, ProviderInfo> }> {
+    baseUrls: string[],
+    options: { forceRefresh?: boolean } = {}
+  ): Promise<{
+    mintsFromProviders: Record<string, string[]>;
+    infoFromProviders: Record<string, ProviderInfo>;
+  }> {
     if (baseUrls.length === 0) {
       return { mintsFromProviders: {}, infoFromProviders: {} };
     }
 
     const mintsFromAllProviders: Record<string, string[]> = {};
     const infoFromAllProviders: Record<string, ProviderInfo> = {};
+    const forceRefresh = options.forceRefresh ?? false;
 
     // Fetch info from each provider
     const fetchPromises = baseUrls.map(async (url) => {
       const base = url.endsWith("/") ? url : `${url}/`;
       try {
+        if (!forceRefresh) {
+          const lastUpdate = this.adapter.getProviderLastUpdate(base);
+          const cacheValid =
+            lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+          if (cacheValid) {
+            const cachedMints = this.adapter.getCachedMints()[base] || [];
+            const cachedInfo = this.adapter.getCachedProviderInfo()[base];
+            mintsFromAllProviders[base] = cachedMints;
+            if (cachedInfo) {
+              infoFromAllProviders[base] = cachedInfo;
+            }
+            return {
+              success: true,
+              base,
+              mints: cachedMints,
+              info: cachedInfo,
+            };
+          }
+        }
+
         const res = await fetch(`${base}v1/info`);
         if (!res.ok) {
           throw new Error(`Failed to fetch info: ${res.status}`);
@@ -51,11 +91,16 @@ export class MintDiscovery {
         // Save provider mints and full info
         mintsFromAllProviders[base] = normalizedMints;
         infoFromAllProviders[base] = json;
+        this.adapter.setProviderLastUpdate(base, Date.now());
 
         return { success: true, base, mints: normalizedMints, info: json };
       } catch (error) {
         console.warn(`Failed to fetch mints from ${base}:`, error);
-        throw new MintDiscoveryError(base, `Failed to discover mints: ${error}`);
+        this.adapter.setProviderLastUpdate(base, Date.now());
+        throw new MintDiscoveryError(
+          base,
+          `Failed to discover mints: ${error}`
+        );
       }
     });
 
@@ -67,7 +112,9 @@ export class MintDiscovery {
       if (result.status === "fulfilled") {
         const { base, mints, info } = result.value;
         mintsFromAllProviders[base] = mints;
-        infoFromAllProviders[base] = info;
+        if (info) {
+          infoFromAllProviders[base] = info;
+        }
       } else {
         // Log but don't throw - continue with partial results
         console.error("Mint discovery error:", result.reason);
@@ -132,7 +179,7 @@ export class MintDiscovery {
    */
   clearProviderMintCache(baseUrl: string): void {
     const normalized = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-    
+
     const mints = this.getCachedMints();
     delete mints[normalized];
     this.adapter.setCachedMints(mints);
