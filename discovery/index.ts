@@ -4,9 +4,5 @@
  */
 
 export type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
-export {
-  ModelManager,
-  type ModelManagerConfig,
-  type ModelProviderPrice,
-} from "./ModelManager";
+export { ModelManager, type ModelManagerConfig } from "./ModelManager";
 export { MintDiscovery } from "./MintDiscovery";

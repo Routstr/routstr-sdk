@@ -74,18 +74,6 @@ export interface DiscoveryAdapter {
   setLastUsedModel(modelId: string): void;
 
   /**
-   * Get model -> provider base URL mapping
-   * @returns Record mapping modelId -> baseUrl (for best-price winner)
-   */
-  getModelProviderMap(): Record<string, string>;
-
-  /**
-   * Save model -> provider mapping
-   * @param map Record mapping modelId -> baseUrl
-   */
-  setModelProviderMap(map: Record<string, string>): void;
-
-  /**
    * Get list of disabled provider base URLs
    * @returns Array of disabled provider URLs
    */

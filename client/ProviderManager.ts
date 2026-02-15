@@ -14,6 +14,14 @@ import type { ProviderRegistry } from "../wallet/interfaces";
 import type { Model } from "../core/types";
 import { isOnionUrl, isTorContext } from "@/utils/torUtils";
 
+export interface ModelProviderPrice {
+  baseUrl: string;
+  model: Model;
+  promptPerMillion: number;
+  completionPerMillion: number;
+  totalPerMillion: number;
+}
+
 /**
  * Extract image resolution (width, height) from a base64 data URL without DOM.
  * Supports PNG and JPEG. Returns null if format unsupported or parsing fails.
@@ -301,6 +309,76 @@ export class ProviderManager {
     }
 
     return candidates.sort((a, b) => a.cost - b.cost);
+  }
+
+  /**
+   * Get providers for a model sorted by prompt+completion pricing
+   */
+  getProviderPriceRankingForModel(
+    modelId: string,
+    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+  ): ModelProviderPrice[] {
+    const normalizedId = this.normalizeModelId(modelId);
+    const includeDisabled = options.includeDisabled ?? false;
+    const torMode = options.torMode ?? false;
+    const disabledProviders = new Set(
+      this.providerRegistry.getDisabledProviders()
+    );
+    const allModels = this.providerRegistry.getAllProvidersModels();
+    const results: ModelProviderPrice[] = [];
+
+    for (const [baseUrl, models] of Object.entries(allModels)) {
+      if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
+      if (torMode && !baseUrl.includes(".onion")) continue;
+      if (!torMode && baseUrl.includes(".onion")) continue;
+
+      const match = models.find(
+        (model) => this.normalizeModelId(model.id) === normalizedId
+      );
+      if (!match?.sats_pricing) continue;
+
+      const prompt = match.sats_pricing.prompt;
+      const completion = match.sats_pricing.completion;
+      if (typeof prompt !== "number" || typeof completion !== "number") {
+        continue;
+      }
+
+      const promptPerMillion = prompt * 1_000_000;
+      const completionPerMillion = completion * 1_000_000;
+      const totalPerMillion = promptPerMillion + completionPerMillion;
+
+      results.push({
+        baseUrl,
+        model: match,
+        promptPerMillion,
+        completionPerMillion,
+        totalPerMillion,
+      });
+    }
+
+    return results.sort((a, b) => {
+      if (a.totalPerMillion !== b.totalPerMillion) {
+        return a.totalPerMillion - b.totalPerMillion;
+      }
+      return a.baseUrl.localeCompare(b.baseUrl);
+    });
+  }
+
+  /**
+   * Get best-priced provider for a specific model
+   */
+  getBestProviderForModel(
+    modelId: string,
+    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+  ): string | null {
+    const ranking = this.getProviderPriceRankingForModel(modelId, options);
+    return ranking[0]?.baseUrl ?? null;
+  }
+
+  private normalizeModelId(modelId: string): string {
+    return modelId.includes("/")
+      ? modelId.split("/").pop() || modelId
+      : modelId;
   }
 
   /**

@@ -25,14 +25,6 @@ export interface ModelManagerConfig {
   cacheTTL?: number;
 }
 
-export interface ModelProviderPrice {
-  baseUrl: string;
-  model: Model;
-  promptPerMillion: number;
-  completionPerMillion: number;
-  totalPerMillion: number;
-}
-
 /**
  * ModelManager handles all model discovery and caching logic
  * Abstracts away storage details via DiscoveryAdapter
@@ -230,19 +222,6 @@ export class ModelManager {
       ...modelsFromAllProviders,
     });
 
-    // Update model -> provider mapping for best-price winners
-    const modelMap = this.adapter.getModelProviderMap();
-    let mapChanged = false;
-    for (const [id, entry] of bestById.entries()) {
-      if (modelMap[id] !== entry.base) {
-        modelMap[id] = entry.base;
-        mapChanged = true;
-      }
-    }
-    if (mapChanged) {
-      this.adapter.setModelProviderMap(modelMap);
-    }
-
     // Return combined models array
     return Array.from(bestById.values()).map((v) => v.model);
   }
@@ -281,72 +260,11 @@ export class ModelManager {
   }
 
   /**
-   * Get best-priced provider for a specific model
-   * @param modelId Model ID to look up
-   * @returns Base URL for the provider with best price, or null if not found
-   */
-  getProviderForModel(modelId: string): string | null {
-    const modelMap = this.adapter.getModelProviderMap();
-    return modelMap[modelId] || null;
-  }
-
-  /**
    * Get all cached models from all providers
    * @returns Record mapping baseUrl -> models
    */
   getAllCachedModels(): Record<string, Model[]> {
     return this.adapter.getCachedModels();
-  }
-
-  /**
-   * Get providers for a model sorted by prompt+completion pricing
-   */
-  getProviderPriceRankingForModel(
-    modelId: string,
-    options: { torMode?: boolean; includeDisabled?: boolean } = {}
-  ): ModelProviderPrice[] {
-    const normalizedId = this.normalizeModelId(modelId);
-    const includeDisabled = options.includeDisabled ?? false;
-    const torMode = options.torMode ?? false;
-    const disabledProviders = new Set(this.adapter.getDisabledProviders());
-    const allModels = this.adapter.getCachedModels();
-    const results: ModelProviderPrice[] = [];
-
-    for (const [baseUrl, models] of Object.entries(allModels)) {
-      if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
-      if (torMode && !baseUrl.includes(".onion")) continue;
-      if (!torMode && baseUrl.includes(".onion")) continue;
-
-      const match = models.find(
-        (model) => this.normalizeModelId(model.id) === normalizedId
-      );
-      if (!match?.sats_pricing) continue;
-
-      const prompt = match.sats_pricing.prompt;
-      const completion = match.sats_pricing.completion;
-      if (typeof prompt !== "number" || typeof completion !== "number") {
-        continue;
-      }
-
-      const promptPerMillion = prompt * 1_000_000;
-      const completionPerMillion = completion * 1_000_000;
-      const totalPerMillion = promptPerMillion + completionPerMillion;
-
-      results.push({
-        baseUrl,
-        model: match,
-        promptPerMillion,
-        completionPerMillion,
-        totalPerMillion,
-      });
-    }
-
-    return results.sort((a, b) => {
-      if (a.totalPerMillion !== b.totalPerMillion) {
-        return a.totalPerMillion - b.totalPerMillion;
-      }
-      return a.baseUrl.localeCompare(b.baseUrl);
-    });
   }
 
   /**
@@ -366,7 +284,6 @@ export class ModelManager {
    */
   clearAllCache(): void {
     this.adapter.setCachedModels({});
-    this.adapter.setModelProviderMap({});
   }
 
   /**
@@ -412,11 +329,5 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
-  }
-
-  private normalizeModelId(modelId: string): string {
-    return modelId.includes("/")
-      ? modelId.split("/").pop() || modelId
-      : modelId;
   }
 }

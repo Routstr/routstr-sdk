@@ -13,7 +13,6 @@ export {
   type DiscoveryAdapter,
   ModelManager,
   type ModelManagerConfig,
-  type ModelProviderPrice,
   MintDiscovery,
 } from "./discovery";
 

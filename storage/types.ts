@@ -6,7 +6,6 @@ export interface StorageDriver {
 
 export interface SdkStorageState {
   modelsFromAllProviders: Record<string, import("../core").Model[]>;
-  modelProviderMap: Record<string, string>;
   lastUsedModel: string | null;
   baseUrlsList: string[];
   disabledProviders: string[];

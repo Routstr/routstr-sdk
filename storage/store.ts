@@ -15,7 +15,6 @@ export interface SdkStoreOptions {
 
 export interface SdkStorageStore extends SdkStorageState {
   setModelsFromAllProviders: (value: Record<string, Model[]>) => void;
-  setModelProviderMap: (value: Record<string, string>) => void;
   setLastUsedModel: (value: string | null) => void;
   setBaseUrlsList: (value: string[]) => void;
   setBaseUrlsLastUpdate: (value: number | null) => void;
@@ -37,10 +36,6 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
           {}
         )
       ).map(([baseUrl, models]) => [normalizeBaseUrl(baseUrl), models])
-    ),
-    modelProviderMap: driver.getItem<Record<string, string>>(
-      SDK_STORAGE_KEYS.MODEL_PROVIDER_MAP,
-      {}
     ),
     lastUsedModel: driver.getItem<string | null>(
       SDK_STORAGE_KEYS.LAST_USED_MODEL,
@@ -98,10 +93,6 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       }
       driver.setItem(SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS, normalized);
       set({ modelsFromAllProviders: normalized });
-    },
-    setModelProviderMap: (value) => {
-      driver.setItem(SDK_STORAGE_KEYS.MODEL_PROVIDER_MAP, value);
-      set({ modelProviderMap: value });
     },
     setLastUsedModel: (value) => {
       driver.setItem(SDK_STORAGE_KEYS.LAST_USED_MODEL, value);
@@ -182,14 +173,6 @@ export const createDiscoveryAdapterFromStore = (
   },
   getLastUsedModel: () => store.getState().lastUsedModel,
   setLastUsedModel: (modelId) => store.getState().setLastUsedModel(modelId),
-  getModelProviderMap: () => store.getState().modelProviderMap,
-  setModelProviderMap: (map) => {
-    const normalized: Record<string, string> = {};
-    for (const [modelId, baseUrl] of Object.entries(map)) {
-      normalized[modelId] = normalizeBaseUrl(baseUrl);
-    }
-    store.getState().setModelProviderMap(normalized);
-  },
   getDisabledProviders: () => store.getState().disabledProviders,
   getBaseUrlsList: () => store.getState().baseUrlsList,
   setBaseUrlsList: (urls) => store.getState().setBaseUrlsList(urls),

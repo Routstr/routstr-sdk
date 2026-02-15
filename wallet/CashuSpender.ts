@@ -158,16 +158,23 @@ export class CashuSpender {
     );
 
     // Check if we need to refund pending tokens to free up balance
-    if (totalBalance < adjustedAmount && totalPending > 0 && (retryCount ?? 0) < 1) {
+    if (
+      totalBalance < adjustedAmount &&
+      totalPending > 0 &&
+      (retryCount ?? 0) < 1
+    ) {
       return await this._refundAndRetry(options);
     }
 
+    const totalAvailableBalance = totalBalance + totalPending;
+
     // Check total balance
-    if (totalBalance + totalPending < adjustedAmount) {
+    if (totalAvailableBalance < adjustedAmount) {
       return this._createInsufficientBalanceError(
         adjustedAmount,
         balances,
-        units
+        units,
+        totalAvailableBalance
       );
     }
 
@@ -208,9 +215,7 @@ export class CashuSpender {
     const activeMintBalance = balances[mintUrl] || 0;
     const activeMintUnit = units[mintUrl];
     const activeMintBalanceInSats =
-      activeMintUnit === "msat"
-        ? activeMintBalance / 1000
-        : activeMintBalance;
+      activeMintUnit === "msat" ? activeMintBalance / 1000 : activeMintBalance;
 
     let token: string | null = null;
 
@@ -293,9 +298,7 @@ export class CashuSpender {
   /**
    * Refund pending tokens and retry
    */
-  private async _refundAndRetry(
-    options: SpendOptions
-  ): Promise<SpendResult> {
+  private async _refundAndRetry(options: SpendOptions): Promise<SpendResult> {
     const { mintUrl, baseUrl, excludeMints, retryCount } = options;
 
     const pendingDistribution =
@@ -403,10 +406,7 @@ export class CashuSpender {
         extendedExcludes
       );
 
-      if (
-        selectedMintUrl &&
-        (retryCount || 0) < Object.keys(balances).length
-      ) {
+      if (selectedMintUrl && (retryCount || 0) < Object.keys(balances).length) {
         return this._spendInternal({
           ...options,
           mintUrl: selectedMintUrl,
@@ -460,7 +460,8 @@ export class CashuSpender {
   private _createInsufficientBalanceError(
     required: number,
     balances: Record<string, number>,
-    units: Record<string, string>
+    units: Record<string, string>,
+    availableBalance?: number
   ): SpendResult {
     let maxBalance = 0;
     let maxMintUrl = "";
@@ -478,7 +479,7 @@ export class CashuSpender {
 
     const error = new InsufficientBalanceError(
       required,
-      0,
+      availableBalance ?? maxBalance,
       maxBalance,
       maxMintUrl
     );
