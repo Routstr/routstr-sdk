@@ -45,16 +45,20 @@ export interface FetchOptions {
 /**
  * RoutstrClient is the main SDK entry point
  */
+export type AlertLevel = "max" | "min";
+
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private refundManager: RefundManager;
   private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
+  private alertLevel: AlertLevel;
 
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry: ProviderRegistry
+    private providerRegistry: ProviderRegistry,
+    alertLevel: AlertLevel
   ) {
     this.cashuSpender = new CashuSpender(
       walletAdapter,
@@ -64,6 +68,7 @@ export class RoutstrClient {
     this.refundManager = new RefundManager(walletAdapter, storageAdapter);
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
+    this.alertLevel = alertLevel;
   }
 
   /**
@@ -564,13 +569,7 @@ export class RoutstrClient {
     const overchargeThreshold = tokenBalanceUnit === "msat" ? 0.05 : 1;
 
     if (netCosts > overchargeThreshold) {
-      const isDev = process.env.NODE_ENV === "development";
-      const isBeta =
-        typeof window !== "undefined" &&
-        (window.location.origin === "https://beta.chat.routstr.com" ||
-          window.location.origin === "https://alpha.chat.routstr.com");
-
-      if (isBeta || isDev) {
+      if (this.alertLevel === "max") {
         callbacks.onMessageAppend({
           role: "system",
           content: `ATTENTION: Provider may be overcharging. Estimated: ${estimatedCosts.toFixed(
@@ -745,12 +744,6 @@ export class RoutstrClient {
   private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
     console.error("RoutstrClient error:", error);
 
-    const isDev = process.env.NODE_ENV === "development";
-    const isBeta =
-      typeof window !== "undefined" &&
-      (window.location.origin === "https://beta.chat.routstr.com" ||
-        window.location.origin === "https://alpha.chat.routstr.com");
-
     if (error instanceof Error) {
       const modifiedErrorMsg =
         error.message.includes("Error in input stream") ||
@@ -763,7 +756,7 @@ export class RoutstrClient {
         content:
           "Uncaught Error: " +
           modifiedErrorMsg +
-          (isDev || isBeta ? " | " + error.stack : ""),
+          (this.alertLevel === "max" ? " | " + error.stack : ""),
       });
     } else {
       callbacks.onMessageAppend({
