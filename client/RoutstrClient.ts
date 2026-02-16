@@ -227,8 +227,14 @@ export class RoutstrClient {
           callbacks,
           transactionHistory,
         });
-
-        callbacks.onLastMessageSatsUpdate?.(satsSpent);
+        const estimatedCosts = this._getEstimatedCosts(
+          selectedModel,
+          streamingResult
+        );
+        const onLastMessageSatsUpdate = callbacks.onLastMessageSatsUpdate as
+          | ((satsSpent: number, estimatedCosts: number) => void)
+          | undefined;
+        onLastMessageSatsUpdate?.(satsSpent, estimatedCosts);
       } else {
         throw new Error(`${response.status} ${response.statusText}`);
       }
@@ -511,16 +517,10 @@ export class RoutstrClient {
     const tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
 
-    // Calculate estimated costs
-    let estimatedCosts = 0;
-    if (streamingResult.usage) {
-      const { completion_tokens, prompt_tokens } = streamingResult.usage;
-      if (completion_tokens !== undefined && prompt_tokens !== undefined) {
-        estimatedCosts =
-          (selectedModel.sats_pricing?.completion ?? 0) * completion_tokens +
-          (selectedModel.sats_pricing?.prompt ?? 0) * prompt_tokens;
-      }
-    }
+    const estimatedCosts = this._getEstimatedCosts(
+      selectedModel,
+      streamingResult
+    );
 
     // Perform refund
     const refundResult = await this.refundManager.refund({
@@ -681,6 +681,25 @@ export class RoutstrClient {
     }
 
     return { amount: 0, unit: "sat" };
+  }
+
+  /**
+   * Calculate estimated costs from usage
+   */
+  private _getEstimatedCosts(
+    selectedModel: Model,
+    streamingResult: StreamingResult
+  ): number {
+    let estimatedCosts = 0;
+    if (streamingResult.usage) {
+      const { completion_tokens, prompt_tokens } = streamingResult.usage;
+      if (completion_tokens !== undefined && prompt_tokens !== undefined) {
+        estimatedCosts =
+          (selectedModel.sats_pricing?.completion ?? 0) * completion_tokens +
+          (selectedModel.sats_pricing?.prompt ?? 0) * prompt_tokens;
+      }
+    }
+    return estimatedCosts;
   }
 
   /**

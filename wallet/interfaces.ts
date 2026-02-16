@@ -123,7 +123,7 @@ export interface StreamingCallbacks {
   onPaymentProcessing?: (isProcessing: boolean) => void;
 
   /** Called when sats spent on the last message is known */
-  onLastMessageSatsUpdate?: (satsSpent: number) => void;
+  onLastMessageSatsUpdate?: (satsSpent: number, estimatedCosts: number) => void;
 }
 
 /**
