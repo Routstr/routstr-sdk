@@ -41,16 +41,8 @@ export class RefundManager {
    */
   async refund(options: RefundOptions): Promise<RefundResult> {
     const { mintUrl, baseUrl, token: providedToken } = options;
-    console.log("[RefundManager] Starting refund", {
-      mintUrl,
-      baseUrl,
-      hasProvidedToken: !!providedToken,
-    });
 
     const storedToken = providedToken || this.storageAdapter.getToken(baseUrl);
-    console.log("[RefundManager] Token lookup", {
-      hasStoredToken: !!storedToken,
-    });
 
     if (!storedToken) {
       console.log("[RefundManager] No token to refund, returning early");
@@ -62,15 +54,8 @@ export class RefundManager {
       | undefined;
 
     try {
-      console.log("[RefundManager] Fetching refund token from provider...");
       // Fetch refund token from provider
       fetchResult = await this._fetchRefundToken(baseUrl, storedToken);
-      console.log("[RefundManager] Fetch result", {
-        success: fetchResult.success,
-        hasToken: !!fetchResult.token,
-        requestId: fetchResult.requestId,
-        error: fetchResult.error,
-      });
 
       if (!fetchResult.success) {
         return {
@@ -97,29 +82,23 @@ export class RefundManager {
         return { success: true, message: "No balance to refund" };
       }
 
-      console.log("[RefundManager] Receiving refunded token into wallet...");
       // Receive the refunded token
       const receiveResult = await this.walletAdapter.receiveToken(
         fetchResult.token
       );
-      const totalAmount = receiveResult.amount;
-      console.log("[RefundManager] Token received", {
-        success: receiveResult.success,
-        totalAmount,
-      });
+      const totalAmountMsat =
+        receiveResult.unit === "msat"
+          ? receiveResult.amount
+          : receiveResult.amount * 1000;
 
       // Remove the stored token if we used it from storage
       if (!providedToken) {
-        console.log("[RefundManager] Removing stored token for baseUrl");
         this.storageAdapter.removeToken(baseUrl);
       }
 
-      console.log("[RefundManager] Refund complete", {
-        refundedAmount: totalAmount,
-      });
       return {
         success: receiveResult.success,
-        refundedAmount: totalAmount,
+        refundedAmount: totalAmountMsat,
         requestId: fetchResult.requestId,
       };
     } catch (error) {
@@ -140,11 +119,7 @@ export class RefundManager {
     requestId?: string;
     error?: string;
   }> {
-    console.log("[RefundManager._fetchRefundToken] Starting fetch", {
-      baseUrl,
-    });
     if (!baseUrl) {
-      console.log("[RefundManager._fetchRefundToken] No base URL configured");
       return {
         success: false,
         error: "No base URL configured",
@@ -154,19 +129,14 @@ export class RefundManager {
     const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
     const url = `${normalizedBaseUrl}v1/wallet/refund`;
-    console.log("[RefundManager._fetchRefundToken] Request URL:", url);
 
     // Create an AbortController for timeout handling
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
-      console.log(
-        "[RefundManager._fetchRefundToken] Request timed out, aborting"
-      );
       controller.abort();
     }, 60000); // 1 minute timeout
 
     try {
-      console.log("[RefundManager._fetchRefundToken] Sending POST request...");
       const response = await fetch(url, {
         method: "POST",
         headers: {
@@ -180,18 +150,9 @@ export class RefundManager {
 
       const requestId =
         response.headers.get("x-routstr-request-id") || undefined;
-      console.log("[RefundManager._fetchRefundToken] Response received", {
-        status: response.status,
-        ok: response.ok,
-        requestId,
-      });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        console.log(
-          "[RefundManager._fetchRefundToken] Error response",
-          errorData
-        );
 
         if (
           response.status === 400 &&
@@ -215,9 +176,6 @@ export class RefundManager {
       }
 
       const data = await response.json();
-      console.log("[RefundManager._fetchRefundToken] Success response", {
-        hasToken: !!data.token,
-      });
       return {
         success: true,
         token: data.token,

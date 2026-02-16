@@ -40,7 +40,9 @@ export interface WalletAdapter {
    * @param token Encoded cashu token string
    * @returns Result with success flag and amount received
    */
-  receiveToken(token: string): Promise<{ success: boolean; amount: number }>;
+  receiveToken(
+    token: string
+  ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }>;
 
   /** Check if using NIP-60 wallet (for unit conversion decisions) */
   isUsingNip60(): boolean;

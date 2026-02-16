@@ -199,6 +199,7 @@ export class RoutstrClient {
           streamingResult.content ||
           (streamingResult.images && streamingResult.images.length > 0)
         ) {
+          console.log(streamingResult);
           // Create assistant message
           const message = await this._createAssistantMessage(streamingResult);
           callbacks.onMessageAppend(message);
@@ -532,7 +533,6 @@ export class RoutstrClient {
         refundResult.refundedAmount !== undefined
           ? refundResult.refundedAmount / 1000
           : 0;
-      console.log("Refunded sats:", refundedSats, refundResult);
     }
 
     let satsSpent: number;
