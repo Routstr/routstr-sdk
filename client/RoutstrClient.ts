@@ -40,6 +40,7 @@ export interface FetchOptions {
   mintUrl: string;
   balance: number;
   transactionHistory: TransactionHistory[];
+  maxTokens?: number;
 }
 
 /**
@@ -106,6 +107,7 @@ export class RoutstrClient {
       mintUrl,
       balance,
       transactionHistory,
+      maxTokens,
     } = options;
 
     const initialBalance = this.walletAdapter.isUsingNip60()
@@ -118,7 +120,8 @@ export class RoutstrClient {
     // Calculate required amount
     const requiredSats = this.providerManager.getRequiredSatsForModel(
       selectedModel,
-      apiMessages
+      apiMessages,
+      maxTokens
     );
 
     let tokenBalance: number;
@@ -170,6 +173,7 @@ export class RoutstrClient {
         mintUrl,
         token,
         requiredSats,
+        maxTokens,
       });
 
       if (response instanceof Response && (response as any).tokenBalance) {
@@ -260,6 +264,7 @@ export class RoutstrClient {
     mintUrl: string;
     token: string;
     requiredSats: number;
+    maxTokens?: number;
   }): Promise<Response> {
     const {
       apiMessages,
@@ -268,6 +273,7 @@ export class RoutstrClient {
       mintUrl,
       token,
       requiredSats,
+      maxTokens,
     } = params;
 
     const headers: Record<string, string> = {
@@ -307,6 +313,10 @@ export class RoutstrClient {
       messages: apiMessages,
       stream: true,
     };
+
+    if (maxTokens !== undefined) {
+      body.max_tokens = maxTokens;
+    }
 
     // Only add tools for OpenAI models
     if (selectedModel?.name?.startsWith("OpenAI:")) {
@@ -348,11 +358,18 @@ export class RoutstrClient {
       mintUrl: string;
       token: string;
       requiredSats: number;
+      maxTokens?: number;
     },
     token: string
   ): Promise<Response> {
-    const { apiMessages, selectedModel, baseUrl, mintUrl, requiredSats } =
-      params;
+    const {
+      apiMessages,
+      selectedModel,
+      baseUrl,
+      mintUrl,
+      requiredSats,
+      maxTokens,
+    } = params;
     const status = response.status;
 
     // Try to refund current token
@@ -391,7 +408,8 @@ export class RoutstrClient {
 
         const newRequiredSats = this.providerManager.getRequiredSatsForModel(
           newModel,
-          apiMessages
+          apiMessages,
+          maxTokens
         );
 
         // Spend new token for next provider
@@ -435,9 +453,10 @@ export class RoutstrClient {
       mintUrl: string;
       token: string;
       requiredSats: number;
+      maxTokens?: number;
     }
   ): Promise<Response> {
-    const { apiMessages, selectedModel, baseUrl, mintUrl } = params;
+    const { apiMessages, selectedModel, baseUrl, mintUrl, maxTokens } = params;
 
     // Refund current token
     await this.refundManager.refund({
@@ -468,7 +487,8 @@ export class RoutstrClient {
 
     const newRequiredSats = this.providerManager.getRequiredSatsForModel(
       newModel,
-      apiMessages
+      apiMessages,
+      maxTokens
     );
 
     const spendResult = await this.cashuSpender.spend({

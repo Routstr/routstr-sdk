@@ -397,7 +397,11 @@ export class ProviderManager {
    * Get required sats for a model based on message history
    * Simple estimation based on typical usage
    */
-  getRequiredSatsForModel(model: Model, apiMessages: any[]): number {
+  getRequiredSatsForModel(
+    model: Model,
+    apiMessages: any[],
+    maxTokens?: number
+  ): number {
     try {
       let imageTokens = 0;
       if (apiMessages) {
@@ -482,7 +486,11 @@ export class ProviderManager {
 
       // Calculate based on token usage (similar to getTokenAmountForModel in apiUtils.ts)
       const promptCosts = (sp.prompt || 0) * totalInputTokens;
-      const totalEstimatedCosts = (promptCosts + sp.max_completion_cost) * 1.05;
+      let completionCost = sp.max_completion_cost;
+      if (maxTokens !== undefined && sp.completion) {
+        completionCost = sp.completion * maxTokens;
+      }
+      const totalEstimatedCosts = (promptCosts + completionCost) * 1.05;
       // return totalEstimatedCosts > sp.max_cost ? sp.max_cost : totalEstimatedCosts; // in some image input calculations, this cost balloons up. Now includes image tokens via 32px patches.
       return totalEstimatedCosts; // Backend has a bug here.it's calculating image tokens wrong. gotta switch to different logic once its fixed
     } catch (e) {
