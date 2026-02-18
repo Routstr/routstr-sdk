@@ -47,6 +47,7 @@ export interface FetchOptions {
  * RoutstrClient is the main SDK entry point
  */
 export type AlertLevel = "max" | "min";
+export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
 
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
@@ -54,12 +55,14 @@ export class RoutstrClient {
   private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
+  private mode: RoutstrClientMode;
 
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
     private providerRegistry: ProviderRegistry,
-    alertLevel: AlertLevel
+    alertLevel: AlertLevel,
+    mode: RoutstrClientMode = "xcashu"
   ) {
     this.cashuSpender = new CashuSpender(
       walletAdapter,
@@ -70,6 +73,14 @@ export class RoutstrClient {
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
+    this.mode = mode;
+  }
+
+  /**
+   * Get the current client mode
+   */
+  getMode(): RoutstrClientMode {
+    return this.mode;
   }
 
   /**
