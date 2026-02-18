@@ -9,6 +9,20 @@ import type { StorageDriver, SdkStorageState } from "./types";
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
+const getTokenBalance = (token: string): number => {
+  try {
+    const decoded = getDecodedToken(token);
+    const unitDivisor = decoded.unit === "msat" ? 1000 : 1;
+    let sum = 0;
+    for (const proof of decoded.proofs) {
+      sum += proof.amount / unitDivisor;
+    }
+    return sum;
+  } catch {
+    return 0;
+  }
+};
+
 export interface SdkStoreOptions {
   driver: StorageDriver;
 }
@@ -23,7 +37,12 @@ export interface SdkStorageStore extends SdkStorageState {
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
   setLocalCashuTokens: (
-    value: Array<{ baseUrl: string; token: string }>
+    value: Array<{
+      baseUrl: string;
+      token: string;
+      balance: number;
+      lastUsed: number | null;
+    }>
   ) => void;
 }
 
@@ -80,11 +99,21 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
     ),
     localCashuTokens: driver
       .getItem<
-        Array<{ baseUrl: string; token: string }>
+        Array<{
+          baseUrl: string;
+          token: string;
+          balance?: number;
+          lastUsed?: number | null;
+        }>
       >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, [])
       .map((entry) => ({
         ...entry,
         baseUrl: normalizeBaseUrl(entry.baseUrl),
+        balance:
+          typeof entry.balance === "number"
+            ? entry.balance
+            : Math.round(getTokenBalance(entry.token)),
+        lastUsed: entry.lastUsed ?? null,
       })),
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
@@ -142,6 +171,11 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       const normalized = value.map((entry) => ({
         ...entry,
         baseUrl: normalizeBaseUrl(entry.baseUrl),
+        balance:
+          typeof entry.balance === "number"
+            ? entry.balance
+            : Math.round(getTokenBalance(entry.token)),
+        lastUsed: entry.lastUsed ?? null,
       }));
       driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
       set({ localCashuTokens: normalized });
@@ -189,19 +223,39 @@ export const createStorageAdapterFromStore = (
     const entry = store
       .getState()
       .localCashuTokens.find((token) => token.baseUrl === normalized);
-    return entry ? entry.token : null;
+    if (!entry) return null;
+    const next = store
+      .getState()
+      .localCashuTokens.map((token) =>
+        token.baseUrl === normalized
+          ? { ...token, lastUsed: Date.now() }
+          : token
+      );
+    store.getState().setLocalCashuTokens(next);
+    return entry.token;
   },
   setToken: (baseUrl, token) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().localCashuTokens;
+    const balance = Math.round(getTokenBalance(token));
     const existingIndex = tokens.findIndex(
       (entry) => entry.baseUrl === normalized
     );
     const next = [...tokens];
     if (existingIndex !== -1) {
-      next[existingIndex] = { baseUrl: normalized, token };
+      next[existingIndex] = {
+        baseUrl: normalized,
+        token,
+        balance: Math.round(balance),
+        lastUsed: Date.now(),
+      };
     } else {
-      next.push({ baseUrl: normalized, token });
+      next.push({
+        baseUrl: normalized,
+        token,
+        balance: Math.round(balance),
+        lastUsed: Date.now(),
+      });
     }
     store.getState().setLocalCashuTokens(next);
   },
@@ -217,19 +271,10 @@ export const createStorageAdapterFromStore = (
     const distributionMap: Record<string, number> = {};
 
     for (const entry of tokens) {
-      try {
-        const decoded = getDecodedToken(entry.token);
-        const unitDivisor = decoded.unit === "msat" ? 1000 : 1;
-        let sum = 0;
-        for (const proof of decoded.proofs) {
-          sum += proof.amount / unitDivisor;
-        }
-        if (sum > 0) {
-          distributionMap[entry.baseUrl] =
-            (distributionMap[entry.baseUrl] || 0) + sum;
-        }
-      } catch {
-        // Skip malformed tokens
+      const sum = entry.balance || 0;
+      if (sum > 0) {
+        distributionMap[entry.baseUrl] =
+          (distributionMap[entry.baseUrl] || 0) + sum;
       }
     }
 

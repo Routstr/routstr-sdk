@@ -16,7 +16,7 @@ export interface WalletAdapter {
   getBalances(): Promise<Record<string, number>>;
 
   /** Get unit type for each mint (mintUrl -> 'sat' | 'msat') */
-  getMintUnits(): Record<string, string>;
+  getMintUnits(): Record<string, "sat" | "msat">;
 
   /** Get the currently active mint URL */
   getActiveMintUrl(): string | null;

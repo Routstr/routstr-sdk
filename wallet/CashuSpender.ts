@@ -262,6 +262,7 @@ export class CashuSpender {
       token,
       status: "success",
       balance: adjustedAmount,
+      unit: activeMintUnit,
     };
   }
 
@@ -283,10 +284,13 @@ export class CashuSpender {
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
     if (balanceForBaseUrl > amount) {
+      const units = this.walletAdapter.getMintUnits();
+      const unit = units[mintUrl] || "sat";
       return {
         token: storedToken,
         status: "success",
         balance: balanceForBaseUrl,
+        unit,
       };
     }
 
@@ -326,7 +330,7 @@ export class CashuSpender {
   private async _findAlternateMint(
     options: SpendOptions,
     balances: Record<string, number>,
-    units: Record<string, string>,
+    units: Record<string, "sat" | "msat">,
     providerMints: string[]
   ): Promise<SpendResult | null> {
     const { amount, excludeMints } = options;
@@ -360,6 +364,7 @@ export class CashuSpender {
             token,
             status: "success",
             balance: adjustedAmount,
+            unit: units[selectedMintUrl] || "sat",
           };
         } catch (error) {
           // Continue to next mint

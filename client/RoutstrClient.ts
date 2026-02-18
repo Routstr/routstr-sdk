@@ -165,11 +165,8 @@ export class RoutstrClient {
       }
 
       const token = spendResult.token;
-
-      // Get token balance from wallet info
-      const balanceInfo = await this._getTokenBalance(token, baseUrl);
-      tokenBalance = balanceInfo.amount;
-      tokenBalanceUnit = balanceInfo.unit;
+      tokenBalance = spendResult.balance;
+      tokenBalanceUnit = spendResult.unit ?? "sat";
 
       const tokenBalanceInSats =
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
@@ -193,7 +190,7 @@ export class RoutstrClient {
 
       let refundToken: string | undefined;
       if (this.mode === "xcashu") {
-        refundToken = response.headers.get("X-Cashu-Refund") ?? undefined;
+        refundToken = response.headers.get("x-cashu") ?? undefined;
       }
 
       if (response instanceof Response && (response as any).tokenBalance) {
@@ -244,20 +241,32 @@ export class RoutstrClient {
         callbacks.onStreamingUpdate("");
         callbacks.onThinkingUpdate("");
 
-        // Handle xcashu mode: receive refund token directly from response
-        if (this.mode === "xcashu" && refundToken) {
-          try {
-            await this.walletAdapter.receiveToken(refundToken);
-            console.log("[xcashu] Received refund token from response");
-          } catch (error) {
-            console.error("[xcashu] Failed to receive refund token:", error);
-          }
-        }
-
         // Handle post-response refund (skip for xcashu mode - refund is in response)
         let satsSpent: number;
         if (this.mode === "xcashu") {
           satsSpent = tokenBalanceInSats;
+          if (refundToken) {
+            try {
+              const receiveResult =
+                await this.walletAdapter.receiveToken(refundToken);
+              satsSpent =
+                tokenBalanceInSats -
+                receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+              console.log("[xcashu] Received refund token from response");
+            } catch (error) {
+              console.error("[xcashu] Failed to receive refund token:", error);
+            }
+          }
+        } else if (this.mode === "lazyrefund") {
+          const latestBalanceInfo = await this._getTokenBalance(
+            token,
+            baseUrlUsed
+          );
+          const latestTokenBalance =
+            latestBalanceInfo.unit === "msat"
+              ? latestBalanceInfo.amount / 1000
+              : latestBalanceInfo.amount;
+          satsSpent = tokenBalanceInSats - latestTokenBalance;
         } else {
           satsSpent = await this._handlePostResponseRefund({
             mintUrl,

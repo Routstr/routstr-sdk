@@ -16,6 +16,7 @@ export interface SpendResult {
   token: string | null;
   status: "success" | "failed";
   balance: number;
+  unit?: "sat" | "msat";
   error?: string;
 }
 
