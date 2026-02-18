@@ -132,6 +132,7 @@ export class CashuSpender {
         mintUrl
       );
       if (existingResult) {
+        console.log("sending exisint", existingResult);
         return existingResult;
       }
     }
@@ -160,7 +161,7 @@ export class CashuSpender {
     // Check if we need to refund pending tokens to free up balance
     if (
       totalBalance < adjustedAmount &&
-      totalPending > 0 &&
+      totalPending + totalBalance > adjustedAmount &&
       (retryCount ?? 0) < 1
     ) {
       return await this._refundAndRetry(options);
@@ -275,6 +276,7 @@ export class CashuSpender {
     mintUrl: string
   ): Promise<SpendResult | null> {
     const storedToken = this.storageAdapter.getToken(baseUrl);
+    console.log("storedTokens", storedToken);
     if (!storedToken) return null;
 
     // Get pending distribution to check balance
@@ -282,6 +284,7 @@ export class CashuSpender {
       this.storageAdapter.getPendingTokenDistribution();
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
+    console.log(balanceForBaseUrl);
 
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
@@ -360,6 +363,7 @@ export class CashuSpender {
             this.storageAdapter.setToken(options.baseUrl, token);
           }
 
+          console.log("sending alternative mint", token, adjustedAmount);
           return {
             token,
             status: "success",

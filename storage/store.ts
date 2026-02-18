@@ -36,7 +36,7 @@ export interface SdkStorageStore extends SdkStorageState {
   setMintsFromAllProviders: (value: Record<string, string[]>) => void;
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
-  setLocalCashuTokens: (
+  setCachedTokens: (
     value: Array<{
       baseUrl: string;
       token: string;
@@ -97,7 +97,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
         )
       ).map(([baseUrl, timestamp]) => [normalizeBaseUrl(baseUrl), timestamp])
     ),
-    localCashuTokens: driver
+    cachedTokens: driver
       .getItem<
         Array<{
           baseUrl: string;
@@ -167,7 +167,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       driver.setItem(SDK_STORAGE_KEYS.LAST_MODELS_UPDATE, normalized);
       set({ lastModelsUpdate: normalized });
     },
-    setLocalCashuTokens: (value) => {
+    setCachedTokens: (value) => {
       const normalized = value.map((entry) => ({
         ...entry,
         baseUrl: normalizeBaseUrl(entry.baseUrl),
@@ -178,7 +178,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
         lastUsed: entry.lastUsed ?? null,
       }));
       driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
-      set({ localCashuTokens: normalized });
+      set({ cachedTokens: normalized });
     },
   }));
 };
@@ -222,52 +222,46 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const entry = store
       .getState()
-      .localCashuTokens.find((token) => token.baseUrl === normalized);
+      .cachedTokens.find((token) => token.baseUrl === normalized);
     if (!entry) return null;
     const next = store
       .getState()
-      .localCashuTokens.map((token) =>
+      .cachedTokens.map((token) =>
         token.baseUrl === normalized
           ? { ...token, lastUsed: Date.now() }
           : token
       );
-    store.getState().setLocalCashuTokens(next);
+    store.getState().setCachedTokens(next);
     return entry.token;
   },
   setToken: (baseUrl, token) => {
     const normalized = normalizeBaseUrl(baseUrl);
-    const tokens = store.getState().localCashuTokens;
+    const tokens = store.getState().cachedTokens;
     const balance = Math.round(getTokenBalance(token));
     const existingIndex = tokens.findIndex(
       (entry) => entry.baseUrl === normalized
     );
-    const next = [...tokens];
     if (existingIndex !== -1) {
-      next[existingIndex] = {
-        baseUrl: normalized,
-        token,
-        balance: Math.round(balance),
-        lastUsed: Date.now(),
-      };
-    } else {
-      next.push({
-        baseUrl: normalized,
-        token,
-        balance: Math.round(balance),
-        lastUsed: Date.now(),
-      });
+      throw new Error(`Token already exists for baseUrl: ${normalized}`);
     }
-    store.getState().setLocalCashuTokens(next);
+    const next = [...tokens];
+    next.push({
+      baseUrl: normalized,
+      token,
+      balance: Math.round(balance),
+      lastUsed: Date.now(),
+    });
+    store.getState().setCachedTokens(next);
   },
   removeToken: (baseUrl) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const next = store
       .getState()
-      .localCashuTokens.filter((entry) => entry.baseUrl !== normalized);
-    store.getState().setLocalCashuTokens(next);
+      .cachedTokens.filter((entry) => entry.baseUrl !== normalized);
+    store.getState().setCachedTokens(next);
   },
   getPendingTokenDistribution: () => {
-    const tokens = store.getState().localCashuTokens;
+    const tokens = store.getState().cachedTokens;
     const distributionMap: Record<string, number> = {};
 
     for (const entry of tokens) {
@@ -279,7 +273,7 @@ export const createStorageAdapterFromStore = (
     }
 
     return Object.entries(distributionMap)
-      .map(([baseUrl, amt]) => ({ baseUrl, amount: Math.round(amt) }))
+      .map(([baseUrl, amt]) => ({ baseUrl, amount: amt }))
       .sort((a, b) => b.amount - a.amount);
   },
   saveProviderInfo: (baseUrl, info) => {

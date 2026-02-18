@@ -43,9 +43,6 @@ export interface WalletAdapter {
   receiveToken(
     token: string
   ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }>;
-
-  /** Check if using NIP-60 wallet (for unit conversion decisions) */
-  isUsingNip60(): boolean;
 }
 
 /**

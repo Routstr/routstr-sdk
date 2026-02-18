@@ -121,10 +121,6 @@ export class RoutstrClient {
       maxTokens,
     } = options;
 
-    const initialBalance = this.walletAdapter.isUsingNip60()
-      ? balance
-      : this._getBalanceFromStoredProofs();
-
     // Convert messages for API
     const apiMessages = await this._convertMessages(messageHistory);
 
@@ -186,7 +182,6 @@ export class RoutstrClient {
         requiredSats,
         maxTokens,
       });
-      console.log(response);
 
       let refundToken: string | undefined;
       if (this.mode === "xcashu") {
@@ -266,6 +261,7 @@ export class RoutstrClient {
             latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
+          console.log("Blaance of tha t otkens;", latestBalanceInfo);
           satsSpent = tokenBalanceInSats - latestTokenBalance;
         } else {
           satsSpent = await this._handlePostResponseRefund({
@@ -273,7 +269,7 @@ export class RoutstrClient {
             baseUrl: baseUrlUsed,
             tokenBalance,
             tokenBalanceUnit,
-            initialBalance,
+            initialBalance: balance,
             selectedModel,
             streamingResult,
             callbacks,
@@ -777,24 +773,6 @@ export class RoutstrClient {
   private _getPendingCashuTokenAmount(): number {
     const distribution = this.storageAdapter.getPendingTokenDistribution();
     return distribution.reduce((total, item) => total + item.amount, 0);
-  }
-
-  /**
-   * Get balance from stored proofs (legacy wallet)
-   */
-  private _getBalanceFromStoredProofs(): number {
-    try {
-      const storedProofs = localStorage.getItem("cashu_proofs");
-      if (!storedProofs) return 0;
-
-      const proofs = JSON.parse(storedProofs);
-      return proofs.reduce(
-        (total: number, proof: any) => total + proof.amount,
-        0
-      );
-    } catch {
-      return 0;
-    }
   }
 
   /**

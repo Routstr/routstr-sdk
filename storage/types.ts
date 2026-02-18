@@ -13,7 +13,7 @@ export interface SdkStorageState {
   infoFromAllProviders: Record<string, import("../core").ProviderInfo>;
   lastModelsUpdate: Record<string, number>;
   lastBaseUrlsUpdate: number | null;
-  localCashuTokens: Array<{
+  cachedTokens: Array<{
     baseUrl: string;
     token: string;
     balance: number;
