@@ -171,6 +171,9 @@ export class RoutstrClient {
       tokenBalance = balanceInfo.amount;
       tokenBalanceUnit = balanceInfo.unit;
 
+      const tokenBalanceInSats =
+        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+
       callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
 
       // Reset failed providers for new request
@@ -186,6 +189,12 @@ export class RoutstrClient {
         requiredSats,
         maxTokens,
       });
+      console.log(response);
+
+      let refundToken: string | undefined;
+      if (this.mode === "xcashu") {
+        refundToken = response.headers.get("X-Cashu-Refund") ?? undefined;
+      }
 
       if (response instanceof Response && (response as any).tokenBalance) {
         tokenBalance = (response as any).tokenBalance;
@@ -235,18 +244,33 @@ export class RoutstrClient {
         callbacks.onStreamingUpdate("");
         callbacks.onThinkingUpdate("");
 
-        // Handle post-response refund
-        const satsSpent = await this._handlePostResponseRefund({
-          mintUrl,
-          baseUrl: baseUrlUsed,
-          tokenBalance,
-          tokenBalanceUnit,
-          initialBalance,
-          selectedModel,
-          streamingResult,
-          callbacks,
-          transactionHistory,
-        });
+        // Handle xcashu mode: receive refund token directly from response
+        if (this.mode === "xcashu" && refundToken) {
+          try {
+            await this.walletAdapter.receiveToken(refundToken);
+            console.log("[xcashu] Received refund token from response");
+          } catch (error) {
+            console.error("[xcashu] Failed to receive refund token:", error);
+          }
+        }
+
+        // Handle post-response refund (skip for xcashu mode - refund is in response)
+        let satsSpent: number;
+        if (this.mode === "xcashu") {
+          satsSpent = tokenBalanceInSats;
+        } else {
+          satsSpent = await this._handlePostResponseRefund({
+            mintUrl,
+            baseUrl: baseUrlUsed,
+            tokenBalance,
+            tokenBalanceUnit,
+            initialBalance,
+            selectedModel,
+            streamingResult,
+            callbacks,
+            transactionHistory,
+          });
+        }
         const estimatedCosts = this._getEstimatedCosts(
           selectedModel,
           streamingResult
@@ -289,8 +313,14 @@ export class RoutstrClient {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
     };
+
+    if (this.mode === "xcashu") {
+      headers["X-Cashu"] = token;
+    } else {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    console.log(headers);
 
     // Dev-only mock controls
     if (
