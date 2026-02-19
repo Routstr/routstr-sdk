@@ -298,7 +298,7 @@ export class CashuSpender {
     }
 
     // Token exists but insufficient balance - attempt refund
-    // This requires RefundManager, which we'll integrate later
+    // This requires BalanceManager, which we'll integrate later
     return null;
   }
 
@@ -315,7 +315,7 @@ export class CashuSpender {
     for (const pending of pendingDistribution) {
       const token = this.storageAdapter.getToken(pending.baseUrl);
       if (token) {
-        // Remove token from storage (refund will be handled by caller or RefundManager)
+        // Remove token from storage (refund will be handled by caller or BalanceManager)
         this.storageAdapter.removeToken(pending.baseUrl);
       }
     }

@@ -31,6 +31,17 @@ export interface RefundResult {
 }
 
 /**
+ * Result from top up operations
+ */
+export interface TopUpResult {
+  success: boolean;
+  toppedUpAmount?: number;
+  message?: string;
+  requestId?: string;
+  recoveredToken?: boolean;
+}
+
+/**
  * Token balance information
  */
 export interface TokenBalance {

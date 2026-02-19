@@ -1,17 +1,17 @@
 /**
- * RefundManager - Handles refunding tokens from providers
+ * BalanceManager - Handles refunding and topping up tokens from providers
  *
  * Handles:
  * - Fetching refund tokens from provider API
  * - Receiving/storing refunded tokens
- * - Error handling for various refund failure modes
+ * - Topping up API key balances with cashu tokens
+ * - Error handling for various refund/topup failure modes
  *
  * Extracted from utils/cashuUtils.ts
  */
 
 import type { WalletAdapter, StorageAdapter } from "./interfaces";
-import type { RefundResult } from "../core/types";
-import { TokenOperationError } from "../core/errors";
+import type { RefundResult, TopUpResult } from "../core/types";
 
 /**
  * Options for refunding tokens
@@ -28,9 +28,26 @@ export interface RefundOptions {
 }
 
 /**
- * RefundManager handles token refunds from providers
+ * Options for topping up API key balance
  */
-export class RefundManager {
+export interface TopUpOptions {
+  /** The mint URL to spend from */
+  mintUrl: string;
+
+  /** The provider base URL */
+  baseUrl: string;
+
+  /** Amount to top up in sats */
+  amount: number;
+
+  /** Optional specific API key to top up (if not provided, uses stored token) */
+  token?: string;
+}
+
+/**
+ * BalanceManager handles token refunds and topups from providers
+ */
+export class BalanceManager {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter
@@ -45,7 +62,7 @@ export class RefundManager {
     const storedToken = providedToken || this.storageAdapter.getToken(baseUrl);
 
     if (!storedToken) {
-      console.log("[RefundManager] No token to refund, returning early");
+      console.log("[BalanceManager] No token to refund, returning early");
       return { success: true, message: "No API key to refund" };
     }
 
@@ -76,7 +93,7 @@ export class RefundManager {
       // Check if this is a "no balance to refund" case
       if (fetchResult.error === "No balance to refund") {
         console.log(
-          "[RefundManager] No balance to refund, removing stored token"
+          "[BalanceManager] No balance to refund, removing stored token"
         );
         this.storageAdapter.removeToken(baseUrl);
         return { success: true, message: "No balance to refund" };
@@ -102,8 +119,60 @@ export class RefundManager {
         requestId: fetchResult.requestId,
       };
     } catch (error) {
-      console.error("[RefundManager] Refund error", error);
+      console.error("[BalanceManager] Refund error", error);
       return this._handleRefundError(error, mintUrl, fetchResult?.requestId);
+    }
+  }
+
+  /**
+   * Top up API key balance with a cashu token
+   */
+  async topUp(options: TopUpOptions): Promise<TopUpResult> {
+    const { mintUrl, baseUrl, amount, token: providedToken } = options;
+
+    if (!amount || amount <= 0) {
+      return { success: false, message: "Invalid top up amount" };
+    }
+
+    const storedToken = providedToken || this.storageAdapter.getToken(baseUrl);
+    if (!storedToken) {
+      return { success: false, message: "No API key available for top up" };
+    }
+
+    let cashuToken: string | null = null;
+    let requestId: string | undefined;
+
+    try {
+      cashuToken = await this.walletAdapter.sendToken(mintUrl, amount);
+
+      const topUpResult = await this._postTopUp(
+        baseUrl,
+        storedToken,
+        cashuToken
+      );
+      requestId = topUpResult.requestId;
+
+      if (!topUpResult.success) {
+        await this._recoverFailedTopUp(cashuToken);
+        return {
+          success: false,
+          message: topUpResult.error || "Top up failed",
+          requestId,
+          recoveredToken: true,
+        };
+      }
+
+      return {
+        success: true,
+        toppedUpAmount: amount,
+        requestId,
+      };
+    } catch (error) {
+      if (cashuToken) {
+        await this._recoverFailedTopUp(cashuToken);
+      }
+
+      return this._handleTopUpError(error, mintUrl, requestId);
     }
   }
 
@@ -183,7 +252,7 @@ export class RefundManager {
       };
     } catch (error) {
       clearTimeout(timeoutId);
-      console.error("[RefundManager._fetchRefundToken] Fetch error", error);
+      console.error("[BalanceManager._fetchRefundToken] Fetch error", error);
 
       if (error instanceof Error) {
         if (error.name === "AbortError") {
@@ -202,6 +271,99 @@ export class RefundManager {
         success: false,
         error: "Unknown error occurred during refund request",
       };
+    }
+  }
+
+  /**
+   * Post topup request to provider API
+   */
+  private async _postTopUp(
+    baseUrl: string,
+    storedToken: string,
+    cashuToken: string
+  ): Promise<{
+    success: boolean;
+    requestId?: string;
+    error?: string;
+  }> {
+    if (!baseUrl) {
+      return {
+        success: false,
+        error: "No base URL configured",
+      };
+    }
+
+    const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+    const url = `${normalizedBaseUrl}v1/wallet/topup?cashu_token=${encodeURIComponent(
+      cashuToken
+    )}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 60000);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${storedToken}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const requestId =
+        response.headers.get("x-routstr-request-id") || undefined;
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        return {
+          success: false,
+          requestId,
+          error:
+            errorData?.detail || `Top up failed with status ${response.status}`,
+        };
+      }
+
+      return { success: true, requestId };
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error("[BalanceManager._postTopUp] Fetch error", error);
+
+      if (error instanceof Error) {
+        if (error.name === "AbortError") {
+          return {
+            success: false,
+            error: "Request timed out after 1 minute",
+          };
+        }
+        return {
+          success: false,
+          error: error.message,
+        };
+      }
+
+      return {
+        success: false,
+        error: "Unknown error occurred during top up request",
+      };
+    }
+  }
+
+  /**
+   * Attempt to receive token back after failed top up
+   */
+  private async _recoverFailedTopUp(cashuToken: string): Promise<void> {
+    try {
+      await this.walletAdapter.receiveToken(cashuToken);
+    } catch (error) {
+      console.error(
+        "[BalanceManager._recoverFailedTopUp] Failed to recover token",
+        error
+      );
     }
   }
 
@@ -248,6 +410,52 @@ export class RefundManager {
     return {
       success: false,
       message: "Refund failed",
+      requestId,
+    };
+  }
+
+  /**
+   * Handle topup errors with specific error types
+   */
+  private _handleTopUpError(
+    error: unknown,
+    mintUrl: string,
+    requestId?: string
+  ): TopUpResult {
+    if (error instanceof Error) {
+      if (
+        error.message.includes(
+          "NetworkError when attempting to fetch resource"
+        ) ||
+        error.message.includes("Failed to fetch") ||
+        error.message.includes("Load failed")
+      ) {
+        return {
+          success: false,
+          message: `Failed to connect to the mint: ${mintUrl}`,
+          requestId,
+        };
+      }
+
+      if (error.message.includes("Wallet not found")) {
+        return {
+          success: false,
+          message:
+            "Wallet couldn't be loaded. The cashu token was recovered locally.",
+          requestId,
+        };
+      }
+
+      return {
+        success: false,
+        message: error.message,
+        requestId,
+      };
+    }
+
+    return {
+      success: false,
+      message: "Top up failed",
       requestId,
     };
   }

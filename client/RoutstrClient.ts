@@ -20,7 +20,7 @@ import type {
   StreamingCallbacks,
 } from "../wallet/interfaces";
 import { CashuSpender } from "../wallet/CashuSpender";
-import { RefundManager } from "../wallet/RefundManager";
+import { BalanceManager } from "../wallet/BalanceManager";
 import { StreamProcessor } from "./StreamProcessor";
 import { ProviderManager } from "./ProviderManager";
 import type { StreamingResult, TokenBalance } from "../core/types";
@@ -51,7 +51,7 @@ export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
 
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
-  private refundManager: RefundManager;
+  private balanceManager: BalanceManager;
   private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
@@ -69,7 +69,7 @@ export class RoutstrClient {
       storageAdapter,
       providerRegistry
     );
-    this.refundManager = new RefundManager(walletAdapter, storageAdapter);
+    this.balanceManager = new BalanceManager(walletAdapter, storageAdapter);
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
@@ -91,10 +91,10 @@ export class RoutstrClient {
   }
 
   /**
-   * Get the RefundManager instance
+   * Get the BalanceManager instance
    */
-  getRefundManager(): RefundManager {
-    return this.refundManager;
+  getBalanceManager(): BalanceManager {
+    return this.balanceManager;
   }
 
   /**
@@ -419,7 +419,7 @@ export class RoutstrClient {
     const status = response.status;
 
     // Try to refund current token
-    await this.refundManager.refund({
+    await this.balanceManager.refund({
       mintUrl,
       baseUrl,
       token,
@@ -505,7 +505,7 @@ export class RoutstrClient {
     const { apiMessages, selectedModel, baseUrl, mintUrl, maxTokens } = params;
 
     // Refund current token
-    await this.refundManager.refund({
+    await this.balanceManager.refund({
       mintUrl,
       baseUrl,
       token: params.token,
@@ -594,7 +594,7 @@ export class RoutstrClient {
     );
 
     // Perform refund
-    const refundResult = await this.refundManager.refund({
+    const refundResult = await this.balanceManager.refund({
       mintUrl,
       baseUrl,
     });
