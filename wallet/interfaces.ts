@@ -56,6 +56,15 @@ export interface ApiKeyEntry {
   lastUsed: number | null;
 }
 
+export interface ChildKeyEntry {
+  parentBaseUrl: string;
+  childKey: string;
+  balance: number;
+  balanceLimit?: number;
+  validityDate?: number;
+  createdAt: number;
+}
+
 export interface StorageAdapter {
   /** Get stored API token for a provider */
   getToken(baseUrl: string): string | null;
@@ -91,6 +100,29 @@ export interface StorageAdapter {
 
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];
+
+  // ========== Child Keys (for apikeys mode) ==========
+
+  /** Get stored child key for a parent provider */
+  getChildKey(parentBaseUrl: string): ChildKeyEntry | null;
+
+  /** Store a child key for a parent provider */
+  setChildKey(
+    parentBaseUrl: string,
+    childKey: string,
+    balance?: number,
+    validityDate?: number,
+    balanceLimit?: number
+  ): void;
+
+  /** Update balance for an existing child key */
+  updateChildKeyBalance(parentBaseUrl: string, balance: number): void;
+
+  /** Remove child key for a parent provider */
+  removeChildKey(parentBaseUrl: string): void;
+
+  /** Get all stored child keys */
+  getAllChildKeys(): ChildKeyEntry[];
 }
 
 /**

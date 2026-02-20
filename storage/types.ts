@@ -25,4 +25,12 @@ export interface SdkStorageState {
     balance: number;
     lastUsed: number | null;
   }>;
+  childKeys: Array<{
+    parentBaseUrl: string;
+    childKey: string;
+    balance: number;
+    balanceLimit?: number;
+    validityDate?: number;
+    createdAt: number;
+  }>;
 }

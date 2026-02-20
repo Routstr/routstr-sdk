@@ -273,29 +273,67 @@ export class RoutstrClient {
       callbacks.onPaymentProcessing?.(true);
 
       let token: string;
-      
+
       // Handle different modes
       if (this.mode === "apikeys") {
-        // In apikeys mode, get API key from storage instead of spending Cashu
-        const apiKey = this.storageAdapter.getApiKey(baseUrl);
-        if (!apiKey) {
+        // In apikeys mode, get API key from storage and create child key
+        let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (!parentApiKey) {
           throw new Error(
             `No API key found for ${baseUrl}. Please add an API key first.`
           );
         }
-        // Derive child key for this request (timestamp-based for parallel requests)
-        const childKey = this._deriveChildKey(apiKey);
-        token = childKey;
-        tokenBalance = 0;
+
+        // Check if we already have a child key for this provider
+        let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
+
+        // If no child key or it's invalid, create a new one
+        if (!childKeyEntry) {
+          try {
+            const childKeyResult = await this._createChildKey(
+              baseUrl,
+              parentApiKey
+            );
+            this.storageAdapter.setChildKey(
+              baseUrl,
+              childKeyResult.childKey,
+              childKeyResult.balance,
+              childKeyResult.validityDate,
+              childKeyResult.balanceLimit
+            );
+            childKeyEntry = {
+              parentBaseUrl: baseUrl,
+              childKey: childKeyResult.childKey,
+              balance: childKeyResult.balance,
+              balanceLimit: childKeyResult.balanceLimit,
+              validityDate: childKeyResult.validityDate,
+              createdAt: Date.now(),
+            };
+          } catch (e) {
+            console.warn("Could not create child key, using parent key:", e);
+            // Fall back to using parent key directly
+            childKeyEntry = {
+              parentBaseUrl: baseUrl,
+              childKey: parentApiKey,
+              balance: 0,
+              createdAt: Date.now(),
+            };
+          }
+        }
+
+        token = childKeyEntry.childKey;
+        tokenBalance = childKeyEntry.balance;
         tokenBalanceUnit = "sat";
-        
-        // Get initial balance from provider
-        try {
-          const balanceInfo = await this._getApiKeyBalance(baseUrl, childKey);
-          tokenBalance = balanceInfo.amount;
-          tokenBalanceUnit = balanceInfo.unit;
-        } catch (e) {
-          console.warn("Could not get initial API key balance:", e);
+
+        // Get initial balance from provider if needed
+        if (tokenBalance === 0) {
+          try {
+            const balanceInfo = await this._getApiKeyBalance(baseUrl, token);
+            tokenBalance = balanceInfo.amount;
+            tokenBalanceUnit = balanceInfo.unit;
+          } catch (e) {
+            console.warn("Could not get initial API key balance:", e);
+          }
         }
       } else {
         const spendResult = await this.cashuSpender.spend({
@@ -425,6 +463,27 @@ export class RoutstrClient {
             latestTokenBalance
           );
           satsSpent = tokenBalanceInSats - latestTokenBalance;
+        } else if (this.mode === "apikeys") {
+          // For apikeys mode, get updated balance from provider (no refund needed)
+          try {
+            const latestBalanceInfo = await this._getApiKeyBalance(
+              baseUrlUsed,
+              token
+            );
+            const latestTokenBalance =
+              latestBalanceInfo.unit === "msat"
+                ? latestBalanceInfo.amount / 1000
+                : latestBalanceInfo.amount;
+            this.storageAdapter.updateChildKeyBalance(
+              baseUrlUsed,
+              latestTokenBalance
+            );
+            satsSpent = tokenBalanceInSats - latestTokenBalance;
+          } catch (e) {
+            console.warn("Could not get updated API key balance:", e);
+            // Estimate based on usage
+            satsSpent = this._getEstimatedCosts(selectedModel, streamingResult);
+          }
         } else {
           satsSpent = await this._handlePostResponseRefund({
             mintUrl,
@@ -578,6 +637,40 @@ export class RoutstrClient {
       maxTokens,
     } = params;
     const status = response.status;
+
+    // Handle apikeys mode differently - no refund needed
+    if (this.mode === "apikeys") {
+      // Remove invalid child key
+      this.storageAdapter.removeChildKey(baseUrl);
+
+      // For auth errors, try with a new child key
+      if (status === 401 || status === 403) {
+        const parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (parentApiKey) {
+          try {
+            const childKeyResult = await this._createChildKey(
+              baseUrl,
+              parentApiKey
+            );
+            this.storageAdapter.setChildKey(
+              baseUrl,
+              childKeyResult.childKey,
+              childKeyResult.balance,
+              childKeyResult.validityDate,
+              childKeyResult.balanceLimit
+            );
+            // Retry with new child key
+            return this._makeRequest({
+              ...params,
+              token: childKeyResult.childKey,
+            });
+          } catch (e) {
+            console.error("Failed to create new child key:", e);
+          }
+        }
+      }
+      throw new ProviderError(baseUrl, status, await response.text());
+    }
 
     // Try to refund current token
     await this.balanceManager.refund({
@@ -917,6 +1010,54 @@ export class RoutstrClient {
     // Format: originalKey_timestamp
     const timestamp = Date.now();
     return `${apiKey}_${timestamp}`;
+  }
+
+  /**
+   * Create a child key for a parent API key via the provider's API
+   * POST /v1/balance/child-key
+   */
+  private async _createChildKey(
+    baseUrl: string,
+    parentApiKey: string,
+    options?: {
+      count?: number;
+      balanceLimit?: number;
+      balanceLimitReset?: string;
+      validityDate?: number;
+    }
+  ): Promise<{
+    childKey: string;
+    balance: number;
+    balanceLimit?: number;
+    validityDate?: number;
+  }> {
+    const response = await fetch(`${baseUrl}v1/balance/child-key`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${parentApiKey}`,
+      },
+      body: JSON.stringify({
+        count: options?.count ?? 1,
+        balance_limit: options?.balanceLimit,
+        balance_limit_reset: options?.balanceLimitReset,
+        validity_date: options?.validityDate,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to create child key: ${response.status} ${await response.text()}`
+      );
+    }
+
+    const data = await response.json();
+    return {
+      childKey: data.key ?? data.keys?.[0],
+      balance: data.balance ?? 0,
+      balanceLimit: data.balance_limit,
+      validityDate: data.validity_date,
+    };
   }
 
   /**

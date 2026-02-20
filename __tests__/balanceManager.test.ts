@@ -21,6 +21,15 @@ const createStorage = (
   getPendingTokenDistribution: () => [],
   saveProviderInfo: () => {},
   getProviderInfo: () => null,
+  getApiKey: () => null,
+  setApiKey: () => {},
+  updateApiKeyBalance: () => {},
+  getAllApiKeys: () => [],
+  getChildKey: () => null,
+  setChildKey: () => {},
+  updateChildKeyBalance: () => {},
+  removeChildKey: () => {},
+  getAllChildKeys: () => [],
   ...overrides,
 });
 

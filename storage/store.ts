@@ -52,6 +52,16 @@ export interface SdkStorageStore extends SdkStorageState {
       lastUsed: number | null;
     }>
   ) => void;
+  setChildKeys: (
+    value: Array<{
+      parentBaseUrl: string;
+      childKey: string;
+      balance: number;
+      balanceLimit?: number;
+      validityDate?: number;
+      createdAt: number;
+    }>
+  ) => void;
 }
 
 export const createSdkStore = ({ driver }: SdkStoreOptions) => {
@@ -123,19 +133,39 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
             : getTokenBalance(entry.token),
         lastUsed: entry.lastUsed ?? null,
       })),
-    apiKeys: driver.getItem<
-      Array<{
-        baseUrl: string;
-        key: string;
-        balance?: number;
-        lastUsed?: number | null;
-      }>
-    >(SDK_STORAGE_KEYS.API_KEYS, [])
+    apiKeys: driver
+      .getItem<
+        Array<{
+          baseUrl: string;
+          key: string;
+          balance?: number;
+          lastUsed?: number | null;
+        }>
+      >(SDK_STORAGE_KEYS.API_KEYS, [])
       .map((entry) => ({
         ...entry,
         baseUrl: normalizeBaseUrl(entry.baseUrl),
         balance: entry.balance ?? 0,
         lastUsed: entry.lastUsed ?? null,
+      })),
+    childKeys: driver
+      .getItem<
+        Array<{
+          parentBaseUrl: string;
+          childKey: string;
+          balance?: number;
+          balanceLimit?: number;
+          validityDate?: number;
+          createdAt?: number;
+        }>
+      >(SDK_STORAGE_KEYS.CHILD_KEYS, [])
+      .map((entry) => ({
+        parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
+        childKey: entry.childKey,
+        balance: entry.balance ?? 0,
+        balanceLimit: entry.balanceLimit,
+        validityDate: entry.validityDate,
+        createdAt: entry.createdAt ?? Date.now(),
       })),
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
@@ -211,6 +241,18 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       }));
       driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
       set({ apiKeys: normalized });
+    },
+    setChildKeys: (value) => {
+      const normalized = value.map((entry) => ({
+        parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
+        childKey: entry.childKey,
+        balance: entry.balance ?? 0,
+        balanceLimit: entry.balanceLimit,
+        validityDate: entry.validityDate,
+        createdAt: entry.createdAt ?? Date.now(),
+      }));
+      driver.setItem(SDK_STORAGE_KEYS.CHILD_KEYS, normalized);
+      set({ childKeys: normalized });
     },
   }));
 };
@@ -387,6 +429,94 @@ export const createStorageAdapterFromStore = (
       key: entry.key,
       balance: entry.balance,
       lastUsed: entry.lastUsed,
+    }));
+  },
+
+  // ========== Child Keys ==========
+
+  getChildKey: (parentBaseUrl) => {
+    const normalized = normalizeBaseUrl(parentBaseUrl);
+    const entry = store
+      .getState()
+      .childKeys.find((key) => key.parentBaseUrl === normalized);
+    if (!entry) return null;
+    return {
+      parentBaseUrl: entry.parentBaseUrl,
+      childKey: entry.childKey,
+      balance: entry.balance,
+      balanceLimit: entry.balanceLimit,
+      validityDate: entry.validityDate,
+      createdAt: entry.createdAt,
+    };
+  },
+
+  setChildKey: (
+    parentBaseUrl,
+    childKey,
+    balance,
+    validityDate,
+    balanceLimit
+  ) => {
+    const normalized = normalizeBaseUrl(parentBaseUrl);
+    const keys = store.getState().childKeys;
+    const existingIndex = keys.findIndex(
+      (entry) => entry.parentBaseUrl === normalized
+    );
+    if (existingIndex !== -1) {
+      // Update existing child key
+      const next = keys.map((entry) =>
+        entry.parentBaseUrl === normalized
+          ? {
+              ...entry,
+              childKey,
+              balance: balance ?? 0,
+              validityDate,
+              balanceLimit,
+              createdAt: Date.now(),
+            }
+          : entry
+      );
+      store.getState().setChildKeys(next);
+    } else {
+      // Add new child key
+      const next = [...keys];
+      next.push({
+        parentBaseUrl: normalized,
+        childKey,
+        balance: balance ?? 0,
+        validityDate,
+        balanceLimit,
+        createdAt: Date.now(),
+      });
+      store.getState().setChildKeys(next);
+    }
+  },
+
+  updateChildKeyBalance: (parentBaseUrl, balance) => {
+    const normalized = normalizeBaseUrl(parentBaseUrl);
+    const keys = store.getState().childKeys;
+    const next = keys.map((entry) =>
+      entry.parentBaseUrl === normalized ? { ...entry, balance } : entry
+    );
+    store.getState().setChildKeys(next);
+  },
+
+  removeChildKey: (parentBaseUrl) => {
+    const normalized = normalizeBaseUrl(parentBaseUrl);
+    const next = store
+      .getState()
+      .childKeys.filter((entry) => entry.parentBaseUrl !== normalized);
+    store.getState().setChildKeys(next);
+  },
+
+  getAllChildKeys: () => {
+    return store.getState().childKeys.map((entry) => ({
+      parentBaseUrl: entry.parentBaseUrl,
+      childKey: entry.childKey,
+      balance: entry.balance,
+      balanceLimit: entry.balanceLimit,
+      validityDate: entry.validityDate,
+      createdAt: entry.createdAt,
     }));
   },
 });
