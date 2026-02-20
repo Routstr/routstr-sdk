@@ -133,6 +133,10 @@ export class RoutstrClient {
   async routeRequest(params: RouteRequestParams): Promise<Response> {
     const { path, method, body, headers = {}, baseUrl, mintUrl } = params;
 
+    console.log(
+      `[RoutstrClient.routeRequest] path: ${path}, baseUrl: ${baseUrl}, mintUrl: ${mintUrl}`
+    );
+
     // Get wallet balance
     const balances = await this.walletAdapter.getBalances();
     const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
@@ -192,6 +196,9 @@ export class RoutstrClient {
     }
 
     // Spend token
+    console.log(
+      `[RoutstrClient.routeRequest] Spending ${requiredSats} sats for token...`
+    );
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
       amount: requiredSats,
@@ -226,7 +233,14 @@ export class RoutstrClient {
       fetchOptions.body = JSON.stringify(requestBody);
     }
 
+    console.log(
+      `[RoutstrClient.routeRequest] Making fetch request to ${url}...`
+    );
     const response = await fetch(url, fetchOptions);
+
+    console.log(
+      `[RoutstrClient.routeRequest] Response status: ${response.status}`
+    );
 
     // Handle error responses
     if (!response.ok) {
