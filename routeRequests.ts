@@ -42,6 +42,8 @@ export interface RouteRequestOptions {
   torMode?: boolean;
   /** Optional: force refresh of cached data */
   forceRefresh?: boolean;
+  /** Optional: pre-initialized ModelManager (skips bootstrap if provided) */
+  modelManager?: ModelManager;
 }
 
 /**
@@ -95,23 +97,36 @@ export async function routeRequests(
     includeProviderUrls = [],
     torMode = false,
     forceRefresh = false,
+    modelManager: providedModelManager,
   } = options;
 
-  // Initialize ModelManager
-  const modelManager = new ModelManager(discoveryAdapter, {
-    includeProviderUrls: forcedProvider
-      ? [forcedProvider, ...includeProviderUrls]
-      : includeProviderUrls,
-  });
+  // Use provided ModelManager or create a new one
+  let modelManager: ModelManager;
+  let providers: string[];
 
-  // Bootstrap providers
-  const providers = await modelManager.bootstrapProviders(torMode);
-  if (providers.length === 0) {
-    throw new Error("No providers available");
+  if (providedModelManager) {
+    modelManager = providedModelManager;
+    providers = modelManager.getBaseUrls();
+    if (providers.length === 0) {
+      throw new Error("No providers available - run bootstrap first");
+    }
+  } else {
+    // Initialize ModelManager
+    modelManager = new ModelManager(discoveryAdapter, {
+      includeProviderUrls: forcedProvider
+        ? [forcedProvider, ...includeProviderUrls]
+        : includeProviderUrls,
+    });
+
+    // Bootstrap providers
+    providers = await modelManager.bootstrapProviders(torMode);
+    if (providers.length === 0) {
+      throw new Error("No providers available");
+    }
+
+    // Fetch models
+    await modelManager.fetchModels(providers, forceRefresh);
   }
-
-  // Fetch models
-  await modelManager.fetchModels(providers, forceRefresh);
 
   // Initialize ProviderManager
   const providerManager = new ProviderManager(providerRegistry);

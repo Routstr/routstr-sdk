@@ -46,6 +46,14 @@ export class ModelManager {
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
 
+  /**
+   * Get the list of bootstrapped provider base URLs
+   * @returns Array of provider base URLs
+   */
+  getBaseUrls(): string[] {
+    return this.adapter.getBaseUrlsList();
+  }
+
   static async init(
     adapter: DiscoveryAdapter,
     config: ModelManagerConfig = {},
