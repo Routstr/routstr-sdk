@@ -49,6 +49,16 @@ export interface FetchOptions {
 export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
 
+export interface RouteRequestParams {
+  path: string;
+  method: string;
+  body?: unknown;
+  headers?: Record<string, string>;
+  baseUrl: string;
+  mintUrl: string;
+  modelId?: string;
+}
+
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private balanceManager: BalanceManager;
@@ -99,10 +109,133 @@ export class RoutstrClient {
   }
 
   /**
+   * Get the ProviderManager instance
+   */
+  getProviderManager(): ProviderManager {
+    return this.providerManager;
+  }
+
+  /**
    * Check if the client is currently busy (in critical section)
    */
   get isBusy(): boolean {
     return this.cashuSpender.isBusy;
+  }
+
+  /**
+   * Route an API request to the upstream provider
+   *
+   * This is a simpler alternative to fetchAIResponse that just proxies
+   * the request upstream without the streaming callback machinery.
+   * Useful for daemon-style routing where you just need to forward
+   * requests and get responses back.
+   */
+  async routeRequest(params: RouteRequestParams): Promise<Response> {
+    const { path, method, body, headers = {}, baseUrl, mintUrl } = params;
+
+    // Get wallet balance
+    const balances = await this.walletAdapter.getBalances();
+    const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
+
+    if (totalBalance <= 0) {
+      throw new InsufficientBalanceError(1, 0);
+    }
+
+    // Get provider info for version compatibility
+    const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
+    const providerVersion = providerInfo?.version ?? "";
+
+    // Prepare request body
+    let requestBody = body;
+    if (body && typeof body === "object") {
+      const bodyObj = body as Record<string, unknown>;
+      // Force stream: false for daemon routing - we handle response ourselves
+      if (!bodyObj.stream) {
+        requestBody = { ...bodyObj, stream: false };
+      }
+    }
+
+    // Build headers
+    const requestHeaders: Record<string, string> = {
+      ...headers,
+      "Content-Type": "application/json",
+    };
+
+    // Dev-only mock controls
+    if (
+      typeof window !== "undefined" &&
+      process.env.NODE_ENV === "development"
+    ) {
+      try {
+        const scenario = window.localStorage.getItem("msw:scenario");
+        const latency = window.localStorage.getItem("msw:latency");
+        if (scenario) requestHeaders["X-Mock-Scenario"] = scenario;
+        if (latency) requestHeaders["X-Mock-Latency"] = latency;
+      } catch {}
+    }
+
+    // For non-streaming requests, we need to get a token and make the request
+    // Calculate required sats if we can determine the model
+    let requiredSats = 1; // Minimum
+    if (params.modelId) {
+      const model = await this.providerManager.getModelForProvider(
+        baseUrl,
+        params.modelId
+      );
+      if (model) {
+        requiredSats = this.providerManager.getRequiredSatsForModel(
+          model,
+          [],
+          undefined
+        );
+      }
+    }
+
+    // Spend token
+    const spendResult = await this.cashuSpender.spend({
+      mintUrl,
+      amount: requiredSats,
+      baseUrl,
+      reuseToken: true,
+    });
+
+    if (spendResult.status === "failed" || !spendResult.token) {
+      const errorMsg =
+        spendResult.error || `Insufficient balance. Need ${requiredSats} sats.`;
+
+      if (this._isNetworkError(errorMsg)) {
+        throw new Error(
+          `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+        );
+      }
+
+      throw new Error(errorMsg);
+    }
+
+    const token = spendResult.token;
+    requestHeaders["Authorization"] = `Bearer ${token}`;
+
+    // Make the request
+    const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+    const fetchOptions: RequestInit = {
+      method,
+      headers: requestHeaders,
+    };
+
+    if (body && method !== "GET") {
+      fetchOptions.body = JSON.stringify(requestBody);
+    }
+
+    const response = await fetch(url, fetchOptions);
+
+    // Handle error responses
+    if (!response.ok) {
+      // Try to refund
+      await this.refundManager.refund({ mintUrl, baseUrl, token });
+      throw new ProviderError(baseUrl, response.status, await response.text());
+    }
+
+    return response;
   }
 
   /**

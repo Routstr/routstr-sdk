@@ -27,3 +27,6 @@ export * from "./utils";
 
 // Storage (default adapters + drivers)
 export * from "./storage";
+
+// Routing helper
+export * from "./routeRequests";
