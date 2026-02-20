@@ -21,6 +21,7 @@ import {
   MintUnreachableError,
   TokenOperationError,
 } from "../core/errors";
+import { BalanceManager } from "./BalanceManager";
 
 /**
  * Options for spending cashu tokens
@@ -57,7 +58,8 @@ export class CashuSpender {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry?: ProviderRegistry
+    private providerRegistry?: ProviderRegistry,
+    private balanceManager?: BalanceManager
   ) {}
 
   /**
@@ -276,7 +278,6 @@ export class CashuSpender {
     mintUrl: string
   ): Promise<SpendResult | null> {
     const storedToken = this.storageAdapter.getToken(baseUrl);
-    console.log("storedTokens", storedToken);
     if (!storedToken) return null;
 
     // Get pending distribution to check balance
@@ -284,7 +285,7 @@ export class CashuSpender {
       this.storageAdapter.getPendingTokenDistribution();
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
-    console.log(balanceForBaseUrl);
+    console.log("Current balcem", balanceForBaseUrl);
 
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
@@ -297,8 +298,28 @@ export class CashuSpender {
       };
     }
 
-    // Token exists but insufficient balance - attempt refund
-    // This requires BalanceManager, which we'll integrate later
+    // Token exists but insufficient balance - attempt topup
+    if (this.balanceManager) {
+      const topUpAmount = amount * 1.2 - balanceForBaseUrl;
+      const topUpResult = await this.balanceManager.topUp({
+        mintUrl,
+        baseUrl,
+        amount: topUpAmount,
+      });
+
+      if (topUpResult.success && topUpResult.toppedUpAmount) {
+        const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
+        const units = this.walletAdapter.getMintUnits();
+        const unit = units[mintUrl] || "sat";
+        return {
+          token: storedToken,
+          status: "success",
+          balance: newBalance,
+          unit,
+        };
+      }
+    }
+
     return null;
   }
 

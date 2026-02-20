@@ -17,6 +17,7 @@ const createStorage = (
   getToken: () => null,
   setToken: () => {},
   removeToken: () => {},
+  updateTokenBalance: () => {},
   getPendingTokenDistribution: () => [],
   saveProviderInfo: () => {},
   getProviderInfo: () => null,

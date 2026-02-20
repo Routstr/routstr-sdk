@@ -64,12 +64,13 @@ export class RoutstrClient {
     alertLevel: AlertLevel,
     mode: RoutstrClientMode = "xcashu"
   ) {
+    this.balanceManager = new BalanceManager(walletAdapter, storageAdapter);
     this.cashuSpender = new CashuSpender(
       walletAdapter,
       storageAdapter,
-      providerRegistry
+      providerRegistry,
+      this.balanceManager
     );
-    this.balanceManager = new BalanceManager(walletAdapter, storageAdapter);
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
@@ -261,8 +262,13 @@ export class RoutstrClient {
             latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
-          console.log("Blaance of tha t otkens;", latestBalanceInfo);
+          console.log("Balance of the tokens:", latestBalanceInfo);
+          this.storageAdapter.updateTokenBalance(
+            baseUrlUsed,
+            latestTokenBalance
+          );
           satsSpent = tokenBalanceInSats - latestTokenBalance;
+          console.log(tokenBalanceInSats, latestTokenBalance);
         } else {
           satsSpent = await this._handlePostResponseRefund({
             mintUrl,

@@ -260,6 +260,16 @@ export const createStorageAdapterFromStore = (
       .cachedTokens.filter((entry) => entry.baseUrl !== normalized);
     store.getState().setCachedTokens(next);
   },
+  updateTokenBalance: (baseUrl, balance) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const tokens = store.getState().cachedTokens;
+    const next = tokens.map((entry) =>
+      entry.baseUrl === normalized
+        ? { ...entry, balance: Math.round(balance) }
+        : entry
+    );
+    store.getState().setCachedTokens(next);
+  },
   getPendingTokenDistribution: () => {
     const tokens = store.getState().cachedTokens;
     const distributionMap: Record<string, number> = {};

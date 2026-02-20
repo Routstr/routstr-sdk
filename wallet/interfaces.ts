@@ -59,6 +59,9 @@ export interface StorageAdapter {
   /** Remove API token for a provider */
   removeToken(baseUrl: string): void;
 
+  /** Update balance for an existing stored token */
+  updateTokenBalance(baseUrl: string, balance: number): void;
+
   /** Get all stored tokens as distribution (baseUrl -> amount in sats) */
   getPendingTokenDistribution(): Array<{ baseUrl: string; amount: number }>;
 
