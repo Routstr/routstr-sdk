@@ -85,6 +85,10 @@ export interface RouteRequestResult {
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<RouteRequestResult> {
+  console.log(
+    `[routeRequests] Starting request routing for model: ${options.modelId}`
+  );
+
   const {
     modelId,
     requestBody,
@@ -100,9 +104,22 @@ export async function routeRequests(
     modelManager: providedModelManager,
   } = options;
 
+<<<<<<< HEAD
   // Use provided ModelManager or create a new one
   let modelManager: ModelManager;
   let providers: string[];
+=======
+  console.log(
+    `[routeRequests] Path: ${path}, Forced provider: ${forcedProvider || "none"}`
+  );
+
+  // Initialize ModelManager
+  const modelManager = new ModelManager(discoveryAdapter, {
+    includeProviderUrls: forcedProvider
+      ? [forcedProvider, ...includeProviderUrls]
+      : includeProviderUrls,
+  });
+>>>>>>> molly-wizard
 
   if (providedModelManager) {
     modelManager = providedModelManager;
@@ -164,6 +181,10 @@ export async function routeRequests(
     selectedModel = cheapest.model;
   }
 
+  console.log(
+    `[routeRequests] Selected provider: ${baseUrl}, model: ${selectedModel.id}`
+  );
+
   // Get wallet balance
   const balances = await walletAdapter.getBalances();
   const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
@@ -199,10 +220,13 @@ export async function routeRequests(
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
 
+  console.log(`[routeRequests] Stream: ${stream}, maxTokens: ${maxTokens}`);
+
   // Make the request using the simpler routeRequest method
   let finalContent = "";
 
   try {
+    console.log(`[routeRequests] Making request to ${baseUrl}${path}...`);
     const response = await client.routeRequest({
       path,
       method: "POST",
