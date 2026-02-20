@@ -138,7 +138,6 @@ export class RoutstrClient {
     try {
       // Spend tokens
       callbacks.onPaymentProcessing?.(true);
-      console.log("Sending token worth: ", requiredSats);
 
       const spendResult = await this.cashuSpender.spend({
         mintUrl,
@@ -221,7 +220,6 @@ export class RoutstrClient {
           streamingResult.content ||
           (streamingResult.images && streamingResult.images.length > 0)
         ) {
-          console.log(streamingResult);
           // Create assistant message
           const message = await this._createAssistantMessage(streamingResult);
           callbacks.onMessageAppend(message);
@@ -262,13 +260,11 @@ export class RoutstrClient {
             latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
-          console.log("Balance of the tokens:", latestBalanceInfo);
           this.storageAdapter.updateTokenBalance(
             baseUrlUsed,
             latestTokenBalance
           );
           satsSpent = tokenBalanceInSats - latestTokenBalance;
-          console.log(tokenBalanceInSats, latestTokenBalance);
         } else {
           satsSpent = await this._handlePostResponseRefund({
             mintUrl,
@@ -331,7 +327,6 @@ export class RoutstrClient {
     } else {
       headers["Authorization"] = `Bearer ${token}`;
     }
-    console.log(headers);
 
     // Dev-only mock controls
     if (

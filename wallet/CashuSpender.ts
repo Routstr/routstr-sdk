@@ -134,7 +134,6 @@ export class CashuSpender {
         mintUrl
       );
       if (existingResult) {
-        console.log("sending exisint", existingResult);
         return existingResult;
       }
     }
@@ -285,7 +284,6 @@ export class CashuSpender {
       this.storageAdapter.getPendingTokenDistribution();
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
-    console.log("Current balcem", balanceForBaseUrl);
 
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
@@ -384,7 +382,6 @@ export class CashuSpender {
             this.storageAdapter.setToken(options.baseUrl, token);
           }
 
-          console.log("sending alternative mint", token, adjustedAmount);
           return {
             token,
             status: "success",
