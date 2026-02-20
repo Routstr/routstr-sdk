@@ -231,7 +231,7 @@ export class RoutstrClient {
     // Handle error responses
     if (!response.ok) {
       // Try to refund
-      await this.refundManager.refund({ mintUrl, baseUrl, token });
+      await this.balanceManager.refund({ mintUrl, baseUrl, token });
       throw new ProviderError(baseUrl, response.status, await response.text());
     }
 
