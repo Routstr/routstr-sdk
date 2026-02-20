@@ -272,30 +272,57 @@ export class RoutstrClient {
       // Spend tokens
       callbacks.onPaymentProcessing?.(true);
 
-      const spendResult = await this.cashuSpender.spend({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-        reuseToken: true,
-      });
-
-      if (spendResult.status === "failed" || !spendResult.token) {
-        const errorMsg =
-          spendResult.error ||
-          `Insufficient balance. Need ${requiredSats} sats.`;
-
-        if (this._isNetworkError(errorMsg)) {
+      let token: string;
+      
+      // Handle different modes
+      if (this.mode === "apikeys") {
+        // In apikeys mode, get API key from storage instead of spending Cashu
+        const apiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (!apiKey) {
           throw new Error(
-            `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+            `No API key found for ${baseUrl}. Please add an API key first.`
           );
         }
+        // Derive child key for this request (timestamp-based for parallel requests)
+        const childKey = this._deriveChildKey(apiKey);
+        token = childKey;
+        tokenBalance = 0;
+        tokenBalanceUnit = "sat";
+        
+        // Get initial balance from provider
+        try {
+          const balanceInfo = await this._getApiKeyBalance(baseUrl, childKey);
+          tokenBalance = balanceInfo.amount;
+          tokenBalanceUnit = balanceInfo.unit;
+        } catch (e) {
+          console.warn("Could not get initial API key balance:", e);
+        }
+      } else {
+        const spendResult = await this.cashuSpender.spend({
+          mintUrl,
+          amount: requiredSats,
+          baseUrl,
+          reuseToken: true,
+        });
 
-        throw new Error(errorMsg);
+        if (spendResult.status === "failed" || !spendResult.token) {
+          const errorMsg =
+            spendResult.error ||
+            `Insufficient balance. Need ${requiredSats} sats.`;
+
+          if (this._isNetworkError(errorMsg)) {
+            throw new Error(
+              `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+            );
+          }
+
+          throw new Error(errorMsg);
+        }
+
+        token = spendResult.token;
+        tokenBalance = spendResult.balance;
+        tokenBalanceUnit = spendResult.unit ?? "sat";
       }
-
-      const token = spendResult.token;
-      tokenBalance = spendResult.balance;
-      tokenBalanceUnit = spendResult.unit ?? "sat";
 
       const tokenBalanceInSats =
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
@@ -873,6 +900,44 @@ export class RoutstrClient {
         return {
           amount: data.balance,
           unit: "msat", // wallet/info returns msats
+        };
+      }
+    } catch {
+      // Fall through to default
+    }
+
+    return { amount: 0, unit: "sat" };
+  }
+
+  /**
+   * Derive a child key from the main API key for parallel requests
+   * Uses timestamp to ensure uniqueness while keeping related requests traceable
+   */
+  private _deriveChildKey(apiKey: string): string {
+    // Format: originalKey_timestamp
+    const timestamp = Date.now();
+    return `${apiKey}_${timestamp}`;
+  }
+
+  /**
+   * Get balance for an API key from the provider
+   */
+  private async _getApiKeyBalance(
+    baseUrl: string,
+    apiKey: string
+  ): Promise<TokenBalance> {
+    try {
+      const response = await fetch(`${baseUrl}v1/wallet/info`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return {
+          amount: data.balance,
+          unit: "msat",
         };
       }
     } catch {

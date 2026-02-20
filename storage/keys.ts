@@ -8,6 +8,7 @@ export const SDK_STORAGE_KEYS = {
   LAST_MODELS_UPDATE: "lastModelsUpdate",
   LAST_BASE_URLS_UPDATE: "lastBaseUrlsUpdate",
   LOCAL_CASHU_TOKENS: "local_cashu_tokens",
+  API_KEYS: "api_keys",
 } as const;
 
 export type SdkStorageKey =

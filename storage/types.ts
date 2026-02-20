@@ -19,4 +19,10 @@ export interface SdkStorageState {
     balance: number;
     lastUsed: number | null;
   }>;
+  apiKeys: Array<{
+    baseUrl: string;
+    key: string;
+    balance: number;
+    lastUsed: number | null;
+  }>;
 }

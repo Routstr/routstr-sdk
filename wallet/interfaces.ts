@@ -49,6 +49,13 @@ export interface WalletAdapter {
  * StorageAdapter - Abstracts local storage operations
  * Separates token storage from wallet operations
  */
+export interface ApiKeyEntry {
+  baseUrl: string;
+  key: string;
+  balance: number; // tracked internally, updated via provider responses
+  lastUsed: number | null;
+}
+
 export interface StorageAdapter {
   /** Get stored API token for a provider */
   getToken(baseUrl: string): string | null;
@@ -70,6 +77,20 @@ export interface StorageAdapter {
 
   /** Get cached provider info */
   getProviderInfo(baseUrl: string): ProviderInfo | null;
+
+  // ========== API Keys (for apikeys mode) ==========
+
+  /** Get stored API key for a provider */
+  getApiKey(baseUrl: string): string | null;
+
+  /** Store API key for a provider */
+  setApiKey(baseUrl: string, key: string): void;
+
+  /** Update balance for an existing stored API key (based on provider response) */
+  updateApiKeyBalance(baseUrl: string, balance: number): void;
+
+  /** Get all stored API keys */
+  getAllApiKeys(): ApiKeyEntry[];
 }
 
 /**

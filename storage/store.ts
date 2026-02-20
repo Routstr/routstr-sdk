@@ -44,6 +44,14 @@ export interface SdkStorageStore extends SdkStorageState {
       lastUsed: number | null;
     }>
   ) => void;
+  setApiKeys: (
+    value: Array<{
+      baseUrl: string;
+      key: string;
+      balance: number;
+      lastUsed: number | null;
+    }>
+  ) => void;
 }
 
 export const createSdkStore = ({ driver }: SdkStoreOptions) => {
@@ -115,6 +123,20 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
             : getTokenBalance(entry.token),
         lastUsed: entry.lastUsed ?? null,
       })),
+    apiKeys: driver.getItem<
+      Array<{
+        baseUrl: string;
+        key: string;
+        balance?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.API_KEYS, [])
+      .map((entry) => ({
+        ...entry,
+        baseUrl: normalizeBaseUrl(entry.baseUrl),
+        balance: entry.balance ?? 0,
+        lastUsed: entry.lastUsed ?? null,
+      })),
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -179,6 +201,16 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       }));
       driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
       set({ cachedTokens: normalized });
+    },
+    setApiKeys: (value) => {
+      const normalized = value.map((entry) => ({
+        ...entry,
+        baseUrl: normalizeBaseUrl(entry.baseUrl),
+        balance: entry.balance ?? 0,
+        lastUsed: entry.lastUsed ?? null,
+      }));
+      driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
+      set({ apiKeys: normalized });
     },
   }));
 };
@@ -293,6 +325,69 @@ export const createStorageAdapterFromStore = (
   getProviderInfo: (baseUrl) => {
     const normalized = normalizeBaseUrl(baseUrl);
     return store.getState().infoFromAllProviders[normalized] || null;
+  },
+
+  // ========== API Keys (for apikeys mode) ==========
+
+  getApiKey: (baseUrl) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const entry = store
+      .getState()
+      .apiKeys.find((key) => key.baseUrl === normalized);
+    if (!entry) return null;
+    // Update lastUsed timestamp
+    const next = store
+      .getState()
+      .apiKeys.map((key) =>
+        key.baseUrl === normalized ? { ...key, lastUsed: Date.now() } : key
+      );
+    store.getState().setApiKeys(next);
+    return entry.key;
+  },
+
+  setApiKey: (baseUrl, key) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const keys = store.getState().apiKeys;
+    const existingIndex = keys.findIndex(
+      (entry) => entry.baseUrl === normalized
+    );
+    if (existingIndex !== -1) {
+      // Update existing key
+      const next = keys.map((entry) =>
+        entry.baseUrl === normalized
+          ? { ...entry, key, lastUsed: Date.now() }
+          : entry
+      );
+      store.getState().setApiKeys(next);
+    } else {
+      // Add new key
+      const next = [...keys];
+      next.push({
+        baseUrl: normalized,
+        key,
+        balance: 0,
+        lastUsed: Date.now(),
+      });
+      store.getState().setApiKeys(next);
+    }
+  },
+
+  updateApiKeyBalance: (baseUrl, balance) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const keys = store.getState().apiKeys;
+    const next = keys.map((entry) =>
+      entry.baseUrl === normalized ? { ...entry, balance } : entry
+    );
+    store.getState().setApiKeys(next);
+  },
+
+  getAllApiKeys: () => {
+    return store.getState().apiKeys.map((entry) => ({
+      baseUrl: entry.baseUrl,
+      key: entry.key,
+      balance: entry.balance,
+      lastUsed: entry.lastUsed,
+    }));
   },
 });
 
