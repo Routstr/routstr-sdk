@@ -112,7 +112,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
         balance:
           typeof entry.balance === "number"
             ? entry.balance
-            : Math.round(getTokenBalance(entry.token)),
+            : getTokenBalance(entry.token),
         lastUsed: entry.lastUsed ?? null,
       })),
     setModelsFromAllProviders: (value) => {
@@ -174,7 +174,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
         balance:
           typeof entry.balance === "number"
             ? entry.balance
-            : Math.round(getTokenBalance(entry.token)),
+            : getTokenBalance(entry.token),
         lastUsed: entry.lastUsed ?? null,
       }));
       driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
@@ -237,7 +237,7 @@ export const createStorageAdapterFromStore = (
   setToken: (baseUrl, token) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().cachedTokens;
-    const balance = Math.round(getTokenBalance(token));
+    const balance = getTokenBalance(token);
     const existingIndex = tokens.findIndex(
       (entry) => entry.baseUrl === normalized
     );
@@ -248,7 +248,7 @@ export const createStorageAdapterFromStore = (
     next.push({
       baseUrl: normalized,
       token,
-      balance: Math.round(balance),
+      balance,
       lastUsed: Date.now(),
     });
     store.getState().setCachedTokens(next);
@@ -264,9 +264,7 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().cachedTokens;
     const next = tokens.map((entry) =>
-      entry.baseUrl === normalized
-        ? { ...entry, balance: Math.round(balance) }
-        : entry
+      entry.baseUrl === normalized ? { ...entry, balance } : entry
     );
     store.getState().setCachedTokens(next);
   },
