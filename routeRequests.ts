@@ -5,13 +5,16 @@
  * provider based on model pricing, with automatic Cashu token handling.
  */
 
-import type { Model, Message, TransactionHistory } from "../core/types";
-import type { DiscoveryAdapter } from "../discovery/interfaces";
-import type { ProviderRegistry, WalletAdapter } from "../wallet/interfaces";
-import type { StorageAdapter } from "../storage/adapters";
-import { ModelManager } from "../discovery/ModelManager";
-import { ProviderManager } from "../client/ProviderManager";
-import { RoutstrClient } from "../client/RoutstrClient";
+import type { Model, Message } from "./core/types";
+import type { DiscoveryAdapter } from "./discovery/interfaces";
+import type {
+  ProviderRegistry,
+  WalletAdapter,
+  StorageAdapter,
+} from "./wallet/interfaces";
+import { ModelManager } from "./discovery/ModelManager";
+import { ProviderManager } from "./client/ProviderManager";
+import { RoutstrClient } from "./client/RoutstrClient";
 
 /**
  * Options for routeRequests function
@@ -93,7 +96,9 @@ export async function routeRequests(
 
   // Initialize ModelManager
   const modelManager = new ModelManager(discoveryAdapter, {
-    includeProviderUrls: forcedProvider ? [forcedProvider, ...includeProviderUrls] : includeProviderUrls,
+    includeProviderUrls: forcedProvider
+      ? [forcedProvider, ...includeProviderUrls]
+      : includeProviderUrls,
   });
 
   // Bootstrap providers
@@ -121,7 +126,9 @@ export async function routeRequests(
     const models = cachedModels[normalizedProvider] || [];
     const match = models.find((m) => m.id === modelId);
     if (!match) {
-      throw new Error(`Provider ${normalizedProvider} does not offer model: ${modelId}`);
+      throw new Error(
+        `Provider ${normalizedProvider} does not offer model: ${modelId}`
+      );
     }
     baseUrl = normalizedProvider;
     selectedModel = match;
@@ -144,12 +151,17 @@ export async function routeRequests(
   const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
 
   if (totalBalance <= 0) {
-    throw new Error("Wallet balance is empty. Add a mint and fund it before making requests.");
+    throw new Error(
+      "Wallet balance is empty. Add a mint and fund it before making requests."
+    );
   }
 
   // Get mint URL
   const providerMints = providerRegistry.getProviderMints(baseUrl);
-  const mintUrl = walletAdapter.getActiveMintUrl() || providerMints[0] || Object.keys(balances)[0];
+  const mintUrl =
+    walletAdapter.getActiveMintUrl() ||
+    providerMints[0] ||
+    Object.keys(balances)[0];
 
   if (!mintUrl) {
     throw new Error("No mint configured in wallet");
@@ -157,55 +169,68 @@ export async function routeRequests(
 
   // Initialize RoutstrClient
   const alertLevel = "min";
-  const client = new RoutstrClient(walletAdapter, storageAdapter, providerRegistry, alertLevel);
+  const client = new RoutstrClient(
+    walletAdapter,
+    storageAdapter,
+    providerRegistry,
+    alertLevel
+  );
 
-  // Extract message history from request body
+  // Extract message history and maxTokens from request body
   const messageHistory = extractMessageHistory(requestBody);
   const maxTokens = extractMaxTokens(requestBody);
 
-  // Make the request
+  // Make the request using the simpler routeRequest method
   let finalContent = "";
-  let errorMessage = "";
 
-  await client.fetchAIResponse(
-    {
-      messageHistory,
-      selectedModel,
+  try {
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: {
+        model: selectedModel.id,
+        messages: messageHistory,
+        stream: false,
+        max_tokens: maxTokens,
+      },
       baseUrl,
       mintUrl,
-      balance: totalBalance,
-      transactionHistory: [],
-      maxTokens,
-    },
-    {
-      onStreamingUpdate: () => {},
-      onThinkingUpdate: () => {},
-      onMessageAppend: (message) => {
-        if (message.role === "assistant") {
-          finalContent = typeof message.content === "string"
-            ? message.content
-            : JSON.stringify(message.content);
-        }
-        if (message.role === "system") {
-          errorMessage = typeof message.content === "string"
-            ? message.content
-            : JSON.stringify(message.content);
-        }
-      },
-      onBalanceUpdate: () => {},
-      onTransactionUpdate: () => {},
-      onTokenCreated: () => {},
-      onPaymentProcessing: () => {},
-      onLastMessageSatsUpdate: () => {},
-    }
-  );
+      modelId: modelId,
+    });
 
-  if (errorMessage) {
-    throw new Error(errorMessage);
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+
+    // Parse the response
+    const responseData = await response.json();
+
+    // Extract content from the response
+    if (responseData.choices && responseData.choices.length > 0) {
+      const choice = responseData.choices[0];
+      if (choice.message) {
+        finalContent =
+          typeof choice.message.content === "string"
+            ? choice.message.content
+            : JSON.stringify(choice.message.content);
+      }
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("401") ||
+        error.message.includes("402") ||
+        error.message.includes("403"))
+    ) {
+      throw new Error(`Authentication failed: ${error.message}`);
+    }
+    throw error;
   }
 
   // Get pricing info
-  const ranking = providerManager.getProviderPriceRankingForModel(modelId, { torMode });
+  const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
+    torMode,
+  });
   const pricingInfo = ranking.find((r) => r.baseUrl === baseUrl);
 
   return {
