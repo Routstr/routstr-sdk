@@ -24,6 +24,8 @@ export interface RouteRequestOptions {
   modelId: string;
   /** The request body to proxy to the provider */
   requestBody: unknown;
+  /** Optional: API path (defaults to /v1/chat/completions) */
+  path?: string;
   /** Optional: force a specific provider base URL */
   forcedProvider?: string;
   /** Wallet adapter for Cashu operations */
@@ -84,6 +86,7 @@ export async function routeRequests(
   const {
     modelId,
     requestBody,
+    path = "/v1/chat/completions",
     forcedProvider,
     walletAdapter,
     storageAdapter,
@@ -176,21 +179,22 @@ export async function routeRequests(
     alertLevel
   );
 
-  // Extract message history and maxTokens from request body
+  // Extract options from request body
   const messageHistory = extractMessageHistory(requestBody);
   const maxTokens = extractMaxTokens(requestBody);
+  const stream = extractStream(requestBody);
 
   // Make the request using the simpler routeRequest method
   let finalContent = "";
 
   try {
     const response = await client.routeRequest({
-      path: "/v1/chat/completions",
+      path,
       method: "POST",
       body: {
         model: selectedModel.id,
         messages: messageHistory,
-        stream: false,
+        stream,
         max_tokens: maxTokens,
       },
       baseUrl,
@@ -200,6 +204,25 @@ export async function routeRequests(
 
     if (!response.ok) {
       throw new Error(`${response.status} ${response.statusText}`);
+    }
+
+    // For streaming responses, return the raw body for SSE handling
+    if (stream) {
+      return {
+        baseUrl,
+        selectedModel,
+        pricing: {
+          promptPerMillion: 0,
+          completionPerMillion: 0,
+          totalPerMillion: 0,
+        },
+        response: {
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "text/event-stream" },
+          body: response.body,
+        },
+      };
     }
 
     // Parse the response
@@ -284,4 +307,18 @@ function extractMaxTokens(requestBody: unknown): number | undefined {
   }
 
   return undefined;
+}
+
+/**
+ * Extract stream option from request body
+ */
+function extractStream(requestBody: unknown): boolean {
+  if (!requestBody || typeof requestBody !== "object") {
+    return false;
+  }
+
+  const body = requestBody as Record<string, unknown>;
+  const stream = body.stream;
+
+  return stream === true;
 }

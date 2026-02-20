@@ -466,15 +466,6 @@ export class ProviderManager {
 
       const totalInputTokens = approximateTokens + imageTokens;
 
-      if (apiMessages) {
-        console.log("OUR TOKENS (TEXT-ONLY)", approximateTokens);
-        console.log(
-          "IMAGE TOKENS",
-          imageTokens,
-          "TOTAL INPUT TOKENS",
-          totalInputTokens
-        );
-      }
       const sp: any = model?.sats_pricing as any;
 
       if (!sp) return 0;
