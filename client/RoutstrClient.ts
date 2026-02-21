@@ -216,6 +216,15 @@ export class RoutstrClient {
         );
       }
 
+      if (spendResult.errorDetails) {
+        throw new InsufficientBalanceError(
+          spendResult.errorDetails.required,
+          spendResult.errorDetails.available,
+          spendResult.errorDetails.maxMintBalance,
+          spendResult.errorDetails.maxMintUrl
+        );
+      }
+
       throw new Error(errorMsg);
     }
 
@@ -365,6 +374,15 @@ export class RoutstrClient {
           if (this._isNetworkError(errorMsg)) {
             throw new Error(
               `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+            );
+          }
+
+          if (spendResult.errorDetails) {
+            throw new InsufficientBalanceError(
+              spendResult.errorDetails.required,
+              spendResult.errorDetails.available,
+              spendResult.errorDetails.maxMintBalance,
+              spendResult.errorDetails.maxMintUrl
             );
           }
 
@@ -735,6 +753,14 @@ export class RoutstrClient {
         });
 
         if (spendResult.status === "failed" || !spendResult.token) {
+          if (spendResult.errorDetails) {
+            throw new InsufficientBalanceError(
+              spendResult.errorDetails.required,
+              spendResult.errorDetails.available,
+              spendResult.errorDetails.maxMintBalance,
+              spendResult.errorDetails.maxMintUrl
+            );
+          }
           throw new Error(
             spendResult.error || `Insufficient balance for ${nextProvider}`
           );
@@ -813,6 +839,14 @@ export class RoutstrClient {
     });
 
     if (spendResult.status === "failed" || !spendResult.token) {
+      if (spendResult.errorDetails) {
+        throw new InsufficientBalanceError(
+          spendResult.errorDetails.required,
+          spendResult.errorDetails.available,
+          spendResult.errorDetails.maxMintBalance,
+          spendResult.errorDetails.maxMintUrl
+        );
+      }
       throw new Error(
         spendResult.error || `Insufficient balance for ${nextProvider}`
       );

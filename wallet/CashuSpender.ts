@@ -518,6 +518,12 @@ export class CashuSpender {
       status: "failed",
       balance: 0,
       error: error.message,
+      errorDetails: {
+        required,
+        available: availableBalance ?? maxBalance,
+        maxMintBalance: maxBalance,
+        maxMintUrl,
+      },
     };
   }
 }

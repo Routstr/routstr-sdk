@@ -18,6 +18,12 @@ export interface SpendResult {
   balance: number;
   unit?: "sat" | "msat";
   error?: string;
+  errorDetails?: {
+    required: number;
+    available: number;
+    maxMintBalance: number;
+    maxMintUrl: string;
+  };
 }
 
 /**
