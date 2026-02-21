@@ -98,6 +98,7 @@ export class BalanceManager {
         this.storageAdapter.removeToken(baseUrl);
         return { success: true, message: "No balance to refund" };
       }
+      console.log("REFUND RESULET", fetchResult);
 
       // Receive the refunded token
       const receiveResult = await this.walletAdapter.receiveToken(
@@ -245,6 +246,7 @@ export class BalanceManager {
       }
 
       const data = await response.json();
+      console.log('refund rsule', data);
       return {
         success: true,
         token: data.token,

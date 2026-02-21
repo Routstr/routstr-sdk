@@ -1144,6 +1144,7 @@ export class RoutstrClient {
     streamingResult: StreamingResult
   ): number {
     let estimatedCosts = 0;
+    console.log(streamingResult);
     if (streamingResult.usage) {
       const { completion_tokens, prompt_tokens } = streamingResult.usage;
       if (completion_tokens !== undefined && prompt_tokens !== undefined) {
