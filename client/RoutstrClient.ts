@@ -228,6 +228,21 @@ export class RoutstrClient {
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
       const satsSpent = tokenBalanceInSats - latestTokenBalance;
       console.log(`[routeRequest] satsSpent (lazyrefund): ${satsSpent}`);
+    } else if (this.mode === "apikeys") {
+      try {
+        const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
+        const latestTokenBalance =
+          latestBalanceInfo.unit === "msat"
+            ? latestBalanceInfo.amount / 1000
+            : latestBalanceInfo.amount;
+        this.storageAdapter.updateChildKeyBalance(baseUrl, latestTokenBalance);
+        const tokenBalanceInSats =
+          tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+        const satsSpent = tokenBalanceInSats - latestTokenBalance;
+        console.log(`[routeRequest] satsSpent (apikeys): ${satsSpent}`);
+      } catch (e) {
+        console.warn("Could not get updated API key balance:", e);
+      }
     }
 
     return response;
@@ -260,9 +275,6 @@ export class RoutstrClient {
       maxTokens
     );
 
-    let tokenBalance: number;
-    let tokenBalanceUnit: "sat" | "msat" = "sat";
-
     try {
       // Check balance first
       await this._checkBalance();
@@ -270,80 +282,15 @@ export class RoutstrClient {
       // Spend tokens
       callbacks.onPaymentProcessing?.(true);
 
-      let token: string;
+      const spendResult = await this._spendToken({
+        mintUrl,
+        amount: requiredSats,
+        baseUrl,
+      });
 
-      // Handle different modes
-      if (this.mode === "apikeys") {
-        // In apikeys mode, get API key from storage and create child key
-        let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
-        if (!parentApiKey) {
-          throw new Error(
-            `No API key found for ${baseUrl}. Please add an API key first.`
-          );
-        }
-
-        // Check if we already have a child key for this provider
-        let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
-
-        // If no child key or it's invalid, create a new one
-        if (!childKeyEntry) {
-          try {
-            const childKeyResult = await this._createChildKey(
-              baseUrl,
-              parentApiKey
-            );
-            this.storageAdapter.setChildKey(
-              baseUrl,
-              childKeyResult.childKey,
-              childKeyResult.balance,
-              childKeyResult.validityDate,
-              childKeyResult.balanceLimit
-            );
-            childKeyEntry = {
-              parentBaseUrl: baseUrl,
-              childKey: childKeyResult.childKey,
-              balance: childKeyResult.balance,
-              balanceLimit: childKeyResult.balanceLimit,
-              validityDate: childKeyResult.validityDate,
-              createdAt: Date.now(),
-            };
-          } catch (e) {
-            console.warn("Could not create child key, using parent key:", e);
-            // Fall back to using parent key directly
-            childKeyEntry = {
-              parentBaseUrl: baseUrl,
-              childKey: parentApiKey,
-              balance: 0,
-              createdAt: Date.now(),
-            };
-          }
-        }
-
-        token = childKeyEntry.childKey;
-        tokenBalance = childKeyEntry.balance;
-        tokenBalanceUnit = "sat";
-
-        // Get initial balance from provider if needed
-        if (tokenBalance === 0) {
-          try {
-            const balanceInfo = await this._getApiKeyBalance(baseUrl, token);
-            tokenBalance = balanceInfo.amount;
-            tokenBalanceUnit = balanceInfo.unit;
-          } catch (e) {
-            console.warn("Could not get initial API key balance:", e);
-          }
-        }
-      } else {
-        const spendResult = await this._spendToken({
-          mintUrl,
-          amount: requiredSats,
-          baseUrl,
-        });
-
-        token = spendResult.token;
-        tokenBalance = spendResult.tokenBalance;
-        tokenBalanceUnit = spendResult.tokenBalanceUnit;
-      }
+      let token = spendResult.token;
+      let tokenBalance = spendResult.tokenBalance;
+      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
 
       const tokenBalanceInSats =
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
@@ -363,11 +310,6 @@ export class RoutstrClient {
         requiredSats,
         maxTokens,
       });
-
-      let refundToken: string | undefined;
-      if (this.mode === "xcashu") {
-        refundToken = response.headers.get("x-cashu") ?? undefined;
-      }
 
       if (response instanceof Response && (response as any).tokenBalance) {
         tokenBalance = (response as any).tokenBalance;
@@ -419,6 +361,7 @@ export class RoutstrClient {
         // Handle post-response refund (skip for xcashu mode - refund is in response)
         let satsSpent: number;
         if (this.mode === "xcashu") {
+          const refundToken = response.headers.get("x-cashu") ?? undefined;
           satsSpent = tokenBalanceInSats;
           if (refundToken) {
             try {
@@ -1179,6 +1122,71 @@ export class RoutstrClient {
     tokenBalanceUnit: "sat" | "msat";
   }> {
     const { mintUrl, amount, baseUrl } = params;
+
+    if (this.mode === "apikeys") {
+      let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+      if (!parentApiKey) {
+        throw new Error(
+          `No API key found for ${baseUrl}. Please add an API key first.`
+        );
+      }
+
+      let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
+
+      if (!childKeyEntry) {
+        try {
+          const childKeyResult = await this._createChildKey(
+            baseUrl,
+            parentApiKey
+          );
+          this.storageAdapter.setChildKey(
+            baseUrl,
+            childKeyResult.childKey,
+            childKeyResult.balance,
+            childKeyResult.validityDate,
+            childKeyResult.balanceLimit
+          );
+          childKeyEntry = {
+            parentBaseUrl: baseUrl,
+            childKey: childKeyResult.childKey,
+            balance: childKeyResult.balance,
+            balanceLimit: childKeyResult.balanceLimit,
+            validityDate: childKeyResult.validityDate,
+            createdAt: Date.now(),
+          };
+        } catch (e) {
+          console.warn("Could not create child key, using parent key:", e);
+          childKeyEntry = {
+            parentBaseUrl: baseUrl,
+            childKey: parentApiKey,
+            balance: 0,
+            createdAt: Date.now(),
+          };
+        }
+      }
+
+      let tokenBalance = childKeyEntry.balance;
+      let tokenBalanceUnit: "sat" | "msat" = "sat";
+
+      if (tokenBalance === 0) {
+        try {
+          const balanceInfo = await this._getApiKeyBalance(
+            baseUrl,
+            childKeyEntry.childKey
+          );
+          tokenBalance = balanceInfo.amount;
+          tokenBalanceUnit = balanceInfo.unit;
+        } catch (e) {
+          console.warn("Could not get initial API key balance:", e);
+        }
+      }
+
+      return {
+        token: childKeyEntry.childKey,
+        tokenBalance,
+        tokenBalanceUnit,
+      };
+    }
 
     console.log(`[RoutstrClient] Spending ${amount} sats for token...`);
 
