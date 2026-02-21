@@ -142,10 +142,6 @@ export class RoutstrClient {
       modelId,
     } = params;
 
-    console.log(
-      `[RoutstrClient.routeRequest] path: ${path}, baseUrl: ${baseUrl}, mintUrl: ${mintUrl}`
-    );
-
     await this._checkBalance();
 
     let requiredSats = 1;
@@ -202,7 +198,6 @@ export class RoutstrClient {
       initialTokenBalance: tokenBalanceInSats,
       response,
     });
-    console.log(`[routeRequest] satsSpent: ${satsSpent}`);
 
     return response;
   }
@@ -294,7 +289,7 @@ export class RoutstrClient {
 
       // Make API request
       const response = await this._makeRequest({
-        path: "v1/chat/completions",
+        path: "/v1/chat/completions",
         method: "POST",
         body,
         selectedModel,
@@ -477,7 +472,7 @@ export class RoutstrClient {
               ),
             });
           } catch (e) {
-            console.error("Failed to create new child key:", e);
+            // Use parent key instead
           }
         }
       }
@@ -802,7 +797,6 @@ export class RoutstrClient {
           satsSpent =
             initialTokenBalance -
             receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
-          console.log("[xcashu] Received refund token from response");
         } catch (error) {
           console.error("[xcashu] Failed to receive refund token:", error);
         }
@@ -1011,7 +1005,6 @@ export class RoutstrClient {
     streamingResult: StreamingResult
   ): number {
     let estimatedCosts = 0;
-    console.log(streamingResult);
     if (streamingResult.usage) {
       const { completion_tokens, prompt_tokens } = streamingResult.usage;
       if (completion_tokens !== undefined && prompt_tokens !== undefined) {
@@ -1160,8 +1153,6 @@ export class RoutstrClient {
         tokenBalanceUnit,
       };
     }
-
-    console.log(`[RoutstrClient] Spending ${amount} sats for token...`);
 
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
