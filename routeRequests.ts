@@ -84,7 +84,7 @@ export interface RouteRequestResult {
  */
 export async function routeRequests(
   options: RouteRequestOptions
-): Promise<RouteRequestResult> {
+): Promise<Response> {
   console.log(
     `[routeRequests] Starting request routing for model: ${options.modelId}`
   );
@@ -215,11 +215,12 @@ export async function routeRequests(
   console.log(`[routeRequests] Stream: ${stream}, maxTokens: ${maxTokens}`);
 
   // Make the request using the simpler routeRequest method
-  let finalContent = "";
+  let response: Response | null = null;
+  let responseData: unknown;
 
   try {
     console.log(`[routeRequests] Making request to ${baseUrl}${path}...`);
-    const response = await client.routeRequest({
+    response = await client.routeRequest({
       path,
       method: "POST",
       body: {
@@ -236,39 +237,15 @@ export async function routeRequests(
     if (!response.ok) {
       throw new Error(`${response.status} ${response.statusText}`);
     }
+    console.log("RESPO", response);
 
     // For streaming responses, return the raw body for SSE handling
     if (stream) {
-      return {
-        baseUrl,
-        selectedModel,
-        pricing: {
-          promptPerMillion: 0,
-          completionPerMillion: 0,
-          totalPerMillion: 0,
-        },
-        response: {
-          status: 200,
-          statusText: "OK",
-          headers: { "content-type": "text/event-stream" },
-          body: response.body,
-        },
-      };
+      return response;
     }
 
-    // Parse the response
-    const responseData = await response.json();
-
-    // Extract content from the response
-    if (responseData.choices && responseData.choices.length > 0) {
-      const choice = responseData.choices[0];
-      if (choice.message) {
-        finalContent =
-          typeof choice.message.content === "string"
-            ? choice.message.content
-            : JSON.stringify(choice.message.content);
-      }
-    }
+    // Get the raw response body
+    responseData = await response.json();
   } catch (error) {
     if (
       error instanceof Error &&
@@ -281,27 +258,7 @@ export async function routeRequests(
     throw error;
   }
 
-  // Get pricing info
-  const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
-    torMode,
-  });
-  const pricingInfo = ranking.find((r) => r.baseUrl === baseUrl);
-
-  return {
-    baseUrl,
-    selectedModel,
-    pricing: {
-      promptPerMillion: pricingInfo?.promptPerMillion ?? 0,
-      completionPerMillion: pricingInfo?.completionPerMillion ?? 0,
-      totalPerMillion: pricingInfo?.totalPerMillion ?? 0,
-    },
-    response: {
-      status: 200,
-      statusText: "OK",
-      headers: { "content-type": "application/json" },
-      body: { content: finalContent },
-    },
-  };
+  return response;
 }
 
 /**

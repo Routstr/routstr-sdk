@@ -22,6 +22,7 @@ import {
   TokenOperationError,
 } from "../core/errors";
 import { BalanceManager } from "./BalanceManager";
+import { auditLogger } from "./AuditLogger";
 
 /**
  * Options for spending cashu tokens
@@ -61,6 +62,62 @@ export class CashuSpender {
     private providerRegistry?: ProviderRegistry,
     private balanceManager?: BalanceManager
   ) {}
+
+  private async _getBalanceState(): Promise<{
+    totalBalance: number;
+    providerBalances: Record<string, number>;
+    mintBalances: Record<string, number>;
+  }> {
+    const mintBalances = await this.walletAdapter.getBalances();
+    const units = this.walletAdapter.getMintUnits();
+
+    let totalMintBalance = 0;
+    const normalizedMintBalances: Record<string, number> = {};
+    for (const url in mintBalances) {
+      const balance = mintBalances[url];
+      const unit = units[url];
+      const balanceInSats = unit === "msat" ? balance / 1000 : balance;
+      normalizedMintBalances[url] = balanceInSats;
+      totalMintBalance += balanceInSats;
+    }
+
+    const pendingDistribution =
+      this.storageAdapter.getPendingTokenDistribution();
+    const providerBalances: Record<string, number> = {};
+    let totalProviderBalance = 0;
+    for (const pending of pendingDistribution) {
+      providerBalances[pending.baseUrl] = pending.amount;
+      totalProviderBalance += pending.amount;
+    }
+
+    const apiKeys = this.storageAdapter.getAllApiKeys();
+    for (const apiKey of apiKeys) {
+      if (!providerBalances[apiKey.baseUrl]) {
+        providerBalances[apiKey.baseUrl] = apiKey.balance;
+        totalProviderBalance += apiKey.balance;
+      }
+    }
+
+    return {
+      totalBalance: totalMintBalance + totalProviderBalance,
+      providerBalances,
+      mintBalances: normalizedMintBalances,
+    };
+  }
+
+  private async _logTransaction(
+    action: "spend" | "topup" | "refund" | "receive" | "balance_check",
+    options?: {
+      amount?: number;
+      mintUrl?: string;
+      baseUrl?: string;
+      status?: "success" | "failed";
+      details?: string;
+    }
+  ): Promise<void> {
+    const balanceState = await this._getBalanceState();
+    await auditLogger.logBalanceSnapshot(action, balanceState, options);
+  }
 
   /**
    * Check if the spender is currently in a critical operation
@@ -260,6 +317,13 @@ export class CashuSpender {
       this.storageAdapter.setToken(baseUrl, token);
     }
 
+    this._logTransaction("spend", {
+      amount: adjustedAmount,
+      mintUrl: selectedMintUrl || mintUrl,
+      baseUrl,
+      status: "success",
+    });
+
     return {
       token,
       status: "success",
@@ -312,6 +376,14 @@ export class CashuSpender {
         const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
         const units = this.walletAdapter.getMintUnits();
         const unit = units[mintUrl] || "sat";
+
+        this._logTransaction("topup", {
+          amount: topUpResult.toppedUpAmount,
+          mintUrl,
+          baseUrl,
+          status: "success",
+        });
+
         return {
           token: storedToken,
           status: "success",
@@ -324,7 +396,7 @@ export class CashuSpender {
         baseUrl,
         storedToken
       );
-      console.log(providerBalance)
+      console.log(providerBalance);
       if (providerBalance <= 0) {
         this.storageAdapter.removeToken(baseUrl);
       }
@@ -367,6 +439,19 @@ export class CashuSpender {
       if (refundResult.success) {
         this.storageAdapter.removeToken(refundResult.baseUrl);
       }
+    }
+
+    const successfulRefunds = refundResults.filter(
+      (r) => r.status === "fulfilled" && r.value.success
+    ).length;
+
+    if (successfulRefunds > 0) {
+      this._logTransaction("refund", {
+        amount: pendingDistribution.length,
+        mintUrl,
+        status: "success",
+        details: `Refunded ${successfulRefunds} of ${pendingDistribution.length} tokens`,
+      });
     }
 
     return this._spendInternal({
