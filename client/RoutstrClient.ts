@@ -131,107 +131,49 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
-    const { path, method, body, headers = {}, baseUrl, mintUrl } = params;
+    const {
+      path,
+      method,
+      body,
+      headers = {},
+      baseUrl,
+      mintUrl,
+      modelId,
+    } = params;
 
     console.log(
       `[RoutstrClient.routeRequest] path: ${path}, baseUrl: ${baseUrl}, mintUrl: ${mintUrl}`
     );
 
-    // Get wallet balance
-    const balances = await this.walletAdapter.getBalances();
-    const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
+    await this._checkBalance();
 
-    if (totalBalance <= 0) {
-      throw new InsufficientBalanceError(1, 0);
+    let requiredSats = 1;
+    if (modelId) {
+      const model = await this.providerManager.getModelForProvider(
+        baseUrl,
+        modelId
+      );
+      if (model) {
+        requiredSats = this.providerManager.getRequiredSatsForModel(model, []);
+      }
     }
 
-    // Get provider info for version compatibility
-    const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
-    const providerVersion = providerInfo?.version ?? "";
+    const { token, tokenBalance, tokenBalanceUnit } = await this._spendToken({
+      mintUrl,
+      amount: requiredSats,
+      baseUrl,
+    });
 
-    // Prepare request body
     let requestBody = body;
     if (body && typeof body === "object") {
       const bodyObj = body as Record<string, unknown>;
-      // Force stream: false for daemon routing - we handle response ourselves
       if (!bodyObj.stream) {
         requestBody = { ...bodyObj, stream: false };
       }
     }
 
-    // Build headers
-    const requestHeaders: Record<string, string> = {
-      ...headers,
-      "Content-Type": "application/json",
-    };
+    const requestHeaders = this._buildRequestHeaders(headers, token);
 
-    // Dev-only mock controls
-    if (
-      typeof window !== "undefined" &&
-      process.env.NODE_ENV === "development"
-    ) {
-      try {
-        const scenario = window.localStorage.getItem("msw:scenario");
-        const latency = window.localStorage.getItem("msw:latency");
-        if (scenario) requestHeaders["X-Mock-Scenario"] = scenario;
-        if (latency) requestHeaders["X-Mock-Latency"] = latency;
-      } catch {}
-    }
-
-    // For non-streaming requests, we need to get a token and make the request
-    // Calculate required sats if we can determine the model
-    let requiredSats = 1; // Minimum
-    if (params.modelId) {
-      const model = await this.providerManager.getModelForProvider(
-        baseUrl,
-        params.modelId
-      );
-      if (model) {
-        requiredSats = this.providerManager.getRequiredSatsForModel(
-          model,
-          [],
-          undefined
-        );
-      }
-    }
-
-    // Spend token
-    console.log(
-      `[RoutstrClient.routeRequest] Spending ${requiredSats} sats for token...`
-    );
-    const spendResult = await this.cashuSpender.spend({
-      mintUrl,
-      amount: requiredSats,
-      baseUrl,
-      reuseToken: true,
-    });
-
-    if (spendResult.status === "failed" || !spendResult.token) {
-      const errorMsg =
-        spendResult.error || `Insufficient balance. Need ${requiredSats} sats.`;
-
-      if (this._isNetworkError(errorMsg)) {
-        throw new Error(
-          `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
-        );
-      }
-
-      if (spendResult.errorDetails) {
-        throw new InsufficientBalanceError(
-          spendResult.errorDetails.required,
-          spendResult.errorDetails.available,
-          spendResult.errorDetails.maxMintBalance,
-          spendResult.errorDetails.maxMintUrl
-        );
-      }
-
-      throw new Error(errorMsg);
-    }
-
-    const token = spendResult.token;
-    requestHeaders["Authorization"] = `Bearer ${token}`;
-
-    // Make the request
     const url = `${baseUrl.replace(/\/$/, "")}${path}`;
     const fetchOptions: RequestInit = {
       method,
@@ -251,11 +193,41 @@ export class RoutstrClient {
       `[RoutstrClient.routeRequest] Response status: ${response.status}`
     );
 
-    // Handle error responses
     if (!response.ok) {
-      // Try to refund
       await this.balanceManager.refund({ mintUrl, baseUrl, token });
       throw new ProviderError(baseUrl, response.status, await response.text());
+    }
+
+    if (this.mode === "xcashu") {
+      const refundToken = response.headers.get("x-cashu") ?? undefined;
+      const tokenBalanceInSats =
+        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+
+      let satsSpent = tokenBalanceInSats;
+      if (refundToken) {
+        try {
+          const receiveResult =
+            await this.walletAdapter.receiveToken(refundToken);
+          satsSpent =
+            tokenBalanceInSats -
+            receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          console.log("[xcashu] Received refund token from response");
+        } catch (error) {
+          console.error("[xcashu] Failed to receive refund token:", error);
+        }
+      }
+      console.log(`[routeRequest] satsSpent: ${satsSpent}`);
+    } else if (this.mode === "lazyrefund") {
+      const latestBalanceInfo = await this._getTokenBalance(token, baseUrl);
+      const latestTokenBalance =
+        latestBalanceInfo.unit === "msat"
+          ? latestBalanceInfo.amount / 1000
+          : latestBalanceInfo.amount;
+      this.storageAdapter.updateTokenBalance(baseUrl, latestTokenBalance);
+      const tokenBalanceInSats =
+        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+      const satsSpent = tokenBalanceInSats - latestTokenBalance;
+      console.log(`[routeRequest] satsSpent (lazyrefund): ${satsSpent}`);
     }
 
     return response;
@@ -292,6 +264,9 @@ export class RoutstrClient {
     let tokenBalanceUnit: "sat" | "msat" = "sat";
 
     try {
+      // Check balance first
+      await this._checkBalance();
+
       // Spend tokens
       callbacks.onPaymentProcessing?.(true);
 
@@ -359,39 +334,15 @@ export class RoutstrClient {
           }
         }
       } else {
-        const spendResult = await this.cashuSpender.spend({
+        const spendResult = await this._spendToken({
           mintUrl,
           amount: requiredSats,
           baseUrl,
-          reuseToken: true,
         });
 
-        if (spendResult.status === "failed" || !spendResult.token) {
-          const errorMsg =
-            spendResult.error ||
-            `Insufficient balance. Need ${requiredSats} sats.`;
-
-          if (this._isNetworkError(errorMsg)) {
-            throw new Error(
-              `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
-            );
-          }
-
-          if (spendResult.errorDetails) {
-            throw new InsufficientBalanceError(
-              spendResult.errorDetails.required,
-              spendResult.errorDetails.available,
-              spendResult.errorDetails.maxMintBalance,
-              spendResult.errorDetails.maxMintUrl
-            );
-          }
-
-          throw new Error(errorMsg);
-        }
-
         token = spendResult.token;
-        tokenBalance = spendResult.balance;
-        tokenBalanceUnit = spendResult.unit ?? "sat";
+        tokenBalance = spendResult.tokenBalance;
+        tokenBalanceUnit = spendResult.tokenBalanceUnit;
       }
 
       const tokenBalanceInSats =
@@ -1201,5 +1152,104 @@ export class RoutstrClient {
         content: "Unknown Error: Please tag Routstr on Nostr and/or retry.",
       });
     }
+  }
+
+  /**
+   * Check wallet balance and throw if insufficient
+   */
+  private async _checkBalance(): Promise<void> {
+    const balances = await this.walletAdapter.getBalances();
+    const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
+
+    if (totalBalance <= 0) {
+      throw new InsufficientBalanceError(1, 0);
+    }
+  }
+
+  /**
+   * Spend a token using CashuSpender with standardized error handling
+   */
+  private async _spendToken(params: {
+    mintUrl: string;
+    amount: number;
+    baseUrl: string;
+  }): Promise<{
+    token: string;
+    tokenBalance: number;
+    tokenBalanceUnit: "sat" | "msat";
+  }> {
+    const { mintUrl, amount, baseUrl } = params;
+
+    console.log(`[RoutstrClient] Spending ${amount} sats for token...`);
+
+    const spendResult = await this.cashuSpender.spend({
+      mintUrl,
+      amount,
+      baseUrl,
+      reuseToken: true,
+    });
+
+    if (spendResult.status === "failed" || !spendResult.token) {
+      const errorMsg =
+        spendResult.error || `Insufficient balance. Need ${amount} sats.`;
+
+      if (this._isNetworkError(errorMsg)) {
+        throw new Error(
+          `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+        );
+      }
+
+      if (spendResult.errorDetails) {
+        throw new InsufficientBalanceError(
+          spendResult.errorDetails.required,
+          spendResult.errorDetails.available,
+          spendResult.errorDetails.maxMintBalance,
+          spendResult.errorDetails.maxMintUrl
+        );
+      }
+
+      throw new Error(errorMsg);
+    }
+
+    return {
+      token: spendResult.token,
+      tokenBalance: spendResult.balance,
+      tokenBalanceUnit: spendResult.unit ?? "sat",
+    };
+  }
+
+  /**
+   * Build request headers with common defaults and dev mock controls
+   */
+  private _buildRequestHeaders(
+    additionalHeaders: Record<string, string> = {},
+    token?: string
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
+      ...additionalHeaders,
+      "Content-Type": "application/json",
+    };
+
+    if (token) {
+      if (this.mode === "xcashu") {
+        headers["X-Cashu"] = token;
+      } else {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      process.env.NODE_ENV === "development"
+    ) {
+      try {
+        const scenario = window.localStorage.getItem("msw:scenario");
+        const latency = window.localStorage.getItem("msw:latency");
+        if (scenario) headers["X-Mock-Scenario"] = scenario;
+        if (latency) headers["X-Mock-Latency"] = latency;
+      } catch {}
+    }
+
+    return headers;
   }
 }
