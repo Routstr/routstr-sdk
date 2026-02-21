@@ -285,6 +285,8 @@ export class CashuSpender {
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
+    console.log("RESUINGDSR GSODGNSD", balanceForBaseUrl, amount);
+
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
       const unit = units[mintUrl] || "sat";
@@ -298,7 +300,7 @@ export class CashuSpender {
 
     // Token exists but insufficient balance - attempt topup
     if (this.balanceManager) {
-      const topUpAmount = amount * 1.2 - balanceForBaseUrl;
+      const topUpAmount = Math.ceil(amount * 1.2 - balanceForBaseUrl);
       const topUpResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,

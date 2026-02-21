@@ -104,22 +104,13 @@ export async function routeRequests(
     modelManager: providedModelManager,
   } = options;
 
-<<<<<<< HEAD
-  // Use provided ModelManager or create a new one
-  let modelManager: ModelManager;
-  let providers: string[];
-=======
   console.log(
     `[routeRequests] Path: ${path}, Forced provider: ${forcedProvider || "none"}`
   );
 
-  // Initialize ModelManager
-  const modelManager = new ModelManager(discoveryAdapter, {
-    includeProviderUrls: forcedProvider
-      ? [forcedProvider, ...includeProviderUrls]
-      : includeProviderUrls,
-  });
->>>>>>> molly-wizard
+  // Use provided ModelManager or create a new one
+  let modelManager: ModelManager;
+  let providers: string[];
 
   if (providedModelManager) {
     modelManager = providedModelManager;
