@@ -41,6 +41,7 @@ export interface FetchOptions {
   balance: number;
   transactionHistory: TransactionHistory[];
   maxTokens?: number;
+  headers?: Record<string, string>;
 }
 
 /**
@@ -172,7 +173,8 @@ export class RoutstrClient {
       }
     }
 
-    const requestHeaders = this._buildRequestHeaders(headers, token);
+    const baseHeaders = this._buildBaseHeaders(headers);
+    const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
     const url = `${baseUrl.replace(/\/$/, "")}${path}`;
     const fetchOptions: RequestInit = {
@@ -263,6 +265,7 @@ export class RoutstrClient {
       balance,
       transactionHistory,
       maxTokens,
+      headers,
     } = options;
 
     // Convert messages for API
@@ -297,6 +300,9 @@ export class RoutstrClient {
 
       callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
 
+      const baseHeaders = this._buildBaseHeaders(headers);
+      const requestHeaders = this._withAuthHeader(baseHeaders, token);
+
       // Reset failed providers for new request
       this.providerManager.resetFailedProviders();
 
@@ -309,6 +315,8 @@ export class RoutstrClient {
         token,
         requiredSats,
         maxTokens,
+        headers: requestHeaders,
+        baseHeaders,
       });
 
       if (response instanceof Response && (response as any).tokenBalance) {
@@ -452,6 +460,8 @@ export class RoutstrClient {
     token: string;
     requiredSats: number;
     maxTokens?: number;
+    headers: Record<string, string>;
+    baseHeaders: Record<string, string>;
   }): Promise<Response> {
     const {
       apiMessages,
@@ -461,30 +471,8 @@ export class RoutstrClient {
       token,
       requiredSats,
       maxTokens,
+      headers,
     } = params;
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    if (this.mode === "xcashu") {
-      headers["X-Cashu"] = token;
-    } else {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-
-    // Dev-only mock controls
-    if (
-      typeof window !== "undefined" &&
-      process.env.NODE_ENV === "development"
-    ) {
-      try {
-        const scenario = window.localStorage.getItem("msw:scenario");
-        const latency = window.localStorage.getItem("msw:latency");
-        if (scenario) headers["X-Mock-Scenario"] = scenario;
-        if (latency) headers["X-Mock-Latency"] = latency;
-      } catch {}
-    }
 
     // Get provider info for version compatibility
     const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
@@ -551,6 +539,8 @@ export class RoutstrClient {
       token: string;
       requiredSats: number;
       maxTokens?: number;
+      headers: Record<string, string>;
+      baseHeaders: Record<string, string>;
     },
     token: string
   ): Promise<Response> {
@@ -589,6 +579,10 @@ export class RoutstrClient {
             return this._makeRequest({
               ...params,
               token: childKeyResult.childKey,
+              headers: this._withAuthHeader(
+                params.baseHeaders,
+                childKeyResult.childKey
+              ),
             });
           } catch (e) {
             console.error("Failed to create new child key:", e);
@@ -667,6 +661,7 @@ export class RoutstrClient {
           selectedModel: newModel,
           token: spendResult.token,
           requiredSats: newRequiredSats,
+          headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
         });
       }
     }
@@ -688,6 +683,8 @@ export class RoutstrClient {
       token: string;
       requiredSats: number;
       maxTokens?: number;
+      headers: Record<string, string>;
+      baseHeaders: Record<string, string>;
     }
   ): Promise<Response> {
     const { apiMessages, selectedModel, baseUrl, mintUrl, maxTokens } = params;
@@ -753,6 +750,7 @@ export class RoutstrClient {
       selectedModel: newModel,
       token: spendResult.token,
       requiredSats: newRequiredSats,
+      headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
     });
   }
 
@@ -1229,7 +1227,7 @@ export class RoutstrClient {
   /**
    * Build request headers with common defaults and dev mock controls
    */
-  private _buildRequestHeaders(
+  private _buildBaseHeaders(
     additionalHeaders: Record<string, string> = {},
     token?: string
   ): Record<string, string> {
@@ -1238,26 +1236,24 @@ export class RoutstrClient {
       "Content-Type": "application/json",
     };
 
-    if (token) {
-      if (this.mode === "xcashu") {
-        headers["X-Cashu"] = token;
-      } else {
-        headers["Authorization"] = `Bearer ${token}`;
-      }
-    }
-
-    if (
-      typeof window !== "undefined" &&
-      process.env.NODE_ENV === "development"
-    ) {
-      try {
-        const scenario = window.localStorage.getItem("msw:scenario");
-        const latency = window.localStorage.getItem("msw:latency");
-        if (scenario) headers["X-Mock-Scenario"] = scenario;
-        if (latency) headers["X-Mock-Latency"] = latency;
-      } catch {}
-    }
-
     return headers;
+  }
+
+  /**
+   * Attach auth headers using the active client mode
+   */
+  private _withAuthHeader(
+    headers: Record<string, string>,
+    token: string
+  ): Record<string, string> {
+    const nextHeaders = { ...headers };
+
+    if (this.mode === "xcashu") {
+      nextHeaders["X-Cashu"] = token;
+    } else {
+      nextHeaders["Authorization"] = `Bearer ${token}`;
+    }
+
+    return nextHeaders;
   }
 }
