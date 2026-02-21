@@ -203,7 +203,8 @@ export async function routeRequests(
     walletAdapter,
     storageAdapter,
     providerRegistry,
-    alertLevel
+    alertLevel,
+    "lazyrefund"
   );
 
   // Extract options from request body

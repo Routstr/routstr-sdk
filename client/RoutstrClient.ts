@@ -194,52 +194,15 @@ export class RoutstrClient {
       selectedModel,
     });
 
-    if (this.mode === "xcashu") {
-      const refundToken = response.headers.get("x-cashu") ?? undefined;
-      const tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-
-      let satsSpent = tokenBalanceInSats;
-      if (refundToken) {
-        try {
-          const receiveResult =
-            await this.walletAdapter.receiveToken(refundToken);
-          satsSpent =
-            tokenBalanceInSats -
-            receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
-          console.log("[xcashu] Received refund token from response");
-        } catch (error) {
-          console.error("[xcashu] Failed to receive refund token:", error);
-        }
-      }
-      console.log(`[routeRequest] satsSpent: ${satsSpent}`);
-    } else if (this.mode === "lazyrefund") {
-      const latestBalanceInfo = await this._getTokenBalance(token, baseUrl);
-      const latestTokenBalance =
-        latestBalanceInfo.unit === "msat"
-          ? latestBalanceInfo.amount / 1000
-          : latestBalanceInfo.amount;
-      this.storageAdapter.updateTokenBalance(baseUrl, latestTokenBalance);
-      const tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-      const satsSpent = tokenBalanceInSats - latestTokenBalance;
-      console.log(`[routeRequest] satsSpent (lazyrefund): ${satsSpent}`);
-    } else if (this.mode === "apikeys") {
-      try {
-        const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
-            ? latestBalanceInfo.amount / 1000
-            : latestBalanceInfo.amount;
-        this.storageAdapter.updateChildKeyBalance(baseUrl, latestTokenBalance);
-        const tokenBalanceInSats =
-          tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-        const satsSpent = tokenBalanceInSats - latestTokenBalance;
-        console.log(`[routeRequest] satsSpent (apikeys): ${satsSpent}`);
-      } catch (e) {
-        console.warn("Could not get updated API key balance:", e);
-      }
-    }
+    const tokenBalanceInSats =
+      tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    const satsSpent = await this._handlePostResponseBalanceUpdate({
+      token,
+      baseUrl,
+      initialTokenBalance: tokenBalanceInSats,
+      response,
+    });
+    console.log(`[routeRequest] satsSpent: ${satsSpent}`);
 
     return response;
   }
@@ -387,57 +350,16 @@ export class RoutstrClient {
         callbacks.onThinkingUpdate("");
 
         // Handle post-response refund (skip for xcashu mode - refund is in response)
-        let satsSpent: number = tokenBalanceInSats;
-        if (this.mode === "xcashu") {
-          const refundToken = response.headers.get("x-cashu") ?? undefined;
-          if (refundToken) {
-            try {
-              const receiveResult =
-                await this.walletAdapter.receiveToken(refundToken);
-              satsSpent =
-                tokenBalanceInSats -
-                receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
-              console.log("[xcashu] Received refund token from response");
-            } catch (error) {
-              console.error("[xcashu] Failed to receive refund token:", error);
-            }
-          }
-        } else if (this.mode === "lazyrefund") {
-          const latestBalanceInfo = await this._getTokenBalance(
-            token,
-            baseUrlUsed
-          );
-          const latestTokenBalance =
-            latestBalanceInfo.unit === "msat"
-              ? latestBalanceInfo.amount / 1000
-              : latestBalanceInfo.amount;
-          this.storageAdapter.updateTokenBalance(
-            baseUrlUsed,
-            latestTokenBalance
-          );
-          satsSpent = tokenBalanceInSats - latestTokenBalance;
-        } else if (this.mode === "apikeys") {
-          // For apikeys mode, get updated balance from provider (no refund needed)
-          try {
-            const latestBalanceInfo = await this._getApiKeyBalance(
-              baseUrlUsed,
-              token
-            );
-            const latestTokenBalance =
-              latestBalanceInfo.unit === "msat"
-                ? latestBalanceInfo.amount / 1000
-                : latestBalanceInfo.amount;
-            this.storageAdapter.updateChildKeyBalance(
-              baseUrlUsed,
-              latestTokenBalance
-            );
-            satsSpent = tokenBalanceInSats - latestTokenBalance;
-          } catch (e) {
-            console.warn("Could not get updated API key balance:", e);
-            // Estimate based on usage
-            satsSpent = this._getEstimatedCosts(selectedModel, streamingResult);
-          }
-        }
+        const isApikeysEstimate = this.mode === "apikeys";
+        let satsSpent = await this._handlePostResponseBalanceUpdate({
+          token,
+          baseUrl: baseUrlUsed,
+          initialTokenBalance: tokenBalanceInSats,
+          fallbackSatsSpent: isApikeysEstimate
+            ? this._getEstimatedCosts(selectedModel, streamingResult)
+            : undefined,
+          response,
+        });
         const estimatedCosts = this._getEstimatedCosts(
           selectedModel,
           streamingResult
@@ -852,6 +774,61 @@ export class RoutstrClient {
 
     // Update transaction history (caller should persist this)
     callbacks.onTransactionUpdate(newTransaction);
+
+    return satsSpent;
+  }
+
+  /**
+   * Handle post-response balance update for all modes
+   */
+  private async _handlePostResponseBalanceUpdate(params: {
+    token: string;
+    baseUrl: string;
+    initialTokenBalance: number;
+    fallbackSatsSpent?: number;
+    response?: Response;
+  }): Promise<number> {
+    const { token, baseUrl, initialTokenBalance, fallbackSatsSpent, response } =
+      params;
+
+    let satsSpent: number = initialTokenBalance;
+
+    if (this.mode === "xcashu" && response) {
+      const refundToken = response.headers.get("x-cashu") ?? undefined;
+      if (refundToken) {
+        try {
+          const receiveResult =
+            await this.walletAdapter.receiveToken(refundToken);
+          satsSpent =
+            initialTokenBalance -
+            receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          console.log("[xcashu] Received refund token from response");
+        } catch (error) {
+          console.error("[xcashu] Failed to receive refund token:", error);
+        }
+      }
+    } else if (this.mode === "lazyrefund") {
+      const latestBalanceInfo = await this._getTokenBalance(token, baseUrl);
+      const latestTokenBalance =
+        latestBalanceInfo.unit === "msat"
+          ? latestBalanceInfo.amount / 1000
+          : latestBalanceInfo.amount;
+      this.storageAdapter.updateTokenBalance(baseUrl, latestTokenBalance);
+      satsSpent = initialTokenBalance - latestTokenBalance;
+    } else if (this.mode === "apikeys") {
+      try {
+        const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
+        const latestTokenBalance =
+          latestBalanceInfo.unit === "msat"
+            ? latestBalanceInfo.amount / 1000
+            : latestBalanceInfo.amount;
+        this.storageAdapter.updateChildKeyBalance(baseUrl, latestTokenBalance);
+        satsSpent = initialTokenBalance - latestTokenBalance;
+      } catch (e) {
+        console.warn("Could not get updated API key balance:", e);
+        satsSpent = fallbackSatsSpent ?? initialTokenBalance;
+      }
+    }
 
     return satsSpent;
   }

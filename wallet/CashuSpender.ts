@@ -306,6 +306,7 @@ export class CashuSpender {
         baseUrl,
         amount: topUpAmount,
       });
+      console.log("TOPUP ", topUpResult);
 
       if (topUpResult.success && topUpResult.toppedUpAmount) {
         const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
@@ -317,6 +318,15 @@ export class CashuSpender {
           balance: newBalance,
           unit,
         };
+      }
+
+      const providerBalance = await this._getProviderTokenBalance(
+        baseUrl,
+        storedToken
+      );
+      console.log(providerBalance)
+      if (providerBalance <= 0) {
+        this.storageAdapter.removeToken(baseUrl);
       }
     }
 
@@ -542,5 +552,26 @@ export class CashuSpender {
         maxMintUrl,
       },
     };
+  }
+
+  private async _getProviderTokenBalance(
+    baseUrl: string,
+    token: string
+  ): Promise<number> {
+    try {
+      const response = await fetch(`${baseUrl}v1/wallet/info`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.balance / 1000;
+      }
+    } catch {
+      return 0;
+    }
+    return 0;
   }
 }
