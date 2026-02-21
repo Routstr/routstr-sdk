@@ -327,21 +327,38 @@ export class CashuSpender {
    * Refund pending tokens and retry
    */
   private async _refundAndRetry(options: SpendOptions): Promise<SpendResult> {
-    const { mintUrl, baseUrl, excludeMints, retryCount } = options;
+    const { mintUrl, retryCount } = options;
 
     const pendingDistribution =
       this.storageAdapter.getPendingTokenDistribution();
 
-    // Refund all pending tokens
-    for (const pending of pendingDistribution) {
-      const token = this.storageAdapter.getToken(pending.baseUrl);
-      if (token) {
-        // Remove token from storage (refund will be handled by caller or BalanceManager)
-        this.storageAdapter.removeToken(pending.baseUrl);
+    const refundResults = await Promise.allSettled(
+      pendingDistribution.map(async (pending) => {
+        const token = this.storageAdapter.getToken(pending.baseUrl);
+        if (!token || !this.balanceManager) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
+
+        const result = await this.balanceManager.refund({
+          mintUrl,
+          baseUrl: pending.baseUrl,
+          token,
+        });
+
+        return { baseUrl: pending.baseUrl, success: result.success };
+      })
+    );
+
+    for (const result of refundResults) {
+      const refundResult =
+        result.status === "fulfilled"
+          ? result.value
+          : { baseUrl: "", success: false };
+      if (refundResult.success) {
+        this.storageAdapter.removeToken(refundResult.baseUrl);
       }
     }
 
-    // Retry with refunded balance
     return this._spendInternal({
       ...options,
       retryCount: (retryCount || 0) + 1,

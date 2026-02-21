@@ -149,13 +149,18 @@ export class RoutstrClient {
     await this._checkBalance();
 
     let requiredSats = 1;
+    let selectedModel: Model | undefined;
     if (modelId) {
-      const model = await this.providerManager.getModelForProvider(
+      const providerModel = await this.providerManager.getModelForProvider(
         baseUrl,
         modelId
       );
-      if (model) {
-        requiredSats = this.providerManager.getRequiredSatsForModel(model, []);
+      selectedModel = providerModel ?? undefined;
+      if (selectedModel) {
+        requiredSats = this.providerManager.getRequiredSatsForModel(
+          selectedModel,
+          []
+        );
       }
     }
 
@@ -176,29 +181,18 @@ export class RoutstrClient {
     const baseHeaders = this._buildBaseHeaders(headers);
     const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
-    const url = `${baseUrl.replace(/\/$/, "")}${path}`;
-    const fetchOptions: RequestInit = {
+    const response = await this._makeRequest({
+      path,
       method,
+      body: method === "GET" ? undefined : requestBody,
+      baseUrl,
+      mintUrl,
+      token,
+      requiredSats,
       headers: requestHeaders,
-    };
-
-    if (body && method !== "GET") {
-      fetchOptions.body = JSON.stringify(requestBody);
-    }
-
-    console.log(
-      `[RoutstrClient.routeRequest] Making fetch request to ${url}...`
-    );
-    const response = await fetch(url, fetchOptions);
-
-    console.log(
-      `[RoutstrClient.routeRequest] Response status: ${response.status}`
-    );
-
-    if (!response.ok) {
-      await this.balanceManager.refund({ mintUrl, baseUrl, token });
-      throw new ProviderError(baseUrl, response.status, await response.text());
-    }
+      baseHeaders,
+      selectedModel,
+    });
 
     if (this.mode === "xcashu") {
       const refundToken = response.headers.get("x-cashu") ?? undefined;
@@ -306,9 +300,40 @@ export class RoutstrClient {
       // Reset failed providers for new request
       this.providerManager.resetFailedProviders();
 
+      // Get provider info for version compatibility
+      const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
+      const providerVersion = providerInfo?.version ?? "";
+
+      // Handle v0.1.x providers (only send leaf ID)
+      let modelIdForRequest = selectedModel.id;
+      if (/^0\.1\./.test(providerVersion)) {
+        const newModel = await this.providerManager.getModelForProvider(
+          baseUrl,
+          selectedModel.id
+        );
+        modelIdForRequest = newModel?.id ?? selectedModel.id;
+      }
+
+      const body: any = {
+        model: modelIdForRequest,
+        messages: apiMessages,
+        stream: true,
+      };
+
+      if (maxTokens !== undefined) {
+        body.max_tokens = maxTokens;
+      }
+
+      // Only add tools for OpenAI models
+      if (selectedModel?.name?.startsWith("OpenAI:")) {
+        body.tools = [{ type: "web_search" }];
+      }
+
       // Make API request
       const response = await this._makeRequest({
-        apiMessages,
+        path: "v1/chat/completions",
+        method: "POST",
+        body,
         selectedModel,
         baseUrl,
         mintUrl,
@@ -318,11 +343,6 @@ export class RoutstrClient {
         headers: requestHeaders,
         baseHeaders,
       });
-
-      if (response instanceof Response && (response as any).tokenBalance) {
-        tokenBalance = (response as any).tokenBalance;
-        tokenBalanceUnit = "sat";
-      }
 
       if (!response.body) {
         throw new Error("Response body is not available");
@@ -367,10 +387,9 @@ export class RoutstrClient {
         callbacks.onThinkingUpdate("");
 
         // Handle post-response refund (skip for xcashu mode - refund is in response)
-        let satsSpent: number;
+        let satsSpent: number = tokenBalanceInSats;
         if (this.mode === "xcashu") {
           const refundToken = response.headers.get("x-cashu") ?? undefined;
-          satsSpent = tokenBalanceInSats;
           if (refundToken) {
             try {
               const receiveResult =
@@ -418,18 +437,6 @@ export class RoutstrClient {
             // Estimate based on usage
             satsSpent = this._getEstimatedCosts(selectedModel, streamingResult);
           }
-        } else {
-          satsSpent = await this._handlePostResponseRefund({
-            mintUrl,
-            baseUrl: baseUrlUsed,
-            tokenBalance,
-            tokenBalanceUnit,
-            initialBalance: balance,
-            selectedModel,
-            streamingResult,
-            callbacks,
-            transactionHistory,
-          });
         }
         const estimatedCosts = this._getEstimatedCosts(
           selectedModel,
@@ -453,8 +460,10 @@ export class RoutstrClient {
    * Make the API request with failover support
    */
   private async _makeRequest(params: {
-    apiMessages: any[];
-    selectedModel: Model;
+    path: string;
+    method: string;
+    body?: unknown;
+    selectedModel?: Model;
     baseUrl: string;
     mintUrl: string;
     token: string;
@@ -463,51 +472,17 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
   }): Promise<Response> {
-    const {
-      apiMessages,
-      selectedModel,
-      baseUrl,
-      mintUrl,
-      token,
-      requiredSats,
-      maxTokens,
-      headers,
-    } = params;
-
-    // Get provider info for version compatibility
-    const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
-    const providerVersion = providerInfo?.version ?? "";
-
-    // Handle v0.1.x providers (only send leaf ID)
-    let modelIdForRequest = selectedModel.id;
-    if (/^0\.1\./.test(providerVersion)) {
-      const newModel = await this.providerManager.getModelForProvider(
-        baseUrl,
-        selectedModel.id
-      );
-      modelIdForRequest = newModel?.id ?? selectedModel.id;
-    }
-
-    const body: any = {
-      model: modelIdForRequest,
-      messages: apiMessages,
-      stream: true,
-    };
-
-    if (maxTokens !== undefined) {
-      body.max_tokens = maxTokens;
-    }
-
-    // Only add tools for OpenAI models
-    if (selectedModel?.name?.startsWith("OpenAI:")) {
-      body.tools = [{ type: "web_search" }];
-    }
+    const { path, method, body, baseUrl, token, headers } = params;
 
     try {
-      const response = await fetch(`${baseUrl}v1/chat/completions`, {
-        method: "POST",
+      const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      const response = await fetch(url, {
+        method,
         headers,
-        body: JSON.stringify(body),
+        body:
+          body === undefined || method === "GET"
+            ? undefined
+            : JSON.stringify(body),
       });
 
       (response as any).baseUrl = baseUrl;
@@ -532,8 +507,10 @@ export class RoutstrClient {
   private async _handleErrorResponse(
     response: Response,
     params: {
-      apiMessages: any[];
-      selectedModel: Model;
+      path: string;
+      method: string;
+      body?: unknown;
+      selectedModel?: Model;
       baseUrl: string;
       mintUrl: string;
       token: string;
@@ -544,14 +521,7 @@ export class RoutstrClient {
     },
     token: string
   ): Promise<Response> {
-    const {
-      apiMessages,
-      selectedModel,
-      baseUrl,
-      mintUrl,
-      requiredSats,
-      maxTokens,
-    } = params;
+    const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     const status = response.status;
 
     // Handle apikeys mode differently - no refund needed
@@ -613,6 +583,10 @@ export class RoutstrClient {
       status === 500 ||
       status === 502
     ) {
+      if (!selectedModel) {
+        throw new ProviderError(baseUrl, status, await response.text());
+      }
+
       const nextProvider = this.providerManager.findNextBestProvider(
         selectedModel.id,
         baseUrl
@@ -626,10 +600,16 @@ export class RoutstrClient {
             selectedModel.id
           )) ?? selectedModel;
 
+        const messagesForPricing = Array.isArray(
+          (body as { messages?: unknown })?.messages
+        )
+          ? ((body as { messages?: unknown }).messages as any[])
+          : [];
+
         const newRequiredSats = this.providerManager.getRequiredSatsForModel(
           newModel,
-          apiMessages,
-          maxTokens
+          messagesForPricing,
+          params.maxTokens
         );
 
         // Spend new token for next provider
@@ -657,6 +637,9 @@ export class RoutstrClient {
         // Retry with new provider
         return this._makeRequest({
           ...params,
+          path,
+          method,
+          body,
           baseUrl: nextProvider,
           selectedModel: newModel,
           token: spendResult.token,
@@ -676,8 +659,10 @@ export class RoutstrClient {
   private async _handleNetworkError(
     error: Error,
     params: {
-      apiMessages: any[];
-      selectedModel: Model;
+      path: string;
+      method: string;
+      body?: unknown;
+      selectedModel?: Model;
       baseUrl: string;
       mintUrl: string;
       token: string;
@@ -687,7 +672,7 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
     }
   ): Promise<Response> {
-    const { apiMessages, selectedModel, baseUrl, mintUrl, maxTokens } = params;
+    const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
 
     // Refund current token
     await this.balanceManager.refund({
@@ -700,6 +685,10 @@ export class RoutstrClient {
     this.providerManager.markFailed(baseUrl);
 
     // Find next provider
+    if (!selectedModel) {
+      throw error;
+    }
+
     const nextProvider = this.providerManager.findNextBestProvider(
       selectedModel.id,
       baseUrl
@@ -716,10 +705,16 @@ export class RoutstrClient {
         selectedModel.id
       )) ?? selectedModel;
 
+    const messagesForPricing = Array.isArray(
+      (body as { messages?: unknown })?.messages
+    )
+      ? ((body as { messages?: unknown }).messages as any[])
+      : [];
+
     const newRequiredSats = this.providerManager.getRequiredSatsForModel(
       newModel,
-      apiMessages,
-      maxTokens
+      messagesForPricing,
+      params.maxTokens
     );
 
     const spendResult = await this.cashuSpender.spend({
@@ -746,6 +741,9 @@ export class RoutstrClient {
     // Retry
     return this._makeRequest({
       ...params,
+      path,
+      method,
+      body,
       baseUrl: nextProvider,
       selectedModel: newModel,
       token: spendResult.token,
