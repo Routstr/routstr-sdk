@@ -887,16 +887,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Derive a child key from the main API key for parallel requests
-   * Uses timestamp to ensure uniqueness while keeping related requests traceable
-   */
-  private _deriveChildKey(apiKey: string): string {
-    // Format: originalKey_timestamp
-    const timestamp = Date.now();
-    return `${apiKey}_${timestamp}`;
-  }
-
-  /**
    * Create a child key for a parent API key via the provider's API
    * POST /v1/balance/child-key
    */
@@ -928,6 +918,7 @@ export class RoutstrClient {
         validity_date: options?.validityDate,
       }),
     });
+    console.log(response);
 
     if (!response.ok) {
       throw new Error(
@@ -936,8 +927,9 @@ export class RoutstrClient {
     }
 
     const data = await response.json();
+
     return {
-      childKey: data.key ?? data.keys?.[0],
+      childKey: data.api_keys?.[0],
       balance: data.balance ?? 0,
       balanceLimit: data.balance_limit,
       validityDate: data.validity_date,
@@ -1067,9 +1059,35 @@ export class RoutstrClient {
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       if (!parentApiKey) {
-        throw new Error(
-          `No API key found for ${baseUrl}. Please add an API key first.`
-        );
+        const spendResult = await this.cashuSpender.spend({
+          mintUrl: mintUrl,
+          amount: 1,
+          baseUrl: "",
+          reuseToken: false
+        })
+        if (spendResult.status === "failed" || !spendResult.token) {
+          const errorMsg =
+            spendResult.error || `Insufficient balance. Need ${amount} sats.`;
+
+          if (this._isNetworkError(errorMsg)) {
+            throw new Error(
+              `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+            );
+          }
+
+          if (spendResult.errorDetails) {
+            throw new InsufficientBalanceError(
+              spendResult.errorDetails.required,
+              spendResult.errorDetails.available,
+              spendResult.errorDetails.maxMintBalance,
+              spendResult.errorDetails.maxMintUrl
+            );
+          }
+
+          throw new Error(errorMsg);
+        }
+        const apiKeyCreated = await this.balanceManager.getTokenBalance(spendResult.token, baseUrl)
+        parentApiKey = apiKeyCreated.apiKey;
       }
 
       let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
@@ -1105,6 +1123,7 @@ export class RoutstrClient {
           };
         }
       }
+      console.log("CHILD KJEY", childKeyEntry);
 
       let tokenBalance = childKeyEntry.balance;
       let tokenBalanceUnit: "sat" | "msat" = "sat";

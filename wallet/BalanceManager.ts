@@ -421,7 +421,7 @@ export class BalanceManager {
   async getTokenBalance(
     token: string,
     baseUrl: string
-  ): Promise<{ amount: number; reserved: number; unit: "sat" | "msat" }> {
+  ): Promise<{ amount: number; reserved: number; unit: "sat" | "msat", apiKey: string }> {
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
         headers: {
@@ -435,13 +435,14 @@ export class BalanceManager {
           amount: data.balance,
           reserved: data.reserved ?? 0,
           unit: "msat",
+          apiKey: data.api_key
         };
       }
     } catch {
       // Fall through to default
     }
 
-    return { amount: 0, reserved: 0, unit: "sat" };
+    return { amount: 0, reserved: 0, unit: "sat", apiKey: "" };
   }
 
   /**

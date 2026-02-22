@@ -462,6 +462,7 @@ export const createStorageAdapterFromStore = (
     const existingIndex = keys.findIndex(
       (entry) => entry.parentBaseUrl === normalized
     );
+    console.log('STOREKING', existingIndex, childKey);
     if (existingIndex !== -1) {
       // Update existing child key
       const next = keys.map((entry) =>
