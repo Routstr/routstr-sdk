@@ -420,7 +420,11 @@ export class CashuSpender {
         if (!token || !this.balanceManager || pending.baseUrl === baseUrl) { // do not refund the current provider's token. 
           return { baseUrl: pending.baseUrl, success: false };
         }
-        this.balanceManager.getTokenBalance(token, pending.baseUrl);
+        const tokenBalance = await this.balanceManager.getTokenBalance(token, pending.baseUrl);
+
+        if (tokenBalance.reserved > 0) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
 
         const result = await this.balanceManager.refund({
           mintUrl,

@@ -37,20 +37,26 @@ export interface SdkStorageStore extends SdkStorageState {
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
   setCachedTokens: (
-    value: Array<{
-      baseUrl: string;
-      token: string;
-      balance: number;
-      lastUsed: number | null;
-    }>
+    value:
+      | Array<{
+          baseUrl: string;
+          token: string;
+          balance?: number;
+          lastUsed?: number | null;
+        }>
+      | ((
+          current: SdkStorageStore["cachedTokens"]
+        ) => SdkStorageStore["cachedTokens"])
   ) => void;
   setApiKeys: (
-    value: Array<{
-      baseUrl: string;
-      key: string;
-      balance: number;
-      lastUsed: number | null;
-    }>
+    value:
+      | Array<{
+          baseUrl: string;
+          key: string;
+          balance?: number;
+          lastUsed?: number | null;
+        }>
+      | ((current: SdkStorageStore["apiKeys"]) => SdkStorageStore["apiKeys"])
   ) => void;
   setChildKeys: (
     value: Array<{
@@ -220,39 +226,65 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       set({ lastModelsUpdate: normalized });
     },
     setCachedTokens: (value) => {
-      const normalized = value.map((entry) => ({
-        ...entry,
-        baseUrl: normalizeBaseUrl(entry.baseUrl),
-        balance:
-          typeof entry.balance === "number"
-            ? entry.balance
-            : getTokenBalance(entry.token),
-        lastUsed: entry.lastUsed ?? null,
-      }));
-      driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
-      set({ cachedTokens: normalized });
+      set((state) => {
+        const updates =
+          typeof value === "function" ? value(state.cachedTokens) : value;
+        const normalized = updates.map((entry) => ({
+          ...entry,
+          baseUrl: normalizeBaseUrl(entry.baseUrl),
+          balance:
+            typeof entry.balance === "number"
+              ? entry.balance
+              : getTokenBalance(entry.token),
+          lastUsed: entry.lastUsed ?? null,
+        }));
+        driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
+        return { cachedTokens: normalized };
+      });
     },
     setApiKeys: (value) => {
-      const normalized = value.map((entry) => ({
-        ...entry,
-        baseUrl: normalizeBaseUrl(entry.baseUrl),
-        balance: entry.balance ?? 0,
-        lastUsed: entry.lastUsed ?? null,
-      }));
-      driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
-      set({ apiKeys: normalized });
+      set((state) => {
+        const updates =
+          typeof value === "function" ? value(state.apiKeys) : value;
+        const normalized = updates.map((entry) => ({
+          ...entry,
+          baseUrl: normalizeBaseUrl(entry.baseUrl),
+          balance: entry.balance ?? 0,
+          lastUsed: entry.lastUsed ?? null,
+        }));
+        driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
+        return { apiKeys: normalized };
+      });
     },
-    setChildKeys: (value) => {
-      const normalized = value.map((entry) => ({
-        parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
-        childKey: entry.childKey,
-        balance: entry.balance ?? 0,
-        balanceLimit: entry.balanceLimit,
-        validityDate: entry.validityDate,
-        createdAt: entry.createdAt ?? Date.now(),
-      }));
-      driver.setItem(SDK_STORAGE_KEYS.CHILD_KEYS, normalized);
-      set({ childKeys: normalized });
+    setChildKeys: (
+      value:
+        | Array<{
+            parentBaseUrl: string;
+            childKey: string;
+            balance?: number;
+            balanceLimit?: number;
+            validityDate?: number;
+            createdAt?: number;
+          }>
+        | ((
+            current: SdkStorageStore["childKeys"]
+          ) => SdkStorageStore["childKeys"])
+    ) => {
+      set((state) => {
+        const updates =
+          typeof value === "function" ? value(state.childKeys) : value;
+        console.log(updates);
+        const normalized = updates.map((entry) => ({
+          parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
+          childKey: entry.childKey,
+          balance: entry.balance ?? 0,
+          balanceLimit: entry.balanceLimit,
+          validityDate: entry.validityDate,
+          createdAt: entry.createdAt ?? Date.now(),
+        }));
+        driver.setItem(SDK_STORAGE_KEYS.CHILD_KEYS, normalized);
+        return { childKeys: normalized };
+      });
     },
   }));
 };
@@ -462,7 +494,6 @@ export const createStorageAdapterFromStore = (
     const existingIndex = keys.findIndex(
       (entry) => entry.parentBaseUrl === normalized
     );
-    console.log('STOREKING', existingIndex, childKey);
     if (existingIndex !== -1) {
       // Update existing child key
       const next = keys.map((entry) =>
@@ -496,6 +527,7 @@ export const createStorageAdapterFromStore = (
   updateChildKeyBalance: (parentBaseUrl, balance) => {
     const normalized = normalizeBaseUrl(parentBaseUrl);
     const keys = store.getState().childKeys;
+    console.log("update balance");
     const next = keys.map((entry) =>
       entry.parentBaseUrl === normalized ? { ...entry, balance } : entry
     );

@@ -443,8 +443,7 @@ export class RoutstrClient {
 
     // Handle apikeys mode differently - no refund needed
     if (this.mode === "apikeys") {
-      // Remove invalid child key
-      this.storageAdapter.removeChildKey(baseUrl);
+      console.log('error ;', status);
 
       // For auth errors, try with a new child key
       if (status === 401 || status === 403) {
@@ -474,6 +473,28 @@ export class RoutstrClient {
           } catch (e) {
             // Use parent key instead
           }
+        }
+      }
+      else if (status === 402) {
+
+        const parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (parentApiKey) {
+          const topupResult = await this.balanceManager.topUp({
+            mintUrl,
+            baseUrl,
+            amount: params.requiredSats * 3,
+            token: parentApiKey
+          });
+          console.log(topupResult);
+
+          return this._makeRequest({
+            ...params,
+            token: params.token,
+            headers: this._withAuthHeader(
+              params.baseHeaders,
+              params.token
+            ),
+          });
         }
       }
       throw new ProviderError(baseUrl, status, await response.text());
@@ -815,6 +836,7 @@ export class RoutstrClient {
     } else if (this.mode === "apikeys") {
       try {
         const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
+        console.log("LATEST BANAL", latestBalanceInfo);
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
@@ -918,7 +940,6 @@ export class RoutstrClient {
         validity_date: options?.validityDate,
       }),
     });
-    console.log(response);
 
     if (!response.ok) {
       throw new Error(
@@ -952,6 +973,7 @@ export class RoutstrClient {
 
       if (response.ok) {
         const data = await response.json();
+        console.log(data)
         return {
           amount: data.balance,
           unit: "msat",
@@ -1061,7 +1083,7 @@ export class RoutstrClient {
       if (!parentApiKey) {
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
-          amount: 1,
+          amount: amount * 3,
           baseUrl: "",
           reuseToken: false
         })
@@ -1083,11 +1105,11 @@ export class RoutstrClient {
               spendResult.errorDetails.maxMintUrl
             );
           }
-
           throw new Error(errorMsg);
         }
         const apiKeyCreated = await this.balanceManager.getTokenBalance(spendResult.token, baseUrl)
         parentApiKey = apiKeyCreated.apiKey;
+        this.storageAdapter.setApiKey(baseUrl, parentApiKey);
       }
 
       let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
