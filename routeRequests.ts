@@ -85,10 +85,6 @@ export interface RouteRequestResult {
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<Response> {
-  console.log(
-    `[routeRequests] Starting request routing for model: ${options.modelId}`
-  );
-
   const {
     modelId,
     requestBody,
@@ -103,10 +99,6 @@ export async function routeRequests(
     forceRefresh = false,
     modelManager: providedModelManager,
   } = options;
-
-  console.log(
-    `[routeRequests] Path: ${path}, Forced provider: ${forcedProvider || "none"}`
-  );
 
   // Use provided ModelManager or create a new one
   let modelManager: ModelManager;
@@ -172,10 +164,6 @@ export async function routeRequests(
     selectedModel = cheapest.model;
   }
 
-  console.log(
-    `[routeRequests] Selected provider: ${baseUrl}, model: ${selectedModel.id}`
-  );
-
   // Get wallet balance
   const balances = await walletAdapter.getBalances();
   const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
@@ -204,7 +192,7 @@ export async function routeRequests(
     storageAdapter,
     providerRegistry,
     alertLevel,
-    "lazyrefund"
+    "apikeys"
   );
 
   // Extract options from request body
@@ -212,23 +200,30 @@ export async function routeRequests(
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
 
-  console.log(`[routeRequests] Stream: ${stream}, maxTokens: ${maxTokens}`);
-
   // Make the request using the simpler routeRequest method
   let response: Response | null = null;
   let responseData: unknown;
 
   try {
-    console.log(`[routeRequests] Making request to ${baseUrl}${path}...`);
+    const proxiedBody: Record<string, unknown> =
+      requestBody && typeof requestBody === "object"
+        ? { ...(requestBody as Record<string, unknown>) }
+        : {};
+
+    proxiedBody.model = selectedModel.id;
+
+    if (stream !== undefined) {
+      proxiedBody.stream = stream;
+    }
+
+    if (maxTokens !== undefined) {
+      proxiedBody.max_tokens = maxTokens;
+    }
+
     response = await client.routeRequest({
       path,
       method: "POST",
-      body: {
-        model: selectedModel.id,
-        messages: messageHistory,
-        stream,
-        max_tokens: maxTokens,
-      },
+      body: proxiedBody,
       baseUrl,
       mintUrl,
       modelId: modelId,
@@ -237,7 +232,6 @@ export async function routeRequests(
     if (!response.ok) {
       throw new Error(`${response.status} ${response.statusText}`);
     }
-    console.log("RESPO", response);
 
     // For streaming responses, return the raw body for SSE handling
     if (stream) {
