@@ -802,7 +802,10 @@ export class RoutstrClient {
         }
       }
     } else if (this.mode === "lazyrefund") {
-      const latestBalanceInfo = await this._getTokenBalance(token, baseUrl);
+      const latestBalanceInfo = await this.balanceManager.getTokenBalance(
+        token,
+        baseUrl
+      );
       const latestTokenBalance =
         latestBalanceInfo.unit === "msat"
           ? latestBalanceInfo.amount / 1000
@@ -881,34 +884,6 @@ export class RoutstrClient {
       role: "assistant",
       content: result.content || "",
     };
-  }
-
-  /**
-   * Get token balance from provider
-   */
-  private async _getTokenBalance(
-    token: string,
-    baseUrl: string
-  ): Promise<TokenBalance> {
-    try {
-      const response = await fetch(`${baseUrl}v1/wallet/info`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return {
-          amount: data.balance,
-          unit: "msat", // wallet/info returns msats
-        };
-      }
-    } catch {
-      // Fall through to default
-    }
-
-    return { amount: 0, unit: "sat" };
   }
 
   /**

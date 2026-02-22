@@ -245,7 +245,7 @@ export class BalanceManager {
       }
 
       const data = await response.json();
-      console.log('refund rsule', data);
+      console.log("refund rsule", data);
       return {
         success: true,
         token: data.token,
@@ -413,6 +413,35 @@ export class BalanceManager {
       message: "Refund failed",
       requestId,
     };
+  }
+
+  /**
+   * Get token balance from provider
+   */
+  async getTokenBalance(
+    token: string,
+    baseUrl: string
+  ): Promise<{ amount: number; reserved: number; unit: "sat" | "msat" }> {
+    try {
+      const response = await fetch(`${baseUrl}v1/wallet/info`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return {
+          amount: data.balance,
+          reserved: data.reserved ?? 0,
+          unit: "msat",
+        };
+      }
+    } catch {
+      // Fall through to default
+    }
+
+    return { amount: 0, reserved: 0, unit: "sat" };
   }
 
   /**

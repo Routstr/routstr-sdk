@@ -409,7 +409,7 @@ export class CashuSpender {
    * Refund pending tokens and retry
    */
   private async _refundAndRetry(options: SpendOptions): Promise<SpendResult> {
-    const { mintUrl, retryCount } = options;
+    const { mintUrl, baseUrl, retryCount } = options;
 
     const pendingDistribution =
       this.storageAdapter.getPendingTokenDistribution();
@@ -417,9 +417,10 @@ export class CashuSpender {
     const refundResults = await Promise.allSettled(
       pendingDistribution.map(async (pending) => {
         const token = this.storageAdapter.getToken(pending.baseUrl);
-        if (!token || !this.balanceManager) {
+        if (!token || !this.balanceManager || pending.baseUrl === baseUrl) { // do not refund the current provider's token. 
           return { baseUrl: pending.baseUrl, success: false };
         }
+        this.balanceManager.getTokenBalance(token, pending.baseUrl);
 
         const result = await this.balanceManager.refund({
           mintUrl,
