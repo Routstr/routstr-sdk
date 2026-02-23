@@ -14,11 +14,28 @@ export { SDK_STORAGE_KEYS } from "./keys";
 export { createSdkStore } from "./store";
 export { localStorageDriver, createMemoryDriver, createSqliteDriver };
 
-const isBrowser = (): boolean =>
-  typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+const isBrowser = (): boolean => {
+  try {
+    return (
+      typeof window !== "undefined" &&
+      typeof window.localStorage !== "undefined"
+    );
+  } catch {
+    return false;
+  }
+};
 
-const isNode = (): boolean =>
-  typeof process !== "undefined" && !!process.versions?.node;
+const isNode = (): boolean => {
+  try {
+    return (
+      typeof process !== "undefined" &&
+      process.versions != null &&
+      process.versions.node != null
+    );
+  } catch {
+    return false;
+  }
+};
 
 let defaultDriver: StorageDriver | null = null;
 

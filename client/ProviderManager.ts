@@ -12,7 +12,7 @@
 
 import type { ProviderRegistry } from "../wallet/interfaces";
 import type { Model } from "../core/types";
-import { isOnionUrl, isTorContext } from "@/utils/torUtils";
+import { isOnionUrl, isTorContext } from "../utils/torUtils";
 
 export interface ModelProviderPrice {
   baseUrl: string;

@@ -1,2 +1,8 @@
-// Utility functions (to be implemented as needed)
-export {};
+export {
+  isOnionUrl,
+  isTorContext,
+  normalizeProviderUrl,
+  getProviderEndpoints,
+  filterBaseUrlsForTor,
+  type ProviderDirectoryEntry,
+} from "./torUtils";

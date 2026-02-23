@@ -11,8 +11,8 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { Message, TransactionHistory } from "@/types/chat";
-import type { Model } from "@/types/models";
+import type { Message, TransactionHistory } from "../core/types";
+import type { Model } from "../core/types";
 import type {
   WalletAdapter,
   StorageAdapter,
@@ -443,7 +443,7 @@ export class RoutstrClient {
 
     // Handle apikeys mode differently - no refund needed
     if (this.mode === "apikeys") {
-      console.log('error ;', status);
+      console.log("error ;", status);
 
       // For auth errors, try with a new child key
       if (status === 401 || status === 403) {
@@ -474,26 +474,21 @@ export class RoutstrClient {
             // Use parent key instead
           }
         }
-      }
-      else if (status === 402) {
-
+      } else if (status === 402) {
         const parentApiKey = this.storageAdapter.getApiKey(baseUrl);
         if (parentApiKey) {
           const topupResult = await this.balanceManager.topUp({
             mintUrl,
             baseUrl,
             amount: params.requiredSats * 3,
-            token: parentApiKey
+            token: parentApiKey,
           });
           console.log(topupResult);
 
           return this._makeRequest({
             ...params,
             token: params.token,
-            headers: this._withAuthHeader(
-              params.baseHeaders,
-              params.token
-            ),
+            headers: this._withAuthHeader(params.baseHeaders, params.token),
           });
         }
       }
@@ -973,7 +968,7 @@ export class RoutstrClient {
 
       if (response.ok) {
         const data = await response.json();
-        console.log(data)
+        console.log(data);
         return {
           amount: data.balance,
           unit: "msat",
@@ -1085,8 +1080,8 @@ export class RoutstrClient {
           mintUrl: mintUrl,
           amount: amount * 3,
           baseUrl: "",
-          reuseToken: false
-        })
+          reuseToken: false,
+        });
         if (spendResult.status === "failed" || !spendResult.token) {
           const errorMsg =
             spendResult.error || `Insufficient balance. Need ${amount} sats.`;
@@ -1107,7 +1102,10 @@ export class RoutstrClient {
           }
           throw new Error(errorMsg);
         }
-        const apiKeyCreated = await this.balanceManager.getTokenBalance(spendResult.token, baseUrl)
+        const apiKeyCreated = await this.balanceManager.getTokenBalance(
+          spendResult.token,
+          baseUrl
+        );
         parentApiKey = apiKeyCreated.apiKey;
         this.storageAdapter.setApiKey(baseUrl, parentApiKey);
       }

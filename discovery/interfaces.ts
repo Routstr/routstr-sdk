@@ -3,7 +3,7 @@
  * These abstractions allow the discovery logic to be independent of storage implementation
  */
 
-import type { Model, ProviderInfo } from "@/sdk/core";
+import type { Model, ProviderInfo } from "../core/types";
 export { ProviderInfo };
 
 /**

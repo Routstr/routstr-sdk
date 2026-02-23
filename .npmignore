@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build outputs (we only publish dist)
+dist/
+
+# Development files
+*.ts
+!*.d.ts
+tsconfig.json
+tsup.config.ts
+
+# Tests
+__tests__/
+*.test.ts
+*.spec.ts
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temp
+*.tmp
+temp/

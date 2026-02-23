@@ -4,12 +4,12 @@
  * (lowest cost) across multiple providers
  */
 
-import type { Model } from "@/types/models";
+import type { Model } from "../core/types";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
-} from "@/sdk/core/errors";
+} from "../core/errors";
 
 /**
  * Configuration for ModelManager

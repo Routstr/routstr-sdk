@@ -3,8 +3,8 @@
  * These interfaces allow the SDK to be framework-agnostic
  */
 
-import type { Message, TransactionHistory } from "@/types/chat";
-import type { Model, ProviderInfo } from "@/sdk/core";
+import type { Message, TransactionHistory } from "../core/types";
+import type { Model, ProviderInfo } from "../core/types";
 export { ProviderInfo };
 
 /**

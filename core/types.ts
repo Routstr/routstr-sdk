@@ -3,11 +3,87 @@
  * These types are shared across wallet and client modules
  */
 
-import type { Message, TransactionHistory } from "@/types/chat";
-import type { Model } from "@/types/models";
+export interface MessageContentType {
+  type: "text" | "image_url" | "file";
+  text?: string;
+  image_url?: {
+    url: string;
+    storageId?: string;
+  };
+  file?: {
+    url: string;
+    name?: string;
+    mimeType?: string;
+    size?: number;
+  };
+  hidden?: boolean;
+  thinking?: string;
+  citations?: string[];
+}
 
-// Re-export for SDK internal use
-export type { Message, TransactionHistory, Model };
+export interface Message {
+  role: string;
+  content: string | MessageContentType[];
+  _eventId?: string;
+  _prevId?: string;
+  _createdAt?: number;
+  _modelId?: string;
+  satsSpent?: number;
+}
+
+export interface TransactionHistory {
+  type: "spent" | "mint" | "send" | "import" | "refund";
+  amount: number;
+  timestamp: number;
+  status: "success" | "failed";
+  model?: string;
+  message?: string;
+  balance?: number;
+}
+
+export interface ModelPricing {
+  prompt: number;
+  completion: number;
+  request: number;
+  image: number;
+  web_search: number;
+  internal_reasoning: number;
+}
+
+export interface ModelSatsPricing extends ModelPricing {
+  max_completion_cost: number;
+  max_prompt_cost: number;
+  max_cost: number;
+}
+
+export interface ModelArchitecture {
+  modality: string;
+  input_modalities: readonly string[];
+  output_modalities: readonly string[];
+  tokenizer: string;
+  instruct_type: string | null;
+}
+
+export interface PerRequestLimits {
+  readonly prompt_tokens?: number;
+  readonly completion_tokens?: number;
+  readonly requests_per_minute?: number;
+  readonly images_per_minute?: number;
+  readonly web_searches_per_minute?: number;
+  readonly [key: string]: number | undefined;
+}
+
+export interface Model {
+  id: string;
+  name: string;
+  created?: number;
+  description?: string;
+  context_length?: number;
+  architecture?: ModelArchitecture;
+  pricing?: ModelPricing;
+  sats_pricing: ModelSatsPricing;
+  per_request_limits?: PerRequestLimits;
+}
 
 /**
  * Result from spending cashu tokens
