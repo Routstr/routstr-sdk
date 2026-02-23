@@ -10,6 +10,14 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
+import { RelayPool } from "applesauce-relay";
+import { EventStore } from "applesauce-core";
+import { lastValueFrom } from "rxjs";
+import { onlyEvents, completeOnEose } from "applesauce-relay/operators";
+import {
+  mapEventsToStore,
+  mapEventsToTimeline,
+} from "applesauce-core/observable";
 
 /**
  * Configuration for ModelManager
@@ -69,25 +77,127 @@ export class ModelManager {
 
   /**
    * Bootstrap provider list from the provider directory
-   * Fetches available providers and caches their base URLs
+   * First tries to fetch from Nostr (kind 30421), falls back to HTTP
    * @param torMode Whether running in Tor context
    * @returns Array of provider base URLs
    * @throws ProviderBootstrapError if all providers fail to fetch
    */
   async bootstrapProviders(torMode: boolean = false): Promise<string[]> {
+    // First try cache
+    const cachedUrls = this.adapter.getBaseUrlsList();
+    if (cachedUrls.length > 0) {
+      const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
+      const cacheValid = lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+      if (cacheValid) {
+        return this.filterBaseUrlsForTor(cachedUrls, torMode);
+      }
+    }
+
+    // Try Nostr first (kind 30421)
     try {
-      // First check if we already have cached providers
-      const cachedUrls = this.adapter.getBaseUrlsList();
-      if (cachedUrls.length > 0) {
-        const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
-        const cacheValid =
-          lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
-        if (cacheValid) {
-          return this.filterBaseUrlsForTor(cachedUrls, torMode);
+      const nostrProviders = await this.bootstrapFromNostr(30421, torMode);
+      console.log("Fetched these number of provider frmo nsotr", nostrProviders.length)
+      if (nostrProviders.length > 0) {
+        this.adapter.setBaseUrlsList(nostrProviders);
+        this.adapter.setBaseUrlsLastUpdate(Date.now());
+        return nostrProviders;
+      }
+    } catch (e) {
+      console.warn("Nostr bootstrap failed, falling back to HTTP:", e);
+    }
+
+    // Fall back to HTTP
+    return this.bootstrapFromHttp(torMode);
+  }
+
+  /**
+   * Bootstrap providers from Nostr network (kind 30421)
+   * @param kind The Nostr kind to fetch
+   * @param torMode Whether running in Tor context
+   * @returns Array of provider base URLs
+   */
+  private async bootstrapFromNostr(
+    kind: number,
+    torMode: boolean
+  ): Promise<string[]> {
+    const DEFAULT_RELAYS = [
+      "wss://relay.primal.net",
+      "wss://nos.lol",
+      "wss://relay.routstr.com"
+    ];
+
+    const pool = new RelayPool();
+    const eventStore = new EventStore();
+
+    const timeline = await lastValueFrom(
+      pool
+        .req(DEFAULT_RELAYS, {
+          kinds: [kind],
+          limit: 100,
+        })
+        .pipe(
+          onlyEvents(),
+          completeOnEose(),
+          mapEventsToStore(eventStore, true),
+          mapEventsToTimeline()
+        )
+    );
+
+    const bases = new Set<string>();
+
+    for (const event of timeline) {
+      try {
+        const content = JSON.parse(event.content);
+        const providers = Array.isArray(content)
+          ? content
+          : content.providers || [];
+
+        for (const p of providers) {
+          const endpoints = this.getProviderEndpoints(p, torMode);
+          for (const endpoint of endpoints) {
+            bases.add(endpoint);
+          }
+        }
+      } catch {
+        // Try parsing as array directly
+        try {
+          const providers = JSON.parse(event.content);
+          if (Array.isArray(providers)) {
+            for (const p of providers) {
+              const endpoints = this.getProviderEndpoints(p, torMode);
+              for (const endpoint of endpoints) {
+                bases.add(endpoint);
+              }
+            }
+          }
+        } catch {
+          console.warn("Failed to parse Nostr event content:", event.id);
         }
       }
+    }
 
-      // Fetch from provider directory
+    // Add additional configured providers
+    for (const url of this.includeProviderUrls) {
+      const normalized = this.normalizeUrl(url);
+      if (!torMode || normalized.includes(".onion")) {
+        bases.add(normalized);
+      }
+    }
+
+    const excluded = new Set(
+      this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
+    );
+
+    return Array.from(bases).filter((base) => !excluded.has(base));
+  }
+
+  /**
+   * Bootstrap providers from HTTP endpoint
+   * @param torMode Whether running in Tor context
+   * @returns Array of provider base URLs
+   */
+  private async bootstrapFromHttp(torMode: boolean): Promise<string[]> {
+    try {
       const res = await fetch(this.providerDirectoryUrl);
       if (!res.ok) {
         throw new Error(`Failed to fetch providers: ${res.status}`);
@@ -96,7 +206,6 @@ export class ModelManager {
       const data = await res.json();
       const providers = Array.isArray(data?.providers) ? data.providers : [];
 
-      // Extract endpoints from providers
       const bases = new Set<string>();
       for (const p of providers) {
         const endpoints = this.getProviderEndpoints(p, torMode);
@@ -105,7 +214,6 @@ export class ModelManager {
         }
       }
 
-      // Add additional configured providers
       for (const url of this.includeProviderUrls) {
         const normalized = this.normalizeUrl(url);
         if (!torMode || normalized.includes(".onion")) {
@@ -117,10 +225,7 @@ export class ModelManager {
         this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
       );
 
-      const list = Array.from(bases).filter((base) => {
-        if (excluded.has(base)) return false;
-        return true;
-      });
+      const list = Array.from(bases).filter((base) => !excluded.has(base));
 
       if (list.length > 0) {
         this.adapter.setBaseUrlsList(list);
