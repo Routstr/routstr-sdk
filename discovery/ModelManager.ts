@@ -44,7 +44,7 @@ export class ModelManager {
   ) {
     this.providerDirectoryUrl =
       config.providerDirectoryUrl || "https://api.routstr.com/v1/providers/";
-    this.cacheTTL = config.cacheTTL || 0 * 60 * 1000; // 21 minutes
+    this.cacheTTL = config.cacheTTL || 210 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
@@ -91,14 +91,11 @@ export class ModelManager {
     // Try Nostr first (kind 38421)
     try {
       const nostrProviders = await this.bootstrapFromNostr(38421, torMode);
-      console.log(
-        "Fetched these number of provider frmo nsotr",
-        nostrProviders.length
-      );
       if (nostrProviders.length > 0) {
-        this.adapter.setBaseUrlsList(nostrProviders);
+        const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
+        this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        return nostrProviders;
+        return filtered;
       }
     } catch (e) {
       console.warn("Nostr bootstrap failed, falling back to HTTP:", e);
@@ -124,13 +121,6 @@ export class ModelManager {
       "wss://relay.routstr.com",
     ];
 
-    console.log(
-      "[NostrBootstrap] Starting Nostr bootstrap, kind:",
-      kind,
-      "relays:",
-      DEFAULT_RELAYS
-    );
-
     const pool = new RelayPool();
     const localEventStore = new EventStore();
 
@@ -150,18 +140,15 @@ export class ModelManager {
         )
         .subscribe({
           complete: () => {
-            console.log("[NostrBootstrap] Subscription complete");
             resolve();
           },
         });
 
       setTimeout(() => {
-        console.log("[NostrBootstrap] Timeout reached");
         resolve();
       }, timeoutMs);
     });
 
-    console.log("[NostrBootstrap] Fetching timeline");
 
     const timeline = localEventStore.getTimeline({ kinds: [kind] });
 
@@ -175,15 +162,8 @@ export class ModelManager {
           eventUrls.push(tag[1]);
         }
       }
-      console.log(eventUrls);
 
       if (eventUrls.length > 0) {
-        console.log(
-          "[NostrBootstrap] Found",
-          eventUrls.length,
-          "URLs from tags for event",
-          event.id
-        );
 
         for (const url of eventUrls) {
           const normalized = this.normalizeUrl(url);
@@ -200,13 +180,6 @@ export class ModelManager {
           ? content
           : content.providers || [];
 
-        console.log(
-          "[NostrBootstrap] Parsed event",
-          event.id,
-          "with",
-          providers.length,
-          "providers"
-        );
 
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
@@ -247,7 +220,6 @@ export class ModelManager {
     );
 
     const result = Array.from(bases).filter((base) => !excluded.has(base));
-    console.log("[NostrBootstrap] Found", result.length, "provider URLs");
 
     return result;
   }
