@@ -273,7 +273,6 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       set((state) => {
         const updates =
           typeof value === "function" ? value(state.childKeys) : value;
-        console.log(updates);
         const normalized = updates.map((entry) => ({
           parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
           childKey: entry.childKey,
@@ -527,7 +526,6 @@ export const createStorageAdapterFromStore = (
   updateChildKeyBalance: (parentBaseUrl, balance) => {
     const normalized = normalizeBaseUrl(parentBaseUrl);
     const keys = store.getState().childKeys;
-    console.log("update balance");
     const next = keys.map((entry) =>
       entry.parentBaseUrl === normalized ? { ...entry, balance } : entry
     );

@@ -1143,7 +1143,6 @@ export class RoutstrClient {
           };
         }
       }
-      console.log("CHILD KJEY", childKeyEntry);
 
       let tokenBalance = childKeyEntry.balance;
       let tokenBalanceUnit: "sat" | "msat" = "sat";

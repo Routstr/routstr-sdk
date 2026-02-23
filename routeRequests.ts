@@ -196,13 +196,11 @@ export async function routeRequests(
   );
 
   // Extract options from request body
-  const messageHistory = extractMessageHistory(requestBody);
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
 
   // Make the request using the simpler routeRequest method
   let response: Response | null = null;
-  let responseData: unknown;
 
   try {
     const proxiedBody: Record<string, unknown> =
@@ -233,13 +231,7 @@ export async function routeRequests(
       throw new Error(`${response.status} ${response.statusText}`);
     }
 
-    // For streaming responses, return the raw body for SSE handling
-    if (stream) {
-      return response;
-    }
-
-    // Get the raw response body
-    responseData = await response.json();
+    return response;
   } catch (error) {
     if (
       error instanceof Error &&
@@ -251,8 +243,6 @@ export async function routeRequests(
     }
     throw error;
   }
-
-  return response;
 }
 
 /**
