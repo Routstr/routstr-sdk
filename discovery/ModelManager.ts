@@ -10,8 +10,9 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
-import { completeOnEose, onlyEvents, RelayPool } from "applesauce-relay";
-import { EventStore, lastValueFrom, mapEventsToStore, mapEventsToTimeline } from "applesauce-core";
+import { onlyEvents, RelayPool } from "applesauce-relay";
+import { EventStore } from "applesauce-core";
+import { tap } from "rxjs";
 
 /**
  * Configuration for ModelManager
@@ -43,7 +44,7 @@ export class ModelManager {
   ) {
     this.providerDirectoryUrl =
       config.providerDirectoryUrl || "https://api.routstr.com/v1/providers/";
-    this.cacheTTL = config.cacheTTL || 1 * 60 * 1000; // 21 minutes
+    this.cacheTTL = config.cacheTTL || 0 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
@@ -87,7 +88,7 @@ export class ModelManager {
       }
     }
 
-    // Try Nostr first (kind 30421)
+    // Try Nostr first (kind 38421)
     try {
       const nostrProviders = await this.bootstrapFromNostr(38421, torMode);
       console.log(
@@ -131,13 +132,11 @@ export class ModelManager {
     );
 
     const pool = new RelayPool();
-    const eventStore = new EventStore();
+    const localEventStore = new EventStore();
 
-    let events: any[] = [];
-    let eoseReceived = false;
-    let error: any = null;
+    const timeoutMs = 5000;
 
-    await lastValueFrom(
+    await new Promise<void>((resolve) => {
       pool
         .req(DEFAULT_RELAYS, {
           kinds: [kind],
@@ -145,63 +144,32 @@ export class ModelManager {
         })
         .pipe(
           onlyEvents(),
-          completeOnEose(),
-          mapEventsToStore(eventStore, true),
-          mapEventsToTimeline()
+          tap((event) => {
+            localEventStore.add(event);
+          })
         )
-    );
-    // pool
-    //   .req(DEFAULT_RELAYS, {
-    //     kinds: [kind],
-    //     limit: 100,
-    //   })
-    //   .subscribe({
-    //     next: (response) => {
-    //       console.log("[NostrBootstrap] Received:", response);
-    //       if (response === "EOSE") {
-    //         console.log("[NostrBootstrap] EOSE received");
-    //         eoseReceived = true;
-    //       }
-    //     },
-    //     error: (err) => {
-    //       console.error("[NostrBootstrap] Error:", err);
-    //       error = err;
-    //     },
-    //     complete: () => {
-    //       console.log("[NostrBootstrap] Complete");
-    //     },
-    //   });
+        .subscribe({
+          complete: () => {
+            console.log("[NostrBootstrap] Subscription complete");
+            resolve();
+          },
+        });
 
-    console.log("[NostrBootstrap] Waiting for events...");
+      setTimeout(() => {
+        console.log("[NostrBootstrap] Timeout reached");
+        resolve();
+      }, timeoutMs);
+    });
 
-    const timeoutMs = 15000;
-    const startTime = Date.now();
+    console.log("[NostrBootstrap] Fetching timeline");
 
-    while (!eoseReceived && !error && Date.now() - startTime < timeoutMs) {
-      await new Promise((r) => setTimeout(r, 500));
-      const currentEvents = eventStore.getTimeline({ kinds: [kind] });
-      console.log(
-        "[NostrBootstrap] Polling... events so far:",
-        currentEvents.length
-      );
-    }
-
-    if (error) {
-      throw error;
-    }
-
-    if (!eoseReceived) {
-      console.warn("[NostrBootstrap] Timeout waiting for EOSE");
-    }
-
-    const timeline = eventStore.getTimeline({ kinds: [kind] });
+    const timeline = localEventStore.getTimeline({ kinds: [kind] });
 
     const bases = new Set<string>();
 
     for (const event of timeline) {
       const eventUrls: string[] = [];
 
-      console.log(event.tags)
       for (const tag of event.tags) {
         if (tag[0] === "u" && typeof tag[1] === "string") {
           eventUrls.push(tag[1]);
