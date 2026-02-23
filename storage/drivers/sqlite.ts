@@ -14,7 +14,17 @@ export interface SqliteDriverOptions {
   tableName?: string;
 }
 
+const isBun = (): boolean => {
+  return typeof process.versions.bun !== "undefined";
+};
+
 const createDatabase = (dbPath: string): BetterSqlite3Database => {
+  if (isBun()) {
+    throw new Error(
+      "SQLite driver not supported in Bun. Use createMemoryDriver() instead."
+    );
+  }
+
   let Database: any = null;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires

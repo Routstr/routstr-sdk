@@ -10,6 +10,8 @@ import {
 } from "./store";
 
 export type { StorageDriver } from "./types";
+export type { DiscoveryAdapter } from "../discovery/interfaces";
+export type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
 export { SDK_STORAGE_KEYS } from "./keys";
 export { createSdkStore } from "./store";
 export { localStorageDriver, createMemoryDriver, createSqliteDriver };
@@ -39,10 +41,18 @@ const isNode = (): boolean => {
 
 let defaultDriver: StorageDriver | null = null;
 
+const isBun = (): boolean => {
+  return typeof process.versions.bun !== "undefined";
+};
+
 export const getDefaultSdkDriver = (): StorageDriver => {
   if (defaultDriver) return defaultDriver;
   if (isBrowser()) {
     defaultDriver = localStorageDriver;
+    return defaultDriver;
+  }
+  if (isBun()) {
+    defaultDriver = createMemoryDriver();
     return defaultDriver;
   }
   if (isNode()) {

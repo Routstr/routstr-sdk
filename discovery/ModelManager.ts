@@ -10,14 +10,8 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
-import { RelayPool } from "applesauce-relay";
-import { EventStore } from "applesauce-core";
-import { lastValueFrom } from "rxjs";
-import { onlyEvents, completeOnEose } from "applesauce-relay/operators";
-import {
-  mapEventsToStore,
-  mapEventsToTimeline,
-} from "applesauce-core/observable";
+import { completeOnEose, onlyEvents, RelayPool } from "applesauce-relay";
+import { EventStore, lastValueFrom, mapEventsToStore, mapEventsToTimeline } from "applesauce-core";
 
 /**
  * Configuration for ModelManager
@@ -49,7 +43,7 @@ export class ModelManager {
   ) {
     this.providerDirectoryUrl =
       config.providerDirectoryUrl || "https://api.routstr.com/v1/providers/";
-    this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
+    this.cacheTTL = config.cacheTTL || 1 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
   }
@@ -95,8 +89,11 @@ export class ModelManager {
 
     // Try Nostr first (kind 30421)
     try {
-      const nostrProviders = await this.bootstrapFromNostr(30421, torMode);
-      console.log("Fetched these number of provider frmo nsotr", nostrProviders.length)
+      const nostrProviders = await this.bootstrapFromNostr(38421, torMode);
+      console.log(
+        "Fetched these number of provider frmo nsotr",
+        nostrProviders.length
+      );
       if (nostrProviders.length > 0) {
         this.adapter.setBaseUrlsList(nostrProviders);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
@@ -123,13 +120,24 @@ export class ModelManager {
     const DEFAULT_RELAYS = [
       "wss://relay.primal.net",
       "wss://nos.lol",
-      "wss://relay.routstr.com"
+      "wss://relay.routstr.com",
     ];
+
+    console.log(
+      "[NostrBootstrap] Starting Nostr bootstrap, kind:",
+      kind,
+      "relays:",
+      DEFAULT_RELAYS
+    );
 
     const pool = new RelayPool();
     const eventStore = new EventStore();
 
-    const timeline = await lastValueFrom(
+    let events: any[] = [];
+    let eoseReceived = false;
+    let error: any = null;
+
+    await lastValueFrom(
       pool
         .req(DEFAULT_RELAYS, {
           kinds: [kind],
@@ -142,15 +150,95 @@ export class ModelManager {
           mapEventsToTimeline()
         )
     );
+    // pool
+    //   .req(DEFAULT_RELAYS, {
+    //     kinds: [kind],
+    //     limit: 100,
+    //   })
+    //   .subscribe({
+    //     next: (response) => {
+    //       console.log("[NostrBootstrap] Received:", response);
+    //       if (response === "EOSE") {
+    //         console.log("[NostrBootstrap] EOSE received");
+    //         eoseReceived = true;
+    //       }
+    //     },
+    //     error: (err) => {
+    //       console.error("[NostrBootstrap] Error:", err);
+    //       error = err;
+    //     },
+    //     complete: () => {
+    //       console.log("[NostrBootstrap] Complete");
+    //     },
+    //   });
+
+    console.log("[NostrBootstrap] Waiting for events...");
+
+    const timeoutMs = 15000;
+    const startTime = Date.now();
+
+    while (!eoseReceived && !error && Date.now() - startTime < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 500));
+      const currentEvents = eventStore.getTimeline({ kinds: [kind] });
+      console.log(
+        "[NostrBootstrap] Polling... events so far:",
+        currentEvents.length
+      );
+    }
+
+    if (error) {
+      throw error;
+    }
+
+    if (!eoseReceived) {
+      console.warn("[NostrBootstrap] Timeout waiting for EOSE");
+    }
+
+    const timeline = eventStore.getTimeline({ kinds: [kind] });
 
     const bases = new Set<string>();
 
     for (const event of timeline) {
+      const eventUrls: string[] = [];
+
+      console.log(event.tags)
+      for (const tag of event.tags) {
+        if (tag[0] === "u" && typeof tag[1] === "string") {
+          eventUrls.push(tag[1]);
+        }
+      }
+      console.log(eventUrls);
+
+      if (eventUrls.length > 0) {
+        console.log(
+          "[NostrBootstrap] Found",
+          eventUrls.length,
+          "URLs from tags for event",
+          event.id
+        );
+
+        for (const url of eventUrls) {
+          const normalized = this.normalizeUrl(url);
+          if (!torMode || normalized.includes(".onion")) {
+            bases.add(normalized);
+          }
+        }
+        continue;
+      }
+
       try {
         const content = JSON.parse(event.content);
         const providers = Array.isArray(content)
           ? content
           : content.providers || [];
+
+        console.log(
+          "[NostrBootstrap] Parsed event",
+          event.id,
+          "with",
+          providers.length,
+          "providers"
+        );
 
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
@@ -159,7 +247,6 @@ export class ModelManager {
           }
         }
       } catch {
-        // Try parsing as array directly
         try {
           const providers = JSON.parse(event.content);
           if (Array.isArray(providers)) {
@@ -171,7 +258,10 @@ export class ModelManager {
             }
           }
         } catch {
-          console.warn("Failed to parse Nostr event content:", event.id);
+          console.warn(
+            "[NostrBootstrap] Failed to parse Nostr event content:",
+            event.id
+          );
         }
       }
     }
@@ -188,7 +278,10 @@ export class ModelManager {
       this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
     );
 
-    return Array.from(bases).filter((base) => !excluded.has(base));
+    const result = Array.from(bases).filter((base) => !excluded.has(base));
+    console.log("[NostrBootstrap] Found", result.length, "provider URLs");
+
+    return result;
   }
 
   /**
