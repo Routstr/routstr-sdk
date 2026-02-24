@@ -483,7 +483,7 @@ export class RoutstrClient {
             amount: params.requiredSats * 1.5,
             token: parentApiKey,
           });
-          console.log("Topped up ", topupResult.toppedUpAmount, " for ", baseUrl);
+          console.log("Topped up ", topupResult, " for ", baseUrl);
 
           return this._makeRequest({
             ...params,

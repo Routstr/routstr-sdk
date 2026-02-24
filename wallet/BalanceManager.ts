@@ -28,6 +28,20 @@ export interface RefundOptions {
 }
 
 /**
+ * Options for refunding API key balance
+ */
+export interface RefundApiKeyOptions {
+  /** The mint URL (for NIP-60 wallet operations) */
+  mintUrl: string;
+
+  /** The provider base URL */
+  baseUrl: string;
+
+  /** The API key to use for authentication */
+  apiKey: string;
+}
+
+/**
  * Options for topping up API key balance
  */
 export interface TopUpOptions {
@@ -125,6 +139,148 @@ export class BalanceManager {
   }
 
   /**
+   * Refund API key balance - convert remaining API key balance to cashu token
+   */
+  async refundApiKey(options: RefundApiKeyOptions): Promise<RefundResult> {
+    const { mintUrl, baseUrl, apiKey } = options;
+
+    if (!apiKey) {
+      return { success: false, message: "No API key to refund" };
+    }
+
+    let fetchResult:
+      | { success: boolean; token?: string; requestId?: string; error?: string }
+      | undefined;
+
+    try {
+      fetchResult = await this._fetchRefundTokenWithApiKey(baseUrl, apiKey);
+
+      if (!fetchResult.success) {
+        return {
+          success: false,
+          message: fetchResult.error || "API key refund failed",
+          requestId: fetchResult.requestId,
+        };
+      }
+
+      if (!fetchResult.token) {
+        return {
+          success: false,
+          message: "No token received from API key refund",
+          requestId: fetchResult.requestId,
+        };
+      }
+
+      if (fetchResult.error === "No balance to refund") {
+        return { success: true, message: "No balance to refund" };
+      }
+
+      const receiveResult = await this.walletAdapter.receiveToken(
+        fetchResult.token
+      );
+      const totalAmountMsat =
+        receiveResult.unit === "msat"
+          ? receiveResult.amount
+          : receiveResult.amount * 1000;
+
+      return {
+        success: receiveResult.success,
+        refundedAmount: totalAmountMsat,
+        requestId: fetchResult.requestId,
+      };
+    } catch (error) {
+      console.error("[BalanceManager] API key refund error", error);
+      return this._handleRefundError(error, mintUrl, fetchResult?.requestId);
+    }
+  }
+
+  /**
+   * Fetch refund token from provider API using API key authentication
+   */
+  private async _fetchRefundTokenWithApiKey(
+    baseUrl: string,
+    apiKey: string
+  ): Promise<{
+    success: boolean;
+    token?: string;
+    requestId?: string;
+    error?: string;
+  }> {
+    if (!baseUrl) {
+      return {
+        success: false,
+        error: "No base URL configured",
+      };
+    }
+
+    const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+    const url = `${normalizedBaseUrl}v1/wallet/refund`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 60000);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const requestId =
+        response.headers.get("x-routstr-request-id") || undefined;
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        return {
+          success: false,
+          requestId,
+          error: `API key refund failed: ${
+            errorData?.detail || response.statusText
+          }`,
+        };
+      }
+
+      const data = await response.json();
+      return {
+        success: true,
+        token: data.token,
+        requestId,
+      };
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error(
+        "[BalanceManager._fetchRefundTokenWithApiKey] Fetch error",
+        error
+      );
+
+      if (error instanceof Error) {
+        if (error.name === "AbortError") {
+          return {
+            success: false,
+            error: "Request timed out after 1 minute",
+          };
+        }
+        return {
+          success: false,
+          error: error.message,
+        };
+      }
+
+      return {
+        success: false,
+        error: "Unknown error occurred during API key refund request",
+      };
+    }
+  }
+
+  /**
    * Top up API key balance with a cashu token
    */
   async topUp(options: TopUpOptions): Promise<TopUpResult> {
@@ -151,6 +307,7 @@ export class BalanceManager {
         cashuToken
       );
       requestId = topUpResult.requestId;
+      console.log(topUpResult);
 
       if (!topUpResult.success) {
         await this._recoverFailedTopUp(cashuToken);
@@ -421,7 +578,12 @@ export class BalanceManager {
   async getTokenBalance(
     token: string,
     baseUrl: string
-  ): Promise<{ amount: number; reserved: number; unit: "sat" | "msat", apiKey: string }> {
+  ): Promise<{
+    amount: number;
+    reserved: number;
+    unit: "sat" | "msat";
+    apiKey: string;
+  }> {
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
         headers: {
@@ -435,7 +597,7 @@ export class BalanceManager {
           amount: data.balance,
           reserved: data.reserved ?? 0,
           unit: "msat",
-          apiKey: data.api_key
+          apiKey: data.api_key,
         };
       }
     } catch {

@@ -481,8 +481,11 @@ export class CashuSpender {
    */
   async refundProviders(
     baseUrls: string[],
-    mintUrl: string
+    mintUrl: string,
+    refundApiKeys: boolean = false
   ): Promise<{ baseUrl: string; success: boolean }[]> {
+    const results: { baseUrl: string; success: boolean }[] = [];
+
     const pendingDistribution =
       this.storageAdapter.getCachedTokenDistribution();
 
@@ -522,9 +525,45 @@ export class CashuSpender {
       })
     );
 
-    return refundResults.map((r) =>
-      r.status === "fulfilled" ? r.value : { baseUrl: "", success: false }
+    results.push(
+      ...refundResults.map((r) =>
+        r.status === "fulfilled" ? r.value : { baseUrl: "", success: false }
+      )
     );
+
+    if (refundApiKeys) {
+      const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
+      const apiKeysToRefund = apiKeyDistribution.filter((p) =>
+        baseUrls.includes(p.baseUrl)
+      );
+
+      for (const apiKeyEntry of apiKeysToRefund) {
+        const apiKey = this.storageAdapter.getApiKey(apiKeyEntry.baseUrl);
+        if (apiKey && this.balanceManager) {
+          const refundResult = await this.balanceManager.refundApiKey({
+            mintUrl,
+            baseUrl: apiKeyEntry.baseUrl,
+            apiKey,
+          });
+
+          if (refundResult.success) {
+            this.storageAdapter.updateApiKeyBalance(apiKeyEntry.baseUrl, 0);
+          }
+
+          results.push({
+            baseUrl: apiKeyEntry.baseUrl,
+            success: refundResult.success,
+          });
+        } else {
+          results.push({
+            baseUrl: apiKeyEntry.baseUrl,
+            success: false,
+          });
+        }
+      }
+    }
+
+    return results;
   }
 
   /**
