@@ -837,6 +837,7 @@ export class RoutstrClient {
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
         this.storageAdapter.updateChildKeyBalance(baseUrl, latestTokenBalance);
+        this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
         satsSpent = initialTokenBalance - latestTokenBalance;
       } catch (e) {
         console.warn("Could not get updated API key balance:", e);

@@ -48,6 +48,9 @@ export interface SpendOptions {
 
   /** Current retry count (for internal recursion) */
   retryCount?: number;
+
+  /** Specific provider baseUrls to refund (if not provided, refunds all except current) */
+  refundBaseUrls?: string[];
 }
 
 /**
@@ -222,7 +225,7 @@ export class CashuSpender {
       totalPending + totalBalance > adjustedAmount &&
       (retryCount ?? 0) < 1
     ) {
-      return await this._refundAndRetry(options);
+      return await this.refundAndRetry(options);
     }
 
     const totalAvailableBalance = totalBalance + totalPending;
@@ -408,19 +411,27 @@ export class CashuSpender {
   /**
    * Refund pending tokens and retry
    */
-  private async _refundAndRetry(options: SpendOptions): Promise<SpendResult> {
-    const { mintUrl, baseUrl, retryCount } = options;
+  async refundAndRetry(options: SpendOptions): Promise<SpendResult> {
+    const { mintUrl, baseUrl, retryCount, refundBaseUrls } = options;
 
     const pendingDistribution =
       this.storageAdapter.getPendingTokenDistribution();
 
+    const toRefund = refundBaseUrls
+      ? pendingDistribution.filter((p) => refundBaseUrls.includes(p.baseUrl))
+      : pendingDistribution.filter((p) => p.baseUrl !== baseUrl);
+
     const refundResults = await Promise.allSettled(
-      pendingDistribution.map(async (pending) => {
+      toRefund.map(async (pending) => {
         const token = this.storageAdapter.getToken(pending.baseUrl);
-        if (!token || !this.balanceManager || pending.baseUrl === baseUrl) { // do not refund the current provider's token. 
+        if (!token || !this.balanceManager || pending.baseUrl === baseUrl) {
+          // do not refund the current provider's token.
           return { baseUrl: pending.baseUrl, success: false };
         }
-        const tokenBalance = await this.balanceManager.getTokenBalance(token, pending.baseUrl);
+        const tokenBalance = await this.balanceManager.getTokenBalance(
+          token,
+          pending.baseUrl
+        );
 
         if (tokenBalance.reserved > 0) {
           return { baseUrl: pending.baseUrl, success: false };
@@ -452,10 +463,10 @@ export class CashuSpender {
 
     if (successfulRefunds > 0) {
       this._logTransaction("refund", {
-        amount: pendingDistribution.length,
+        amount: toRefund.length,
         mintUrl,
         status: "success",
-        details: `Refunded ${successfulRefunds} of ${pendingDistribution.length} tokens`,
+        details: `Refunded ${successfulRefunds} of ${toRefund.length} tokens`,
       });
     }
 
@@ -463,6 +474,57 @@ export class CashuSpender {
       ...options,
       retryCount: (retryCount || 0) + 1,
     });
+  }
+
+  /**
+   * Refund specific providers without retrying spend
+   */
+  async refundProviders(
+    baseUrls: string[],
+    mintUrl: string
+  ): Promise<{ baseUrl: string; success: boolean }[]> {
+    const pendingDistribution =
+      this.storageAdapter.getPendingTokenDistribution();
+
+    const toRefund = pendingDistribution.filter((p) =>
+      baseUrls.includes(p.baseUrl)
+    );
+
+    const refundResults = await Promise.allSettled(
+      toRefund.map(async (pending) => {
+        const token = this.storageAdapter.getToken(pending.baseUrl);
+        console.log(token, this.balanceManager);
+        if (!token || !this.balanceManager) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
+
+        const tokenBalance = await this.balanceManager.getTokenBalance(
+          token,
+          pending.baseUrl
+        );
+
+        if (tokenBalance.reserved > 0) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
+
+        const result = await this.balanceManager.refund({
+          mintUrl,
+          baseUrl: pending.baseUrl,
+          token,
+        });
+        console.log(result);
+
+        if (result.success) {
+          this.storageAdapter.removeToken(pending.baseUrl);
+        }
+
+        return { baseUrl: pending.baseUrl, success: result.success };
+      })
+    );
+
+    return refundResults.map((r) =>
+      r.status === "fulfilled" ? r.value : { baseUrl: "", success: false }
+    );
   }
 
   /**
