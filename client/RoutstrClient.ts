@@ -480,10 +480,10 @@ export class RoutstrClient {
           const topupResult = await this.balanceManager.topUp({
             mintUrl,
             baseUrl,
-            amount: params.requiredSats * 3,
+            amount: params.requiredSats * 1.5,
             token: parentApiKey,
           });
-          console.log(topupResult);
+          console.log("Topped up ", topupResult.toppedUpAmount, " for ", baseUrl);
 
           return this._makeRequest({
             ...params,
@@ -686,110 +686,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Handle post-response refund and balance updates
-   */
-  private async _handlePostResponseRefund(params: {
-    mintUrl: string;
-    baseUrl: string;
-    tokenBalance: number;
-    tokenBalanceUnit: "sat" | "msat";
-    initialBalance: number;
-    selectedModel: Model;
-    streamingResult: StreamingResult;
-    callbacks: StreamingCallbacks;
-    transactionHistory: TransactionHistory[];
-  }): Promise<number> {
-    const {
-      mintUrl,
-      baseUrl,
-      tokenBalance,
-      tokenBalanceUnit,
-      initialBalance,
-      selectedModel,
-      streamingResult,
-      callbacks,
-    } = params;
-
-    const tokenBalanceInSats =
-      tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-
-    const estimatedCosts = this._getEstimatedCosts(
-      selectedModel,
-      streamingResult
-    );
-
-    // Perform refund
-    const refundResult = await this.balanceManager.refund({
-      mintUrl,
-      baseUrl,
-    });
-
-    if (refundResult.success) {
-      const refundedSats =
-        refundResult.refundedAmount !== undefined
-          ? refundResult.refundedAmount / 1000
-          : 0;
-    }
-
-    let satsSpent: number;
-
-    if (refundResult.success) {
-      if (refundResult.refundedAmount !== undefined) {
-        satsSpent = tokenBalanceInSats - refundResult.refundedAmount / 1000;
-      } else if (refundResult.message?.includes("No API key to refund")) {
-        satsSpent = 0;
-      } else {
-        satsSpent = tokenBalanceInSats;
-      }
-
-      // Update balance
-      const newBalance = initialBalance - satsSpent;
-      callbacks.onBalanceUpdate(newBalance);
-    } else {
-      // Refund failed
-      if (
-        refundResult.message?.includes("Refund request failed with status 401")
-      ) {
-        this.storageAdapter.removeToken(baseUrl);
-      }
-      satsSpent = tokenBalanceInSats;
-    }
-
-    // Check for overcharge
-    const netCosts = satsSpent - estimatedCosts;
-    const overchargeThreshold = tokenBalanceUnit === "msat" ? 0.05 : 1;
-
-    if (netCosts > overchargeThreshold) {
-      if (this.alertLevel === "max") {
-        callbacks.onMessageAppend({
-          role: "system",
-          content: `ATTENTION: Provider may be overcharging. Estimated: ${estimatedCosts.toFixed(
-            tokenBalanceUnit === "msat" ? 3 : 0
-          )}, Actual: ${satsSpent.toFixed(
-            tokenBalanceUnit === "msat" ? 3 : 0
-          )}`,
-        });
-      }
-    }
-
-    // Record transaction
-    const newTransaction: TransactionHistory = {
-      type: "spent",
-      amount: satsSpent,
-      timestamp: Date.now(),
-      status: "success",
-      model: selectedModel.id,
-      message: "Tokens spent",
-      balance: initialBalance - satsSpent,
-    };
-
-    // Update transaction history (caller should persist this)
-    callbacks.onTransactionUpdate(newTransaction);
-
-    return satsSpent;
-  }
-
-  /**
    * Handle post-response balance update for all modes
    */
   private async _handlePostResponseBalanceUpdate(params: {
@@ -831,7 +727,7 @@ export class RoutstrClient {
     } else if (this.mode === "apikeys") {
       try {
         const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
-        console.log("LATEST BANAL", latestBalanceInfo);
+        console.log("LATEST Balance", latestBalanceInfo);
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
@@ -969,7 +865,6 @@ export class RoutstrClient {
 
       if (response.ok) {
         const data = await response.json();
-        console.log(data);
         return {
           amount: data.balance,
           unit: "msat",
@@ -1005,7 +900,7 @@ export class RoutstrClient {
    * Get pending cashu token amount
    */
   private _getPendingCashuTokenAmount(): number {
-    const distribution = this.storageAdapter.getPendingTokenDistribution();
+    const distribution = this.storageAdapter.getCachedTokenDistribution();
     return distribution.reduce((total, item) => total + item.amount, 0);
   }
 
@@ -1079,7 +974,7 @@ export class RoutstrClient {
       if (!parentApiKey) {
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
-          amount: amount * 3,
+          amount: amount * 1.5,
           baseUrl: "",
           reuseToken: false,
         });

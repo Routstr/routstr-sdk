@@ -85,7 +85,7 @@ export class CashuSpender {
     }
 
     const pendingDistribution =
-      this.storageAdapter.getPendingTokenDistribution();
+      this.storageAdapter.getCachedTokenDistribution();
     const providerBalances: Record<string, number> = {};
     let totalProviderBalance = 0;
     for (const pending of pendingDistribution) {
@@ -213,7 +213,7 @@ export class CashuSpender {
 
     // Check pending tokens
     const pendingDistribution =
-      this.storageAdapter.getPendingTokenDistribution();
+      this.storageAdapter.getCachedTokenDistribution();
     const totalPending = pendingDistribution.reduce(
       (sum, item) => sum + item.amount,
       0
@@ -348,7 +348,7 @@ export class CashuSpender {
 
     // Get pending distribution to check balance
     const pendingDistribution =
-      this.storageAdapter.getPendingTokenDistribution();
+      this.storageAdapter.getCachedTokenDistribution();
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
@@ -415,7 +415,7 @@ export class CashuSpender {
     const { mintUrl, baseUrl, retryCount, refundBaseUrls } = options;
 
     const pendingDistribution =
-      this.storageAdapter.getPendingTokenDistribution();
+      this.storageAdapter.getCachedTokenDistribution();
 
     const toRefund = refundBaseUrls
       ? pendingDistribution.filter((p) => refundBaseUrls.includes(p.baseUrl))
@@ -484,7 +484,7 @@ export class CashuSpender {
     mintUrl: string
   ): Promise<{ baseUrl: string; success: boolean }[]> {
     const pendingDistribution =
-      this.storageAdapter.getPendingTokenDistribution();
+      this.storageAdapter.getCachedTokenDistribution();
 
     const toRefund = pendingDistribution.filter((p) =>
       baseUrls.includes(p.baseUrl)

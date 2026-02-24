@@ -373,9 +373,8 @@ export const createStorageAdapterFromStore = (
     );
     store.getState().setCachedTokens(next);
   },
-  getPendingTokenDistribution: () => {
+  getCachedTokenDistribution: () => {
     const cachedTokens = store.getState().cachedTokens;
-    const apiKeys = store.getState().apiKeys;
     const distributionMap: Record<string, number> = {};
 
     for (const entry of cachedTokens) {
@@ -385,6 +384,14 @@ export const createStorageAdapterFromStore = (
           (distributionMap[entry.baseUrl] || 0) + sum;
       }
     }
+
+    return Object.entries(distributionMap)
+      .map(([baseUrl, amt]) => ({ baseUrl, amount: amt }))
+      .sort((a, b) => b.amount - a.amount);
+  },
+  getApiKeyDistribution: () => {
+    const apiKeys = store.getState().apiKeys;
+    const distributionMap: Record<string, number> = {};
 
     for (const entry of apiKeys) {
       const sum = entry.balance || 0;

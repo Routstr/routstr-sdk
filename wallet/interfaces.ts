@@ -79,7 +79,7 @@ export interface StorageAdapter {
   updateTokenBalance(baseUrl: string, balance: number): void;
 
   /** Get all stored tokens as distribution (baseUrl -> amount in sats) */
-  getPendingTokenDistribution(): Array<{ baseUrl: string; amount: number }>;
+  getCachedTokenDistribution(): Array<{ baseUrl: string; amount: number }>;
 
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
@@ -100,6 +100,9 @@ export interface StorageAdapter {
 
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];
+
+  /** Get all stored API keys as distribution (baseUrl -> amount in sats) */
+  getApiKeyDistribution(): Array<{ baseUrl: string; amount: number }>;
 
   // ========== Child Keys (for apikeys mode) ==========
 
