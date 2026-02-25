@@ -485,6 +485,20 @@ export class RoutstrClient {
           });
           console.log("Topped up ", topupResult, " for ", baseUrl);
 
+          if (!topupResult.success) {
+            const message = topupResult.message || "";
+            if (message.includes("Insufficient balance")) {
+              const needMatch = message.match(/need (\d+)/);
+              const haveMatch = message.match(/have (\d+)/);
+              const required = needMatch
+                ? parseInt(needMatch[1], 10)
+                : params.requiredSats;
+              const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
+              throw new InsufficientBalanceError(required, available);
+            }
+            throw new ProviderError(baseUrl, 402, message);
+          }
+
           return this._makeRequest({
             ...params,
             token: params.token,

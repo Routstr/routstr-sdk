@@ -13,7 +13,12 @@ export type { StorageDriver } from "./types";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
 export type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
 export { SDK_STORAGE_KEYS } from "./keys";
-export { createSdkStore } from "./store";
+export {
+  createSdkStore,
+  createDiscoveryAdapterFromStore,
+  createProviderRegistryFromStore,
+  createStorageAdapterFromStore,
+} from "./store";
 export { localStorageDriver, createMemoryDriver, createSqliteDriver };
 
 const isBrowser = (): boolean => {
