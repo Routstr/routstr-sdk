@@ -407,14 +407,26 @@ export class RoutstrClient {
       (response as any).baseUrl = baseUrl;
 
       if (!response.ok) {
-        return await this._handleErrorResponse(response, params, token);
+        const requestId = response.headers.get("x-routstr-request-id") || undefined;
+        return await this._handleErrorResponse(
+          params, 
+          token, 
+          response.status, 
+          requestId, 
+          this.mode === "xcashu" ? response.headers.get("x-cashu") ?? undefined : undefined
+        );
       }
 
       return response;
     } catch (error: any) {
       // Handle network errors with failover
       if (this._isNetworkError(error?.message || "")) {
-        return await this._handleNetworkError(error, params);
+        return await this._handleErrorResponse(
+          params, 
+          token, 
+          -1, // just for Network Error to skip all statuses 
+        );
+        // return await this._handleNetworkError(error, params);
       }
       throw error;
     }
@@ -424,7 +436,6 @@ export class RoutstrClient {
    * Handle error responses with failover
    */
   private async _handleErrorResponse(
-    response: Response,
     params: {
       path: string;
       method: string;
@@ -438,42 +449,61 @@ export class RoutstrClient {
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
     },
-    token: string
+    token: string,
+    status: number,
+    requestId?: string,
+    xCashuRefundToken? : string
   ): Promise<Response> {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
-    const status = response.status;
 
     let tryNextProvider: boolean = false;
-    const requestId = response.headers.get("x-routstr-request-id") || undefined;
-    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(params.token); 
+    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+      params.token
+    );
     if (tryReceiveTokenResult.success) {
       tryNextProvider = true;
-      if (this.mode === "lazyrefund")
-        this.storageAdapter.removeToken(baseUrl);
-      else if (this.mode === "apikeys") 
+      if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
+      else if (this.mode === "apikeys")
         this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
     }
     if (this.mode === "xcashu") {
-      const refundToken = response.headers.get("x-cashu") ?? undefined;
-      if (refundToken) {
+      if (xCashuRefundToken) {
         try {
           const receiveResult =
-            await this.walletAdapter.receiveToken(refundToken);
-          if (receiveResult.success) 
-            tryNextProvider = true;
+            await this.walletAdapter.receiveToken(xCashuRefundToken);
+          if (receiveResult.success) tryNextProvider = true;
           else
-            throw new ProviderError(baseUrl, status,  "xcashu refund failed", requestId)
+            throw new ProviderError(
+              baseUrl,
+              status,
+              "xcashu refund failed",
+              requestId
+            );
         } catch (error) {
           console.error("[xcashu] Failed to receive refund token:", error);
-          throw new ProviderError(baseUrl, status,  "[xcashu] Failed to receive refund token", requestId)
+          throw new ProviderError(
+            baseUrl,
+            status,
+            "[xcashu] Failed to receive refund token",
+            requestId
+          );
         }
       } else {
         if (!tryNextProvider)
-          throw new ProviderError(baseUrl, status, "[xcashu] Failed to receive refund token", requestId);
+          throw new ProviderError(
+            baseUrl,
+            status,
+            "[xcashu] Failed to receive refund token",
+            requestId
+          );
       }
     }
 
-    if (status === 402 && !tryNextProvider && (this.mode === "apikeys" || this.mode === "lazyrefund")) {
+    if (
+      status === 402 &&
+      !tryNextProvider &&
+      (this.mode === "apikeys" || this.mode === "lazyrefund")
+    ) {
       const topupResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
@@ -506,17 +536,18 @@ export class RoutstrClient {
         });
     }
 
-    if ((
-      status === 401 ||
-      status === 403 ||
-      status === 413 ||
-      status === 400 ||      
-      status === 500 ||
-      status === 502 ||
-      status === 503 ||
-      status === 521
-    ) && !tryNextProvider ) {
-      if (this.mode === 'lazyrefund') {
+    if (
+      (status === 401 ||
+        status === 403 ||
+        status === 413 ||
+        status === 400 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 521) &&
+      !tryNextProvider
+    ) {
+      if (this.mode === "lazyrefund") {
         try {
           // Refund current token
           const refundResult = await this.balanceManager.refund({
@@ -524,18 +555,38 @@ export class RoutstrClient {
             baseUrl,
             token: params.token,
           });
-          if (refundResult.success) 
-            this.storageAdapter.removeToken(baseUrl);
+          if (refundResult.success) this.storageAdapter.removeToken(baseUrl);
           else
-            throw new ProviderError(baseUrl, status,  "refund failed", requestId)
+            throw new ProviderError(
+              baseUrl,
+              status,
+              "refund failed",
+              requestId
+            );
         } catch (error) {
-          throw new ProviderError(baseUrl, status,  "Failed to refund token", requestId)
+          throw new ProviderError(
+            baseUrl,
+            status,
+            "Failed to refund token",
+            requestId
+          );
         }
       } else if (this.mode === "apikeys") {
-        const initialBalance = await this.balanceManager.getTokenBalance(token, baseUrl);          
-        const refundResult = await this.balanceManager.refundApiKey({mintUrl, baseUrl, apiKey: token})
+        const initialBalance = await this.balanceManager.getTokenBalance(
+          token,
+          baseUrl
+        );
+        const refundResult = await this.balanceManager.refundApiKey({
+          mintUrl,
+          baseUrl,
+          apiKey: token,
+        });
         if (!refundResult.success && initialBalance.amount > 0) {
-          throw new ProviderError(baseUrl, status, refundResult.message ?? "Unknown error");
+          throw new ProviderError(
+            baseUrl,
+            status,
+            refundResult.message ?? "Unknown error"
+          );
         } else {
           this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
         }
@@ -545,7 +596,7 @@ export class RoutstrClient {
     this.providerManager.markFailed(baseUrl);
 
     if (!selectedModel) {
-      throw new ProviderError(baseUrl, status, await response.text());
+      throw new ProviderError(baseUrl, status, "Funny, no selected model. HMM. ");
     }
 
     const nextProvider = this.providerManager.findNextBestProvider(
@@ -573,27 +624,7 @@ export class RoutstrClient {
         params.maxTokens
       );
 
-      // Spend new token for next provider
-      const spendResult = await this.cashuSpender.spend({
-        mintUrl,
-        amount: newRequiredSats,
-        baseUrl: nextProvider,
-        reuseToken: true,
-      });
-
-      if (spendResult.status === "failed" || !spendResult.token) {
-        if (spendResult.errorDetails) {
-          throw new InsufficientBalanceError(
-            spendResult.errorDetails.required,
-            spendResult.errorDetails.available,
-            spendResult.errorDetails.maxMintBalance,
-            spendResult.errorDetails.maxMintUrl
-          );
-        }
-        throw new Error(
-          spendResult.error || `Insufficient balance for ${nextProvider}`
-        );
-      }
+      const spendResult = await this._spendToken({mintUrl, amount: newRequiredSats, baseUrl: nextProvider})
 
       // Retry with new provider
       return this._makeRequest({
@@ -603,113 +634,14 @@ export class RoutstrClient {
         body,
         baseUrl: nextProvider,
         selectedModel: newModel,
-        token: spendResult.token,
+        token: spendResult.token!,
         requiredSats: newRequiredSats,
-        headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
+        headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
       });
     }
 
     // No more providers to try
-    throw new ProviderError(baseUrl, status, await response.text());
-  }
-
-  /**
-   * Handle network errors with failover
-   */
-  private async _handleNetworkError(
-    error: Error,
-    params: {
-      path: string;
-      method: string;
-      body?: unknown;
-      selectedModel?: Model;
-      baseUrl: string;
-      mintUrl: string;
-      token: string;
-      requiredSats: number;
-      maxTokens?: number;
-      headers: Record<string, string>;
-      baseHeaders: Record<string, string>;
-    }
-  ): Promise<Response> {
-    const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
-
-    // Refund current token
-    await this.balanceManager.refund({
-      mintUrl,
-      baseUrl,
-      token: params.token,
-    });
-
-    // Mark provider as failed
-    this.providerManager.markFailed(baseUrl);
-
-    // Find next provider
-    if (!selectedModel) {
-      throw error;
-    }
-
-    const nextProvider = this.providerManager.findNextBestProvider(
-      selectedModel.id,
-      baseUrl
-    );
-
-    if (!nextProvider) {
-      throw new FailoverError(baseUrl, Array.from(this.providerManager as any));
-    }
-
-    // Get new model and spend token
-    const newModel =
-      (await this.providerManager.getModelForProvider(
-        nextProvider,
-        selectedModel.id
-      )) ?? selectedModel;
-
-    const messagesForPricing = Array.isArray(
-      (body as { messages?: unknown })?.messages
-    )
-      ? ((body as { messages?: unknown }).messages as any[])
-      : [];
-
-    const newRequiredSats = this.providerManager.getRequiredSatsForModel(
-      newModel,
-      messagesForPricing,
-      params.maxTokens
-    );
-
-    const spendResult = await this.cashuSpender.spend({
-      mintUrl,
-      amount: newRequiredSats,
-      baseUrl: nextProvider,
-      reuseToken: true,
-    });
-
-    if (spendResult.status === "failed" || !spendResult.token) {
-      if (spendResult.errorDetails) {
-        throw new InsufficientBalanceError(
-          spendResult.errorDetails.required,
-          spendResult.errorDetails.available,
-          spendResult.errorDetails.maxMintBalance,
-          spendResult.errorDetails.maxMintUrl
-        );
-      }
-      throw new Error(
-        spendResult.error || `Insufficient balance for ${nextProvider}`
-      );
-    }
-
-    // Retry
-    return this._makeRequest({
-      ...params,
-      path,
-      method,
-      body,
-      baseUrl: nextProvider,
-      selectedModel: newModel,
-      token: spendResult.token,
-      requiredSats: newRequiredSats,
-      headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
-    });
+    throw new FailoverError(baseUrl, Array.from(this.providerManager as any));
   }
 
   /**
@@ -753,7 +685,10 @@ export class RoutstrClient {
       satsSpent = initialTokenBalance - latestTokenBalance;
     } else if (this.mode === "apikeys") {
       try {
-        const latestBalanceInfo = await this.balanceManager.getTokenBalance(token, baseUrl);
+        const latestBalanceInfo = await this.balanceManager.getTokenBalance(
+          token,
+          baseUrl
+        );
         console.log("LATEST Balance", latestBalanceInfo);
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
@@ -977,28 +912,8 @@ export class RoutstrClient {
           baseUrl: "",
           reuseToken: false,
         });
-        if (spendResult.status === "failed" || !spendResult.token) {
-          const errorMsg =
-            spendResult.error || `Insufficient balance. Need ${amount} sats.`;
-
-          if (this._isNetworkError(errorMsg)) {
-            throw new Error(
-              `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
-            );
-          }
-
-          if (spendResult.errorDetails) {
-            throw new InsufficientBalanceError(
-              spendResult.errorDetails.required,
-              spendResult.errorDetails.available,
-              spendResult.errorDetails.maxMintBalance,
-              spendResult.errorDetails.maxMintUrl
-            );
-          }
-          throw new Error(errorMsg);
-        }
         const apiKeyCreated = await this.balanceManager.getTokenBalance(
-          spendResult.token,
+          spendResult.token!,
           baseUrl
         );
         this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
@@ -1039,34 +954,12 @@ export class RoutstrClient {
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
       amount,
-      baseUrl,
+      baseUrl: this.mode === "lazyrefund" ? baseUrl : "", // do not store token in xcashu mode
       reuseToken: this.mode === "lazyrefund", // reuse tokens only if lazyrefund mode, not xcashu mode
     });
 
-    if (spendResult.status === "failed" || !spendResult.token) {
-      const errorMsg =
-        spendResult.error || `Insufficient balance. Need ${amount} sats.`;
-
-      if (this._isNetworkError(errorMsg)) {
-        throw new Error(
-          `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
-        );
-      }
-
-      if (spendResult.errorDetails) {
-        throw new InsufficientBalanceError(
-          spendResult.errorDetails.required,
-          spendResult.errorDetails.available,
-          spendResult.errorDetails.maxMintBalance,
-          spendResult.errorDetails.maxMintUrl
-        );
-      }
-
-      throw new Error(errorMsg);
-    }
-
     return {
-      token: spendResult.token,
+      token: spendResult.token!,
       tokenBalance: spendResult.balance,
       tokenBalanceUnit: spendResult.unit ?? "sat",
     };

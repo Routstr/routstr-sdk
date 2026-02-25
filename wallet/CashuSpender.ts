@@ -131,6 +131,7 @@ export class CashuSpender {
 
   /**
    * Spend Cashu tokens with automatic mint selection and retry logic
+   * Throws errors on failure instead of returning failed SpendResult
    */
   async spend(options: SpendOptions): Promise<SpendResult> {
     const {
@@ -143,11 +144,10 @@ export class CashuSpender {
       retryCount = 0,
     } = options;
 
-    // Enter critical section
     this._isBusy = true;
 
     try {
-      return await this._spendInternal({
+      const result = await this._spendInternal({
         mintUrl,
         amount,
         baseUrl,
@@ -156,9 +156,45 @@ export class CashuSpender {
         excludeMints,
         retryCount,
       });
+
+      if (result.status === "failed" || !result.token) {
+        const errorMsg =
+          result.error || `Insufficient balance. Need ${amount} sats.`;
+
+        if (this._isNetworkError(errorMsg)) {
+          throw new Error(
+            `Your mint ${mintUrl} is unreachable or is blocking your IP. Please try again later or switch mints.`
+          );
+        }
+
+        if (result.errorDetails) {
+          throw new InsufficientBalanceError(
+            result.errorDetails.required,
+            result.errorDetails.available,
+            result.errorDetails.maxMintBalance,
+            result.errorDetails.maxMintUrl
+          );
+        }
+
+        throw new Error(errorMsg);
+      }
+
+      return result;
     } finally {
       this._isBusy = false;
     }
+  }
+
+  /**
+   * Check if error message indicates a network error
+   */
+  private _isNetworkError(message: string): boolean {
+    return (
+      message.includes("NetworkError when attempting to fetch resource") ||
+      message.includes("Failed to fetch") ||
+      message.includes("Load failed") ||
+      (message.includes("Your mint") && message.includes("unreachable"))
+    );
   }
 
   /**
