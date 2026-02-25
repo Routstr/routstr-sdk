@@ -89,14 +89,17 @@ export interface StorageAdapter {
 
   // ========== API Keys (for apikeys mode) ==========
 
-  /** Get stored API key for a provider */
-  getApiKey(baseUrl: string): string | null;
+  /** Get stored API key entry for a provider */
+  getApiKey(baseUrl: string): ApiKeyEntry | null;
 
   /** Store API key for a provider */
   setApiKey(baseUrl: string, key: string): void;
 
   /** Update balance for an existing stored API key (based on provider response) */
   updateApiKeyBalance(baseUrl: string, balance: number): void;
+
+  /** Remove API key for a provider */
+  removeApiKey(baseUrl: string): void;
 
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];

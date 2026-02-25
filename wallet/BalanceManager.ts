@@ -172,7 +172,7 @@ export class BalanceManager {
       }
 
       if (fetchResult.error === "No balance to refund") {
-        return { success: true, message: "No balance to refund" };
+        return { success: false, message: "No balance to refund" };
       }
 
       const receiveResult = await this.walletAdapter.receiveToken(

@@ -23,7 +23,7 @@ import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { StreamProcessor } from "./StreamProcessor";
 import { ProviderManager } from "./ProviderManager";
-import type { StreamingResult, TokenBalance } from "../core/types";
+import type { StreamingResult } from "../core/types";
 import {
   ProviderError,
   FailoverError,
@@ -393,6 +393,7 @@ export class RoutstrClient {
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      if (this.mode === "xcashu") console.log("HEADERS,", headers);
       const response = await fetch(url, {
         method,
         headers,
@@ -401,6 +402,7 @@ export class RoutstrClient {
             ? undefined
             : JSON.stringify(body),
       });
+      if (this.mode === "xcashu") console.log("response,", response);
 
       (response as any).baseUrl = baseUrl;
 
@@ -441,159 +443,170 @@ export class RoutstrClient {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     const status = response.status;
 
-    // Handle apikeys mode differently - no refund needed
-    if (this.mode === "apikeys") {
-      console.log("error ;", status);
-
-      // For auth errors, try with a new child key
-      if (status === 401 || status === 403) {
-        const parentApiKey = this.storageAdapter.getApiKey(baseUrl);
-        if (parentApiKey) {
-          try {
-            const childKeyResult = await this._createChildKey(
-              baseUrl,
-              parentApiKey
-            );
-            this.storageAdapter.setChildKey(
-              baseUrl,
-              childKeyResult.childKey,
-              childKeyResult.balance,
-              childKeyResult.validityDate,
-              childKeyResult.balanceLimit
-            );
-            // Retry with new child key
-            return this._makeRequest({
-              ...params,
-              token: childKeyResult.childKey,
-              headers: this._withAuthHeader(
-                params.baseHeaders,
-                childKeyResult.childKey
-              ),
-            });
-          } catch (e) {
-            // Use parent key instead
-          }
+    let tryNextProvider: boolean = false;
+    const requestId = response.headers.get("x-routstr-request-id") || undefined;
+    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(params.token); 
+    if (tryReceiveTokenResult.success) {
+      tryNextProvider = true;
+      if (this.mode === "lazyrefund")
+        this.storageAdapter.removeToken(baseUrl);
+      else if (this.mode === "apikeys") 
+        this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
+    }
+    if (this.mode === "xcashu") {
+      const refundToken = response.headers.get("x-cashu") ?? undefined;
+      if (refundToken) {
+        try {
+          const receiveResult =
+            await this.walletAdapter.receiveToken(refundToken);
+          if (receiveResult.success) 
+            tryNextProvider = true;
+          else
+            throw new ProviderError(baseUrl, status,  "xcashu refund failed", requestId)
+        } catch (error) {
+          console.error("[xcashu] Failed to receive refund token:", error);
+          throw new ProviderError(baseUrl, status,  "[xcashu] Failed to receive refund token", requestId)
         }
-      } else if (status === 402) {
-        const parentApiKey = this.storageAdapter.getApiKey(baseUrl);
-        if (parentApiKey) {
-          const topupResult = await this.balanceManager.topUp({
+      } else {
+        if (!tryNextProvider)
+          throw new ProviderError(baseUrl, status, "[xcashu] Failed to receive refund token", requestId);
+      }
+    }
+
+    if (status === 402 && !tryNextProvider && (this.mode === "apikeys" || this.mode === "lazyrefund")) {
+      const topupResult = await this.balanceManager.topUp({
+        mintUrl,
+        baseUrl,
+        amount: params.requiredSats * 1.5,
+        token: params.token,
+      });
+      console.log("Topped up ", topupResult, " for ", baseUrl);
+
+      if (!topupResult.success) {
+        const message = topupResult.message || "";
+        if (message.includes("Insufficient balance")) {
+          const needMatch = message.match(/need (\d+)/);
+          const haveMatch = message.match(/have (\d+)/);
+          const required = needMatch
+            ? parseInt(needMatch[1], 10)
+            : params.requiredSats;
+          const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
+          throw new InsufficientBalanceError(required, available);
+        } else {
+          tryNextProvider = true;
+        }
+      } else {
+        tryNextProvider = true;
+      }
+      if (!tryNextProvider)
+        return this._makeRequest({
+          ...params,
+          token: params.token,
+          headers: this._withAuthHeader(params.baseHeaders, params.token),
+        });
+    }
+
+    if ((
+      status === 401 ||
+      status === 403 ||
+      status === 413 ||
+      status === 400 ||      
+      status === 500 ||
+      status === 502 ||
+      status === 503 ||
+      status === 521
+    ) && !tryNextProvider ) {
+      if (this.mode === 'lazyrefund') {
+        try {
+          // Refund current token
+          const refundResult = await this.balanceManager.refund({
             mintUrl,
             baseUrl,
-            amount: params.requiredSats * 1.5,
-            token: parentApiKey,
-          });
-          console.log("Topped up ", topupResult, " for ", baseUrl);
-
-          if (!topupResult.success) {
-            const message = topupResult.message || "";
-            if (message.includes("Insufficient balance")) {
-              const needMatch = message.match(/need (\d+)/);
-              const haveMatch = message.match(/have (\d+)/);
-              const required = needMatch
-                ? parseInt(needMatch[1], 10)
-                : params.requiredSats;
-              const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
-              throw new InsufficientBalanceError(required, available);
-            }
-            throw new ProviderError(baseUrl, 402, message);
-          }
-
-          return this._makeRequest({
-            ...params,
             token: params.token,
-            headers: this._withAuthHeader(params.baseHeaders, params.token),
           });
+          if (refundResult.success) 
+            this.storageAdapter.removeToken(baseUrl);
+          else
+            throw new ProviderError(baseUrl, status,  "refund failed", requestId)
+        } catch (error) {
+          throw new ProviderError(baseUrl, status,  "Failed to refund token", requestId)
+        }
+      } else if (this.mode === "apikeys") {
+        const initialBalance = await this.balanceManager.getTokenBalance(token, baseUrl);          
+        const refundResult = await this.balanceManager.refundApiKey({mintUrl, baseUrl, apiKey: token})
+        if (!refundResult.success && initialBalance.amount > 0) {
+          throw new ProviderError(baseUrl, status, refundResult.message ?? "Unknown error");
+        } else {
+          this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
         }
       }
+    }
+
+    this.providerManager.markFailed(baseUrl);
+
+    if (!selectedModel) {
       throw new ProviderError(baseUrl, status, await response.text());
     }
 
-    // Try to refund current token
-    await this.balanceManager.refund({
-      mintUrl,
-      baseUrl,
-      token,
-    });
+    const nextProvider = this.providerManager.findNextBestProvider(
+      selectedModel.id,
+      baseUrl
+    );
 
-    // Mark current provider as failed
-    this.providerManager.markFailed(baseUrl);
-    this.storageAdapter.removeToken(baseUrl);
+    if (nextProvider) {
+      // Get new model for this provider
+      const newModel =
+        (await this.providerManager.getModelForProvider(
+          nextProvider,
+          selectedModel.id
+        )) ?? selectedModel;
 
-    // Find next best provider for retryable errors
-    if (
-      status === 401 ||
-      status === 403 ||
-      status === 402 ||
-      status === 413 ||
-      status === 400 ||
-      status === 500 ||
-      status === 502
-    ) {
-      if (!selectedModel) {
-        throw new ProviderError(baseUrl, status, await response.text());
-      }
+      const messagesForPricing = Array.isArray(
+        (body as { messages?: unknown })?.messages
+      )
+        ? ((body as { messages?: unknown }).messages as any[])
+        : [];
 
-      const nextProvider = this.providerManager.findNextBestProvider(
-        selectedModel.id,
-        baseUrl
+      const newRequiredSats = this.providerManager.getRequiredSatsForModel(
+        newModel,
+        messagesForPricing,
+        params.maxTokens
       );
 
-      if (nextProvider) {
-        // Get new model for this provider
-        const newModel =
-          (await this.providerManager.getModelForProvider(
-            nextProvider,
-            selectedModel.id
-          )) ?? selectedModel;
+      // Spend new token for next provider
+      const spendResult = await this.cashuSpender.spend({
+        mintUrl,
+        amount: newRequiredSats,
+        baseUrl: nextProvider,
+        reuseToken: true,
+      });
 
-        const messagesForPricing = Array.isArray(
-          (body as { messages?: unknown })?.messages
-        )
-          ? ((body as { messages?: unknown }).messages as any[])
-          : [];
-
-        const newRequiredSats = this.providerManager.getRequiredSatsForModel(
-          newModel,
-          messagesForPricing,
-          params.maxTokens
-        );
-
-        // Spend new token for next provider
-        const spendResult = await this.cashuSpender.spend({
-          mintUrl,
-          amount: newRequiredSats,
-          baseUrl: nextProvider,
-          reuseToken: true,
-        });
-
-        if (spendResult.status === "failed" || !spendResult.token) {
-          if (spendResult.errorDetails) {
-            throw new InsufficientBalanceError(
-              spendResult.errorDetails.required,
-              spendResult.errorDetails.available,
-              spendResult.errorDetails.maxMintBalance,
-              spendResult.errorDetails.maxMintUrl
-            );
-          }
-          throw new Error(
-            spendResult.error || `Insufficient balance for ${nextProvider}`
+      if (spendResult.status === "failed" || !spendResult.token) {
+        if (spendResult.errorDetails) {
+          throw new InsufficientBalanceError(
+            spendResult.errorDetails.required,
+            spendResult.errorDetails.available,
+            spendResult.errorDetails.maxMintBalance,
+            spendResult.errorDetails.maxMintUrl
           );
         }
-
-        // Retry with new provider
-        return this._makeRequest({
-          ...params,
-          path,
-          method,
-          body,
-          baseUrl: nextProvider,
-          selectedModel: newModel,
-          token: spendResult.token,
-          requiredSats: newRequiredSats,
-          headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
-        });
+        throw new Error(
+          spendResult.error || `Insufficient balance for ${nextProvider}`
+        );
       }
+
+      // Retry with new provider
+      return this._makeRequest({
+        ...params,
+        path,
+        method,
+        body,
+        baseUrl: nextProvider,
+        selectedModel: newModel,
+        token: spendResult.token,
+        requiredSats: newRequiredSats,
+        headers: this._withAuthHeader(params.baseHeaders, spendResult.token),
+      });
     }
 
     // No more providers to try
@@ -740,7 +753,7 @@ export class RoutstrClient {
       satsSpent = initialTokenBalance - latestTokenBalance;
     } else if (this.mode === "apikeys") {
       try {
-        const latestBalanceInfo = await this._getApiKeyBalance(baseUrl, token);
+        const latestBalanceInfo = await this.balanceManager.getTokenBalance(token, baseUrl);
         console.log("LATEST Balance", latestBalanceInfo);
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
@@ -861,34 +874,6 @@ export class RoutstrClient {
       balanceLimit: data.balance_limit,
       validityDate: data.validity_date,
     };
-  }
-
-  /**
-   * Get balance for an API key from the provider
-   */
-  private async _getApiKeyBalance(
-    baseUrl: string,
-    apiKey: string
-  ): Promise<TokenBalance> {
-    try {
-      const response = await fetch(`${baseUrl}v1/wallet/info`, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return {
-          amount: data.balance,
-          unit: "msat",
-        };
-      }
-    } catch {
-      // Fall through to default
-    }
-
-    return { amount: 0, unit: "sat" };
   }
 
   /**
@@ -1016,52 +1001,26 @@ export class RoutstrClient {
           spendResult.token,
           baseUrl
         );
-        parentApiKey = apiKeyCreated.apiKey;
-        this.storageAdapter.setApiKey(baseUrl, parentApiKey);
+        this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
+        parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       }
 
-      let childKeyEntry = this.storageAdapter.getChildKey(baseUrl);
-
-      if (!childKeyEntry) {
-        try {
-          const childKeyResult = await this._createChildKey(
-            baseUrl,
-            parentApiKey
-          );
-          this.storageAdapter.setChildKey(
-            baseUrl,
-            childKeyResult.childKey,
-            childKeyResult.balance,
-            childKeyResult.validityDate,
-            childKeyResult.balanceLimit
-          );
-          childKeyEntry = {
-            parentBaseUrl: baseUrl,
-            childKey: childKeyResult.childKey,
-            balance: childKeyResult.balance,
-            balanceLimit: childKeyResult.balanceLimit,
-            validityDate: childKeyResult.validityDate,
-            createdAt: Date.now(),
-          };
-        } catch (e) {
-          console.warn("Could not create child key, using parent key:", e);
-          childKeyEntry = {
-            parentBaseUrl: baseUrl,
-            childKey: parentApiKey,
-            balance: 0,
-            createdAt: Date.now(),
-          };
-        }
-      }
-
-      let tokenBalance = childKeyEntry.balance;
+      let tokenBalance = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
 
-      if (tokenBalance === 0) {
+      const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
+      const distributionForBaseUrl = apiKeyDistribution.find(
+        (d) => d.baseUrl === baseUrl
+      );
+      if (distributionForBaseUrl) {
+        tokenBalance = distributionForBaseUrl.amount;
+      }
+
+      if (tokenBalance === 0 && parentApiKey) {
         try {
-          const balanceInfo = await this._getApiKeyBalance(
-            baseUrl,
-            childKeyEntry.childKey
+          const balanceInfo = await this.balanceManager.getTokenBalance(
+            parentApiKey.key,
+            baseUrl
           );
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
@@ -1071,7 +1030,7 @@ export class RoutstrClient {
       }
 
       return {
-        token: childKeyEntry.childKey,
+        token: parentApiKey?.key ?? "",
         tokenBalance,
         tokenBalanceUnit,
       };
@@ -1081,7 +1040,7 @@ export class RoutstrClient {
       mintUrl,
       amount,
       baseUrl,
-      reuseToken: true,
+      reuseToken: this.mode === "lazyrefund", // reuse tokens only if lazyrefund mode, not xcashu mode
     });
 
     if (spendResult.status === "failed" || !spendResult.token) {

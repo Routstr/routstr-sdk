@@ -538,12 +538,14 @@ export class CashuSpender {
       );
 
       for (const apiKeyEntry of apiKeysToRefund) {
-        const apiKey = this.storageAdapter.getApiKey(apiKeyEntry.baseUrl);
-        if (apiKey && this.balanceManager) {
+        const apiKeyEntryFull = this.storageAdapter.getApiKey(
+          apiKeyEntry.baseUrl
+        );
+        if (apiKeyEntryFull && this.balanceManager) {
           const refundResult = await this.balanceManager.refundApiKey({
             mintUrl,
             baseUrl: apiKeyEntry.baseUrl,
-            apiKey,
+            apiKey: apiKeyEntryFull.key,
           });
 
           if (refundResult.success) {

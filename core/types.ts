@@ -124,14 +124,6 @@ export interface TopUpResult {
 }
 
 /**
- * Token balance information
- */
-export interface TokenBalance {
-  amount: number;
-  unit: "sat" | "msat";
-}
-
-/**
  * API error verdict for retry logic
  */
 export interface APIErrorVerdict {

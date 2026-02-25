@@ -431,7 +431,7 @@ export const createStorageAdapterFromStore = (
         key.baseUrl === normalized ? { ...key, lastUsed: Date.now() } : key
       );
     store.getState().setApiKeys(next);
-    return entry.key;
+    return entry;
   },
 
   setApiKey: (baseUrl, key) => {
@@ -467,6 +467,14 @@ export const createStorageAdapterFromStore = (
     const next = keys.map((entry) =>
       entry.baseUrl === normalized ? { ...entry, balance } : entry
     );
+    store.getState().setApiKeys(next);
+  },
+
+  removeApiKey: (baseUrl) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const next = store
+      .getState()
+      .apiKeys.filter((entry) => entry.baseUrl !== normalized);
     store.getState().setApiKeys(next);
   },
 
