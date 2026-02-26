@@ -441,24 +441,16 @@ export const createStorageAdapterFromStore = (
       (entry) => entry.baseUrl === normalized
     );
     if (existingIndex !== -1) {
-      // Update existing key
-      const next = keys.map((entry) =>
-        entry.baseUrl === normalized
-          ? { ...entry, key, lastUsed: Date.now() }
-          : entry
-      );
-      store.getState().setApiKeys(next);
-    } else {
-      // Add new key
-      const next = [...keys];
-      next.push({
-        baseUrl: normalized,
-        key,
-        balance: 0,
-        lastUsed: Date.now(),
-      });
-      store.getState().setApiKeys(next);
+      throw new Error(`ApiKey already exists for baseUrl: ${normalized}`);
     }
+    const next = [...keys];
+    next.push({
+      baseUrl: normalized,
+      key,
+      balance: 0,
+      lastUsed: Date.now(),
+    });
+    store.getState().setApiKeys(next);
   },
 
   updateApiKeyBalance: (baseUrl, balance) => {

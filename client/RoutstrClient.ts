@@ -165,6 +165,7 @@ export class RoutstrClient {
       amount: requiredSats,
       baseUrl,
     });
+    console.log(token, baseUrl);
 
     let requestBody = body;
     if (body && typeof body === "object") {
@@ -455,17 +456,18 @@ export class RoutstrClient {
     xCashuRefundToken? : string
   ): Promise<Response> {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
-
     let tryNextProvider: boolean = false;
-    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
-      params.token
-    );
-    if (tryReceiveTokenResult.success) {
-      tryNextProvider = true;
-      if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
-      else if (this.mode === "apikeys")
-        this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
+
+    if (this.mode === "xcashu" || this.mode === "lazyrefund") {
+      const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+        params.token
+      );
+      if (tryReceiveTokenResult.success) {
+        tryNextProvider = true;
+        if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
+      }
     }
+
     if (this.mode === "xcashu") {
       if (xCashuRefundToken) {
         try {
@@ -689,7 +691,7 @@ export class RoutstrClient {
           token,
           baseUrl
         );
-        console.log("LATEST Balance", latestBalanceInfo);
+        console.log("LATEST Balance", latestBalanceInfo.amount, latestBalanceInfo.apiKey, baseUrl);
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
@@ -916,6 +918,8 @@ export class RoutstrClient {
           spendResult.token!,
           baseUrl
         );
+        console.log("CREATING PARAPTE", baseUrl, apiKeyCreated.apiKey, spendResult.token);
+
         this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       }

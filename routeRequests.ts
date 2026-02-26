@@ -217,6 +217,7 @@ export async function routeRequests(
     if (maxTokens !== undefined) {
       proxiedBody.max_tokens = maxTokens;
     }
+    console.log(modelId);
 
     response = await client.routeRequest({
       path,
