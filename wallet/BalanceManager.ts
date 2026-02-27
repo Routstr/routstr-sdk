@@ -10,7 +10,11 @@
  * Extracted from utils/cashuUtils.ts
  */
 
-import type { WalletAdapter, StorageAdapter } from "./interfaces";
+import type {
+  WalletAdapter,
+  StorageAdapter,
+  ProviderRegistry,
+} from "./interfaces";
 import type { RefundResult, TopUpResult } from "../core/types";
 
 /**
@@ -64,7 +68,8 @@ export interface TopUpOptions {
 export class BalanceManager {
   constructor(
     private walletAdapter: WalletAdapter,
-    private storageAdapter: StorageAdapter
+    private storageAdapter: StorageAdapter,
+    private providerRegistry?: ProviderRegistry
   ) {}
 
   /**
@@ -299,7 +304,20 @@ export class BalanceManager {
     let requestId: string | undefined;
 
     try {
-      cashuToken = await this.walletAdapter.sendToken(mintUrl, amount);
+      const tokenResult = await this._createTopUpToken({
+        mintUrl,
+        baseUrl,
+        amount,
+      });
+
+      if (!tokenResult.success || !tokenResult.token) {
+        return {
+          success: false,
+          message: tokenResult.error || "Unable to create top up token",
+        };
+      }
+
+      cashuToken = tokenResult.token;
 
       const topUpResult = await this._postTopUp(
         baseUrl,
@@ -330,6 +348,212 @@ export class BalanceManager {
       }
 
       return this._handleTopUpError(error, mintUrl, requestId);
+    }
+  }
+
+  private async _createTopUpToken(options: {
+    mintUrl: string;
+    baseUrl: string;
+    amount: number;
+    retryCount?: number;
+    excludeMints?: string[];
+  }): Promise<{ success: boolean; token?: string; error?: string }> {
+    const {
+      mintUrl,
+      baseUrl,
+      amount,
+      retryCount = 0,
+      excludeMints = [],
+    } = options;
+
+    const adjustedAmount = Math.ceil(amount);
+    if (!adjustedAmount || isNaN(adjustedAmount)) {
+      return { success: false, error: "Invalid top up amount" };
+    }
+
+    const balances = await this.walletAdapter.getBalances();
+    const units = this.walletAdapter.getMintUnits();
+
+    let totalMintBalance = 0;
+    for (const url in balances) {
+      const unit = units[url];
+      const balanceInSats =
+        unit === "msat" ? balances[url] / 1000 : balances[url];
+      totalMintBalance += balanceInSats;
+    }
+
+    const pendingDistribution =
+      this.storageAdapter.getCachedTokenDistribution();
+    const refundablePending = pendingDistribution
+      .filter((entry) => entry.baseUrl !== baseUrl)
+      .reduce((sum, entry) => sum + entry.amount, 0);
+
+    if (
+      totalMintBalance < adjustedAmount &&
+      totalMintBalance + refundablePending >= adjustedAmount &&
+      retryCount < 1
+    ) {
+      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl);
+      return this._createTopUpToken({
+        ...options,
+        retryCount: retryCount + 1,
+      });
+    }
+
+    const providerMints =
+      baseUrl && this.providerRegistry
+        ? this.providerRegistry.getProviderMints(baseUrl)
+        : [];
+
+    let requiredAmount = adjustedAmount;
+    const supportedMintsOnly = providerMints.length > 0;
+
+    let candidates = this._selectCandidateMints({
+      balances,
+      units,
+      amount: requiredAmount,
+      preferredMintUrl: mintUrl,
+      excludeMints,
+      allowedMints: supportedMintsOnly ? providerMints : undefined,
+    });
+
+    if (candidates.length === 0 && supportedMintsOnly) {
+      requiredAmount += 2;
+      candidates = this._selectCandidateMints({
+        balances,
+        units,
+        amount: requiredAmount,
+        preferredMintUrl: mintUrl,
+        excludeMints,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return { success: false, error: "Insufficient balance to top up" };
+    }
+
+    let lastError: string | undefined;
+    for (const candidateMint of candidates) {
+      try {
+        const token = await this.walletAdapter.sendToken(
+          candidateMint,
+          requiredAmount
+        );
+        return { success: true, token };
+      } catch (error) {
+        if (error instanceof Error) {
+          lastError = error.message;
+
+          if (
+            error.message.includes(
+              "NetworkError when attempting to fetch resource"
+            ) ||
+            error.message.includes("Failed to fetch") ||
+            error.message.includes("Load failed")
+          ) {
+            continue;
+          }
+        }
+
+        return {
+          success: false,
+          error: lastError || "Failed to create top up token",
+        };
+      }
+    }
+
+    return {
+      success: false,
+      error:
+        lastError || "All candidate mints failed while creating top up token",
+    };
+  }
+
+  private _selectCandidateMints(options: {
+    balances: Record<string, number>;
+    units: Record<string, "sat" | "msat">;
+    amount: number;
+    preferredMintUrl: string;
+    excludeMints: string[];
+    allowedMints?: string[];
+  }): string[] {
+    const {
+      balances,
+      units,
+      amount,
+      preferredMintUrl,
+      excludeMints,
+      allowedMints,
+    } = options;
+
+    const candidates: string[] = [];
+
+    const canUseMint = (mint: string): boolean => {
+      if (excludeMints.includes(mint)) return false;
+      if (
+        allowedMints &&
+        allowedMints.length > 0 &&
+        !allowedMints.includes(mint)
+      ) {
+        return false;
+      }
+      const rawBalance = balances[mint] || 0;
+      const unit = units[mint];
+      const balanceInSats = unit === "msat" ? rawBalance / 1000 : rawBalance;
+      return balanceInSats >= amount;
+    };
+
+    if (preferredMintUrl && canUseMint(preferredMintUrl)) {
+      candidates.push(preferredMintUrl);
+    }
+
+    for (const mint in balances) {
+      if (mint === preferredMintUrl) continue;
+      if (canUseMint(mint)) {
+        candidates.push(mint);
+      }
+    }
+
+    return candidates;
+  }
+
+  private async _refundOtherProvidersForTopUp(
+    baseUrl: string,
+    mintUrl: string
+  ): Promise<void> {
+    const pendingDistribution =
+      this.storageAdapter.getCachedTokenDistribution();
+
+    const toRefund = pendingDistribution.filter(
+      (pending) => pending.baseUrl !== baseUrl
+    );
+
+    const refundResults = await Promise.allSettled(
+      toRefund.map(async (pending) => {
+        const token = this.storageAdapter.getToken(pending.baseUrl);
+        if (!token) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
+
+        const tokenBalance = await this.getTokenBalance(token, pending.baseUrl);
+        if (tokenBalance.reserved > 0) {
+          return { baseUrl: pending.baseUrl, success: false };
+        }
+
+        const result = await this.refund({
+          mintUrl,
+          baseUrl: pending.baseUrl,
+          token,
+        });
+
+        return { baseUrl: pending.baseUrl, success: result.success };
+      })
+    );
+
+    for (const result of refundResults) {
+      if (result.status === "fulfilled" && result.value.success) {
+        this.storageAdapter.removeToken(result.value.baseUrl);
+      }
     }
   }
 

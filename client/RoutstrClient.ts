@@ -77,7 +77,11 @@ export class RoutstrClient {
     alertLevel: AlertLevel,
     mode: RoutstrClientMode = "xcashu"
   ) {
-    this.balanceManager = new BalanceManager(walletAdapter, storageAdapter);
+    this.balanceManager = new BalanceManager(
+      walletAdapter,
+      storageAdapter,
+      providerRegistry
+    );
     this.cashuSpender = new CashuSpender(
       walletAdapter,
       storageAdapter,
