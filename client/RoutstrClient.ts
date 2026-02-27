@@ -408,13 +408,16 @@ export class RoutstrClient {
       (response as any).baseUrl = baseUrl;
 
       if (!response.ok) {
-        const requestId = response.headers.get("x-routstr-request-id") || undefined;
+        const requestId =
+          response.headers.get("x-routstr-request-id") || undefined;
         return await this._handleErrorResponse(
-          params, 
-          token, 
-          response.status, 
-          requestId, 
-          this.mode === "xcashu" ? response.headers.get("x-cashu") ?? undefined : undefined
+          params,
+          token,
+          response.status,
+          requestId,
+          this.mode === "xcashu"
+            ? (response.headers.get("x-cashu") ?? undefined)
+            : undefined
         );
       }
 
@@ -423,9 +426,9 @@ export class RoutstrClient {
       // Handle network errors with failover
       if (this._isNetworkError(error?.message || "")) {
         return await this._handleErrorResponse(
-          params, 
-          token, 
-          -1, // just for Network Error to skip all statuses 
+          params,
+          token,
+          -1 // just for Network Error to skip all statuses
         );
         // return await this._handleNetworkError(error, params);
       }
@@ -453,28 +456,50 @@ export class RoutstrClient {
     token: string,
     status: number,
     requestId?: string,
-    xCashuRefundToken? : string
+    xCashuRefundToken?: string
   ): Promise<Response> {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
 
+    console.log(
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token.substring(0, 20)}..., requestId=${requestId}`
+    );
+
     if (this.mode === "xcashu" || this.mode === "lazyrefund") {
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
+      );
       const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
         params.token
       );
       if (tryReceiveTokenResult.success) {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+        );
         tryNextProvider = true;
-        if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
+        if (this.mode === "lazyrefund")
+          this.storageAdapter.removeToken(baseUrl);
+      } else {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
+        );
       }
     }
 
     if (this.mode === "xcashu") {
       if (xCashuRefundToken) {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
+        );
         try {
           const receiveResult =
             await this.walletAdapter.receiveToken(xCashuRefundToken);
-          if (receiveResult.success) tryNextProvider = true;
-          else
+          if (receiveResult.success) {
+            console.log(
+              `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
+            );
+            tryNextProvider = true;
+          } else
             throw new ProviderError(
               baseUrl,
               status,
@@ -512,7 +537,9 @@ export class RoutstrClient {
         amount: params.requiredSats * 1.5,
         token: params.token,
       });
-      console.log("Topped up ", topupResult, " for ", baseUrl);
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
+      );
 
       if (!topupResult.success) {
         const message = topupResult.message || "";
@@ -523,12 +550,20 @@ export class RoutstrClient {
             ? parseInt(needMatch[1], 10)
             : params.requiredSats;
           const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
+          console.log(
+            `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
+          );
           throw new InsufficientBalanceError(required, available);
         } else {
+          console.log(
+            `[RoutstrClient] _handleErrorResponse: Topup failed with non-insufficient-balance error, will try next provider`
+          );
           tryNextProvider = true;
         }
       } else {
-        tryNextProvider = true;
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
+        );
       }
       if (!tryNextProvider)
         return this._makeRequest({
@@ -549,6 +584,9 @@ export class RoutstrClient {
         status === 521) &&
       !tryNextProvider
     ) {
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Status ${status} (auth/server error), attempting refund for ${baseUrl}, mode=${this.mode}`
+      );
       if (this.mode === "lazyrefund") {
         try {
           // Refund current token
@@ -557,6 +595,9 @@ export class RoutstrClient {
             baseUrl,
             token: params.token,
           });
+          console.log(
+            `[RoutstrClient] _handleErrorResponse: Lazyrefund result: success=${refundResult.success}`
+          );
           if (refundResult.success) this.storageAdapter.removeToken(baseUrl);
           else
             throw new ProviderError(
@@ -574,15 +615,24 @@ export class RoutstrClient {
           );
         }
       } else if (this.mode === "apikeys") {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token.substring(0, 20)}...`
+        );
         const initialBalance = await this.balanceManager.getTokenBalance(
           token,
           baseUrl
+        );
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${initialBalance.amount}`
         );
         const refundResult = await this.balanceManager.refundApiKey({
           mintUrl,
           baseUrl,
           apiKey: token,
         });
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
+        );
         if (!refundResult.success && initialBalance.amount > 0) {
           throw new ProviderError(
             baseUrl,
@@ -596,9 +646,16 @@ export class RoutstrClient {
     }
 
     this.providerManager.markFailed(baseUrl);
+    console.log(
+      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed`
+    );
 
     if (!selectedModel) {
-      throw new ProviderError(baseUrl, status, "Funny, no selected model. HMM. ");
+      throw new ProviderError(
+        baseUrl,
+        status,
+        "Funny, no selected model. HMM. "
+      );
     }
 
     const nextProvider = this.providerManager.findNextBestProvider(
@@ -607,6 +664,9 @@ export class RoutstrClient {
     );
 
     if (nextProvider) {
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${selectedModel.id}`
+      );
       // Get new model for this provider
       const newModel =
         (await this.providerManager.getModelForProvider(
@@ -626,7 +686,14 @@ export class RoutstrClient {
         params.maxTokens
       );
 
-      const spendResult = await this._spendToken({mintUrl, amount: newRequiredSats, baseUrl: nextProvider})
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
+      );
+      const spendResult = await this._spendToken({
+        mintUrl,
+        amount: newRequiredSats,
+        baseUrl: nextProvider,
+      });
 
       // Retry with new provider
       return this._makeRequest({
@@ -691,7 +758,13 @@ export class RoutstrClient {
           token,
           baseUrl
         );
-        console.log("LATEST Balance", latestBalanceInfo.amount, latestBalanceInfo.apiKey, baseUrl);
+        console.log(
+          "LATEST Balance",
+          latestBalanceInfo.amount,
+          latestBalanceInfo.reserved,
+          latestBalanceInfo.apiKey,
+          baseUrl
+        );
         const latestTokenBalance =
           latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
@@ -855,14 +928,19 @@ export class RoutstrClient {
    * Handle errors and notify callbacks
    */
   private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
-    console.error("RoutstrClient error:", error);
+    console.error("[RoutstrClient] _handleError: Error occurred", error);
 
     if (error instanceof Error) {
-      const modifiedErrorMsg =
+      const isStreamError =
         error.message.includes("Error in input stream") ||
-        error.message.includes("Load failed")
-          ? "AI stream was cut off, turn on Keep Active or please try again"
-          : error.message;
+        error.message.includes("Load failed");
+      const modifiedErrorMsg = isStreamError
+        ? "AI stream was cut off, turn on Keep Active or please try again"
+        : error.message;
+
+      console.error(
+        `[RoutstrClient] _handleError: Error type=${error.constructor.name}, message=${modifiedErrorMsg}, isStreamError=${isStreamError}`
+      );
 
       callbacks.onMessageAppend({
         role: "system",
@@ -905,23 +983,48 @@ export class RoutstrClient {
   }> {
     const { mintUrl, amount, baseUrl } = params;
 
+    console.log(
+      `[RoutstrClient] _spendToken: mode=${this.mode}, amount=${amount}, baseUrl=${baseUrl}, mintUrl=${mintUrl}`
+    );
+
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       if (!parentApiKey) {
+        console.log(
+          `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
+        );
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
           amount: amount * 1.5,
           baseUrl: "",
           reuseToken: false,
         });
+
+        if (!spendResult.token) {
+          console.error(
+            `[RoutstrClient] _spendToken: Failed to create Cashu token for API key creation, error:`,
+            spendResult.error
+          );
+        } else {
+          console.log(
+            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token.substring(0, 20)}...`
+          );
+        }
+
         const apiKeyCreated = await this.balanceManager.getTokenBalance(
           spendResult.token!,
           baseUrl
         );
-        console.log("CREATING PARAPTE", baseUrl, apiKeyCreated.apiKey, spendResult.token);
+        console.log(
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${apiKeyCreated.apiKey}..., balance: ${apiKeyCreated.amount}`
+        );
 
         this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+      } else {
+        console.log(
+          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}...`
+        );
       }
 
       let tokenBalance = 0;
@@ -948,6 +1051,10 @@ export class RoutstrClient {
         }
       }
 
+      console.log(
+        `[RoutstrClient] _spendToken: Returning token with balance=${tokenBalance} ${tokenBalanceUnit}`
+      );
+
       return {
         token: parentApiKey?.key ?? "",
         tokenBalance,
@@ -955,12 +1062,26 @@ export class RoutstrClient {
       };
     }
 
+    console.log(
+      `[RoutstrClient] _spendToken: Calling CashuSpender.spend for amount=${amount}, mintUrl=${mintUrl}, mode=${this.mode}`
+    );
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
       amount,
-      baseUrl: this.mode === "lazyrefund" ? baseUrl : "", // do not store token in xcashu mode
-      reuseToken: this.mode === "lazyrefund", // reuse tokens only if lazyrefund mode, not xcashu mode
+      baseUrl: this.mode === "lazyrefund" ? baseUrl : "",
+      reuseToken: this.mode === "lazyrefund",
     });
+
+    if (!spendResult.token) {
+      console.error(
+        `[RoutstrClient] _spendToken: CashuSpender.spend failed, error:`,
+        spendResult.error
+      );
+    } else {
+      console.log(
+        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token.substring(0, 20)}..., balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
+      );
+    }
 
     return {
       token: spendResult.token!,

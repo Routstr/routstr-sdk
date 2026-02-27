@@ -211,9 +211,14 @@ export class CashuSpender {
       retryCount,
     } = options;
 
+    console.log(
+      `[CashuSpender] _spendInternal: amount=${amount}, mintUrl=${mintUrl}, baseUrl=${baseUrl}, reuseToken=${reuseToken}`
+    );
+
     // Validate amount
     let adjustedAmount = Math.ceil(amount);
     if (!adjustedAmount || isNaN(adjustedAmount)) {
+      console.error(`[CashuSpender] _spendInternal: Invalid amount: ${amount}`);
       return {
         token: null,
         status: "failed",
@@ -224,14 +229,23 @@ export class CashuSpender {
 
     // Try to get existing token for reuse
     if (reuseToken && baseUrl) {
+      console.log(
+        `[CashuSpender] _spendInternal: Attempting to reuse token for ${baseUrl}`
+      );
       const existingResult = await this._tryReuseToken(
         baseUrl,
         adjustedAmount,
         mintUrl
       );
       if (existingResult) {
+        console.log(
+          `[CashuSpender] _spendInternal: Successfully reused token, balance: ${existingResult.balance}`
+        );
         return existingResult;
       }
+      console.log(
+        `[CashuSpender] _spendInternal: Could not reuse token, will create new token`
+      );
     }
 
     // Get current balances
@@ -255,12 +269,19 @@ export class CashuSpender {
       0
     );
 
+    console.log(
+      `[CashuSpender] _spendInternal: totalBalance=${totalBalance}, totalPending=${totalPending}, adjustedAmount=${adjustedAmount}`
+    );
+
     // Check if we need to refund pending tokens to free up balance
     if (
       totalBalance < adjustedAmount &&
       totalPending + totalBalance > adjustedAmount &&
       (retryCount ?? 0) < 1
     ) {
+      console.log(
+        `[CashuSpender] _spendInternal: Need to refund pending tokens to free up balance`
+      );
       return await this.refundAndRetry(options);
     }
 
@@ -268,6 +289,9 @@ export class CashuSpender {
 
     // Check total balance
     if (totalAvailableBalance < adjustedAmount) {
+      console.error(
+        `[CashuSpender] _spendInternal: Insufficient balance, have=${totalAvailableBalance}, need=${adjustedAmount}`
+      );
       return this._createInsufficientBalanceError(
         adjustedAmount,
         balances,
@@ -284,6 +308,10 @@ export class CashuSpender {
       excludeMints
     );
 
+    console.log(
+      `[CashuSpender] _spendInternal: Selected mint: ${selectedMintUrl}, balance: ${selectedMintBalance}`
+    );
+
     // Check provider mint compatibility if provider registry is available
     if (selectedMintUrl && baseUrl && this.providerRegistry) {
       const providerMints = this.providerRegistry.getProviderMints(baseUrl);
@@ -292,6 +320,9 @@ export class CashuSpender {
         providerMints.length > 0 &&
         !providerMints.includes(selectedMintUrl)
       ) {
+        console.log(
+          `[CashuSpender] _spendInternal: Provider ${baseUrl} prefers different mint, looking for alternate`
+        );
         // Try to find an alternate mint that the provider accepts
         const alternateResult = await this._findAlternateMint(
           options,
@@ -322,28 +353,55 @@ export class CashuSpender {
       (baseUrl === "" || !this.providerRegistry)
     ) {
       // Use active mint (either no provider or provider accepts it)
+      console.log(
+        `[CashuSpender] _spendInternal: Creating token using active mint ${mintUrl}, amount=${adjustedAmount}`
+      );
       try {
         token = await this.walletAdapter.sendToken(
           mintUrl,
           adjustedAmount,
           p2pkPubkey
         );
+        if (token) {
+          console.log(
+            `[CashuSpender] _spendInternal: Token created successfully, token preview: ${token.substring(0, 20)}...`
+          );
+        }
       } catch (error) {
+        console.error(
+          `[CashuSpender] _spendInternal: Error sending token:`,
+          error
+        );
         return this._handleSendError(error, options, balances, units);
       }
     } else if (selectedMintUrl && selectedMintBalance >= adjustedAmount) {
       // Use selected alternate mint
+      console.log(
+        `[CashuSpender] _spendInternal: Creating token using alternate mint ${selectedMintUrl}, amount=${adjustedAmount}`
+      );
       try {
         token = await this.walletAdapter.sendToken(
           selectedMintUrl,
           adjustedAmount,
           p2pkPubkey
         );
+        if (token) {
+          console.log(
+            `[CashuSpender] _spendInternal: Token created successfully, token preview: ${token.substring(0, 20)}...`
+          );
+        }
       } catch (error) {
+        console.error(
+          `[CashuSpender] _spendInternal: Error sending token:`,
+          error
+        );
         return this._handleSendError(error, options, balances, units);
       }
     } else {
       // Insufficient balance
+      console.error(
+        `[CashuSpender] _spendInternal: No mint found with sufficient balance, activeMintBalance=${activeMintBalanceInSats}, selectedMintBalance=${selectedMintBalance}`
+      );
       return this._createInsufficientBalanceError(
         adjustedAmount,
         balances,
@@ -362,6 +420,10 @@ export class CashuSpender {
       baseUrl,
       status: "success",
     });
+
+    console.log(
+      `[CashuSpender] _spendInternal: Successfully spent ${adjustedAmount}, returning token with balance=${adjustedAmount}`
+    );
 
     return {
       token,
