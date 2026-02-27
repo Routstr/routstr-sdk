@@ -16,6 +16,11 @@ import type {
   ProviderRegistry,
 } from "./interfaces";
 import type { RefundResult, TopUpResult } from "../core/types";
+import {
+  getBalanceInSats,
+  isNetworkErrorMessage,
+  selectMintWithBalance,
+} from "./tokenUtils";
 
 /**
  * Options for refunding tokens
@@ -377,8 +382,7 @@ export class BalanceManager {
     let totalMintBalance = 0;
     for (const url in balances) {
       const unit = units[url];
-      const balanceInSats =
-        unit === "msat" ? balances[url] / 1000 : balances[url];
+      const balanceInSats = getBalanceInSats(balances[url], unit);
       totalMintBalance += balanceInSats;
     }
 
@@ -444,13 +448,7 @@ export class BalanceManager {
         if (error instanceof Error) {
           lastError = error.message;
 
-          if (
-            error.message.includes(
-              "NetworkError when attempting to fetch resource"
-            ) ||
-            error.message.includes("Failed to fetch") ||
-            error.message.includes("Load failed")
-          ) {
+          if (isNetworkErrorMessage(error.message)) {
             continue;
           }
         }
@@ -488,6 +486,22 @@ export class BalanceManager {
 
     const candidates: string[] = [];
 
+    const { selectedMintUrl: firstMint } = selectMintWithBalance(
+      balances,
+      units,
+      amount,
+      excludeMints
+    );
+
+    if (
+      firstMint &&
+      (!allowedMints ||
+        allowedMints.length === 0 ||
+        allowedMints.includes(firstMint))
+    ) {
+      candidates.push(firstMint);
+    }
+
     const canUseMint = (mint: string): boolean => {
       if (excludeMints.includes(mint)) return false;
       if (
@@ -499,16 +513,20 @@ export class BalanceManager {
       }
       const rawBalance = balances[mint] || 0;
       const unit = units[mint];
-      const balanceInSats = unit === "msat" ? rawBalance / 1000 : rawBalance;
+      const balanceInSats = getBalanceInSats(rawBalance, unit);
       return balanceInSats >= amount;
     };
 
-    if (preferredMintUrl && canUseMint(preferredMintUrl)) {
+    if (
+      preferredMintUrl &&
+      canUseMint(preferredMintUrl) &&
+      !candidates.includes(preferredMintUrl)
+    ) {
       candidates.push(preferredMintUrl);
     }
 
     for (const mint in balances) {
-      if (mint === preferredMintUrl) continue;
+      if (mint === preferredMintUrl || candidates.includes(mint)) continue;
       if (canUseMint(mint)) {
         candidates.push(mint);
       }
@@ -759,13 +777,7 @@ export class BalanceManager {
   ): RefundResult {
     if (error instanceof Error) {
       // Network errors
-      if (
-        error.message.includes(
-          "NetworkError when attempting to fetch resource"
-        ) ||
-        error.message.includes("Failed to fetch") ||
-        error.message.includes("Load failed")
-      ) {
+      if (isNetworkErrorMessage(error.message)) {
         return {
           success: false,
           message: `Failed to connect to the mint: ${mintUrl}`,
@@ -841,13 +853,7 @@ export class BalanceManager {
     requestId?: string
   ): TopUpResult {
     if (error instanceof Error) {
-      if (
-        error.message.includes(
-          "NetworkError when attempting to fetch resource"
-        ) ||
-        error.message.includes("Failed to fetch") ||
-        error.message.includes("Load failed")
-      ) {
+      if (isNetworkErrorMessage(error.message)) {
         return {
           success: false,
           message: `Failed to connect to the mint: ${mintUrl}`,

@@ -18,7 +18,9 @@ const createStorage = (
   setToken: () => {},
   removeToken: () => {},
   updateTokenBalance: () => {},
-  getPendingTokenDistribution: () => [],
+  getCachedTokenDistribution: () => [],
+  getApiKeyDistribution: () => [],
+  removeApiKey: () => {},
   saveProviderInfo: () => {},
   getProviderInfo: () => null,
   getApiKey: () => null,
@@ -54,7 +56,7 @@ describe("CashuSpender", () => {
       }),
       createStorage({
         getToken: () => "stored-token",
-        getPendingTokenDistribution: () => [
+        getCachedTokenDistribution: () => [
           { baseUrl: "https://provider.example.com", amount: 42 },
         ],
       })
@@ -78,7 +80,7 @@ describe("CashuSpender", () => {
         getBalances: async () => ({ "https://mint.example.com": 5 }),
         getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       }),
-      createStorage({ getPendingTokenDistribution: () => [] })
+      createStorage({ getCachedTokenDistribution: () => [] })
     );
 
     const result = await spender.spend({

@@ -15,7 +15,7 @@ import type {
   StorageAdapter,
   ProviderRegistry,
 } from "./interfaces";
-import type { SpendResult, MintSelection } from "../core/types";
+import type { SpendResult } from "../core/types";
 import {
   InsufficientBalanceError,
   MintUnreachableError,
@@ -23,6 +23,11 @@ import {
 } from "../core/errors";
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
+import {
+  getBalanceInSats,
+  isNetworkErrorMessage,
+  selectMintWithBalance,
+} from "./tokenUtils";
 
 /**
  * Options for spending cashu tokens
@@ -79,7 +84,7 @@ export class CashuSpender {
     for (const url in mintBalances) {
       const balance = mintBalances[url];
       const unit = units[url];
-      const balanceInSats = unit === "msat" ? balance / 1000 : balance;
+      const balanceInSats = getBalanceInSats(balance, unit);
       normalizedMintBalances[url] = balanceInSats;
       totalMintBalance += balanceInSats;
     }
@@ -190,9 +195,7 @@ export class CashuSpender {
    */
   private _isNetworkError(message: string): boolean {
     return (
-      message.includes("NetworkError when attempting to fetch resource") ||
-      message.includes("Failed to fetch") ||
-      message.includes("Load failed") ||
+      isNetworkErrorMessage(message) ||
       (message.includes("Your mint") && message.includes("unreachable"))
     );
   }
@@ -257,7 +260,7 @@ export class CashuSpender {
     for (const url in balances) {
       const balance = balances[url];
       const unit = units[url];
-      const balanceInSats = unit === "msat" ? balance / 1000 : balance;
+      const balanceInSats = getBalanceInSats(balance, unit);
       totalBalance += balanceInSats;
     }
 
@@ -301,7 +304,7 @@ export class CashuSpender {
     }
 
     // Select mint with sufficient balance
-    let { selectedMintUrl, selectedMintBalance } = this._selectMintWithBalance(
+    let { selectedMintUrl, selectedMintBalance } = selectMintWithBalance(
       balances,
       units,
       adjustedAmount,
@@ -343,8 +346,10 @@ export class CashuSpender {
     // Check active mint balance
     const activeMintBalance = balances[mintUrl] || 0;
     const activeMintUnit = units[mintUrl];
-    const activeMintBalanceInSats =
-      activeMintUnit === "msat" ? activeMintBalance / 1000 : activeMintBalance;
+    const activeMintBalanceInSats = getBalanceInSats(
+      activeMintBalance,
+      activeMintUnit
+    );
 
     let token: string | null = null;
 
@@ -681,7 +686,7 @@ export class CashuSpender {
     const extendedExcludes = [...(excludeMints || [])];
 
     while (true) {
-      const { selectedMintUrl } = this._selectMintWithBalance(
+      const { selectedMintUrl } = selectMintWithBalance(
         balances,
         units,
         adjustedAmount,
@@ -733,12 +738,7 @@ export class CashuSpender {
 
     // Check for network errors
     const isNetworkError =
-      error instanceof Error &&
-      (error.message.includes(
-        "NetworkError when attempting to fetch resource"
-      ) ||
-        error.message.includes("Failed to fetch") ||
-        error.message.includes("Load failed"));
+      error instanceof Error && isNetworkErrorMessage(error.message);
 
     if (isNetworkError) {
       const { mintUrl, amount, baseUrl, p2pkPubkey, excludeMints, retryCount } =
@@ -746,7 +746,7 @@ export class CashuSpender {
 
       // Try alternate mint
       const extendedExcludes = [...(excludeMints || []), mintUrl];
-      const { selectedMintUrl } = this._selectMintWithBalance(
+      const { selectedMintUrl } = selectMintWithBalance(
         balances,
         units,
         Math.ceil(amount),
@@ -776,32 +776,6 @@ export class CashuSpender {
   }
 
   /**
-   * Select a mint with sufficient balance
-   */
-  private _selectMintWithBalance(
-    balances: Record<string, number>,
-    units: Record<string, string>,
-    amount: number,
-    excludeMints: string[] = []
-  ): MintSelection {
-    for (const mintUrl in balances) {
-      if (excludeMints.includes(mintUrl)) {
-        continue;
-      }
-
-      const balance = balances[mintUrl];
-      const unit = units[mintUrl];
-      const balanceInSats = unit === "msat" ? balance / 1000 : balance;
-
-      if (balanceInSats >= amount) {
-        return { selectedMintUrl: mintUrl, selectedMintBalance: balanceInSats };
-      }
-    }
-
-    return { selectedMintUrl: null, selectedMintBalance: 0 };
-  }
-
-  /**
    * Create an insufficient balance error result
    */
   private _createInsufficientBalanceError(
@@ -816,7 +790,7 @@ export class CashuSpender {
     for (const mintUrl in balances) {
       const balance = balances[mintUrl];
       const unit = units[mintUrl];
-      const balanceInSats = unit === "msat" ? balance / 1000 : balance;
+      const balanceInSats = getBalanceInSats(balance, unit);
 
       if (balanceInSats > maxBalance) {
         maxBalance = balanceInSats;
