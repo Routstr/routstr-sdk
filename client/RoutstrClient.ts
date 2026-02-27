@@ -50,6 +50,8 @@ export interface FetchOptions {
 export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
 
+const TOPUP_MARGIN = 0.7;
+
 export interface RouteRequestParams {
   path: string;
   method: string;
@@ -462,7 +464,7 @@ export class RoutstrClient {
     let tryNextProvider: boolean = false;
 
     console.log(
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token.substring(0, 20)}..., requestId=${requestId}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}`
     );
 
     if (this.mode === "xcashu" || this.mode === "lazyrefund") {
@@ -534,7 +536,7 @@ export class RoutstrClient {
       const topupResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
-        amount: params.requiredSats * 1.5,
+        amount: params.requiredSats * TOPUP_MARGIN,
         token: params.token,
       });
       console.log(
@@ -564,6 +566,7 @@ export class RoutstrClient {
         console.log(
           `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
         );
+        tryNextProvider = true;
       }
       if (!tryNextProvider)
         return this._makeRequest({
@@ -616,7 +619,7 @@ export class RoutstrClient {
         }
       } else if (this.mode === "apikeys") {
         console.log(
-          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token.substring(0, 20)}...`
+          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
         );
         const initialBalance = await this.balanceManager.getTokenBalance(
           token,
@@ -995,7 +998,7 @@ export class RoutstrClient {
         );
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
-          amount: amount * 1.5,
+          amount: amount * TOPUP_MARGIN,
           baseUrl: "",
           reuseToken: false,
         });
@@ -1007,7 +1010,7 @@ export class RoutstrClient {
           );
         } else {
           console.log(
-            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token.substring(0, 20)}...`
+            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
           );
         }
 
@@ -1016,14 +1019,14 @@ export class RoutstrClient {
           baseUrl
         );
         console.log(
-          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${apiKeyCreated.apiKey}..., balance: ${apiKeyCreated.amount}`
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${apiKeyCreated.apiKey}, balance: ${apiKeyCreated.amount}`
         );
 
         this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       } else {
         console.log(
-          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}...`
+          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}`
         );
       }
 
@@ -1079,7 +1082,7 @@ export class RoutstrClient {
       );
     } else {
       console.log(
-        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token.substring(0, 20)}..., balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
+        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
     }
 
