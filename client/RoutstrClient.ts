@@ -200,8 +200,9 @@ export class RoutstrClient {
     const tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
+    const tokenUsed = (response as any).token || token;
     const satsSpent = await this._handlePostResponseBalanceUpdate({
-      token,
+      token: tokenUsed,
       baseUrl: baseUrlUsed,
       initialTokenBalance: tokenBalanceInSats,
       response,
@@ -413,6 +414,7 @@ export class RoutstrClient {
       if (this.mode === "xcashu") console.log("response,", response);
 
       (response as any).baseUrl = baseUrl;
+      (response as any).token = token;
 
       if (!response.ok) {
         const requestId =
@@ -488,7 +490,7 @@ export class RoutstrClient {
           this.storageAdapter.removeToken(baseUrl);
       } else {
         console.log(
-          `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
+          `[RoutstrClient] _handleErrorResponse: Failed to receive token. `
         );
       }
     }
@@ -588,6 +590,7 @@ export class RoutstrClient {
         status === 500 ||
         status === 502 ||
         status === 503 ||
+        status === 504 ||
         status === 521) &&
       !tryNextProvider
     ) {

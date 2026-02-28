@@ -62,12 +62,13 @@ export interface SdkStorageStore extends SdkStorageState {
     value: Array<{
       parentBaseUrl: string;
       childKey: string;
-      balance: number;
+      balance?: number;
       balanceLimit?: number;
       validityDate?: number;
-      createdAt: number;
+      createdAt?: number;
     }>
   ) => void;
+  setRoutstr21Models: (value: string[]) => void;
 }
 
 /** Store type returned after async initialization */
@@ -89,6 +90,7 @@ export const createSdkStore = async ({
     rawCachedTokens,
     rawApiKeys,
     rawChildKeys,
+    rawRoutstr21Models,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
@@ -136,6 +138,7 @@ export const createSdkStore = async ({
         createdAt?: number;
       }>
     >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
   ]);
 
   // Normalize all hydrated state
@@ -199,6 +202,8 @@ export const createSdkStore = async ({
     createdAt: entry.createdAt ?? Date.now(),
   }));
 
+  const routstr21Models = rawRoutstr21Models;
+
   // Create the store with hydrated state.
   // All setters update in-memory state synchronously and persist to driver
   // as fire-and-forget (no await on setItem).
@@ -214,6 +219,7 @@ export const createSdkStore = async ({
     cachedTokens,
     apiKeys,
     childKeys,
+    routstr21Models,
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -332,6 +338,10 @@ export const createSdkStore = async ({
         return { childKeys: normalized };
       });
     },
+    setRoutstr21Models: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
+      set({ routstr21Models: value });
+    },
   }));
 };
 
@@ -365,6 +375,8 @@ export const createDiscoveryAdapterFromStore = (
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
   setBaseUrlsLastUpdate: (timestamp) =>
     store.getState().setBaseUrlsLastUpdate(timestamp),
+  getRoutstr21Models: () => store.getState().routstr21Models,
+  setRoutstr21Models: (models) => store.getState().setRoutstr21Models(models),
 });
 
 export const createStorageAdapterFromStore = (

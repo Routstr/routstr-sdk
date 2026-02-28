@@ -10,6 +10,7 @@ export const SDK_STORAGE_KEYS = {
   LOCAL_CASHU_TOKENS: "local_cashu_tokens",
   API_KEYS: "api_keys",
   CHILD_KEYS: "child_keys",
+  ROUTSTR21_MODELS: "routstr21Models",
 } as const;
 
 export type SdkStorageKey =

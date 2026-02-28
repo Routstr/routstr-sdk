@@ -95,6 +95,7 @@ export class ModelManager {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
+        await this.fetchRoutstr21Models();
         return filtered;
       }
     } catch (e) {
@@ -149,7 +150,6 @@ export class ModelManager {
       }, timeoutMs);
     });
 
-
     const timeline = localEventStore.getTimeline({ kinds: [kind] });
 
     const bases = new Set<string>();
@@ -164,7 +164,6 @@ export class ModelManager {
       }
 
       if (eventUrls.length > 0) {
-
         for (const url of eventUrls) {
           const normalized = this.normalizeUrl(url);
           if (!torMode || normalized.includes(".onion")) {
@@ -179,7 +178,6 @@ export class ModelManager {
         const providers = Array.isArray(content)
           ? content
           : content.providers || [];
-
 
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
@@ -263,6 +261,7 @@ export class ModelManager {
       if (list.length > 0) {
         this.adapter.setBaseUrlsList(list);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
+        await this.fetchRoutstr21Models();
       }
 
       return list;
@@ -475,5 +474,67 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  /**
+   * Fetch routstr21 models from Nostr network (kind 38423)
+   * @returns Array of model IDs or empty array if not found
+   */
+  async fetchRoutstr21Models(): Promise<string[]> {
+    const DEFAULT_RELAYS = [
+      "wss://relay.primal.net",
+      "wss://nos.lol",
+      "wss://relay.routstr.com",
+    ];
+
+    const pool = new RelayPool();
+    const localEventStore = new EventStore();
+
+    const timeoutMs = 5000;
+
+    await new Promise<void>((resolve) => {
+      pool
+        .req(DEFAULT_RELAYS, {
+          kinds: [38423],
+          "#d": ["routstr-21-models"],
+          limit: 1,
+        })
+        .pipe(
+          onlyEvents(),
+          tap((event) => {
+            localEventStore.add(event);
+          })
+        )
+        .subscribe({
+          complete: () => {
+            resolve();
+          },
+        });
+
+      setTimeout(() => {
+        resolve();
+      }, timeoutMs);
+    });
+
+    const timeline = localEventStore.getTimeline({ kinds: [38423] });
+
+    if (timeline.length === 0) {
+      return [];
+    }
+
+    const event = timeline[0];
+
+    try {
+      const content = JSON.parse(event.content);
+      const models = Array.isArray(content?.models) ? content.models : [];
+      this.adapter.setRoutstr21Models(models);
+      return models;
+    } catch {
+      console.warn(
+        "[Routstr21Models] Failed to parse Nostr event content:",
+        event.id
+      );
+      return [];
+    }
   }
 }

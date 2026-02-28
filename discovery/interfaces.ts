@@ -102,4 +102,16 @@ export interface DiscoveryAdapter {
    * @param timestamp Timestamp in milliseconds
    */
   setBaseUrlsLastUpdate(timestamp: number): void;
+
+  /**
+   * Get list of routstr21 models
+   * @returns Array of model IDs
+   */
+  getRoutstr21Models(): string[];
+
+  /**
+   * Save routstr21 models list
+   * @param models Array of model IDs
+   */
+  setRoutstr21Models(models: string[]): void;
 }

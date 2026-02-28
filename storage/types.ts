@@ -33,4 +33,5 @@ export interface SdkStorageState {
     validityDate?: number;
     createdAt: number;
   }>;
+  routstr21Models: string[];
 }
