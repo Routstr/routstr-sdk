@@ -17,7 +17,7 @@ const isQuotaExceeded = (error: unknown): boolean => {
 const NON_CRITICAL_KEYS = new Set<string>(["modelsFromAllProviders"]);
 
 export const localStorageDriver: StorageDriver = {
-  getItem<T>(key: string, defaultValue: T): T {
+  async getItem<T>(key: string, defaultValue: T): Promise<T> {
     if (!canUseLocalStorage()) return defaultValue;
     try {
       const item = window.localStorage.getItem(key);
@@ -45,7 +45,7 @@ export const localStorageDriver: StorageDriver = {
       return defaultValue;
     }
   },
-  setItem<T>(key: string, value: T): void {
+  async setItem<T>(key: string, value: T): Promise<void> {
     if (!canUseLocalStorage()) return;
     try {
       window.localStorage.setItem(key, JSON.stringify(value));
@@ -74,7 +74,7 @@ export const localStorageDriver: StorageDriver = {
       console.error(`Error storing item with key "${key}":`, error);
     }
   },
-  removeItem(key: string): void {
+  async removeItem(key: string): Promise<void> {
     if (!canUseLocalStorage()) return;
     try {
       window.localStorage.removeItem(key);

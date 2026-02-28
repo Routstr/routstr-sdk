@@ -56,7 +56,7 @@ export const createSqliteDriver = (
   const deleteStmt = db.prepare(`DELETE FROM ${tableName} WHERE key = ?`);
 
   return {
-    getItem<T>(key: string, defaultValue: T): T {
+    async getItem<T>(key: string, defaultValue: T): Promise<T> {
       try {
         const row = selectStmt.get(key);
         if (!row || typeof row.value !== "string") return defaultValue;
@@ -73,14 +73,14 @@ export const createSqliteDriver = (
         return defaultValue;
       }
     },
-    setItem<T>(key: string, value: T): void {
+    async setItem<T>(key: string, value: T): Promise<void> {
       try {
         upsertStmt.run(key, JSON.stringify(value));
       } catch (error) {
         console.error(`SQLite setItem failed for key "${key}":`, error);
       }
     },
-    removeItem(key: string): void {
+    async removeItem(key: string): Promise<void> {
       try {
         deleteStmt.run(key);
       } catch (error) {

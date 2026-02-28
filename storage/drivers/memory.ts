@@ -12,7 +12,7 @@ export const createMemoryDriver = (
   }
 
   return {
-    getItem<T>(key: string, defaultValue: T): T {
+    async getItem<T>(key: string, defaultValue: T): Promise<T> {
       const item = store.get(key);
       if (item === undefined) return defaultValue;
       try {
@@ -24,10 +24,10 @@ export const createMemoryDriver = (
         throw parseError;
       }
     },
-    setItem<T>(key: string, value: T): void {
+    async setItem<T>(key: string, value: T): Promise<void> {
       store.set(key, JSON.stringify(value));
     },
-    removeItem(key: string): void {
+    async removeItem(key: string): Promise<void> {
       store.delete(key);
     },
   };

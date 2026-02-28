@@ -7,7 +7,7 @@ import {
 import { createStorageAdapterFromStore } from "../storage/store";
 
 describe("sdk storage store", () => {
-  it("normalizes baseUrls and persists cached tokens", () => {
+  it("normalizes baseUrls and persists cached tokens", async () => {
     const seed = {
       [SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS]: JSON.stringify([
         {
@@ -26,7 +26,7 @@ describe("sdk storage store", () => {
     };
 
     const driver = createMemoryDriver(seed);
-    const store = createSdkStore({ driver });
+    const store = await createSdkStore({ driver });
 
     expect(store.getState().cachedTokens[0]?.baseUrl).toBe(
       "https://provider.example.com/"
@@ -39,9 +39,9 @@ describe("sdk storage store", () => {
     ]);
   });
 
-  it("setToken rejects duplicate provider tokens", () => {
+  it("setToken rejects duplicate provider tokens", async () => {
     const driver = createMemoryDriver();
-    const store = createSdkStore({ driver });
+    const store = await createSdkStore({ driver });
     const storage = createStorageAdapterFromStore(store);
 
     storage.setToken("https://provider.example.com", "token-1");
@@ -51,9 +51,9 @@ describe("sdk storage store", () => {
     ).toThrowError("Token already exists for baseUrl");
   });
 
-  it("getToken updates lastUsed timestamp", () => {
+  it("getToken updates lastUsed timestamp", async () => {
     const driver = createMemoryDriver();
-    const store = createSdkStore({ driver });
+    const store = await createSdkStore({ driver });
     const storage = createStorageAdapterFromStore(store);
 
     storage.setToken("https://provider.example.com", "token-1");

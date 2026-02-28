@@ -1,4 +1,4 @@
-import { createStore } from "zustand/vanilla";
+import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
 import type { ProviderInfo, Model } from "../core";
@@ -70,133 +70,177 @@ export interface SdkStorageStore extends SdkStorageState {
   ) => void;
 }
 
-export const createSdkStore = ({ driver }: SdkStoreOptions) => {
+/** Store type returned after async initialization */
+export type SdkStore = StoreApi<SdkStorageStore>;
+
+export const createSdkStore = async ({
+  driver,
+}: SdkStoreOptions): Promise<SdkStore> => {
+  // Hydrate all initial state from the async driver in parallel
+  const [
+    rawModels,
+    lastUsedModel,
+    rawBaseUrls,
+    lastBaseUrlsUpdate,
+    rawDisabledProviders,
+    rawMints,
+    rawInfo,
+    rawLastModelsUpdate,
+    rawCachedTokens,
+    rawApiKeys,
+    rawChildKeys,
+  ] = await Promise.all([
+    driver.getItem<Record<string, Model[]>>(
+      SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<string | null>(SDK_STORAGE_KEYS.LAST_USED_MODEL, null),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
+    driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
+    driver.getItem<Record<string, string[]>>(
+      SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<Record<string, ProviderInfo>>(
+      SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<Record<string, number>>(
+      SDK_STORAGE_KEYS.LAST_MODELS_UPDATE,
+      {}
+    ),
+    driver.getItem<
+      Array<{
+        baseUrl: string;
+        token: string;
+        balance?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, []),
+    driver.getItem<
+      Array<{
+        baseUrl: string;
+        key: string;
+        balance?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.API_KEYS, []),
+    driver.getItem<
+      Array<{
+        parentBaseUrl: string;
+        childKey: string;
+        balance?: number;
+        balanceLimit?: number;
+        validityDate?: number;
+        createdAt?: number;
+      }>
+    >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
+  ]);
+
+  // Normalize all hydrated state
+  const modelsFromAllProviders = Object.fromEntries(
+    Object.entries(rawModels).map(([baseUrl, models]) => [
+      normalizeBaseUrl(baseUrl),
+      models,
+    ])
+  );
+
+  const baseUrlsList = rawBaseUrls.map((url) => normalizeBaseUrl(url));
+
+  const disabledProviders = rawDisabledProviders.map((url) =>
+    normalizeBaseUrl(url)
+  );
+
+  const mintsFromAllProviders = Object.fromEntries(
+    Object.entries(rawMints).map(([baseUrl, mints]) => [
+      normalizeBaseUrl(baseUrl),
+      mints.map((mint) => (mint.endsWith("/") ? mint.slice(0, -1) : mint)),
+    ])
+  );
+
+  const infoFromAllProviders = Object.fromEntries(
+    Object.entries(rawInfo).map(([baseUrl, info]) => [
+      normalizeBaseUrl(baseUrl),
+      info,
+    ])
+  );
+
+  const lastModelsUpdate = Object.fromEntries(
+    Object.entries(rawLastModelsUpdate).map(([baseUrl, timestamp]) => [
+      normalizeBaseUrl(baseUrl),
+      timestamp,
+    ])
+  );
+
+  const cachedTokens = rawCachedTokens.map((entry) => ({
+    ...entry,
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    balance:
+      typeof entry.balance === "number"
+        ? entry.balance
+        : getTokenBalance(entry.token),
+    lastUsed: entry.lastUsed ?? null,
+  }));
+
+  const apiKeys = rawApiKeys.map((entry) => ({
+    ...entry,
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    balance: entry.balance ?? 0,
+    lastUsed: entry.lastUsed ?? null,
+  }));
+
+  const childKeys = rawChildKeys.map((entry) => ({
+    parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
+    childKey: entry.childKey,
+    balance: entry.balance ?? 0,
+    balanceLimit: entry.balanceLimit,
+    validityDate: entry.validityDate,
+    createdAt: entry.createdAt ?? Date.now(),
+  }));
+
+  // Create the store with hydrated state.
+  // All setters update in-memory state synchronously and persist to driver
+  // as fire-and-forget (no await on setItem).
   return createStore<SdkStorageStore>((set, get) => ({
-    modelsFromAllProviders: Object.fromEntries(
-      Object.entries(
-        driver.getItem<Record<string, Model[]>>(
-          SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
-          {}
-        )
-      ).map(([baseUrl, models]) => [normalizeBaseUrl(baseUrl), models])
-    ),
-    lastUsedModel: driver.getItem<string | null>(
-      SDK_STORAGE_KEYS.LAST_USED_MODEL,
-      null
-    ),
-    baseUrlsList: driver
-      .getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, [])
-      .map((url) => normalizeBaseUrl(url)),
-    lastBaseUrlsUpdate: driver.getItem<number | null>(
-      SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE,
-      null
-    ),
-    disabledProviders: driver
-      .getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, [])
-      .map((url) => normalizeBaseUrl(url)),
-    mintsFromAllProviders: Object.fromEntries(
-      Object.entries(
-        driver.getItem<Record<string, string[]>>(
-          SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
-          {}
-        )
-      ).map(([baseUrl, mints]) => [
-        normalizeBaseUrl(baseUrl),
-        mints.map((mint) => (mint.endsWith("/") ? mint.slice(0, -1) : mint)),
-      ])
-    ),
-    infoFromAllProviders: Object.fromEntries(
-      Object.entries(
-        driver.getItem<Record<string, ProviderInfo>>(
-          SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS,
-          {}
-        )
-      ).map(([baseUrl, info]) => [normalizeBaseUrl(baseUrl), info])
-    ),
-    lastModelsUpdate: Object.fromEntries(
-      Object.entries(
-        driver.getItem<Record<string, number>>(
-          SDK_STORAGE_KEYS.LAST_MODELS_UPDATE,
-          {}
-        )
-      ).map(([baseUrl, timestamp]) => [normalizeBaseUrl(baseUrl), timestamp])
-    ),
-    cachedTokens: driver
-      .getItem<
-        Array<{
-          baseUrl: string;
-          token: string;
-          balance?: number;
-          lastUsed?: number | null;
-        }>
-      >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, [])
-      .map((entry) => ({
-        ...entry,
-        baseUrl: normalizeBaseUrl(entry.baseUrl),
-        balance:
-          typeof entry.balance === "number"
-            ? entry.balance
-            : getTokenBalance(entry.token),
-        lastUsed: entry.lastUsed ?? null,
-      })),
-    apiKeys: driver
-      .getItem<
-        Array<{
-          baseUrl: string;
-          key: string;
-          balance?: number;
-          lastUsed?: number | null;
-        }>
-      >(SDK_STORAGE_KEYS.API_KEYS, [])
-      .map((entry) => ({
-        ...entry,
-        baseUrl: normalizeBaseUrl(entry.baseUrl),
-        balance: entry.balance ?? 0,
-        lastUsed: entry.lastUsed ?? null,
-      })),
-    childKeys: driver
-      .getItem<
-        Array<{
-          parentBaseUrl: string;
-          childKey: string;
-          balance?: number;
-          balanceLimit?: number;
-          validityDate?: number;
-          createdAt?: number;
-        }>
-      >(SDK_STORAGE_KEYS.CHILD_KEYS, [])
-      .map((entry) => ({
-        parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
-        childKey: entry.childKey,
-        balance: entry.balance ?? 0,
-        balanceLimit: entry.balanceLimit,
-        validityDate: entry.validityDate,
-        createdAt: entry.createdAt ?? Date.now(),
-      })),
+    modelsFromAllProviders,
+    lastUsedModel,
+    baseUrlsList,
+    lastBaseUrlsUpdate,
+    disabledProviders,
+    mintsFromAllProviders,
+    infoFromAllProviders,
+    lastModelsUpdate,
+    cachedTokens,
+    apiKeys,
+    childKeys,
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
         normalized[normalizeBaseUrl(baseUrl)] = models;
       }
-      driver.setItem(SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS, normalized);
+      void driver.setItem(
+        SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
+        normalized
+      );
       set({ modelsFromAllProviders: normalized });
     },
     setLastUsedModel: (value) => {
-      driver.setItem(SDK_STORAGE_KEYS.LAST_USED_MODEL, value);
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_USED_MODEL, value);
       set({ lastUsedModel: value });
     },
     setBaseUrlsList: (value) => {
       const normalized = value.map((url) => normalizeBaseUrl(url));
-      driver.setItem(SDK_STORAGE_KEYS.BASE_URLS_LIST, normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.BASE_URLS_LIST, normalized);
       set({ baseUrlsList: normalized });
     },
     setBaseUrlsLastUpdate: (value) => {
-      driver.setItem(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, value);
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, value);
       set({ lastBaseUrlsUpdate: value });
     },
     setDisabledProviders: (value) => {
       const normalized = value.map((url) => normalizeBaseUrl(url));
-      driver.setItem(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, normalized);
       set({ disabledProviders: normalized });
     },
     setMintsFromAllProviders: (value) => {
@@ -206,7 +250,10 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
           mint.endsWith("/") ? mint.slice(0, -1) : mint
         );
       }
-      driver.setItem(SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS, normalized);
+      void driver.setItem(
+        SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
+        normalized
+      );
       set({ mintsFromAllProviders: normalized });
     },
     setInfoFromAllProviders: (value) => {
@@ -214,7 +261,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       for (const [baseUrl, info] of Object.entries(value)) {
         normalized[normalizeBaseUrl(baseUrl)] = info;
       }
-      driver.setItem(SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS, normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS, normalized);
       set({ infoFromAllProviders: normalized });
     },
     setLastModelsUpdate: (value) => {
@@ -222,7 +269,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
       for (const [baseUrl, timestamp] of Object.entries(value)) {
         normalized[normalizeBaseUrl(baseUrl)] = timestamp;
       }
-      driver.setItem(SDK_STORAGE_KEYS.LAST_MODELS_UPDATE, normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_MODELS_UPDATE, normalized);
       set({ lastModelsUpdate: normalized });
     },
     setCachedTokens: (value) => {
@@ -238,7 +285,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
               : getTokenBalance(entry.token),
           lastUsed: entry.lastUsed ?? null,
         }));
-        driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
+        void driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
         return { cachedTokens: normalized };
       });
     },
@@ -252,7 +299,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
           balance: entry.balance ?? 0,
           lastUsed: entry.lastUsed ?? null,
         }));
-        driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
+        void driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
         return { apiKeys: normalized };
       });
     },
@@ -281,7 +328,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
           validityDate: entry.validityDate,
           createdAt: entry.createdAt ?? Date.now(),
         }));
-        driver.setItem(SDK_STORAGE_KEYS.CHILD_KEYS, normalized);
+        void driver.setItem(SDK_STORAGE_KEYS.CHILD_KEYS, normalized);
         return { childKeys: normalized };
       });
     },
@@ -289,7 +336,7 @@ export const createSdkStore = ({ driver }: SdkStoreOptions) => {
 };
 
 export const createDiscoveryAdapterFromStore = (
-  store: ReturnType<typeof createSdkStore>
+  store: SdkStore
 ): DiscoveryAdapter => ({
   getCachedModels: () => store.getState().modelsFromAllProviders,
   setCachedModels: (models) =>
@@ -321,7 +368,7 @@ export const createDiscoveryAdapterFromStore = (
 });
 
 export const createStorageAdapterFromStore = (
-  store: ReturnType<typeof createSdkStore>
+  store: SdkStore
 ): StorageAdapter => ({
   getToken: (baseUrl) => {
     const normalized = normalizeBaseUrl(baseUrl);
@@ -569,7 +616,7 @@ export const createStorageAdapterFromStore = (
 });
 
 export const createProviderRegistryFromStore = (
-  store: ReturnType<typeof createSdkStore>
+  store: SdkStore
 ): ProviderRegistry => ({
   getModelsForProvider: (baseUrl) => {
     const normalized = normalizeBaseUrl(baseUrl);

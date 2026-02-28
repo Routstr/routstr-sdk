@@ -1,7 +1,7 @@
 export interface StorageDriver {
-  getItem<T>(key: string, defaultValue: T): T;
-  setItem<T>(key: string, value: T): void;
-  removeItem(key: string): void;
+  getItem<T>(key: string, defaultValue: T): Promise<T>;
+  setItem<T>(key: string, value: T): Promise<void>;
+  removeItem(key: string): Promise<void>;
 }
 
 export interface SdkStorageState {

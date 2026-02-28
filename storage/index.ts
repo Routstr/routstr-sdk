@@ -1,15 +1,18 @@
 import { localStorageDriver } from "./drivers/localStorage";
 import { createMemoryDriver } from "./drivers/memory";
 import { createSqliteDriver } from "./drivers/sqlite";
+import { createIndexedDBDriver } from "./drivers/indexedDB";
 import type { StorageDriver } from "./types";
 import {
   createSdkStore,
   createDiscoveryAdapterFromStore,
   createProviderRegistryFromStore,
   createStorageAdapterFromStore,
+  type SdkStore,
 } from "./store";
 
 export type { StorageDriver } from "./types";
+export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
 export type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
 export { SDK_STORAGE_KEYS } from "./keys";
@@ -19,7 +22,12 @@ export {
   createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "./store";
-export { localStorageDriver, createMemoryDriver, createSqliteDriver };
+export {
+  localStorageDriver,
+  createMemoryDriver,
+  createSqliteDriver,
+  createIndexedDBDriver,
+};
 
 const isBrowser = (): boolean => {
   try {
@@ -68,20 +76,20 @@ export const getDefaultSdkDriver = (): StorageDriver => {
   return defaultDriver;
 };
 
-let defaultStore: ReturnType<typeof createSdkStore> | null = null;
+let defaultStorePromise: Promise<SdkStore> | null = null;
 
-export const getDefaultSdkStore = () => {
-  if (!defaultStore) {
-    defaultStore = createSdkStore({ driver: getDefaultSdkDriver() });
+export const getDefaultSdkStore = (): Promise<SdkStore> => {
+  if (!defaultStorePromise) {
+    defaultStorePromise = createSdkStore({ driver: getDefaultSdkDriver() });
   }
-  return defaultStore;
+  return defaultStorePromise;
 };
 
-export const getDefaultDiscoveryAdapter = () =>
-  createDiscoveryAdapterFromStore(getDefaultSdkStore());
+export const getDefaultDiscoveryAdapter = async () =>
+  createDiscoveryAdapterFromStore(await getDefaultSdkStore());
 
-export const getDefaultStorageAdapter = () =>
-  createStorageAdapterFromStore(getDefaultSdkStore());
+export const getDefaultStorageAdapter = async () =>
+  createStorageAdapterFromStore(await getDefaultSdkStore());
 
-export const getDefaultProviderRegistry = () =>
-  createProviderRegistryFromStore(getDefaultSdkStore());
+export const getDefaultProviderRegistry = async () =>
+  createProviderRegistryFromStore(await getDefaultSdkStore());
