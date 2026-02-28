@@ -1,35 +1,35 @@
 {
   "name": "@routstr/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Framework-agnostic SDK for Routstr API interactions",
-  "main": "index.ts",
-  "module": "index.ts",
-  "types": "index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./index.ts",
-      "import": "./index.ts",
-      "require": "./index.ts"
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
     },
     "./storage": {
-      "types": "./storage/index.ts",
-      "import": "./storage/index.ts",
-      "require": "./storage/index.ts"
+      "types": "./dist/storage/index.d.mts",
+      "import": "./dist/storage/index.mjs",
+      "require": "./dist/storage/index.js"
     },
     "./wallet": {
-      "types": "./wallet/index.ts",
-      "import": "./wallet/index.ts",
-      "require": "./wallet/index.ts"
+      "types": "./dist/wallet/index.d.mts",
+      "import": "./dist/wallet/index.mjs",
+      "require": "./dist/wallet/index.js"
     },
     "./discovery": {
-      "types": "./discovery/index.ts",
-      "import": "./discovery/index.ts",
-      "require": "./discovery/index.ts"
+      "types": "./dist/discovery/index.d.mts",
+      "import": "./dist/discovery/index.mjs",
+      "require": "./dist/discovery/index.js"
     },
     "./client": {
-      "types": "./client/index.ts",
-      "import": "./client/index.ts",
-      "require": "./client/index.ts"
+      "types": "./dist/client/index.d.mts",
+      "import": "./dist/client/index.mjs",
+      "require": "./dist/client/index.js"
     }
   },
   "files": [
