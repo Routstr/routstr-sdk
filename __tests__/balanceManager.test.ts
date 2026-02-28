@@ -32,6 +32,8 @@ const createStorage = (
   updateChildKeyBalance: () => {},
   removeChildKey: () => {},
   getAllChildKeys: () => [],
+  getCachedReceiveTokens: () => [],
+  setCachedReceiveTokens: () => {},
   ...overrides,
 });
 

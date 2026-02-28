@@ -40,9 +40,12 @@ export interface WalletAdapter {
    * @param token Encoded cashu token string
    * @returns Result with success flag and amount received
    */
-  receiveToken(
-    token: string
-  ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }>;
+  receiveToken(token: string): Promise<{
+    success: boolean;
+    amount: number;
+    unit: "sat" | "msat";
+    message?: string;
+  }>;
 }
 
 /**
@@ -129,6 +132,24 @@ export interface StorageAdapter {
 
   /** Get all stored child keys */
   getAllChildKeys(): ChildKeyEntry[];
+
+  /** Get cached receive tokens (tokens that failed to receive due to mint errors) */
+  getCachedReceiveTokens(): Array<{
+    token: string;
+    amount: number;
+    unit: "sat" | "msat";
+    createdAt: number;
+  }>;
+
+  /** Set cached receive tokens */
+  setCachedReceiveTokens(
+    tokens: Array<{
+      token: string;
+      amount: number;
+      unit: "sat" | "msat";
+      createdAt?: number;
+    }>
+  ): void;
 }
 
 /**

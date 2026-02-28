@@ -498,6 +498,7 @@ export class ModelManager {
           kinds: [38423],
           "#d": ["routstr-21-models"],
           limit: 1,
+          authors: ["4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8"]
         })
         .pipe(
           onlyEvents(),

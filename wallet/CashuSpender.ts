@@ -59,6 +59,33 @@ export class CashuSpender {
     private balanceManager?: BalanceManager
   ) {}
 
+  async receiveToken(token: string): Promise<{
+    success: boolean;
+    amount: number;
+    unit: "sat" | "msat";
+    message?: string;
+  }> {
+    const result = await this.walletAdapter.receiveToken(token);
+
+    if (!result.success && result.message?.includes("Failed to fetch mint")) {
+      const cachedTokens = this.storageAdapter.getCachedReceiveTokens();
+      const existingIndex = cachedTokens.findIndex((t) => t.token === token);
+      if (existingIndex === -1) {
+        this.storageAdapter.setCachedReceiveTokens([
+          ...cachedTokens,
+          {
+            token,
+            amount: result.amount,
+            unit: result.unit,
+            createdAt: Date.now(),
+          },
+        ]);
+      }
+    }
+
+    return result;
+  }
+
   private async _getBalanceState(): Promise<{
     totalBalance: number;
     providerBalances: Record<string, number>;

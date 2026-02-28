@@ -34,4 +34,10 @@ export interface SdkStorageState {
     createdAt: number;
   }>;
   routstr21Models: string[];
+  cachedReceiveTokens: Array<{
+    token: string;
+    amount: number;
+    unit: "sat" | "msat";
+    createdAt: number;
+  }>;
 }

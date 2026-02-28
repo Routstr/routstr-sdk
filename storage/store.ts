@@ -69,6 +69,14 @@ export interface SdkStorageStore extends SdkStorageState {
     }>
   ) => void;
   setRoutstr21Models: (value: string[]) => void;
+  setCachedReceiveTokens: (
+    value: Array<{
+      token: string;
+      amount: number;
+      unit: "sat" | "msat";
+      createdAt?: number;
+    }>
+  ) => void;
 }
 
 /** Store type returned after async initialization */
@@ -91,6 +99,7 @@ export const createSdkStore = async ({
     rawApiKeys,
     rawChildKeys,
     rawRoutstr21Models,
+    rawCachedReceiveTokens,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
@@ -139,6 +148,14 @@ export const createSdkStore = async ({
       }>
     >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
+    driver.getItem<
+      Array<{
+        token: string;
+        amount: number;
+        unit: "sat" | "msat";
+        createdAt?: number;
+      }>
+    >(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
   ]);
 
   // Normalize all hydrated state
@@ -204,6 +221,13 @@ export const createSdkStore = async ({
 
   const routstr21Models = rawRoutstr21Models;
 
+  const cachedReceiveTokens = rawCachedReceiveTokens.map((entry) => ({
+    token: entry.token,
+    amount: entry.amount,
+    unit: entry.unit || "sat",
+    createdAt: entry.createdAt ?? Date.now(),
+  }));
+
   // Create the store with hydrated state.
   // All setters update in-memory state synchronously and persist to driver
   // as fire-and-forget (no await on setItem).
@@ -220,6 +244,7 @@ export const createSdkStore = async ({
     apiKeys,
     childKeys,
     routstr21Models,
+    cachedReceiveTokens,
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -341,6 +366,16 @@ export const createSdkStore = async ({
     setRoutstr21Models: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
       set({ routstr21Models: value });
+    },
+    setCachedReceiveTokens: (value) => {
+      const normalized = value.map((entry) => ({
+        token: entry.token,
+        amount: entry.amount,
+        unit: entry.unit || "sat",
+        createdAt: entry.createdAt ?? Date.now(),
+      }));
+      void driver.setItem(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, normalized);
+      set({ cachedReceiveTokens: normalized });
     },
   }));
 };
@@ -624,6 +659,14 @@ export const createStorageAdapterFromStore = (
       validityDate: entry.validityDate,
       createdAt: entry.createdAt,
     }));
+  },
+
+  getCachedReceiveTokens: () => {
+    return store.getState().cachedReceiveTokens;
+  },
+
+  setCachedReceiveTokens: (tokens) => {
+    store.getState().setCachedReceiveTokens(tokens);
   },
 });
 
