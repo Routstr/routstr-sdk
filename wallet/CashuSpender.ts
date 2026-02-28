@@ -10,24 +10,12 @@
  * Extracted from hooks/useCashuWithXYZ.ts
  */
 
-import type {
-  WalletAdapter,
-  StorageAdapter,
-  ProviderRegistry,
-} from "./interfaces";
+import type { WalletAdapter, StorageAdapter } from "./interfaces";
 import type { SpendResult } from "../core/types";
-import {
-  InsufficientBalanceError,
-  MintUnreachableError,
-  TokenOperationError,
-} from "../core/errors";
+import { InsufficientBalanceError } from "../core/errors";
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
-import {
-  getBalanceInSats,
-  isNetworkErrorMessage,
-  selectMintWithBalance,
-} from "./tokenUtils";
+import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
 
 /**
  * Options for spending cashu tokens
@@ -67,7 +55,7 @@ export class CashuSpender {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry?: ProviderRegistry,
+    private _providerRegistry?: unknown,
     private balanceManager?: BalanceManager
   ) {}
 
@@ -276,18 +264,6 @@ export class CashuSpender {
       `[CashuSpender] _spendInternal: totalBalance=${totalBalance}, totalPending=${totalPending}, adjustedAmount=${adjustedAmount}`
     );
 
-    // Check if we need to refund pending tokens to free up balance
-    if (
-      totalBalance < adjustedAmount &&
-      totalPending + totalBalance > adjustedAmount &&
-      (retryCount ?? 0) < 1
-    ) {
-      console.log(
-        `[CashuSpender] _spendInternal: Need to refund pending tokens to free up balance`
-      );
-      return await this.refundAndRetry(options);
-    }
-
     const totalAvailableBalance = totalBalance + totalPending;
 
     // Check total balance
@@ -303,115 +279,58 @@ export class CashuSpender {
       );
     }
 
-    // Select mint with sufficient balance
-    let { selectedMintUrl, selectedMintBalance } = selectMintWithBalance(
-      balances,
-      units,
-      adjustedAmount,
-      excludeMints
-    );
+    let token: string | null = null;
+    let selectedMintUrl: string | undefined;
+    let spentAmount = adjustedAmount;
 
-    console.log(
-      `[CashuSpender] _spendInternal: Selected mint: ${selectedMintUrl}, balance: ${selectedMintBalance}`
-    );
+    if (this.balanceManager) {
+      const tokenResult = await this.balanceManager.createProviderToken({
+        mintUrl,
+        baseUrl,
+        amount: adjustedAmount,
+        p2pkPubkey,
+        excludeMints,
+        retryCount,
+      });
 
-    // Check provider mint compatibility if provider registry is available
-    if (selectedMintUrl && baseUrl && this.providerRegistry) {
-      const providerMints = this.providerRegistry.getProviderMints(baseUrl);
-
-      if (
-        providerMints.length > 0 &&
-        !providerMints.includes(selectedMintUrl)
-      ) {
-        console.log(
-          `[CashuSpender] _spendInternal: Provider ${baseUrl} prefers different mint, looking for alternate`
-        );
-        // Try to find an alternate mint that the provider accepts
-        const alternateResult = await this._findAlternateMint(
-          options,
-          balances,
-          units,
-          providerMints
-        );
-
-        if (alternateResult) {
-          return alternateResult;
+      if (!tokenResult.success || !tokenResult.token) {
+        if ((tokenResult.error || "").includes("Insufficient balance")) {
+          return this._createInsufficientBalanceError(
+            adjustedAmount,
+            balances,
+            units,
+            totalAvailableBalance
+          );
         }
 
-        // If no alternate found, add fee for unsupported mint
-        adjustedAmount += 2;
+        return {
+          token: null,
+          status: "failed",
+          balance: 0,
+          error: tokenResult.error || "Failed to create token",
+        };
       }
-    }
 
-    // Check active mint balance
-    const activeMintBalance = balances[mintUrl] || 0;
-    const activeMintUnit = units[mintUrl];
-    const activeMintBalanceInSats = getBalanceInSats(
-      activeMintBalance,
-      activeMintUnit
-    );
-
-    let token: string | null = null;
-
-    if (
-      activeMintBalanceInSats >= adjustedAmount &&
-      (baseUrl === "" || !this.providerRegistry)
-    ) {
-      // Use active mint (either no provider or provider accepts it)
-      console.log(
-        `[CashuSpender] _spendInternal: Creating token using active mint ${mintUrl}, amount=${adjustedAmount}`
-      );
+      token = tokenResult.token;
+      selectedMintUrl = tokenResult.selectedMintUrl;
+      spentAmount = tokenResult.amountSpent || adjustedAmount;
+    } else {
       try {
         token = await this.walletAdapter.sendToken(
           mintUrl,
           adjustedAmount,
           p2pkPubkey
         );
-        if (token) {
-          console.log(
-            `[CashuSpender] _spendInternal: Token created successfully, token preview: ${token.substring(0, 20)}...`
-          );
-        }
+        selectedMintUrl = mintUrl;
       } catch (error) {
-        console.error(
-          `[CashuSpender] _spendInternal: Error sending token:`,
-          error
-        );
-        return this._handleSendError(error, options, balances, units);
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        return {
+          token: null,
+          status: "failed",
+          balance: 0,
+          error: `Error generating token: ${errorMsg}`,
+        };
       }
-    } else if (selectedMintUrl && selectedMintBalance >= adjustedAmount) {
-      // Use selected alternate mint
-      console.log(
-        `[CashuSpender] _spendInternal: Creating token using alternate mint ${selectedMintUrl}, amount=${adjustedAmount}`
-      );
-      try {
-        token = await this.walletAdapter.sendToken(
-          selectedMintUrl,
-          adjustedAmount,
-          p2pkPubkey
-        );
-        if (token) {
-          console.log(
-            `[CashuSpender] _spendInternal: Token created successfully, token preview: ${token.substring(0, 20)}...`
-          );
-        }
-      } catch (error) {
-        console.error(
-          `[CashuSpender] _spendInternal: Error sending token:`,
-          error
-        );
-        return this._handleSendError(error, options, balances, units);
-      }
-    } else {
-      // Insufficient balance
-      console.error(
-        `[CashuSpender] _spendInternal: No mint found with sufficient balance, activeMintBalance=${activeMintBalanceInSats}, selectedMintBalance=${selectedMintBalance}`
-      );
-      return this._createInsufficientBalanceError(
-        adjustedAmount,
-        balances,
-        units
-      );
     }
 
     // Store token and return
@@ -420,21 +339,22 @@ export class CashuSpender {
     }
 
     this._logTransaction("spend", {
-      amount: adjustedAmount,
+      amount: spentAmount,
       mintUrl: selectedMintUrl || mintUrl,
       baseUrl,
       status: "success",
     });
 
     console.log(
-      `[CashuSpender] _spendInternal: Successfully spent ${adjustedAmount}, returning token with balance=${adjustedAmount}`
+      `[CashuSpender] _spendInternal: Successfully spent ${spentAmount}, returning token with balance=${spentAmount}`
     );
 
     return {
       token,
       status: "success",
-      balance: adjustedAmount,
-      unit: activeMintUnit,
+      balance: spentAmount,
+      unit:
+        (selectedMintUrl ? units[selectedMintUrl] : units[mintUrl]) || "sat",
     };
   }
 
@@ -509,74 +429,6 @@ export class CashuSpender {
     }
 
     return null;
-  }
-
-  /**
-   * Refund pending tokens and retry
-   */
-  async refundAndRetry(options: SpendOptions): Promise<SpendResult> {
-    const { mintUrl, baseUrl, retryCount, refundBaseUrls } = options;
-
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
-
-    const toRefund = refundBaseUrls
-      ? pendingDistribution.filter((p) => refundBaseUrls.includes(p.baseUrl))
-      : pendingDistribution.filter((p) => p.baseUrl !== baseUrl);
-
-    const refundResults = await Promise.allSettled(
-      toRefund.map(async (pending) => {
-        const token = this.storageAdapter.getToken(pending.baseUrl);
-        if (!token || !this.balanceManager || pending.baseUrl === baseUrl) {
-          // do not refund the current provider's token.
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-        const tokenBalance = await this.balanceManager.getTokenBalance(
-          token,
-          pending.baseUrl
-        );
-
-        if (tokenBalance.reserved > 0) {
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-
-        const result = await this.balanceManager.refund({
-          mintUrl,
-          baseUrl: pending.baseUrl,
-          token,
-        });
-
-        return { baseUrl: pending.baseUrl, success: result.success };
-      })
-    );
-
-    for (const result of refundResults) {
-      const refundResult =
-        result.status === "fulfilled"
-          ? result.value
-          : { baseUrl: "", success: false };
-      if (refundResult.success) {
-        this.storageAdapter.removeToken(refundResult.baseUrl);
-      }
-    }
-
-    const successfulRefunds = refundResults.filter(
-      (r) => r.status === "fulfilled" && r.value.success
-    ).length;
-
-    if (successfulRefunds > 0) {
-      this._logTransaction("refund", {
-        amount: toRefund.length,
-        mintUrl,
-        status: "success",
-        details: `Refunded ${successfulRefunds} of ${toRefund.length} tokens`,
-      });
-    }
-
-    return this._spendInternal({
-      ...options,
-      retryCount: (retryCount || 0) + 1,
-    });
   }
 
   /**
@@ -669,110 +521,6 @@ export class CashuSpender {
     }
 
     return results;
-  }
-
-  /**
-   * Find an alternate mint that the provider accepts
-   */
-  private async _findAlternateMint(
-    options: SpendOptions,
-    balances: Record<string, number>,
-    units: Record<string, "sat" | "msat">,
-    providerMints: string[]
-  ): Promise<SpendResult | null> {
-    const { amount, excludeMints } = options;
-    const adjustedAmount = Math.ceil(amount) + 2; // Add fee for unsupported mint
-
-    const extendedExcludes = [...(excludeMints || [])];
-
-    while (true) {
-      const { selectedMintUrl } = selectMintWithBalance(
-        balances,
-        units,
-        adjustedAmount,
-        extendedExcludes
-      );
-
-      if (!selectedMintUrl) break;
-
-      if (providerMints.includes(selectedMintUrl)) {
-        // Found an acceptable mint
-        try {
-          const token = await this.walletAdapter.sendToken(
-            selectedMintUrl,
-            adjustedAmount
-          );
-
-          if (options.baseUrl) {
-            this.storageAdapter.setToken(options.baseUrl, token);
-          }
-
-          return {
-            token,
-            status: "success",
-            balance: adjustedAmount,
-            unit: units[selectedMintUrl] || "sat",
-          };
-        } catch (error) {
-          // Continue to next mint
-          extendedExcludes.push(selectedMintUrl);
-        }
-      } else {
-        extendedExcludes.push(selectedMintUrl);
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Handle send errors with retry logic for network errors
-   */
-  private async _handleSendError(
-    error: unknown,
-    options: SpendOptions,
-    balances: Record<string, number>,
-    units: Record<string, string>
-  ): Promise<SpendResult> {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-
-    // Check for network errors
-    const isNetworkError =
-      error instanceof Error && isNetworkErrorMessage(error.message);
-
-    if (isNetworkError) {
-      const { mintUrl, amount, baseUrl, p2pkPubkey, excludeMints, retryCount } =
-        options;
-
-      // Try alternate mint
-      const extendedExcludes = [...(excludeMints || []), mintUrl];
-      const { selectedMintUrl } = selectMintWithBalance(
-        balances,
-        units,
-        Math.ceil(amount),
-        extendedExcludes
-      );
-
-      if (selectedMintUrl && (retryCount || 0) < Object.keys(balances).length) {
-        return this._spendInternal({
-          ...options,
-          mintUrl: selectedMintUrl,
-          excludeMints: extendedExcludes,
-          retryCount: (retryCount || 0) + 1,
-        });
-      }
-
-      // No more alternate mints
-      throw new MintUnreachableError(mintUrl);
-    }
-
-    // Other errors
-    return {
-      token: null,
-      status: "failed",
-      balance: 0,
-      error: `Error generating token: ${errorMsg}`,
-    };
   }
 
   /**

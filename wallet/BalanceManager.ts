@@ -67,6 +67,23 @@ export interface TopUpOptions {
   token?: string;
 }
 
+export interface CreateProviderTokenOptions {
+  mintUrl: string;
+  baseUrl: string;
+  amount: number;
+  p2pkPubkey?: string;
+  excludeMints?: string[];
+  retryCount?: number;
+}
+
+export interface ProviderTokenResult {
+  success: boolean;
+  token?: string;
+  error?: string;
+  selectedMintUrl?: string;
+  amountSpent?: number;
+}
+
 /**
  * BalanceManager handles token refunds and topups from providers
  */
@@ -309,7 +326,7 @@ export class BalanceManager {
     let requestId: string | undefined;
 
     try {
-      const tokenResult = await this._createTopUpToken({
+      const tokenResult = await this.createProviderToken({
         mintUrl,
         baseUrl,
         amount,
@@ -356,19 +373,16 @@ export class BalanceManager {
     }
   }
 
-  private async _createTopUpToken(options: {
-    mintUrl: string;
-    baseUrl: string;
-    amount: number;
-    retryCount?: number;
-    excludeMints?: string[];
-  }): Promise<{ success: boolean; token?: string; error?: string }> {
+  async createProviderToken(
+    options: CreateProviderTokenOptions
+  ): Promise<ProviderTokenResult> {
     const {
       mintUrl,
       baseUrl,
       amount,
       retryCount = 0,
       excludeMints = [],
+      p2pkPubkey,
     } = options;
 
     const adjustedAmount = Math.ceil(amount);
@@ -398,7 +412,7 @@ export class BalanceManager {
       retryCount < 1
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl);
-      return this._createTopUpToken({
+      return this.createProviderToken({
         ...options,
         retryCount: retryCount + 1,
       });
@@ -441,9 +455,15 @@ export class BalanceManager {
       try {
         const token = await this.walletAdapter.sendToken(
           candidateMint,
-          requiredAmount
+          requiredAmount,
+          p2pkPubkey
         );
-        return { success: true, token };
+        return {
+          success: true,
+          token,
+          selectedMintUrl: candidateMint,
+          amountSpent: requiredAmount,
+        };
       } catch (error) {
         if (error instanceof Error) {
           lastError = error.message;
@@ -836,12 +856,15 @@ export class BalanceManager {
           unit: "msat",
           apiKey: data.api_key,
         };
+      } else {
+        console.log(response.status);
       }
-    } catch {
+    } catch (error) {
+      console.error("ERRORR IN RESTPONSE", error);
       // Fall through to default
     }
 
-    return { amount: 0, reserved: 0, unit: "sat", apiKey: "" };
+    return { amount: -1, reserved: 0, unit: "sat", apiKey: "" };
   }
 
   /**

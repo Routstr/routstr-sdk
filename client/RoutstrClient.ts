@@ -471,25 +471,22 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}`
     );
 
-    if (this.mode === "xcashu" || this.mode === "lazyrefund") {
+    console.log(
+      `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
+    );
+    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+      params.token
+    );
+    if (tryReceiveTokenResult.success) {
       console.log(
-        `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
+        `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
       );
-      const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
-        params.token
+      tryNextProvider = true;
+      if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
+    } else {
+      console.log(
+        `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
       );
-      if (tryReceiveTokenResult.success) {
-        console.log(
-          `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
-        );
-        tryNextProvider = true;
-        if (this.mode === "lazyrefund")
-          this.storageAdapter.removeToken(baseUrl);
-      } else {
-        console.log(
-          `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
-        );
-      }
     }
 
     if (this.mode === "xcashu") {
@@ -1018,15 +1015,11 @@ export class RoutstrClient {
           );
         }
 
-        const apiKeyCreated = await this.balanceManager.getTokenBalance(
-          spendResult.token!,
-          baseUrl
-        );
         console.log(
-          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${apiKeyCreated.apiKey}, balance: ${apiKeyCreated.amount}`
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
         );
 
-        this.storageAdapter.setApiKey(baseUrl, apiKeyCreated.apiKey);
+        this.storageAdapter.setApiKey(baseUrl, spendResult.token!);
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       } else {
         console.log(
