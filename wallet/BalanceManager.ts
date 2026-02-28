@@ -16,6 +16,7 @@ import type {
   ProviderRegistry,
 } from "./interfaces";
 import type { RefundResult, TopUpResult } from "../core/types";
+import { InsufficientBalanceError } from "../core/errors";
 import {
   getBalanceInSats,
   isNetworkErrorMessage,
@@ -447,7 +448,26 @@ export class BalanceManager {
     }
 
     if (candidates.length === 0) {
-      return { success: false, error: "Insufficient balance to top up" };
+      let maxBalance = 0;
+      let maxMintUrl = "";
+      for (const mintUrl in balances) {
+        const balance = balances[mintUrl];
+        const unit = units[mintUrl];
+        const balanceInSats = getBalanceInSats(balance, unit);
+        if (balanceInSats > maxBalance) {
+          maxBalance = balanceInSats;
+          maxMintUrl = mintUrl;
+        }
+      }
+
+      const error = new InsufficientBalanceError(
+        adjustedAmount,
+        totalMintBalance,
+        maxBalance,
+        maxMintUrl
+      );
+
+      return { success: false, error: error.message };
     }
 
     let lastError: string | undefined;
@@ -858,6 +878,8 @@ export class BalanceManager {
         };
       } else {
         console.log(response.status);
+        const data = await response.json();
+        console.log("FAILED ", data);
       }
     } catch (error) {
       console.error("ERRORR IN RESTPONSE", error);

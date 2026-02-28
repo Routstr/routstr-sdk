@@ -199,9 +199,10 @@ export class RoutstrClient {
 
     const tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const satsSpent = await this._handlePostResponseBalanceUpdate({
       token,
-      baseUrl,
+      baseUrl: baseUrlUsed,
       initialTokenBalance: tokenBalanceInSats,
       response,
     });
@@ -474,19 +475,22 @@ export class RoutstrClient {
     console.log(
       `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
     );
-    const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
-      params.token
-    );
-    if (tryReceiveTokenResult.success) {
-      console.log(
-        `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+    if (params.token.startsWith("cashu")) {
+      const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+        params.token
       );
-      tryNextProvider = true;
-      if (this.mode === "lazyrefund") this.storageAdapter.removeToken(baseUrl);
-    } else {
-      console.log(
-        `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
-      );
+      if (tryReceiveTokenResult.success) {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+        );
+        tryNextProvider = true;
+        if (this.mode === "lazyrefund")
+          this.storageAdapter.removeToken(baseUrl);
+      } else {
+        console.log(
+          `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
+        );
+      }
     }
 
     if (this.mode === "xcashu") {
@@ -567,7 +571,6 @@ export class RoutstrClient {
         console.log(
           `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
         );
-        tryNextProvider = true;
       }
       if (!tryNextProvider)
         return this._makeRequest({
@@ -1009,6 +1012,9 @@ export class RoutstrClient {
             `[RoutstrClient] _spendToken: Failed to create Cashu token for API key creation, error:`,
             spendResult.error
           );
+          throw new Error(
+            `[RoutstrClient] _spendToken: Failed to create Cashu token for API key creation, error: ${spendResult.error}`
+          );
         } else {
           console.log(
             `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
@@ -1019,7 +1025,32 @@ export class RoutstrClient {
           `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
         );
 
-        this.storageAdapter.setApiKey(baseUrl, spendResult.token!);
+        try {
+          this.storageAdapter.setApiKey(baseUrl, spendResult.token);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes("ApiKey already exists")
+          ) {
+            const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+              spendResult.token
+            );
+            if (tryReceiveTokenResult.success) {
+              console.log(
+                `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+              );
+            } else {
+              console.log(
+                `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
+              );
+            }
+            console.log(
+              `[RoutstrClient] _spendToken: API key already exists for ${baseUrl}, using existing key`
+            );
+          } else {
+            throw error;
+          }
+        }
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       } else {
         console.log(
