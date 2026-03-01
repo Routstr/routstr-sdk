@@ -69,6 +69,7 @@ export interface SdkStorageStore extends SdkStorageState {
     }>
   ) => void;
   setRoutstr21Models: (value: string[]) => void;
+  setRoutstr21ModelsLastUpdate: (value: number | null) => void;
   setCachedReceiveTokens: (
     value: Array<{
       token: string;
@@ -250,6 +251,7 @@ export const createSdkStore = async ({
     apiKeys,
     childKeys,
     routstr21Models,
+    lastRoutstr21ModelsUpdate,
     cachedReceiveTokens,
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
@@ -373,6 +375,10 @@ export const createSdkStore = async ({
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
       set({ routstr21Models: value });
     },
+    setRoutstr21ModelsLastUpdate: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE, value);
+      set({ lastRoutstr21ModelsUpdate: value });
+    },
     setCachedReceiveTokens: (value) => {
       const normalized = value.map((entry) => ({
         token: entry.token,
@@ -418,6 +424,10 @@ export const createDiscoveryAdapterFromStore = (
     store.getState().setBaseUrlsLastUpdate(timestamp),
   getRoutstr21Models: () => store.getState().routstr21Models,
   setRoutstr21Models: (models) => store.getState().setRoutstr21Models(models),
+  getRoutstr21ModelsLastUpdate: () =>
+    store.getState().lastRoutstr21ModelsUpdate,
+  setRoutstr21ModelsLastUpdate: (timestamp) =>
+    store.getState().setRoutstr21ModelsLastUpdate(timestamp),
 });
 
 export const createStorageAdapterFromStore = (
