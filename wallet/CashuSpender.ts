@@ -46,11 +46,14 @@ export interface SpendOptions {
   refundBaseUrls?: string[];
 }
 
+type DebugLevel = "DEBUG" | "WARN" | "ERROR";
+
 /**
  * CashuSpender manages the spending of Cashu tokens
  */
 export class CashuSpender {
   private _isBusy = false;
+  private debugLevel: DebugLevel = "WARN";
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -149,6 +152,36 @@ export class CashuSpender {
     return this._isBusy;
   }
 
+  getDebugLevel(): DebugLevel {
+    return this.debugLevel;
+  }
+
+  setDebugLevel(level: DebugLevel): void {
+    this.debugLevel = level;
+  }
+
+  private _log(level: "DEBUG" | "WARN" | "ERROR", ...args: unknown[]): void {
+    const levelPriority: Record<DebugLevel, number> = {
+      DEBUG: 0,
+      WARN: 1,
+      ERROR: 2,
+    };
+
+    if (levelPriority[level] >= levelPriority[this.debugLevel]) {
+      switch (level) {
+        case "DEBUG":
+          console.log(...args);
+          break;
+        case "WARN":
+          console.warn(...args);
+          break;
+        case "ERROR":
+          console.error(...args);
+          break;
+      }
+    }
+  }
+
   /**
    * Spend Cashu tokens with automatic mint selection and retry logic
    * Throws errors on failure instead of returning failed SpendResult
@@ -229,14 +262,18 @@ export class CashuSpender {
       retryCount,
     } = options;
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[CashuSpender] _spendInternal: amount=${amount}, mintUrl=${mintUrl}, baseUrl=${baseUrl}, reuseToken=${reuseToken}`
     );
 
     // Validate amount
     let adjustedAmount = Math.ceil(amount);
     if (!adjustedAmount || isNaN(adjustedAmount)) {
-      console.error(`[CashuSpender] _spendInternal: Invalid amount: ${amount}`);
+      this._log(
+        "ERROR",
+        `[CashuSpender] _spendInternal: Invalid amount: ${amount}`
+      );
       return {
         token: null,
         status: "failed",
@@ -247,7 +284,8 @@ export class CashuSpender {
 
     // Try to get existing token for reuse
     if (reuseToken && baseUrl) {
-      console.log(
+      this._log(
+        "DEBUG",
         `[CashuSpender] _spendInternal: Attempting to reuse token for ${baseUrl}`
       );
       const existingResult = await this._tryReuseToken(
@@ -256,12 +294,14 @@ export class CashuSpender {
         mintUrl
       );
       if (existingResult) {
-        console.log(
+        this._log(
+          "DEBUG",
           `[CashuSpender] _spendInternal: Successfully reused token, balance: ${existingResult.balance}`
         );
         return existingResult;
       }
-      console.log(
+      this._log(
+        "DEBUG",
         `[CashuSpender] _spendInternal: Could not reuse token, will create new token`
       );
     }
@@ -287,7 +327,8 @@ export class CashuSpender {
       0
     );
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[CashuSpender] _spendInternal: totalBalance=${totalBalance}, totalPending=${totalPending}, adjustedAmount=${adjustedAmount}`
     );
 
@@ -295,7 +336,8 @@ export class CashuSpender {
 
     // Check total balance
     if (totalAvailableBalance < adjustedAmount) {
-      console.error(
+      this._log(
+        "ERROR",
         `[CashuSpender] _spendInternal: Insufficient balance, have=${totalAvailableBalance}, need=${adjustedAmount}`
       );
       return this._createInsufficientBalanceError(
@@ -372,7 +414,8 @@ export class CashuSpender {
       status: "success",
     });
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[CashuSpender] _spendInternal: Successfully spent ${spentAmount}, returning token with balance=${spentAmount}`
     );
 
@@ -402,7 +445,7 @@ export class CashuSpender {
     const balanceForBaseUrl =
       pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
-    console.log("RESUINGDSR GSODGNSD", balanceForBaseUrl, amount);
+    this._log("DEBUG", "RESUINGDSR GSODGNSD", balanceForBaseUrl, amount);
 
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
@@ -423,7 +466,7 @@ export class CashuSpender {
         baseUrl,
         amount: topUpAmount,
       });
-      console.log("TOPUP ", topUpResult);
+      this._log("DEBUG", "TOPUP ", topUpResult);
 
       if (topUpResult.success && topUpResult.toppedUpAmount) {
         const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
@@ -449,7 +492,7 @@ export class CashuSpender {
         baseUrl,
         storedToken
       );
-      console.log(providerBalance);
+      this._log("DEBUG", providerBalance);
       if (providerBalance <= 0) {
         this.storageAdapter.removeToken(baseUrl);
       }
@@ -478,7 +521,7 @@ export class CashuSpender {
     const refundResults = await Promise.allSettled(
       toRefund.map(async (pending) => {
         const token = this.storageAdapter.getToken(pending.baseUrl);
-        console.log(token, this.balanceManager);
+        this._log("DEBUG", token, this.balanceManager);
         if (!token || !this.balanceManager) {
           return { baseUrl: pending.baseUrl, success: false };
         }
@@ -497,7 +540,7 @@ export class CashuSpender {
           baseUrl: pending.baseUrl,
           token,
         });
-        console.log(result);
+        this._log("DEBUG", result);
 
         if (result.success) {
           this.storageAdapter.removeToken(pending.baseUrl);

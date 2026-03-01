@@ -49,6 +49,7 @@ export interface FetchOptions {
  */
 export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
+export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 0.7;
 
@@ -69,6 +70,7 @@ export class RoutstrClient {
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
   private mode: RoutstrClientMode;
+  private debugLevel: DebugLevel = "WARN";
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -99,6 +101,36 @@ export class RoutstrClient {
    */
   getMode(): RoutstrClientMode {
     return this.mode;
+  }
+
+  getDebugLevel(): DebugLevel {
+    return this.debugLevel;
+  }
+
+  setDebugLevel(level: DebugLevel): void {
+    this.debugLevel = level;
+  }
+
+  private _log(level: "DEBUG" | "WARN" | "ERROR", ...args: unknown[]): void {
+    const levelPriority: Record<DebugLevel, number> = {
+      DEBUG: 0,
+      WARN: 1,
+      ERROR: 2,
+    };
+
+    if (levelPriority[level] >= levelPriority[this.debugLevel]) {
+      switch (level) {
+        case "DEBUG":
+          console.log(...args);
+          break;
+        case "WARN":
+          console.warn(...args);
+          break;
+        case "ERROR":
+          console.error(...args);
+          break;
+      }
+    }
   }
 
   /**
@@ -171,7 +203,7 @@ export class RoutstrClient {
       amount: requiredSats,
       baseUrl,
     });
-    console.log(token, baseUrl);
+    this._log("DEBUG", token, baseUrl);
 
     let requestBody = body;
     if (body && typeof body === "object") {
@@ -402,7 +434,7 @@ export class RoutstrClient {
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
-      if (this.mode === "xcashu") console.log("HEADERS,", headers);
+      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
       const response = await fetch(url, {
         method,
         headers,
@@ -411,7 +443,7 @@ export class RoutstrClient {
             ? undefined
             : JSON.stringify(body),
       });
-      if (this.mode === "xcashu") console.log("response,", response);
+      if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
@@ -470,26 +502,30 @@ export class RoutstrClient {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}`
     );
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
     );
     if (params.token.startsWith("cashu")) {
-      const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+      const tryReceiveTokenResult = await this.cashuSpender.receiveToken(
         params.token
       );
       if (tryReceiveTokenResult.success) {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
         );
         tryNextProvider = true;
         if (this.mode === "lazyrefund")
           this.storageAdapter.removeToken(baseUrl);
       } else {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Failed to receive token. `
         );
       }
@@ -497,14 +533,16 @@ export class RoutstrClient {
 
     if (this.mode === "xcashu") {
       if (xCashuRefundToken) {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
         );
         try {
           const receiveResult =
-            await this.walletAdapter.receiveToken(xCashuRefundToken);
+            await this.cashuSpender.receiveToken(xCashuRefundToken);
           if (receiveResult.success) {
-            console.log(
+            this._log(
+              "DEBUG",
               `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
             );
             tryNextProvider = true;
@@ -516,7 +554,7 @@ export class RoutstrClient {
               requestId
             );
         } catch (error) {
-          console.error("[xcashu] Failed to receive refund token:", error);
+          this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
           throw new ProviderError(
             baseUrl,
             status,
@@ -546,7 +584,8 @@ export class RoutstrClient {
         amount: params.requiredSats * TOPUP_MARGIN,
         token: params.token,
       });
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
       );
 
@@ -559,18 +598,21 @@ export class RoutstrClient {
             ? parseInt(needMatch[1], 10)
             : params.requiredSats;
           const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
-          console.log(
+          this._log(
+            "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
           );
           throw new InsufficientBalanceError(required, available);
         } else {
-          console.log(
+          this._log(
+            "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Topup failed with non-insufficient-balance error, will try next provider`
           );
           tryNextProvider = true;
         }
       } else {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
         );
       }
@@ -594,7 +636,8 @@ export class RoutstrClient {
         status === 521) &&
       !tryNextProvider
     ) {
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Status ${status} (auth/server error), attempting refund for ${baseUrl}, mode=${this.mode}`
       );
       if (this.mode === "lazyrefund") {
@@ -605,7 +648,8 @@ export class RoutstrClient {
             baseUrl,
             token: params.token,
           });
-          console.log(
+          this._log(
+            "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Lazyrefund result: success=${refundResult.success}`
           );
           if (refundResult.success) this.storageAdapter.removeToken(baseUrl);
@@ -625,14 +669,16 @@ export class RoutstrClient {
           );
         }
       } else if (this.mode === "apikeys") {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
         );
         const initialBalance = await this.balanceManager.getTokenBalance(
           token,
           baseUrl
         );
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${initialBalance.amount}`
         );
         const refundResult = await this.balanceManager.refundApiKey({
@@ -640,7 +686,8 @@ export class RoutstrClient {
           baseUrl,
           apiKey: token,
         });
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
         if (!refundResult.success && initialBalance.amount > 0) {
@@ -656,7 +703,8 @@ export class RoutstrClient {
     }
 
     this.providerManager.markFailed(baseUrl);
-    console.log(
+    this._log(
+      "DEBUG",
       `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed`
     );
 
@@ -674,7 +722,8 @@ export class RoutstrClient {
     );
 
     if (nextProvider) {
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${selectedModel.id}`
       );
       // Get new model for this provider
@@ -696,7 +745,8 @@ export class RoutstrClient {
         params.maxTokens
       );
 
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
       );
       const spendResult = await this._spendToken({
@@ -743,12 +793,12 @@ export class RoutstrClient {
       if (refundToken) {
         try {
           const receiveResult =
-            await this.walletAdapter.receiveToken(refundToken);
+            await this.cashuSpender.receiveToken(refundToken);
           satsSpent =
             initialTokenBalance -
             receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
         } catch (error) {
-          console.error("[xcashu] Failed to receive refund token:", error);
+          this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
         }
       }
     } else if (this.mode === "lazyrefund") {
@@ -768,7 +818,8 @@ export class RoutstrClient {
           token,
           baseUrl
         );
-        console.log(
+        this._log(
+          "DEBUG",
           "LATEST Balance",
           latestBalanceInfo.amount,
           latestBalanceInfo.reserved,
@@ -783,7 +834,7 @@ export class RoutstrClient {
         this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
         satsSpent = initialTokenBalance - latestTokenBalance;
       } catch (e) {
-        console.warn("Could not get updated API key balance:", e);
+        this._log("WARN", "Could not get updated API key balance:", e);
         satsSpent = fallbackSatsSpent ?? initialTokenBalance;
       }
     }
@@ -938,7 +989,7 @@ export class RoutstrClient {
    * Handle errors and notify callbacks
    */
   private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
-    console.error("[RoutstrClient] _handleError: Error occurred", error);
+    this._log("ERROR", "[RoutstrClient] _handleError: Error occurred", error);
 
     if (error instanceof Error) {
       const isStreamError =
@@ -948,7 +999,8 @@ export class RoutstrClient {
         ? "AI stream was cut off, turn on Keep Active or please try again"
         : error.message;
 
-      console.error(
+      this._log(
+        "ERROR",
         `[RoutstrClient] _handleError: Error type=${error.constructor.name}, message=${modifiedErrorMsg}, isStreamError=${isStreamError}`
       );
 
@@ -993,14 +1045,16 @@ export class RoutstrClient {
   }> {
     const { mintUrl, amount, baseUrl } = params;
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[RoutstrClient] _spendToken: mode=${this.mode}, amount=${amount}, baseUrl=${baseUrl}, mintUrl=${mintUrl}`
     );
 
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       if (!parentApiKey) {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
         );
         const spendResult = await this.cashuSpender.spend({
@@ -1011,7 +1065,8 @@ export class RoutstrClient {
         });
 
         if (!spendResult.token) {
-          console.error(
+          this._log(
+            "ERROR",
             `[RoutstrClient] _spendToken: Failed to create Cashu token for API key creation, error:`,
             spendResult.error
           );
@@ -1019,12 +1074,14 @@ export class RoutstrClient {
             `[RoutstrClient] _spendToken: Failed to create Cashu token for API key creation, error: ${spendResult.error}`
           );
         } else {
-          console.log(
+          this._log(
+            "DEBUG",
             `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
           );
         }
 
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
         );
 
@@ -1035,19 +1092,22 @@ export class RoutstrClient {
             error instanceof Error &&
             error.message.includes("ApiKey already exists")
           ) {
-            const tryReceiveTokenResult = await this.walletAdapter.receiveToken(
+            const tryReceiveTokenResult = await this.cashuSpender.receiveToken(
               spendResult.token
             );
             if (tryReceiveTokenResult.success) {
-              console.log(
+              this._log(
+                "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
               );
             } else {
-              console.log(
+              this._log(
+                "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
               );
             }
-            console.log(
+            this._log(
+              "DEBUG",
               `[RoutstrClient] _spendToken: API key already exists for ${baseUrl}, using existing key`
             );
           } else {
@@ -1056,7 +1116,8 @@ export class RoutstrClient {
         }
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       } else {
-        console.log(
+        this._log(
+          "DEBUG",
           `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}`
         );
       }
@@ -1081,11 +1142,12 @@ export class RoutstrClient {
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
         } catch (e) {
-          console.warn("Could not get initial API key balance:", e);
+          this._log("WARN", "Could not get initial API key balance:", e);
         }
       }
 
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _spendToken: Returning token with balance=${tokenBalance} ${tokenBalanceUnit}`
       );
 
@@ -1096,7 +1158,8 @@ export class RoutstrClient {
       };
     }
 
-    console.log(
+    this._log(
+      "DEBUG",
       `[RoutstrClient] _spendToken: Calling CashuSpender.spend for amount=${amount}, mintUrl=${mintUrl}, mode=${this.mode}`
     );
     const spendResult = await this.cashuSpender.spend({
@@ -1107,12 +1170,14 @@ export class RoutstrClient {
     });
 
     if (!spendResult.token) {
-      console.error(
+      this._log(
+        "ERROR",
         `[RoutstrClient] _spendToken: CashuSpender.spend failed, error:`,
         spendResult.error
       );
     } else {
-      console.log(
+      this._log(
+        "DEBUG",
         `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
     }

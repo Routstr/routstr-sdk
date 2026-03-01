@@ -17,6 +17,7 @@ import type {
 } from "./interfaces";
 import type { RefundResult, TopUpResult } from "../core/types";
 import { InsufficientBalanceError } from "../core/errors";
+import { CashuSpender } from "./CashuSpender";
 import {
   getBalanceInSats,
   isNetworkErrorMessage,
@@ -89,11 +90,25 @@ export interface ProviderTokenResult {
  * BalanceManager handles token refunds and topups from providers
  */
 export class BalanceManager {
+  private cashuSpender: CashuSpender;
+
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry?: ProviderRegistry
-  ) {}
+    private providerRegistry?: ProviderRegistry,
+    cashuSpender?: CashuSpender
+  ) {
+    if (cashuSpender) {
+      this.cashuSpender = cashuSpender;
+    } else {
+      this.cashuSpender = new CashuSpender(
+        walletAdapter,
+        storageAdapter,
+        providerRegistry,
+        this
+      );
+    }
+  }
 
   /**
    * Unified refund - handles both NIP-60 and legacy wallet refunds
@@ -142,7 +157,7 @@ export class BalanceManager {
       }
 
       // Receive the refunded token
-      const receiveResult = await this.walletAdapter.receiveToken(
+      const receiveResult = await this.cashuSpender.receiveToken(
         fetchResult.token
       );
       const totalAmountMsat =
@@ -203,7 +218,7 @@ export class BalanceManager {
         return { success: false, message: "No balance to refund" };
       }
 
-      const receiveResult = await this.walletAdapter.receiveToken(
+      const receiveResult = await this.cashuSpender.receiveToken(
         fetchResult.token
       );
       const totalAmountMsat =
@@ -798,7 +813,7 @@ export class BalanceManager {
    */
   private async _recoverFailedTopUp(cashuToken: string): Promise<void> {
     try {
-      await this.walletAdapter.receiveToken(cashuToken);
+      await this.cashuSpender.receiveToken(cashuToken);
     } catch (error) {
       console.error(
         "[BalanceManager._recoverFailedTopUp] Failed to recover token",
