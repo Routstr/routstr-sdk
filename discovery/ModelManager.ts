@@ -84,6 +84,7 @@ export class ModelManager {
       const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
       const cacheValid = lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
       if (cacheValid) {
+        await this.fetchRoutstr21Models();
         return this.filterBaseUrlsForTor(cachedUrls, torMode);
       }
     }
@@ -478,9 +479,20 @@ export class ModelManager {
 
   /**
    * Fetch routstr21 models from Nostr network (kind 38423)
+   * Uses cache if available and not expired
    * @returns Array of model IDs or empty array if not found
    */
-  async fetchRoutstr21Models(): Promise<string[]> {
+  async fetchRoutstr21Models(forceRefresh: boolean = false): Promise<string[]> {
+    // Check cache first
+    const cachedModels = this.adapter.getRoutstr21Models();
+    if (!forceRefresh && cachedModels.length > 0) {
+      const lastUpdate = this.adapter.getRoutstr21ModelsLastUpdate();
+      const cacheValid = lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+      if (cacheValid) {
+        return cachedModels;
+      }
+    }
+
     const DEFAULT_RELAYS = [
       "wss://relay.primal.net",
       "wss://nos.lol",
@@ -498,7 +510,9 @@ export class ModelManager {
           kinds: [38423],
           "#d": ["routstr-21-models"],
           limit: 1,
-          authors: ["4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8"]
+          authors: [
+            "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8",
+          ],
         })
         .pipe(
           onlyEvents(),
@@ -520,7 +534,7 @@ export class ModelManager {
     const timeline = localEventStore.getTimeline({ kinds: [38423] });
 
     if (timeline.length === 0) {
-      return [];
+      return cachedModels.length > 0 ? cachedModels : [];
     }
 
     const event = timeline[0];
@@ -529,13 +543,14 @@ export class ModelManager {
       const content = JSON.parse(event.content);
       const models = Array.isArray(content?.models) ? content.models : [];
       this.adapter.setRoutstr21Models(models);
+      this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
       return models;
     } catch {
       console.warn(
         "[Routstr21Models] Failed to parse Nostr event content:",
         event.id
       );
-      return [];
+      return cachedModels.length > 0 ? cachedModels : [];
     }
   }
 }

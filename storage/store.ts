@@ -99,6 +99,7 @@ export const createSdkStore = async ({
     rawApiKeys,
     rawChildKeys,
     rawRoutstr21Models,
+    rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
@@ -148,6 +149,10 @@ export const createSdkStore = async ({
       }>
     >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
+    driver.getItem<number | null>(
+      SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
+      null
+    ),
     driver.getItem<
       Array<{
         token: string;
@@ -220,8 +225,9 @@ export const createSdkStore = async ({
   }));
 
   const routstr21Models = rawRoutstr21Models;
+  const lastRoutstr21ModelsUpdate = rawLastRoutstr21ModelsUpdate;
 
-  const cachedReceiveTokens = rawCachedReceiveTokens.map((entry) => ({
+  const cachedReceiveTokens = rawCachedReceiveTokens?.map((entry) => ({
     token: entry.token,
     amount: entry.amount,
     unit: entry.unit || "sat",

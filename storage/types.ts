@@ -34,6 +34,7 @@ export interface SdkStorageState {
     createdAt: number;
   }>;
   routstr21Models: string[];
+  lastRoutstr21ModelsUpdate: number | null;
   cachedReceiveTokens: Array<{
     token: string;
     amount: number;

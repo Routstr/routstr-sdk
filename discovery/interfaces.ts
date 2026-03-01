@@ -114,4 +114,16 @@ export interface DiscoveryAdapter {
    * @param models Array of model IDs
    */
   setRoutstr21Models(models: string[]): void;
+
+  /**
+   * Get routstr21 models last update timestamp
+   * @returns Timestamp in milliseconds or null if never updated
+   */
+  getRoutstr21ModelsLastUpdate(): number | null;
+
+  /**
+   * Set routstr21 models last update timestamp
+   * @param timestamp Timestamp in milliseconds
+   */
+  setRoutstr21ModelsLastUpdate(timestamp: number): void;
 }
