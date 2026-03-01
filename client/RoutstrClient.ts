@@ -451,6 +451,12 @@ export class RoutstrClient {
       if (!response.ok) {
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
+        let bodyText: string | undefined;
+        try {
+          bodyText = await response.text();
+        } catch (e) {
+          bodyText = undefined;
+        }
         return await this._handleErrorResponse(
           params,
           token,
@@ -458,7 +464,8 @@ export class RoutstrClient {
           requestId,
           this.mode === "xcashu"
             ? (response.headers.get("x-cashu") ?? undefined)
-            : undefined
+            : undefined,
+          bodyText
         );
       }
 
@@ -497,7 +504,8 @@ export class RoutstrClient {
     token: string,
     status: number,
     requestId?: string,
-    xCashuRefundToken?: string
+    xCashuRefundToken?: string,
+    responseBody?: string
   ): Promise<Response> {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
@@ -574,7 +582,8 @@ export class RoutstrClient {
     }
 
     if (
-      status === 402 &&
+      (status === 402 ||
+        (status === 413 && responseBody?.includes("Insufficient balance"))) &&
       !tryNextProvider &&
       (this.mode === "apikeys" || this.mode === "lazyrefund")
     ) {
