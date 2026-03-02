@@ -14,7 +14,7 @@ import type {
 } from "./wallet/interfaces";
 import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
-import { RoutstrClient } from "./client/RoutstrClient";
+import { RoutstrClient, type DebugLevel } from "./client/RoutstrClient";
 
 /**
  * Options for routeRequests function
@@ -44,6 +44,8 @@ export interface RouteRequestOptions {
   forceRefresh?: boolean;
   /** Optional: pre-initialized ModelManager (skips bootstrap if provided) */
   modelManager?: ModelManager;
+  /** Optional: set RoutstrClient debug level */
+  debugLevel?: DebugLevel;
 }
 
 /**
@@ -98,6 +100,7 @@ export async function routeRequests(
     torMode = false,
     forceRefresh = false,
     modelManager: providedModelManager,
+    debugLevel,
   } = options;
 
   // Use provided ModelManager or create a new one
@@ -194,6 +197,10 @@ export async function routeRequests(
     alertLevel,
     "apikeys"
   );
+
+  if (debugLevel) {
+    client.setDebugLevel(debugLevel);
+  }
 
   // Extract options from request body
   const maxTokens = extractMaxTokens(requestBody);

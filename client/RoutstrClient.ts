@@ -435,6 +435,7 @@ export class RoutstrClient {
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+      this._log("DEBUG", "HEADERS,", headers);
       const response = await fetch(url, {
         method,
         headers,
@@ -444,6 +445,7 @@ export class RoutstrClient {
             : JSON.stringify(body),
       });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
+      this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
@@ -587,6 +589,7 @@ export class RoutstrClient {
       !tryNextProvider &&
       (this.mode === "apikeys" || this.mode === "lazyrefund")
     ) {
+      console.log("RESPONSFE ", responseBody);
       const topupResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
