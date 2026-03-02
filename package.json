@@ -1,6 +1,6 @@
 {
   "name": "@routstr/sdk",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Framework-agnostic SDK for Routstr API interactions",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
