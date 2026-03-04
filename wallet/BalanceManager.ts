@@ -226,6 +226,10 @@ export class BalanceManager {
           ? receiveResult.amount
           : receiveResult.amount * 1000;
 
+      if (receiveResult.success) {
+        this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
+      }
+
       return {
         success: receiveResult.success,
         refundedAmount: totalAmountMsat,

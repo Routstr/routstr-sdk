@@ -708,8 +708,6 @@ export class RoutstrClient {
             status,
             refundResult.message ?? "Unknown error"
           );
-        } else {
-          this.storageAdapter.removeApiKey(baseUrl); // TODO: remove this after all nodes upgrade to 0.4.0
         }
       }
     }
