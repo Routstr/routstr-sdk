@@ -51,7 +51,7 @@ export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
-const TOPUP_MARGIN = 0.7;
+const TOPUP_MARGIN = 1.2;
 
 export interface RouteRequestParams {
   path: string;
@@ -840,8 +840,17 @@ export class RoutstrClient {
           latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
-        this.storageAdapter.updateChildKeyBalance(baseUrl, latestTokenBalance);
+
+        const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+        if (
+          storedApiKeyEntry?.key.startsWith("cashu") &&
+          latestBalanceInfo.apiKey
+        ) {
+          this.storageAdapter.removeApiKey(baseUrl);
+          this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+        }
         this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+
         satsSpent = initialTokenBalance - latestTokenBalance;
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
