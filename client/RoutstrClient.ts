@@ -584,12 +584,10 @@ export class RoutstrClient {
     }
 
     if (
-      (status === 402 ||
-        (status === 413 && responseBody?.includes("Insufficient balance"))) &&
+      status === 402 &&
       !tryNextProvider &&
       (this.mode === "apikeys" || this.mode === "lazyrefund")
     ) {
-      console.log("RESPONSFE ", responseBody);
       const topupResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
@@ -634,6 +632,55 @@ export class RoutstrClient {
           token: params.token,
           headers: this._withAuthHeader(params.baseHeaders, params.token),
         });
+    }
+
+    const isInsufficientBalance413 =
+      status === 413 && responseBody?.includes("Insufficient balance");
+
+    if (
+      isInsufficientBalance413 &&
+      !tryNextProvider &&
+      this.mode === "apikeys"
+    ) {
+      let retryToken = params.token;
+
+      try {
+        const latestBalanceInfo = await this.balanceManager.getTokenBalance(
+          params.token,
+          baseUrl
+        );
+        const latestTokenBalance =
+          latestBalanceInfo.unit === "msat"
+            ? latestBalanceInfo.amount / 1000
+            : latestBalanceInfo.amount;
+
+        if (latestBalanceInfo.apiKey) {
+          const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+          if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
+            if (storedApiKeyEntry) {
+              this.storageAdapter.removeApiKey(baseUrl);
+            }
+            this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+          }
+          retryToken = latestBalanceInfo.apiKey;
+        }
+
+        if (latestTokenBalance >= 0) {
+          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        }
+      } catch (error) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: Failed to refresh API key after 413 insufficient balance for ${baseUrl}`,
+          error
+        );
+      }
+
+      return this._makeRequest({
+        ...params,
+        token: retryToken,
+        headers: this._withAuthHeader(params.baseHeaders, retryToken),
+      });
     }
 
     if (

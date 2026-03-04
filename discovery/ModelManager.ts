@@ -65,7 +65,7 @@ export class ModelManager {
     const manager = new ModelManager(adapter, config);
     const torMode = options.torMode ?? false;
     const forceRefresh = options.forceRefresh ?? false;
-    const providers = await manager.bootstrapProviders(torMode);
+    const providers = await manager.bootstrapProviders(torMode, forceRefresh);
     await manager.fetchModels(providers, forceRefresh);
     return manager;
   }
@@ -74,18 +74,25 @@ export class ModelManager {
    * Bootstrap provider list from the provider directory
    * First tries to fetch from Nostr (kind 30421), falls back to HTTP
    * @param torMode Whether running in Tor context
+   * @param forceRefresh Ignore provider cache and refresh provider sources
    * @returns Array of provider base URLs
    * @throws ProviderBootstrapError if all providers fail to fetch
    */
-  async bootstrapProviders(torMode: boolean = false): Promise<string[]> {
+  async bootstrapProviders(
+    torMode: boolean = false,
+    forceRefresh: boolean = false
+  ): Promise<string[]> {
     // First try cache
-    const cachedUrls = this.adapter.getBaseUrlsList();
-    if (cachedUrls.length > 0) {
-      const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
-      const cacheValid = lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
-      if (cacheValid) {
-        await this.fetchRoutstr21Models();
-        return this.filterBaseUrlsForTor(cachedUrls, torMode);
+    if (!forceRefresh) {
+      const cachedUrls = this.adapter.getBaseUrlsList();
+      if (cachedUrls.length > 0) {
+        const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
+        const cacheValid =
+          lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+        if (cacheValid) {
+          await this.fetchRoutstr21Models(forceRefresh);
+          return this.filterBaseUrlsForTor(cachedUrls, torMode);
+        }
       }
     }
 
@@ -96,7 +103,7 @@ export class ModelManager {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await this.fetchRoutstr21Models();
+        await this.fetchRoutstr21Models(forceRefresh);
         return filtered;
       }
     } catch (e) {
@@ -104,7 +111,7 @@ export class ModelManager {
     }
 
     // Fall back to HTTP
-    return this.bootstrapFromHttp(torMode);
+    return this.bootstrapFromHttp(torMode, forceRefresh);
   }
 
   /**
@@ -226,9 +233,13 @@ export class ModelManager {
   /**
    * Bootstrap providers from HTTP endpoint
    * @param torMode Whether running in Tor context
+   * @param forceRefresh Ignore routstr21 cache and fetch fresh data
    * @returns Array of provider base URLs
    */
-  private async bootstrapFromHttp(torMode: boolean): Promise<string[]> {
+  private async bootstrapFromHttp(
+    torMode: boolean,
+    forceRefresh: boolean = false
+  ): Promise<string[]> {
     try {
       const res = await fetch(this.providerDirectoryUrl);
       if (!res.ok) {
@@ -262,7 +273,7 @@ export class ModelManager {
       if (list.length > 0) {
         this.adapter.setBaseUrlsList(list);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await this.fetchRoutstr21Models();
+        await this.fetchRoutstr21Models(forceRefresh);
       }
 
       return list;
