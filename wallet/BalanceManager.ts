@@ -899,6 +899,12 @@ export class BalanceManager {
         console.log(response.status);
         const data = await response.json();
         console.log("FAILED ", data);
+        return {
+          amount: -1,
+          reserved: data.reserved ?? 0,
+          unit: "msat",
+          apiKey: data.api_key,
+        };
       }
     } catch (error) {
       console.error("ERRORR IN RESTPONSE", error);
