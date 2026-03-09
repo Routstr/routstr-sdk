@@ -429,6 +429,7 @@ export class RoutstrClient {
     maxTokens?: number;
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
+    retryCount?: number;
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers } = params;
 
@@ -467,7 +468,8 @@ export class RoutstrClient {
           this.mode === "xcashu"
             ? (response.headers.get("x-cashu") ?? undefined)
             : undefined,
-          bodyText
+          bodyText,
+          params.retryCount ?? 0
         );
       }
 
@@ -478,7 +480,11 @@ export class RoutstrClient {
         return await this._handleErrorResponse(
           params,
           token,
-          -1 // just for Network Error to skip all statuses
+          -1, // just for Network Error to skip all statuses
+          undefined,
+          undefined,
+          undefined,
+          params.retryCount ?? 0
         );
         // return await this._handleNetworkError(error, params);
       }
@@ -507,8 +513,10 @@ export class RoutstrClient {
     status: number,
     requestId?: string,
     xCashuRefundToken?: string,
-    responseBody?: string
+    responseBody?: string,
+    retryCount: number = 0
   ): Promise<Response> {
+    const MAX_RETRIES_PER_PROVIDER = 2;
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
 
@@ -626,12 +634,26 @@ export class RoutstrClient {
           `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
         );
       }
-      if (!tryNextProvider)
-        return this._makeRequest({
-          ...params,
-          token: params.token,
-          headers: this._withAuthHeader(params.baseHeaders, params.token),
-        });
+      if (!tryNextProvider) {
+        if (retryCount < MAX_RETRIES_PER_PROVIDER) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
+          );
+          return this._makeRequest({
+            ...params,
+            token: params.token,
+            headers: this._withAuthHeader(params.baseHeaders, params.token),
+            retryCount: retryCount + 1,
+          });
+        } else {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: 402 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
+          );
+          tryNextProvider = true;
+        }
+      }
     }
 
     const isInsufficientBalance413 =
@@ -676,11 +698,24 @@ export class RoutstrClient {
         );
       }
 
-      return this._makeRequest({
-        ...params,
-        token: retryToken,
-        headers: this._withAuthHeader(params.baseHeaders, retryToken),
-      });
+      if (retryCount < MAX_RETRIES_PER_PROVIDER) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: Retrying 413 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
+        );
+        return this._makeRequest({
+          ...params,
+          token: retryToken,
+          headers: this._withAuthHeader(params.baseHeaders, retryToken),
+          retryCount: retryCount + 1,
+        });
+      } else {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: 413 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
+        );
+        tryNextProvider = true;
+      }
     }
 
     if (
@@ -812,7 +847,7 @@ export class RoutstrClient {
         baseUrl: nextProvider,
       });
 
-      // Retry with new provider
+      // Retry with new provider (reset retry count)
       return this._makeRequest({
         ...params,
         path,
@@ -823,6 +858,7 @@ export class RoutstrClient {
         token: spendResult.token!,
         requiredSats: newRequiredSats,
         headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
+        retryCount: 0,
       });
     }
 
