@@ -671,24 +671,35 @@ export class RoutstrClient {
           params.token,
           baseUrl
         );
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
-            ? latestBalanceInfo.amount / 1000
-            : latestBalanceInfo.amount;
 
-        if (latestBalanceInfo.apiKey) {
-          const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
-          if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-            if (storedApiKeyEntry) {
-              this.storageAdapter.removeApiKey(baseUrl);
+        // Handle invalid/expired API key - delete and fail over
+        if (latestBalanceInfo.isInvalidApiKey) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Invalid API key (proofs already spent), removing for ${baseUrl}`
+          );
+          this.storageAdapter.removeApiKey(baseUrl);
+          tryNextProvider = true;
+        } else {
+          const latestTokenBalance =
+            latestBalanceInfo.unit === "msat"
+              ? latestBalanceInfo.amount / 1000
+              : latestBalanceInfo.amount;
+
+          if (latestBalanceInfo.apiKey) {
+            const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+            if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
+              if (storedApiKeyEntry) {
+                this.storageAdapter.removeApiKey(baseUrl);
+              }
+              this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
             }
-            this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+            retryToken = latestBalanceInfo.apiKey;
           }
-          retryToken = latestBalanceInfo.apiKey;
-        }
 
-        if (latestTokenBalance >= 0) {
-          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+          if (latestTokenBalance >= 0) {
+            this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+          }
         }
       } catch (error) {
         this._log(

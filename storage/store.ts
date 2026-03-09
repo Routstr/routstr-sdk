@@ -9,7 +9,7 @@ import type { StorageDriver, SdkStorageState } from "./types";
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
-const getTokenBalance = (token: string): number => {
+const getCashuTokenBalance = (token: string): number => {
   try {
     const decoded = getDecodedToken(token);
     const unitDivisor = decoded.unit === "msat" ? 1000 : 1;
@@ -205,7 +205,7 @@ export const createSdkStore = async ({
     balance:
       typeof entry.balance === "number"
         ? entry.balance
-        : getTokenBalance(entry.token),
+        : getCashuTokenBalance(entry.token),
     lastUsed: entry.lastUsed ?? null,
   }));
 
@@ -321,7 +321,7 @@ export const createSdkStore = async ({
           balance:
             typeof entry.balance === "number"
               ? entry.balance
-              : getTokenBalance(entry.token),
+              : getCashuTokenBalance(entry.token),
           lastUsed: entry.lastUsed ?? null,
         }));
         void driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
@@ -452,7 +452,7 @@ export const createStorageAdapterFromStore = (
   setToken: (baseUrl, token) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().cachedTokens;
-    const balance = getTokenBalance(token);
+    const balance = getCashuTokenBalance(token);
     const existingIndex = tokens.findIndex(
       (entry) => entry.baseUrl === normalized
     );

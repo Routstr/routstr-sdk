@@ -878,6 +878,7 @@ export class BalanceManager {
     reserved: number;
     unit: "sat" | "msat";
     apiKey: string;
+    isInvalidApiKey?: boolean;
   }> {
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
@@ -899,11 +900,19 @@ export class BalanceManager {
         console.log(response.status);
         const data = await response.json();
         console.log("FAILED ", data);
+
+        // Check for invalid/expired API key error (proofs already spent)
+        const isInvalidApiKey =
+          response.status === 401 &&
+          data?.code === "invalid_api_key" &&
+          data?.message?.includes("proofs already spent");
+
         return {
           amount: -1,
           reserved: data.reserved ?? 0,
           unit: "msat",
           apiKey: data.api_key,
+          isInvalidApiKey,
         };
       }
     } catch (error) {
