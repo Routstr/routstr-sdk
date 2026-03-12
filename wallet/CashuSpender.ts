@@ -112,14 +112,14 @@ export class CashuSpender {
     const providerBalances: Record<string, number> = {};
     let totalProviderBalance = 0;
     for (const pending of pendingDistribution) {
-      providerBalances[pending.baseUrl] = pending.amount;
+      providerBalances[pending.baseUrl] += pending.amount;
       totalProviderBalance += pending.amount;
     }
 
     const apiKeys = this.storageAdapter.getAllApiKeys();
     for (const apiKey of apiKeys) {
       if (!providerBalances[apiKey.baseUrl]) {
-        providerBalances[apiKey.baseUrl] = apiKey.balance;
+        providerBalances[apiKey.baseUrl] += apiKey.balance;
         totalProviderBalance += apiKey.balance;
       }
     }
@@ -306,33 +306,14 @@ export class CashuSpender {
       );
     }
 
-    // Get current balances
-    const balances = await this.walletAdapter.getBalances();
-    const units = this.walletAdapter.getMintUnits();
-
-    // Calculate total available balance
-    let totalBalance = 0;
-    for (const url in balances) {
-      const balance = balances[url];
-      const unit = units[url];
-      const balanceInSats = getBalanceInSats(balance, unit);
-      totalBalance += balanceInSats;
-    }
-
-    // Check pending tokens
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
-    const totalPending = pendingDistribution.reduce(
-      (sum, item) => sum + item.amount,
-      0
-    );
+    // Get current balance state
+    const balanceState = await this._getBalanceState();
+    const totalAvailableBalance = balanceState.totalBalance;
 
     this._log(
       "DEBUG",
-      `[CashuSpender] _spendInternal: totalBalance=${totalBalance}, totalPending=${totalPending}, adjustedAmount=${adjustedAmount}`
+      `[CashuSpender] _spendInternal: totalAvailableBalance=${totalAvailableBalance}, adjustedAmount=${adjustedAmount}`
     );
-
-    const totalAvailableBalance = totalBalance + totalPending;
 
     // Check total balance
     if (totalAvailableBalance < adjustedAmount) {
@@ -342,8 +323,7 @@ export class CashuSpender {
       );
       return this._createInsufficientBalanceError(
         adjustedAmount,
-        balances,
-        units,
+        balanceState.mintBalances,
         totalAvailableBalance
       );
     }
@@ -366,8 +346,7 @@ export class CashuSpender {
         if ((tokenResult.error || "").includes("Insufficient balance")) {
           return this._createInsufficientBalanceError(
             adjustedAmount,
-            balances,
-            units,
+            balanceState.mintBalances,
             totalAvailableBalance
           );
         }
@@ -418,6 +397,8 @@ export class CashuSpender {
       "DEBUG",
       `[CashuSpender] _spendInternal: Successfully spent ${spentAmount}, returning token with balance=${spentAmount}`
     );
+
+    const units = this.walletAdapter.getMintUnits();
 
     return {
       token,
@@ -598,17 +579,14 @@ export class CashuSpender {
    */
   private _createInsufficientBalanceError(
     required: number,
-    balances: Record<string, number>,
-    units: Record<string, string>,
+    normalizedBalances: Record<string, number>,
     availableBalance?: number
   ): SpendResult {
     let maxBalance = 0;
     let maxMintUrl = "";
 
-    for (const mintUrl in balances) {
-      const balance = balances[mintUrl];
-      const unit = units[mintUrl];
-      const balanceInSats = getBalanceInSats(balance, unit);
+    for (const mintUrl in normalizedBalances) {
+      const balanceInSats = normalizedBalances[mintUrl];
 
       if (balanceInSats > maxBalance) {
         maxBalance = balanceInSats;
