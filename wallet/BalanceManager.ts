@@ -86,6 +86,12 @@ export interface ProviderTokenResult {
   amountSpent?: number;
 }
 
+export interface BalanceState {
+  totalBalance: number;
+  providerBalances: Record<string, number>;
+  mintBalances: Record<string, number>;
+}
+
 /**
  * BalanceManager handles token refunds and topups from providers
  */
@@ -108,6 +114,46 @@ export class BalanceManager {
         this
       );
     }
+  }
+
+  async getBalanceState(): Promise<BalanceState> {
+    const mintBalances = await this.walletAdapter.getBalances();
+    const units = this.walletAdapter.getMintUnits();
+
+    let totalMintBalance = 0;
+    const normalizedMintBalances: Record<string, number> = {};
+    for (const url in mintBalances) {
+      const balance = mintBalances[url];
+      const unit = units[url];
+      const balanceInSats = getBalanceInSats(balance, unit);
+      normalizedMintBalances[url] = balanceInSats;
+      totalMintBalance += balanceInSats;
+    }
+
+    const pendingDistribution =
+      this.storageAdapter.getCachedTokenDistribution();
+    const providerBalances: Record<string, number> = {};
+    let totalProviderBalance = 0;
+    for (const pending of pendingDistribution) {
+      providerBalances[pending.baseUrl] =
+        (providerBalances[pending.baseUrl] || 0) + pending.amount;
+      totalProviderBalance += pending.amount;
+    }
+
+    const apiKeys = this.storageAdapter.getAllApiKeys();
+    for (const apiKey of apiKeys) {
+      if (!providerBalances[apiKey.baseUrl]) {
+        providerBalances[apiKey.baseUrl] = 0;
+      }
+      providerBalances[apiKey.baseUrl] += apiKey.balance;
+      totalProviderBalance += apiKey.balance;
+    }
+
+    return {
+      totalBalance: totalMintBalance + totalProviderBalance,
+      providerBalances,
+      mintBalances: normalizedMintBalances,
+    };
   }
 
   /**

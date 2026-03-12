@@ -94,6 +94,10 @@ export class CashuSpender {
     providerBalances: Record<string, number>;
     mintBalances: Record<string, number>;
   }> {
+    if (this.balanceManager) {
+      return this.balanceManager.getBalanceState();
+    }
+
     const mintBalances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
 
@@ -112,16 +116,18 @@ export class CashuSpender {
     const providerBalances: Record<string, number> = {};
     let totalProviderBalance = 0;
     for (const pending of pendingDistribution) {
-      providerBalances[pending.baseUrl] += pending.amount;
+      providerBalances[pending.baseUrl] =
+        (providerBalances[pending.baseUrl] || 0) + pending.amount;
       totalProviderBalance += pending.amount;
     }
 
     const apiKeys = this.storageAdapter.getAllApiKeys();
     for (const apiKey of apiKeys) {
       if (!providerBalances[apiKey.baseUrl]) {
-        providerBalances[apiKey.baseUrl] += apiKey.balance;
-        totalProviderBalance += apiKey.balance;
+        providerBalances[apiKey.baseUrl] = 0;
       }
+      providerBalances[apiKey.baseUrl] += apiKey.balance;
+      totalProviderBalance += apiKey.balance;
     }
 
     return {
