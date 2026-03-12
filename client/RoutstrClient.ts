@@ -596,10 +596,42 @@ export class RoutstrClient {
       !tryNextProvider &&
       (this.mode === "apikeys" || this.mode === "lazyrefund")
     ) {
+      this.storageAdapter.getApiKey(baseUrl);
+
+      let topupAmount = params.requiredSats;
+
+      try {
+        let currentBalance = 0;
+
+        if (this.mode === "apikeys") {
+          const currentBalanceInfo = await this.balanceManager.getTokenBalance(
+            params.token,
+            baseUrl
+          );
+          currentBalance =
+            currentBalanceInfo.unit === "msat"
+              ? currentBalanceInfo.amount / 1000
+              : currentBalanceInfo.amount;
+        } else if (this.mode === "lazyrefund") {
+          const distribution = this.storageAdapter.getCachedTokenDistribution();
+          const tokenEntry = distribution.find((t) => t.baseUrl === baseUrl);
+          currentBalance = tokenEntry?.amount ?? 0;
+        }
+
+        const shortfall = Math.max(0, params.requiredSats - currentBalance);
+        topupAmount = shortfall > 0 ? shortfall : params.requiredSats;
+      } catch (e) {
+        this._log(
+          "WARN",
+          "Could not get current token balance for topup calculation:",
+          e
+        );
+      }
+
       const topupResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
-        amount: params.requiredSats * TOPUP_MARGIN,
+        amount: topupAmount * TOPUP_MARGIN,
         token: params.token,
       });
       this._log(
@@ -698,7 +730,10 @@ export class RoutstrClient {
           }
 
           if (latestTokenBalance >= 0) {
-            this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+            this.storageAdapter.updateApiKeyBalance(
+              baseUrl,
+              latestTokenBalance
+            );
           }
         }
       } catch (error) {
