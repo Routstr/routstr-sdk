@@ -100,197 +100,23 @@ export interface SdkStorageStore extends SdkStorageState {
 /** Store type returned after async initialization */
 export type SdkStore = StoreApi<SdkStorageStore>;
 
-export const createSdkStore = async ({
-  driver,
-}: SdkStoreOptions): Promise<SdkStore> => {
-  // Hydrate all initial state from the async driver in parallel
-  const [
-    rawModels,
-    lastUsedModel,
-    rawBaseUrls,
-    lastBaseUrlsUpdate,
-    rawDisabledProviders,
-    rawMints,
-    rawInfo,
-    rawLastModelsUpdate,
-    rawCachedTokens,
-    rawApiKeys,
-    rawChildKeys,
-    rawRoutstr21Models,
-    rawLastRoutstr21ModelsUpdate,
-    rawCachedReceiveTokens,
-    rawUsageTracking,
-  ] = await Promise.all([
-    driver.getItem<Record<string, Model[]>>(
-      SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
-      {}
-    ),
-    driver.getItem<string | null>(SDK_STORAGE_KEYS.LAST_USED_MODEL, null),
-    driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
-    driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
-    driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
-    driver.getItem<Record<string, string[]>>(
-      SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
-      {}
-    ),
-    driver.getItem<Record<string, ProviderInfo>>(
-      SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS,
-      {}
-    ),
-    driver.getItem<Record<string, number>>(
-      SDK_STORAGE_KEYS.LAST_MODELS_UPDATE,
-      {}
-    ),
-    driver.getItem<
-      Array<{
-        baseUrl: string;
-        token: string;
-        balance?: number;
-        lastUsed?: number | null;
-      }>
-    >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, []),
-    driver.getItem<
-      Array<{
-        baseUrl: string;
-        key: string;
-        balance?: number;
-        lastUsed?: number | null;
-      }>
-    >(SDK_STORAGE_KEYS.API_KEYS, []),
-    driver.getItem<
-      Array<{
-        parentBaseUrl: string;
-        childKey: string;
-        balance?: number;
-        balanceLimit?: number;
-        validityDate?: number;
-        createdAt?: number;
-      }>
-    >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
-    driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
-    driver.getItem<number | null>(
-      SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
-      null
-    ),
-    driver.getItem<
-      Array<{
-        token: string;
-        amount: number;
-        unit: "sat" | "msat";
-        createdAt?: number;
-      }>
-    >(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
-    driver.getItem<
-      Array<{
-        id: string;
-        timestamp: number;
-        modelId: string;
-        baseUrl: string;
-        requestId: string;
-        cost: number;
-        satsCost: number;
-        promptTokens: number;
-        completionTokens: number;
-        totalTokens: number;
-        client?: string;
-        sessionId?: string;
-        tags?: string[];
-      }>
-    >(SDK_STORAGE_KEYS.USAGE_TRACKING, []),
-  ]);
-
-  // Normalize all hydrated state
-  const modelsFromAllProviders = Object.fromEntries(
-    Object.entries(rawModels).map(([baseUrl, models]) => [
-      normalizeBaseUrl(baseUrl),
-      models,
-    ])
-  );
-
-  const baseUrlsList = rawBaseUrls.map((url) => normalizeBaseUrl(url));
-
-  const disabledProviders = rawDisabledProviders.map((url) =>
-    normalizeBaseUrl(url)
-  );
-
-  const mintsFromAllProviders = Object.fromEntries(
-    Object.entries(rawMints).map(([baseUrl, mints]) => [
-      normalizeBaseUrl(baseUrl),
-      mints.map((mint) => (mint.endsWith("/") ? mint.slice(0, -1) : mint)),
-    ])
-  );
-
-  const infoFromAllProviders = Object.fromEntries(
-    Object.entries(rawInfo).map(([baseUrl, info]) => [
-      normalizeBaseUrl(baseUrl),
-      info,
-    ])
-  );
-
-  const lastModelsUpdate = Object.fromEntries(
-    Object.entries(rawLastModelsUpdate).map(([baseUrl, timestamp]) => [
-      normalizeBaseUrl(baseUrl),
-      timestamp,
-    ])
-  );
-
-  const cachedTokens = rawCachedTokens.map((entry) => ({
-    ...entry,
-    baseUrl: normalizeBaseUrl(entry.baseUrl),
-    balance:
-      typeof entry.balance === "number"
-        ? entry.balance
-        : getCashuTokenBalance(entry.token),
-    lastUsed: entry.lastUsed ?? null,
-  }));
-
-  const apiKeys = rawApiKeys.map((entry) => ({
-    ...entry,
-    baseUrl: normalizeBaseUrl(entry.baseUrl),
-    balance: entry.balance ?? 0,
-    lastUsed: entry.lastUsed ?? null,
-  }));
-
-  const childKeys = rawChildKeys.map((entry) => ({
-    parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
-    childKey: entry.childKey,
-    balance: entry.balance ?? 0,
-    balanceLimit: entry.balanceLimit,
-    validityDate: entry.validityDate,
-    createdAt: entry.createdAt ?? Date.now(),
-  }));
-
-  const routstr21Models = rawRoutstr21Models;
-  const lastRoutstr21ModelsUpdate = rawLastRoutstr21ModelsUpdate;
-
-  const cachedReceiveTokens = rawCachedReceiveTokens?.map((entry) => ({
-    token: entry.token,
-    amount: entry.amount,
-    unit: entry.unit || "sat",
-    createdAt: entry.createdAt ?? Date.now(),
-  }));
-
-  const usageTracking = rawUsageTracking;
-
-  // Create the store with hydrated state.
-  // All setters update in-memory state synchronously and persist to driver
-  // as fire-and-forget (no await on setItem).
-  return createStore<SdkStorageStore>((set, get) => ({
-    modelsFromAllProviders,
-    lastUsedModel,
-    baseUrlsList,
-    lastBaseUrlsUpdate,
-    disabledProviders,
-    mintsFromAllProviders,
-    infoFromAllProviders,
-    lastModelsUpdate,
-    cachedTokens,
-    apiKeys,
-    childKeys,
-    routstr21Models,
-    lastRoutstr21ModelsUpdate,
-    cachedReceiveTokens,
-    usageTracking,
+const createEmptyStore = (driver: StorageDriver): SdkStore =>
+  createStore<SdkStorageStore>((set, get) => ({
+    modelsFromAllProviders: {},
+    lastUsedModel: null,
+    baseUrlsList: [],
+    lastBaseUrlsUpdate: null,
+    disabledProviders: [],
+    mintsFromAllProviders: {},
+    infoFromAllProviders: {},
+    lastModelsUpdate: {},
+    cachedTokens: [],
+    apiKeys: [],
+    childKeys: [],
+    routstr21Models: [],
+    lastRoutstr21ModelsUpdate: null,
+    cachedReceiveTokens: [],
+    usageTracking: [],
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -432,6 +258,205 @@ export const createSdkStore = async ({
       set({ usageTracking: value });
     },
   }));
+
+const hydrateStoreFromDriver = async (
+  store: SdkStore,
+  driver: StorageDriver
+): Promise<void> => {
+  const [
+    rawModels,
+    lastUsedModel,
+    rawBaseUrls,
+    lastBaseUrlsUpdate,
+    rawDisabledProviders,
+    rawMints,
+    rawInfo,
+    rawLastModelsUpdate,
+    rawCachedTokens,
+    rawApiKeys,
+    rawChildKeys,
+    rawRoutstr21Models,
+    rawLastRoutstr21ModelsUpdate,
+    rawCachedReceiveTokens,
+    rawUsageTracking,
+  ] = await Promise.all([
+    driver.getItem<Record<string, Model[]>>(
+      SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<string | null>(SDK_STORAGE_KEYS.LAST_USED_MODEL, null),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
+    driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
+    driver.getItem<Record<string, string[]>>(
+      SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<Record<string, ProviderInfo>>(
+      SDK_STORAGE_KEYS.INFO_FROM_ALL_PROVIDERS,
+      {}
+    ),
+    driver.getItem<Record<string, number>>(
+      SDK_STORAGE_KEYS.LAST_MODELS_UPDATE,
+      {}
+    ),
+    driver.getItem<
+      Array<{
+        baseUrl: string;
+        token: string;
+        balance?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, []),
+    driver.getItem<
+      Array<{
+        baseUrl: string;
+        key: string;
+        balance?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.API_KEYS, []),
+    driver.getItem<
+      Array<{
+        parentBaseUrl: string;
+        childKey: string;
+        balance?: number;
+        balanceLimit?: number;
+        validityDate?: number;
+        createdAt?: number;
+      }>
+    >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
+    driver.getItem<number | null>(
+      SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
+      null
+    ),
+    driver.getItem<
+      Array<{
+        token: string;
+        amount: number;
+        unit: "sat" | "msat";
+        createdAt?: number;
+      }>
+    >(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
+    driver.getItem<
+      Array<{
+        id: string;
+        timestamp: number;
+        modelId: string;
+        baseUrl: string;
+        requestId: string;
+        cost: number;
+        satsCost: number;
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        client?: string;
+        sessionId?: string;
+        tags?: string[];
+      }>
+    >(SDK_STORAGE_KEYS.USAGE_TRACKING, []),
+  ]);
+
+  const modelsFromAllProviders = Object.fromEntries(
+    Object.entries(rawModels).map(([baseUrl, models]) => [
+      normalizeBaseUrl(baseUrl),
+      models,
+    ])
+  );
+
+  const baseUrlsList = rawBaseUrls.map((url) => normalizeBaseUrl(url));
+
+  const disabledProviders = rawDisabledProviders.map((url) =>
+    normalizeBaseUrl(url)
+  );
+
+  const mintsFromAllProviders = Object.fromEntries(
+    Object.entries(rawMints).map(([baseUrl, mints]) => [
+      normalizeBaseUrl(baseUrl),
+      mints.map((mint) => (mint.endsWith("/") ? mint.slice(0, -1) : mint)),
+    ])
+  );
+
+  const infoFromAllProviders = Object.fromEntries(
+    Object.entries(rawInfo).map(([baseUrl, info]) => [
+      normalizeBaseUrl(baseUrl),
+      info,
+    ])
+  );
+
+  const lastModelsUpdate = Object.fromEntries(
+    Object.entries(rawLastModelsUpdate).map(([baseUrl, timestamp]) => [
+      normalizeBaseUrl(baseUrl),
+      timestamp,
+    ])
+  );
+
+  const cachedTokens = rawCachedTokens.map((entry) => ({
+    ...entry,
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    balance:
+      typeof entry.balance === "number"
+        ? entry.balance
+        : getCashuTokenBalance(entry.token),
+    lastUsed: entry.lastUsed ?? null,
+  }));
+
+  const apiKeys = rawApiKeys.map((entry) => ({
+    ...entry,
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    balance: entry.balance ?? 0,
+    lastUsed: entry.lastUsed ?? null,
+  }));
+
+  const childKeys = rawChildKeys.map((entry) => ({
+    parentBaseUrl: normalizeBaseUrl(entry.parentBaseUrl),
+    childKey: entry.childKey,
+    balance: entry.balance ?? 0,
+    balanceLimit: entry.balanceLimit,
+    validityDate: entry.validityDate,
+    createdAt: entry.createdAt ?? Date.now(),
+  }));
+
+  const routstr21Models = rawRoutstr21Models;
+  const lastRoutstr21ModelsUpdate = rawLastRoutstr21ModelsUpdate;
+
+  const cachedReceiveTokens = rawCachedReceiveTokens?.map((entry) => ({
+    token: entry.token,
+    amount: entry.amount,
+    unit: entry.unit || "sat",
+    createdAt: entry.createdAt ?? Date.now(),
+  }));
+
+  const usageTracking = rawUsageTracking;
+
+  store.setState({
+    modelsFromAllProviders,
+    lastUsedModel,
+    baseUrlsList,
+    lastBaseUrlsUpdate,
+    disabledProviders,
+    mintsFromAllProviders,
+    infoFromAllProviders,
+    lastModelsUpdate,
+    cachedTokens,
+    apiKeys,
+    childKeys,
+    routstr21Models,
+    lastRoutstr21ModelsUpdate,
+    cachedReceiveTokens,
+    usageTracking,
+  });
+};
+
+export const createSdkStore = ({
+  driver,
+}: SdkStoreOptions): { store: SdkStore; hydrate: Promise<void> } => {
+  const store = createEmptyStore(driver);
+  return {
+    store,
+    hydrate: hydrateStoreFromDriver(store, driver),
+  };
 };
 
 export const createDiscoveryAdapterFromStore = (

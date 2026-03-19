@@ -288,11 +288,13 @@ export class ModelManager {
    * Uses cache if available and not expired
    * @param baseUrls List of provider base URLs to fetch from
    * @param forceRefresh Ignore cache and fetch fresh data
+   * @param onProgress Callback fired after each provider completes with current combined models
    * @returns Array of unique models with best prices selected
    */
   async fetchModels(
     baseUrls: string[],
-    forceRefresh: boolean = false
+    forceRefresh: boolean = false,
+    onProgress?: (models: Model[]) => void
   ): Promise<Model[]> {
     if (baseUrls.length === 0) {
       throw new NoProvidersAvailableError();
@@ -307,7 +309,15 @@ export class ModelManager {
       return m?.sats_pricing?.completion ?? 0;
     };
 
-    // Fetch from all providers in parallel
+    // Helper to emit current progress
+    const emitProgress = () => {
+      if (onProgress) {
+        const currentModels = Array.from(bestById.values()).map((v) => v.model);
+        onProgress(currentModels);
+      }
+    };
+
+    // Fetch from all providers in parallel with progressive updates
     const fetchPromises = baseUrls.map(async (url) => {
       const base = url.endsWith("/") ? url : `${url}/`;
       try {
@@ -357,6 +367,8 @@ export class ModelManager {
           }
         }
 
+        emitProgress();
+
         return { success: true, base, list };
       } catch (error) {
         if (this.isProviderDownError(error)) {
@@ -369,7 +381,6 @@ export class ModelManager {
       }
     });
 
-    // Wait for all to complete
     await Promise.allSettled(fetchPromises);
 
     // Cache all provider results

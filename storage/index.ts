@@ -76,13 +76,13 @@ export const getDefaultSdkDriver = (): StorageDriver => {
   return defaultDriver;
 };
 
-let defaultStorePromise: Promise<SdkStore> | null = null;
+let defaultStore: ReturnType<typeof createSdkStore> | null = null;
 
 export const getDefaultSdkStore = (): Promise<SdkStore> => {
-  if (!defaultStorePromise) {
-    defaultStorePromise = createSdkStore({ driver: getDefaultSdkDriver() });
+  if (!defaultStore) {
+    defaultStore = createSdkStore({ driver: getDefaultSdkDriver() });
   }
-  return defaultStorePromise;
+  return defaultStore.hydrate.then(() => defaultStore!.store);
 };
 
 export const getDefaultDiscoveryAdapter = async () =>
