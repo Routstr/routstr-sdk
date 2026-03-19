@@ -86,6 +86,12 @@ export interface ProviderTokenResult {
   amountSpent?: number;
 }
 
+export interface BalanceState {
+  totalBalance: number;
+  providerBalances: Record<string, number>;
+  mintBalances: Record<string, number>;
+}
+
 /**
  * BalanceManager handles token refunds and topups from providers
  */
@@ -108,6 +114,46 @@ export class BalanceManager {
         this
       );
     }
+  }
+
+  async getBalanceState(): Promise<BalanceState> {
+    const mintBalances = await this.walletAdapter.getBalances();
+    const units = this.walletAdapter.getMintUnits();
+
+    let totalMintBalance = 0;
+    const normalizedMintBalances: Record<string, number> = {};
+    for (const url in mintBalances) {
+      const balance = mintBalances[url];
+      const unit = units[url];
+      const balanceInSats = getBalanceInSats(balance, unit);
+      normalizedMintBalances[url] = balanceInSats;
+      totalMintBalance += balanceInSats;
+    }
+
+    const pendingDistribution =
+      this.storageAdapter.getCachedTokenDistribution();
+    const providerBalances: Record<string, number> = {};
+    let totalProviderBalance = 0;
+    for (const pending of pendingDistribution) {
+      providerBalances[pending.baseUrl] =
+        (providerBalances[pending.baseUrl] || 0) + pending.amount;
+      totalProviderBalance += pending.amount;
+    }
+
+    const apiKeys = this.storageAdapter.getAllApiKeys();
+    for (const apiKey of apiKeys) {
+      if (!providerBalances[apiKey.baseUrl]) {
+        providerBalances[apiKey.baseUrl] = 0;
+      }
+      providerBalances[apiKey.baseUrl] += apiKey.balance;
+      totalProviderBalance += apiKey.balance;
+    }
+
+    return {
+      totalBalance: totalMintBalance + totalProviderBalance,
+      providerBalances,
+      mintBalances: normalizedMintBalances,
+    };
   }
 
   /**
@@ -410,25 +456,23 @@ export class BalanceManager {
       return { success: false, error: "Invalid top up amount" };
     }
 
+    const balanceState = await this.getBalanceState();
     const balances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
 
-    let totalMintBalance = 0;
-    for (const url in balances) {
-      const unit = units[url];
-      const balanceInSats = getBalanceInSats(balances[url], unit);
-      totalMintBalance += balanceInSats;
-    }
-
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
-    const refundablePending = pendingDistribution
-      .filter((entry) => entry.baseUrl !== baseUrl)
-      .reduce((sum, entry) => sum + entry.amount, 0);
+    const totalMintBalance = Object.values(balanceState.mintBalances).reduce(
+      (sum, value) => sum + value,
+      0
+    );
+    const refundableProviderBalance = Object.entries(
+      balanceState.providerBalances
+    )
+      .filter(([providerBaseUrl]) => providerBaseUrl !== baseUrl)
+      .reduce((sum, [, value]) => sum + value, 0);
 
     if (
       totalMintBalance < adjustedAmount &&
-      totalMintBalance + refundablePending >= adjustedAmount &&
+      totalMintBalance + refundableProviderBalance >= adjustedAmount &&
       retryCount < 1
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl);
@@ -600,12 +644,16 @@ export class BalanceManager {
   ): Promise<void> {
     const pendingDistribution =
       this.storageAdapter.getCachedTokenDistribution();
+    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
 
     const toRefund = pendingDistribution.filter(
       (pending) => pending.baseUrl !== baseUrl
     );
+    const apiKeysToRefund = apiKeyDistribution.filter(
+      (apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0
+    );
 
-    const refundResults = await Promise.allSettled(
+    const tokenRefundResults = await Promise.allSettled(
       toRefund.map(async (pending) => {
         const token = this.storageAdapter.getToken(pending.baseUrl);
         if (!token) {
@@ -627,9 +675,34 @@ export class BalanceManager {
       })
     );
 
-    for (const result of refundResults) {
+    for (const result of tokenRefundResults) {
       if (result.status === "fulfilled" && result.value.success) {
         this.storageAdapter.removeToken(result.value.baseUrl);
+      }
+    }
+
+    const apiKeyRefundResults = await Promise.allSettled(
+      apiKeysToRefund.map(async (apiKeyEntry) => {
+        const fullApiKeyEntry = this.storageAdapter.getApiKey(
+          apiKeyEntry.baseUrl
+        );
+        if (!fullApiKeyEntry) {
+          return { baseUrl: apiKeyEntry.baseUrl, success: false };
+        }
+
+        const result = await this.refundApiKey({
+          mintUrl,
+          baseUrl: apiKeyEntry.baseUrl,
+          apiKey: fullApiKeyEntry.key,
+        });
+
+        return { baseUrl: apiKeyEntry.baseUrl, success: result.success };
+      })
+    );
+
+    for (const result of apiKeyRefundResults) {
+      if (result.status === "fulfilled" && result.value.success) {
+        this.storageAdapter.updateApiKeyBalance(result.value.baseUrl, 0);
       }
     }
   }

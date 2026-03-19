@@ -78,6 +78,23 @@ export interface SdkStorageStore extends SdkStorageState {
       createdAt?: number;
     }>
   ) => void;
+  setUsageTracking: (
+    value: Array<{
+      id: string;
+      timestamp: number;
+      modelId: string;
+      baseUrl: string;
+      requestId: string;
+      cost: number;
+      satsCost: number;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+      client?: string;
+      sessionId?: string;
+      tags?: string[];
+    }>
+  ) => void;
 }
 
 /** Store type returned after async initialization */
@@ -102,6 +119,7 @@ export const createSdkStore = async ({
     rawRoutstr21Models,
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
+    rawUsageTracking,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
@@ -162,6 +180,23 @@ export const createSdkStore = async ({
         createdAt?: number;
       }>
     >(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
+    driver.getItem<
+      Array<{
+        id: string;
+        timestamp: number;
+        modelId: string;
+        baseUrl: string;
+        requestId: string;
+        cost: number;
+        satsCost: number;
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        client?: string;
+        sessionId?: string;
+        tags?: string[];
+      }>
+    >(SDK_STORAGE_KEYS.USAGE_TRACKING, []),
   ]);
 
   // Normalize all hydrated state
@@ -235,6 +270,8 @@ export const createSdkStore = async ({
     createdAt: entry.createdAt ?? Date.now(),
   }));
 
+  const usageTracking = rawUsageTracking;
+
   // Create the store with hydrated state.
   // All setters update in-memory state synchronously and persist to driver
   // as fire-and-forget (no await on setItem).
@@ -253,6 +290,7 @@ export const createSdkStore = async ({
     routstr21Models,
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens,
+    usageTracking,
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -388,6 +426,10 @@ export const createSdkStore = async ({
       }));
       void driver.setItem(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, normalized);
       set({ cachedReceiveTokens: normalized });
+    },
+    setUsageTracking: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.USAGE_TRACKING, value);
+      set({ usageTracking: value });
     },
   }));
 };
