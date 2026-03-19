@@ -11,13 +11,15 @@ export class InsufficientBalanceError extends Error {
     public required: number,
     public available: number,
     public maxMintBalance: number = 0,
-    public maxMintUrl: string = ""
+    public maxMintUrl: string = "",
+    customMessage?: string
   ) {
     super(
-      `Insufficient balance: need ${required} sats, have ${available} sats available. ` +
-        (maxMintBalance > 0
-          ? `Largest mint balance: ${maxMintBalance} sats from ${maxMintUrl}`
-          : "")
+      customMessage ??
+        (`Insufficient balance: need ${required} sats, have ${available} sats available. ` +
+          (maxMintBalance > 0
+            ? `Largest mint balance: ${maxMintBalance} sats from ${maxMintUrl}`
+            : ""))
     );
     this.name = "InsufficientBalanceError";
   }

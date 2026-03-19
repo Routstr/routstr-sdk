@@ -652,7 +652,7 @@ export class RoutstrClient {
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
           );
-          throw new InsufficientBalanceError(required, available);
+          throw new InsufficientBalanceError(required, available, 0, "", message);
         } else {
           this._log(
             "DEBUG",

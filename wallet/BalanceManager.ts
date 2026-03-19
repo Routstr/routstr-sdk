@@ -431,6 +431,10 @@ export class BalanceManager {
         requestId,
       };
     } catch (error) {
+      console.log(
+        "DEBUG",
+        `[TopuPU] topup: Topup result for ${baseUrl}: error=${error}`
+      ); 
       if (cashuToken) {
         await this._recoverFailedTopUp(cashuToken);
       }
