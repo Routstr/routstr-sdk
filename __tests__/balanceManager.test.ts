@@ -75,4 +75,38 @@ describe("BalanceManager", () => {
     expect(result.success).toBe(false);
     expect(result.message).toBe("No API key available for top up");
   });
+
+  it("throws InsufficientBalanceError when API key balance + wallet balance is sufficient but mint balance alone is insufficient", async () => {
+    const apiKeyBalance = 520;
+    const walletBalance = 400;
+    const modelCost = 500;
+
+    const manager = new BalanceManager(
+      createWallet({
+        getBalances: async () => ({
+          "https://mint.example.com": walletBalance,
+        }),
+        getMintUnits: () => ({ "https://mint.example.com": "sat" }),
+      }),
+      createStorage({
+        getAllApiKeys: () => [
+          {
+            key: "test-api-key",
+            baseUrl: "https://provider.example.com",
+            balance: apiKeyBalance,
+            lastUsed: null,
+          },
+        ],
+      })
+    );
+
+    const result = await manager.createProviderToken({
+      mintUrl: "https://mint.example.com",
+      baseUrl: "https://provider.example.com",
+      amount: modelCost,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Insufficient balance");
+  });
 });
