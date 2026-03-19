@@ -46,6 +46,8 @@ export interface RouteRequestOptions {
   modelManager?: ModelManager;
   /** Optional: set RoutstrClient debug level */
   debugLevel?: DebugLevel;
+  /** Optional: client mode (xcashu, lazyrefund, or apikeys) */
+  mode?: "xcashu" | "lazyrefund" | "apikeys";
 }
 
 /**
@@ -101,6 +103,7 @@ export async function routeRequests(
     forceRefresh = false,
     modelManager: providedModelManager,
     debugLevel,
+    mode = "apikeys",
   } = options;
 
   // Use provided ModelManager or create a new one
@@ -195,7 +198,7 @@ export async function routeRequests(
     storageAdapter,
     providerRegistry,
     alertLevel,
-    "apikeys"
+    mode
   );
 
   if (debugLevel) {
