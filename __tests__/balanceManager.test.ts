@@ -76,7 +76,7 @@ describe("BalanceManager", () => {
     expect(result.message).toBe("No API key available for top up");
   });
 
-  it("throws InsufficientBalanceError when API key balance + wallet balance is sufficient but mint balance alone is insufficient", async () => {
+  it("succeeds when API key balance alone is sufficient for the model cost", async () => {
     const apiKeyBalance = 520;
     const walletBalance = 400;
     const modelCost = 500;
@@ -106,7 +106,6 @@ describe("BalanceManager", () => {
       amount: modelCost,
     });
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("Insufficient balance");
+    expect(result.success).toBe(true);
   });
 });

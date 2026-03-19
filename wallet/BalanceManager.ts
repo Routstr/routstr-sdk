@@ -434,7 +434,7 @@ export class BalanceManager {
       console.log(
         "DEBUG",
         `[TopuPU] topup: Topup result for ${baseUrl}: error=${error}`
-      ); 
+      );
       if (cashuToken) {
         await this._recoverFailedTopUp(cashuToken);
       }
@@ -468,6 +468,7 @@ export class BalanceManager {
       (sum, value) => sum + value,
       0
     );
+    const targetProviderBalance = balanceState.providerBalances[baseUrl] || 0;
     const refundableProviderBalance = Object.entries(
       balanceState.providerBalances
     )
@@ -475,8 +476,9 @@ export class BalanceManager {
       .reduce((sum, [, value]) => sum + value, 0);
 
     if (
-      totalMintBalance < adjustedAmount &&
-      totalMintBalance + refundableProviderBalance >= adjustedAmount &&
+      totalMintBalance + targetProviderBalance < adjustedAmount &&
+      totalMintBalance + targetProviderBalance + refundableProviderBalance >=
+        adjustedAmount &&
       retryCount < 1
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl);
@@ -484,6 +486,27 @@ export class BalanceManager {
         ...options,
         retryCount: retryCount + 1,
       });
+    }
+
+    if (totalMintBalance + targetProviderBalance < adjustedAmount) {
+      const error = new InsufficientBalanceError(
+        adjustedAmount,
+        totalMintBalance + targetProviderBalance,
+        totalMintBalance,
+        Object.entries(balanceState.mintBalances).reduce(
+          (max, [url, balance]) =>
+            balance > max.balance ? { url, balance } : max,
+          { url: "", balance: 0 }
+        ).url
+      );
+      return { success: false, error: error.message };
+    }
+
+    if (targetProviderBalance >= adjustedAmount) {
+      return {
+        success: true,
+        amountSpent: 0,
+      };
     }
 
     const providerMints =
