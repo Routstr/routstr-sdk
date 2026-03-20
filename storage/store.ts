@@ -101,7 +101,6 @@ export interface SdkStorageStore extends SdkStorageState {
           clientId: string;
           name: string;
           apiKey: string;
-          baseUrl: string;
           createdAt?: number;
           lastUsed?: number | null;
         }>
@@ -276,7 +275,6 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
           typeof value === "function" ? value(state.clientIds) : value;
         const normalized = updates.map((entry) => ({
           ...entry,
-          baseUrl: normalizeBaseUrl(entry.baseUrl),
           createdAt: entry.createdAt ?? Date.now(),
           lastUsed: entry.lastUsed ?? null,
         }));
@@ -389,7 +387,6 @@ const hydrateStoreFromDriver = async (
         clientId: string;
         name: string;
         apiKey: string;
-        baseUrl: string;
         createdAt?: number;
         lastUsed?: number | null;
       }>
@@ -470,7 +467,6 @@ const hydrateStoreFromDriver = async (
 
   const clientIds = rawClientIds.map((entry) => ({
     ...entry,
-    baseUrl: normalizeBaseUrl(entry.baseUrl),
     createdAt: entry.createdAt ?? Date.now(),
     lastUsed: entry.lastUsed ?? null,
   }));

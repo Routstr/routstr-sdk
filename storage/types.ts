@@ -60,7 +60,6 @@ export interface SdkStorageState {
     clientId: string;
     name: string;
     apiKey: string;
-    baseUrl: string;
     createdAt: number;
     lastUsed?: number | null;
   }>;
