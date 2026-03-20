@@ -95,6 +95,18 @@ export interface SdkStorageStore extends SdkStorageState {
       tags?: string[];
     }>
   ) => void;
+  setClientIds: (
+    value:
+      | Array<{
+          clientId: string;
+          name: string;
+          apiKey: string;
+          baseUrl: string;
+          createdAt?: number;
+          lastUsed?: number | null;
+        }>
+      | ((current: SdkStorageStore["clientIds"]) => SdkStorageStore["clientIds"])
+  ) => void;
 }
 
 /** Store type returned after async initialization */
@@ -117,6 +129,7 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     lastRoutstr21ModelsUpdate: null,
     cachedReceiveTokens: [],
     usageTracking: [],
+    clientIds: [],
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -257,6 +270,20 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
       void driver.setItem(SDK_STORAGE_KEYS.USAGE_TRACKING, value);
       set({ usageTracking: value });
     },
+    setClientIds: (value) => {
+      set((state) => {
+        const updates =
+          typeof value === "function" ? value(state.clientIds) : value;
+        const normalized = updates.map((entry) => ({
+          ...entry,
+          baseUrl: normalizeBaseUrl(entry.baseUrl),
+          createdAt: entry.createdAt ?? Date.now(),
+          lastUsed: entry.lastUsed ?? null,
+        }));
+        void driver.setItem(SDK_STORAGE_KEYS.CLIENT_IDS, normalized);
+        return { clientIds: normalized };
+      });
+    },
   }));
 
 const hydrateStoreFromDriver = async (
@@ -279,6 +306,7 @@ const hydrateStoreFromDriver = async (
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
     rawUsageTracking,
+    rawClientIds,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
@@ -356,6 +384,16 @@ const hydrateStoreFromDriver = async (
         tags?: string[];
       }>
     >(SDK_STORAGE_KEYS.USAGE_TRACKING, []),
+    driver.getItem<
+      Array<{
+        clientId: string;
+        name: string;
+        apiKey: string;
+        baseUrl: string;
+        createdAt?: number;
+        lastUsed?: number | null;
+      }>
+    >(SDK_STORAGE_KEYS.CLIENT_IDS, []),
   ]);
 
   const modelsFromAllProviders = Object.fromEntries(
@@ -430,6 +468,13 @@ const hydrateStoreFromDriver = async (
 
   const usageTracking = rawUsageTracking;
 
+  const clientIds = rawClientIds.map((entry) => ({
+    ...entry,
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    createdAt: entry.createdAt ?? Date.now(),
+    lastUsed: entry.lastUsed ?? null,
+  }));
+
   store.setState({
     modelsFromAllProviders,
     lastUsedModel,
@@ -446,6 +491,7 @@ const hydrateStoreFromDriver = async (
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens,
     usageTracking,
+    clientIds,
   });
 };
 

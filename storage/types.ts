@@ -56,4 +56,12 @@ export interface SdkStorageState {
     sessionId?: string;
     tags?: string[];
   }>;
+  clientIds: Array<{
+    clientId: string;
+    name: string;
+    apiKey: string;
+    baseUrl: string;
+    createdAt: number;
+    lastUsed?: number | null;
+  }>;
 }

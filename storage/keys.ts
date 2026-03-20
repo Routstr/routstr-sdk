@@ -14,6 +14,7 @@ export const SDK_STORAGE_KEYS = {
   LAST_ROUTSTR21_MODELS_UPDATE: "lastRoutstr21ModelsUpdate",
   CACHED_RECEIVE_TOKENS: "cached_receive_tokens",
   USAGE_TRACKING: "usage_tracking",
+  CLIENT_IDS: "client_ids",
 } as const;
 
 export type SdkStorageKey =
