@@ -5,10 +5,15 @@ export interface IndexedDBDriverOptions {
   storeName?: string;
 }
 
+const isBrowser = typeof indexedDB !== "undefined";
+
 const openDatabase = (
   dbName: string,
   storeName: string
 ): Promise<IDBDatabase> => {
+  if (!isBrowser) {
+    return Promise.reject(new Error("IndexedDB is not available"));
+  }
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(dbName, 1);
 
