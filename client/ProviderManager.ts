@@ -207,6 +207,13 @@ export class ProviderManager {
   }
 
   /**
+   * Get a copy of the failed providers set
+   */
+  getFailedProviders(): Set<string> {
+    return new Set(this.failedProviders);
+  }
+
+  /**
    * Find the next best provider for a model
    * @param modelId The model ID to find a provider for
    * @param currentBaseUrl The current provider to exclude

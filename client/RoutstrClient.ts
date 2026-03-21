@@ -909,7 +909,7 @@ export class RoutstrClient {
     }
 
     // No more providers to try
-    throw new FailoverError(baseUrl, Array.from(this.providerManager as any));
+    throw new FailoverError(baseUrl, Array.from(this.providerManager.getFailedProviders()));
   }
 
   /**
