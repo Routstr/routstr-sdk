@@ -29,6 +29,7 @@ import {
   FailoverError,
   InsufficientBalanceError,
 } from "../core/errors";
+import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 
 /**
  * Options for fetching AI response
@@ -476,7 +477,7 @@ export class RoutstrClient {
       return response;
     } catch (error: any) {
       // Handle network errors with failover
-      if (this._isNetworkError(error?.message || "")) {
+      if (isNetworkErrorMessage(error?.message || "")) {
         return await this._handleErrorResponse(
           params,
           token,
@@ -1120,17 +1121,6 @@ export class RoutstrClient {
   private _getPendingCashuTokenAmount(): number {
     const distribution = this.storageAdapter.getCachedTokenDistribution();
     return distribution.reduce((total, item) => total + item.amount, 0);
-  }
-
-  /**
-   * Check if error message indicates a network error
-   */
-  private _isNetworkError(message: string): boolean {
-    return (
-      message.includes("NetworkError when attempting to fetch resource") ||
-      message.includes("Failed to fetch") ||
-      message.includes("Load failed")
-    );
   }
 
   /**

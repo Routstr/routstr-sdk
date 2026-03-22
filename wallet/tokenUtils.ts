@@ -4,7 +4,12 @@ export function isNetworkErrorMessage(message: string): boolean {
   return (
     message.includes("NetworkError when attempting to fetch resource") ||
     message.includes("Failed to fetch") ||
-    message.includes("Load failed")
+    message.includes("Load failed") ||
+    message.includes("ERR_TLS_CERT_ALTNAME_INVALID") ||
+    message.includes("ERR_TLS_CERT_NOT_YET_VALID") ||
+    message.includes("ERR_TLS_CERT_EXPIRED") ||
+    message.includes("UNABLE_TO_VERIFY_LEAF_SIGNATURE") ||
+    message.includes("SELF_SIGNED_CERT_IN_CHAIN")
   );
 }
 
