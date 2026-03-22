@@ -389,7 +389,29 @@ export class CashuSpender {
 
     // Store token and return
     if (token && baseUrl) {
-      this.storageAdapter.setToken(baseUrl, token);
+      try {
+        this.storageAdapter.setToken(baseUrl, token);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.includes("Token already exists")
+        ) {
+          this._log(
+            "DEBUG",
+            `[CashuSpender] _spendInternal: Token already exists for ${baseUrl}, receiving newly created token and using existing`
+          );
+          const receiveResult = await this.receiveToken(token);
+          if (receiveResult.success) {
+            this._log(
+              "DEBUG",
+              `[CashuSpender] _spendInternal: Token restored successfully, amount=${receiveResult.amount}`
+            );
+          }
+          token = this.storageAdapter.getToken(baseUrl);
+        } else {
+          throw error;
+        }
+      }
     }
 
     this._logTransaction("spend", {
