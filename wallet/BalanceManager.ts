@@ -456,9 +456,13 @@ export class BalanceManager {
     } = options;
 
     const adjustedAmount = Math.ceil(amount);
-    console.log(`[BalanceManager.createProviderToken] Starting: baseUrl=${baseUrl}, mintUrl=${mintUrl}, amount=${amount}, adjustedAmount=${adjustedAmount}, retryCount=${retryCount}`);
+    console.log(
+      `[BalanceManager.createProviderToken] Starting: baseUrl=${baseUrl}, mintUrl=${mintUrl}, amount=${amount}, adjustedAmount=${adjustedAmount}, retryCount=${retryCount}`
+    );
     if (!adjustedAmount || isNaN(adjustedAmount)) {
-      console.error(`[BalanceManager.createProviderToken] FAILURE: Invalid amount - amount=${amount}, adjustedAmount=${adjustedAmount}`);
+      console.error(
+        `[BalanceManager.createProviderToken] FAILURE: Invalid amount - amount=${amount}, adjustedAmount=${adjustedAmount}`
+      );
       return { success: false, error: "Invalid top up amount" };
     }
 
@@ -501,15 +505,10 @@ export class BalanceManager {
           { url: "", balance: 0 }
         ).url
       );
-      console.error(`[BalanceManager.createProviderToken] FAILURE: Insufficient balance - required=${adjustedAmount}, available=${totalMintBalance + targetProviderBalance}, totalMintBalance=${totalMintBalance}, targetProviderBalance=${targetProviderBalance}, refundableProviderBalance=${refundableProviderBalance}`);
+      console.error(
+        `[BalanceManager.createProviderToken] FAILURE: Insufficient balance - required=${adjustedAmount}, available=${totalMintBalance + targetProviderBalance}, totalMintBalance=${totalMintBalance}, targetProviderBalance=${targetProviderBalance}, refundableProviderBalance=${refundableProviderBalance}`
+      );
       return { success: false, error: error.message };
-    }
-
-    if (targetProviderBalance >= adjustedAmount) {
-      return {
-        success: true,
-        amountSpent: 0,
-      };
     }
 
     const providerMints =
@@ -553,7 +552,9 @@ export class BalanceManager {
         }
       }
 
-      console.error(`[BalanceManager.createProviderToken] FAILURE: No candidate mints found - requiredAmount=${requiredAmount}, totalMintBalance=${totalMintBalance}, maxBalance=${maxBalance}, maxMintUrl=${maxMintUrl}, providerMints=${JSON.stringify(providerMints)}`);
+      console.error(
+        `[BalanceManager.createProviderToken] FAILURE: No candidate mints found - requiredAmount=${requiredAmount}, totalMintBalance=${totalMintBalance}, maxBalance=${maxBalance}, maxMintUrl=${maxMintUrl}, providerMints=${JSON.stringify(providerMints)}`
+      );
       const error = new InsufficientBalanceError(
         adjustedAmount,
         totalMintBalance,
@@ -567,13 +568,17 @@ export class BalanceManager {
     let lastError: string | undefined;
     for (const candidateMint of candidates) {
       try {
-        console.log(`[BalanceManager.createProviderToken] Attempting mint: ${candidateMint}, amount: ${requiredAmount}`);
+        console.log(
+          `[BalanceManager.createProviderToken] Attempting mint: ${candidateMint}, amount: ${requiredAmount}`
+        );
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
           p2pkPubkey
         );
-        console.log(`[BalanceManager.createProviderToken] SUCCESS: Token created from mint ${candidateMint}`);
+        console.log(
+          `[BalanceManager.createProviderToken] SUCCESS: Token created from mint ${candidateMint}`
+        );
         return {
           success: true,
           token,
@@ -582,12 +587,16 @@ export class BalanceManager {
         };
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        console.error(`[BalanceManager.createProviderToken] FAILURE: Mint ${candidateMint} failed with error: ${errorMsg}`);
+        console.error(
+          `[BalanceManager.createProviderToken] FAILURE: Mint ${candidateMint} failed with error: ${errorMsg}`
+        );
         if (error instanceof Error) {
           lastError = errorMsg;
 
           if (isNetworkErrorMessage(error.message)) {
-            console.warn(`[BalanceManager.createProviderToken] Network error from ${candidateMint}, trying next mint...`);
+            console.warn(
+              `[BalanceManager.createProviderToken] Network error from ${candidateMint}, trying next mint...`
+            );
             continue;
           }
         }
@@ -599,7 +608,9 @@ export class BalanceManager {
       }
     }
 
-    console.error(`[BalanceManager.createProviderToken] FAILURE: All candidate mints exhausted - lastError=${lastError}, candidates=${JSON.stringify(candidates)}`);
+    console.error(
+      `[BalanceManager.createProviderToken] FAILURE: All candidate mints exhausted - lastError=${lastError}, candidates=${JSON.stringify(candidates)}`
+    );
     return {
       success: false,
       error:
