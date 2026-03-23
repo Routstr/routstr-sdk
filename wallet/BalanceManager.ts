@@ -989,7 +989,6 @@ export class BalanceManager {
 
       if (response.ok) {
         const data = await response.json();
-        console.log("TOKENA FASJDFAS", data);
         return {
           amount: data.balance,
           reserved: data.reserved ?? 0,

@@ -447,7 +447,6 @@ export class RoutstrClient {
             : JSON.stringify(body),
       });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
-      this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
@@ -653,7 +652,13 @@ export class RoutstrClient {
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
           );
-          throw new InsufficientBalanceError(required, available, 0, "", message);
+          throw new InsufficientBalanceError(
+            required,
+            available,
+            0,
+            "",
+            message
+          );
         } else {
           this._log(
             "DEBUG",
@@ -910,7 +915,10 @@ export class RoutstrClient {
     }
 
     // No more providers to try
-    throw new FailoverError(baseUrl, Array.from(this.providerManager.getFailedProviders()));
+    throw new FailoverError(
+      baseUrl,
+      Array.from(this.providerManager.getFailedProviders())
+    );
   }
 
   /**

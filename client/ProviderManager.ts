@@ -182,8 +182,47 @@ function isInsecureHttpUrl(url: string): boolean {
 
 export class ProviderManager {
   private failedProviders = new Set<string>();
+  /** Track when each provider last failed (provider URL -> timestamp) */
+  private lastFailed = new Map<string, number>();
+  /** Providers on cooldown: [provider_url, cooldown_started_timestamp][] */
+  private providersOnCoolDown: [string, number][] = [];
+  /** Cooldown duration in milliseconds (5 minutes) */
+  private static readonly COOLDOWN_DURATION_MS = 5 * 60 * 1000;
 
   constructor(private providerRegistry: ProviderRegistry) {}
+
+  /**
+   * Clean up expired cooldown entries
+   */
+  private cleanupExpiredCooldowns(): void {
+    const now = Date.now();
+    this.providersOnCoolDown = this.providersOnCoolDown.filter(
+      ([, timestamp]) => now - timestamp < ProviderManager.COOLDOWN_DURATION_MS
+    );
+  }
+
+  /**
+   * Get the cooldown duration in milliseconds
+   */
+  getCooldownDurationMs(): number {
+    return ProviderManager.COOLDOWN_DURATION_MS;
+  }
+
+  /**
+   * Check if a provider is currently on cooldown
+   */
+  isOnCooldown(baseUrl: string): boolean {
+    this.cleanupExpiredCooldowns();
+    return this.providersOnCoolDown.some(([url]) => url === baseUrl);
+  }
+
+  /**
+   * Get all providers currently on cooldown
+   */
+  getProvidersOnCooldown(): [string, number][] {
+    this.cleanupExpiredCooldowns();
+    return [...this.providersOnCoolDown];
+  }
 
   /**
    * Reset the failed providers list
@@ -193,10 +232,67 @@ export class ProviderManager {
   }
 
   /**
+   * Get the last failed timestamp for a provider
+   */
+  getLastFailed(baseUrl: string): number | undefined {
+    return this.lastFailed.get(baseUrl);
+  }
+
+  /**
+   * Get all providers with their last failed timestamps
+   */
+  getAllLastFailed(): Map<string, number> {
+    return new Map(this.lastFailed);
+  }
+
+  /**
    * Mark a provider as failed
+   * If a provider fails twice within 5 minutes, it's added to cooldown
    */
   markFailed(baseUrl: string): void {
+    const now = Date.now();
+    const lastFailure = this.lastFailed.get(baseUrl);
+
+    // Track this failure
+    this.lastFailed.set(baseUrl, now);
     this.failedProviders.add(baseUrl);
+
+    // Check if this is a second failure within the cooldown window
+    if (
+      lastFailure !== undefined &&
+      now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
+    ) {
+      // Second failure within 5 minutes - add to cooldown
+      if (!this.isOnCooldown(baseUrl)) {
+        this.providersOnCoolDown.push([baseUrl, now]);
+        console.log(
+          `Provider ${baseUrl} added to cooldown after second failure within 5 minutes`
+        );
+      }
+    }
+  }
+
+  /**
+   * Remove a provider from cooldown (e.g., after successful request)
+   */
+  removeFromCooldown(baseUrl: string): void {
+    this.providersOnCoolDown = this.providersOnCoolDown.filter(
+      ([url]) => url !== baseUrl
+    );
+  }
+
+  /**
+   * Clear all cooldown tracking
+   */
+  clearCooldowns(): void {
+    this.providersOnCoolDown = [];
+  }
+
+  /**
+   * Clear all failure tracking (lastFailed timestamps)
+   */
+  clearFailureHistory(): void {
+    this.lastFailed.clear();
   }
 
   /**
@@ -233,11 +329,12 @@ export class ProviderManager {
       const candidates: CandidateProvider[] = [];
 
       for (const [baseUrl, models] of Object.entries(allProviders)) {
-        // Skip current, failed, and disabled providers
+        // Skip current, failed, disabled, and cooldown providers
         if (
           baseUrl === currentBaseUrl ||
           this.failedProviders.has(baseUrl) ||
-          disabledProviders.has(baseUrl)
+          disabledProviders.has(baseUrl) ||
+          this.isOnCooldown(baseUrl)
         ) {
           continue;
         }
@@ -310,6 +407,7 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allProviders)) {
       if (disabledProviders.has(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl)) continue;
       if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl)))
         continue;
 
@@ -341,6 +439,7 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allModels)) {
       if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl)) continue;
       if (torMode && !baseUrl.includes(".onion")) continue;
       if (
         !torMode &&
