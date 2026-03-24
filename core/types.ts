@@ -161,6 +161,8 @@ export interface UsageStats {
   total_tokens?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  cost?: number;
+  sats_cost?: number;
 }
 
 /**
@@ -172,6 +174,7 @@ export interface StreamingResult {
   images?: ImageData[];
   usage?: UsageStats;
   model?: string;
+  responseId?: string;
   finish_reason?: string;
   citations?: string[];
   annotations?: AnnotationData[];

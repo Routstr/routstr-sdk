@@ -30,6 +30,12 @@ import {
   InsufficientBalanceError,
 } from "../core/errors";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
+import { getDefaultSdkStore } from "../storage";
+import {
+  extractResponseId,
+  extractUsageFromResponseBody,
+  type UsageTrackingData,
+} from "./usage";
 
 /**
  * Options for fetching AI response
@@ -239,6 +245,7 @@ export class RoutstrClient {
       baseUrl: baseUrlUsed,
       initialTokenBalance: tokenBalanceInSats,
       response,
+      modelId,
     });
 
     return response;
@@ -396,6 +403,19 @@ export class RoutstrClient {
             ? this._getEstimatedCosts(selectedModel, streamingResult)
             : undefined,
           response,
+          modelId: selectedModel.id,
+          usage: streamingResult.usage
+            ? {
+                promptTokens: Number(streamingResult.usage.prompt_tokens ?? 0),
+                completionTokens: Number(
+                  streamingResult.usage.completion_tokens ?? 0
+                ),
+                totalTokens: Number(streamingResult.usage.total_tokens ?? 0),
+                cost: Number(streamingResult.usage.cost ?? 0),
+                satsCost: Number(streamingResult.usage.sats_cost ?? 0),
+              }
+            : undefined,
+          requestId: streamingResult.responseId,
         });
         const estimatedCosts = this._getEstimatedCosts(
           selectedModel,
@@ -930,9 +950,20 @@ export class RoutstrClient {
     initialTokenBalance: number;
     fallbackSatsSpent?: number;
     response?: Response;
+    modelId?: string;
+    usage?: UsageTrackingData;
+    requestId?: string;
   }): Promise<number> {
-    const { token, baseUrl, initialTokenBalance, fallbackSatsSpent, response } =
-      params;
+    const {
+      token,
+      baseUrl,
+      initialTokenBalance,
+      fallbackSatsSpent,
+      response,
+      modelId,
+      usage,
+      requestId,
+    } = params;
 
     let satsSpent: number = initialTokenBalance;
 
@@ -996,7 +1027,92 @@ export class RoutstrClient {
       }
     }
 
+    await this._trackResponseUsage({
+      token,
+      baseUrl,
+      response,
+      modelId,
+      satsSpent,
+      usage,
+      requestId,
+    });
+
     return satsSpent;
+  }
+
+  private async _trackResponseUsage(params: {
+    token: string;
+    baseUrl: string;
+    response?: Response;
+    modelId?: string;
+    satsSpent: number;
+    usage?: UsageTrackingData;
+    requestId?: string;
+  }): Promise<void> {
+    const {
+      token,
+      baseUrl,
+      response,
+      modelId,
+      satsSpent,
+      usage: providedUsage,
+      requestId: providedRequestId,
+    } = params;
+
+    if (!response || !modelId) {
+      return;
+    }
+
+    try {
+      let usage = providedUsage;
+      let requestId = providedRequestId;
+
+      if (!usage || !requestId) {
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("text/event-stream")) {
+          return;
+        }
+
+        const cloned = response.clone();
+        const responseBody = await cloned.json();
+        usage = usage ?? extractUsageFromResponseBody(responseBody, satsSpent) ?? undefined;
+        requestId =
+          requestId ??
+          extractResponseId(responseBody) ??
+          response.headers.get("x-routstr-request-id") ??
+          undefined;
+      }
+
+      if (!usage) {
+        return;
+      }
+
+      const finalRequestId = requestId || "unknown";
+      const store = await getDefaultSdkStore();
+      const state = store.getState();
+      const matchingClient = state.clientIds.find(
+        (client) => client.apiKey === token
+      );
+      const entryId =
+        finalRequestId === "unknown"
+          ? `req-${Date.now()}-${modelId}`
+          : finalRequestId;
+
+      state.setUsageTracking([
+        ...(state.usageTracking || []),
+        {
+          id: entryId,
+          timestamp: Date.now(),
+          modelId,
+          baseUrl,
+          requestId: finalRequestId,
+          client: matchingClient?.clientId,
+          ...usage,
+        },
+      ]);
+    } catch (error) {
+      this._log("WARN", "Failed to track response usage:", error);
+    }
   }
 
   /**

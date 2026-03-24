@@ -13,6 +13,7 @@
  */
 
 import type { StreamingResult, ImageData, AnnotationData } from "../core/types";
+import { extractUsageFromSSEJson, toUsageStats } from "./usage";
 
 /**
  * Callbacks for streaming updates
@@ -63,6 +64,7 @@ export class StreamProcessor {
     let finish_reason: string | undefined;
     let citations: string[] | undefined;
     let annotations: AnnotationData[] | undefined;
+    let responseId: string | undefined;
 
     try {
       while (true) {
@@ -103,6 +105,9 @@ export class StreamProcessor {
           if (parsed.finish_reason) {
             finish_reason = parsed.finish_reason;
           }
+          if (parsed.responseId) {
+            responseId = parsed.responseId;
+          }
           if (parsed.citations) {
             citations = parsed.citations;
           }
@@ -126,6 +131,7 @@ export class StreamProcessor {
       images: this.accumulatedImages.length > 0 ? this.accumulatedImages : undefined,
       usage,
       model,
+      responseId,
       finish_reason,
       citations,
       annotations,
@@ -144,6 +150,7 @@ export class StreamProcessor {
     citations?: string[];
     annotations?: AnnotationData[];
     images?: ImageData[];
+    responseId?: string;
   } | null {
     if (!line.trim()) return null;
 
@@ -175,11 +182,15 @@ export class StreamProcessor {
 
       // Extract usage (usually in final chunk)
       if (parsed.usage) {
-        result.usage = {
+        result.usage = toUsageStats(extractUsageFromSSEJson(parsed)) ?? {
           total_tokens: parsed.usage.total_tokens,
           prompt_tokens: parsed.usage.prompt_tokens,
           completion_tokens: parsed.usage.completion_tokens,
         };
+      }
+
+      if (parsed.id) {
+        result.responseId = parsed.id;
       }
 
       // Extract model info
