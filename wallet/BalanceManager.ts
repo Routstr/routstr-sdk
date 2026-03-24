@@ -456,13 +456,7 @@ export class BalanceManager {
     } = options;
 
     const adjustedAmount = Math.ceil(amount);
-    console.log(
-      `[BalanceManager.createProviderToken] Starting: baseUrl=${baseUrl}, mintUrl=${mintUrl}, amount=${amount}, adjustedAmount=${adjustedAmount}, retryCount=${retryCount}`
-    );
     if (!adjustedAmount || isNaN(adjustedAmount)) {
-      console.error(
-        `[BalanceManager.createProviderToken] FAILURE: Invalid amount - amount=${amount}, adjustedAmount=${adjustedAmount}`
-      );
       return { success: false, error: "Invalid top up amount" };
     }
 
@@ -506,7 +500,7 @@ export class BalanceManager {
         ).url
       );
       console.error(
-        `[BalanceManager.createProviderToken] FAILURE: Insufficient balance - required=${adjustedAmount}, available=${totalMintBalance + targetProviderBalance}, totalMintBalance=${totalMintBalance}, targetProviderBalance=${targetProviderBalance}, refundableProviderBalance=${refundableProviderBalance}`
+        `[BalanceManager.createProviderToken] Insufficient balance - required=${adjustedAmount}, available=${totalMintBalance + targetProviderBalance}`
       );
       return { success: false, error: error.message };
     }
@@ -553,7 +547,7 @@ export class BalanceManager {
       }
 
       console.error(
-        `[BalanceManager.createProviderToken] FAILURE: No candidate mints found - requiredAmount=${requiredAmount}, totalMintBalance=${totalMintBalance}, maxBalance=${maxBalance}, maxMintUrl=${maxMintUrl}, providerMints=${JSON.stringify(providerMints)}`
+        `[BalanceManager.createProviderToken] No candidate mints found`
       );
       const error = new InsufficientBalanceError(
         adjustedAmount,
@@ -568,16 +562,10 @@ export class BalanceManager {
     let lastError: string | undefined;
     for (const candidateMint of candidates) {
       try {
-        console.log(
-          `[BalanceManager.createProviderToken] Attempting mint: ${candidateMint}, amount: ${requiredAmount}`
-        );
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
           p2pkPubkey
-        );
-        console.log(
-          `[BalanceManager.createProviderToken] SUCCESS: Token created from mint ${candidateMint}`
         );
         return {
           success: true,
@@ -587,16 +575,10 @@ export class BalanceManager {
         };
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        console.error(
-          `[BalanceManager.createProviderToken] FAILURE: Mint ${candidateMint} failed with error: ${errorMsg}`
-        );
         if (error instanceof Error) {
           lastError = errorMsg;
 
           if (isNetworkErrorMessage(error.message)) {
-            console.warn(
-              `[BalanceManager.createProviderToken] Network error from ${candidateMint}, trying next mint...`
-            );
             continue;
           }
         }
@@ -608,9 +590,6 @@ export class BalanceManager {
       }
     }
 
-    console.error(
-      `[BalanceManager.createProviderToken] FAILURE: All candidate mints exhausted - lastError=${lastError}, candidates=${JSON.stringify(candidates)}`
-    );
     return {
       success: false,
       error:
