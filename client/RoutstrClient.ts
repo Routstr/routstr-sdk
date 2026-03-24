@@ -30,7 +30,7 @@ import {
   InsufficientBalanceError,
 } from "../core/errors";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
-import { getDefaultSdkStore } from "../storage";
+import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
   extractResponseId,
   extractUsageFromResponseBody,
@@ -1098,18 +1098,16 @@ export class RoutstrClient {
           ? `req-${Date.now()}-${modelId}`
           : finalRequestId;
 
-      state.setUsageTracking([
-        ...(state.usageTracking || []),
-        {
-          id: entryId,
-          timestamp: Date.now(),
-          modelId,
-          baseUrl,
-          requestId: finalRequestId,
-          client: matchingClient?.clientId,
-          ...usage,
-        },
-      ]);
+      const usageTracking = getDefaultUsageTrackingDriver();
+      await usageTracking.append({
+        id: entryId,
+        timestamp: Date.now(),
+        modelId,
+        baseUrl,
+        requestId: finalRequestId,
+        client: matchingClient?.clientId,
+        ...usage,
+      });
     } catch (error) {
       this._log("WARN", "Failed to track response usage:", error);
     }

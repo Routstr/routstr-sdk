@@ -41,21 +41,6 @@ export interface SdkStorageState {
     unit: "sat" | "msat";
     createdAt: number;
   }>;
-  usageTracking: Array<{
-    id: string;
-    timestamp: number;
-    modelId: string;
-    baseUrl: string;
-    requestId: string;
-    cost: number;
-    satsCost: number;
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-    client?: string;
-    sessionId?: string;
-    tags?: string[];
-  }>;
   clientIds: Array<{
     clientId: string;
     name: string;

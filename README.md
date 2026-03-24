@@ -25,9 +25,16 @@ This SDK lives under `sdk/` and exposes a framework-agnostic surface for Routstr
 - `sdk/storage/index.ts` exposes:
   - `getDefaultSdkDriver()` (localStorage -> sqlite -> memory)
   - `getDefaultSdkStore()`
+  - `getDefaultUsageTrackingDriver()`
   - `getDefaultDiscoveryAdapter()`
   - `getDefaultStorageAdapter()`
   - `getDefaultProviderRegistry()`
+
+Usage tracking is now stored separately from the Zustand-backed SDK state:
+
+- browser: IndexedDB usage-tracking object store
+- node: SQLite usage-tracking table
+- bun/ephemeral: in-memory usage-tracking driver
 
 ## Minimal Usage
 

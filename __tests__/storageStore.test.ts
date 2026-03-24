@@ -26,7 +26,8 @@ describe("sdk storage store", () => {
     };
 
     const driver = createMemoryDriver(seed);
-    const store = await createSdkStore({ driver });
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
 
     expect(store.getState().cachedTokens[0]?.baseUrl).toBe(
       "https://provider.example.com/"
@@ -41,7 +42,8 @@ describe("sdk storage store", () => {
 
   it("setToken rejects duplicate provider tokens", async () => {
     const driver = createMemoryDriver();
-    const store = await createSdkStore({ driver });
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
     const storage = createStorageAdapterFromStore(store);
 
     storage.setToken("https://provider.example.com", "token-1");
@@ -53,7 +55,8 @@ describe("sdk storage store", () => {
 
   it("getToken updates lastUsed timestamp", async () => {
     const driver = createMemoryDriver();
-    const store = await createSdkStore({ driver });
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
     const storage = createStorageAdapterFromStore(store);
 
     storage.setToken("https://provider.example.com", "token-1");
