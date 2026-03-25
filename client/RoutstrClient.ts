@@ -1193,23 +1193,7 @@ export class RoutstrClient {
       requestId: providedRequestId,
     } = params;
 
-    this._log("DEBUG", "[_trackResponseUsage] Starting", {
-      hasResponse: !!response,
-      modelId,
-      satsSpent,
-      hasProvidedUsage: !!providedUsage,
-      hasProvidedRequestId: !!providedRequestId,
-    });
-
     if (!response || !modelId) {
-      this._log(
-        "DEBUG",
-        "[_trackResponseUsage] Early return: missing response or modelId",
-        {
-          hasResponse: !!response,
-          modelId,
-        }
-      );
       return;
     }
 
@@ -1228,10 +1212,6 @@ export class RoutstrClient {
             undefined;
 
           if (!usage) {
-            this._log(
-              "DEBUG",
-              "[_trackResponseUsage] No usage extracted from streaming response"
-            );
             return;
           }
         } else {
@@ -1250,18 +1230,10 @@ export class RoutstrClient {
       }
 
       if (!usage) {
-        this._log(
-          "DEBUG",
-          "[_trackResponseUsage] No usage extracted, returning early"
-        );
         return;
       }
 
       const finalRequestId = requestId || "unknown";
-      this._log("DEBUG", "[_trackResponseUsage] Extracted usage", {
-        usage,
-        finalRequestId,
-      });
 
       const store = await getDefaultSdkStore();
       const state = store.getState();
@@ -1288,18 +1260,9 @@ export class RoutstrClient {
       if (this.mode === "xcashu") {
         entry.satsCost = satsSpent;
       }
-      this._log("DEBUG", "[_trackResponseUsage] Appending usage entry", entry);
       await usageTracking.append(entry);
-      this._log(
-        "DEBUG",
-        "[_trackResponseUsage] Successfully appended usage entry"
-      );
     } catch (error) {
-      this._log(
-        "WARN",
-        "[_trackResponseUsage] Failed to track response usage:",
-        error
-      );
+      // Silently ignore tracking failures
     }
   }
 
