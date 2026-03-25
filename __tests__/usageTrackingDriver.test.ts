@@ -67,6 +67,8 @@ describe("usage tracking drivers", () => {
       legacyStorageDriver: legacyDriver,
     });
 
+    await driver.migrate();
+
     const rows = await driver.list();
     expect(rows).toHaveLength(1);
     expect(rows[0]?.id).toBe("legacy-1");

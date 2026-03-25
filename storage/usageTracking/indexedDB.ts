@@ -129,6 +129,10 @@ export const createIndexedDBUsageTrackingDriver = (
   };
 
   return {
+    async migrate(): Promise<void> {
+      await ensureMigrated();
+    },
+
     async append(entry: UsageTrackingEntry): Promise<void> {
       await ensureMigrated();
       await putMany([entry]);

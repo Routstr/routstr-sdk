@@ -36,6 +36,8 @@ Usage tracking is now stored separately from the Zustand-backed SDK state:
 - node: SQLite usage-tracking table
 - bun/ephemeral: in-memory usage-tracking driver
 
+The usage tracking driver also exposes `migrate()` so apps can proactively move legacy blob data into the new backend during startup instead of waiting for the first append/read operation.
+
 ## Minimal Usage
 
 ```ts

@@ -39,6 +39,10 @@ export const createMemoryUsageTrackingDriver = (
   }
 
   return {
+    async migrate(): Promise<void> {
+      return;
+    },
+
     async append(entry: UsageTrackingEntry): Promise<void> {
       store.set(entry.id, { ...entry, baseUrl: normalizeBaseUrl(entry.baseUrl) });
     },

@@ -11,6 +11,7 @@ export interface ListUsageTrackingOptions {
 }
 
 export interface UsageTrackingDriver {
+  migrate(): Promise<void>;
   append(entry: UsageTrackingEntry): Promise<void>;
   appendMany(entries: UsageTrackingEntry[]): Promise<void>;
   list(options?: ListUsageTrackingOptions): Promise<UsageTrackingEntry[]>;
