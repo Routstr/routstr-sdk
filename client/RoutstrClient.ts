@@ -1355,55 +1355,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Create a child key for a parent API key via the provider's API
-   * POST /v1/balance/child-key
-   */
-  private async _createChildKey(
-    baseUrl: string,
-    parentApiKey: string,
-    options?: {
-      count?: number;
-      balanceLimit?: number;
-      balanceLimitReset?: string;
-      validityDate?: number;
-    }
-  ): Promise<{
-    childKey: string;
-    balance: number;
-    balanceLimit?: number;
-    validityDate?: number;
-  }> {
-    const response = await fetch(`${baseUrl}v1/balance/child-key`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${parentApiKey}`,
-      },
-      body: JSON.stringify({
-        count: options?.count ?? 1,
-        balance_limit: options?.balanceLimit,
-        balance_limit_reset: options?.balanceLimitReset,
-        validity_date: options?.validityDate,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to create child key: ${response.status} ${await response.text()}`
-      );
-    }
-
-    const data = await response.json();
-
-    return {
-      childKey: data.api_keys?.[0],
-      balance: data.balance ?? 0,
-      balanceLimit: data.balance_limit,
-      validityDate: data.validity_date,
-    };
-  }
-
-  /**
    * Calculate estimated costs from usage
    */
   private _getEstimatedCosts(
