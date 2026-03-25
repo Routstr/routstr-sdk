@@ -19,6 +19,7 @@ import type {
   ProviderRegistry,
   StreamingCallbacks,
 } from "../wallet/interfaces";
+import type { ServerResponse } from "http";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { StreamProcessor } from "./StreamProcessor";
@@ -36,6 +37,8 @@ import {
   extractUsageFromResponseBody,
   type UsageTrackingData,
 } from "./usage";
+import { createSSEParserTransform } from "./sse";
+import { Readable } from "stream";
 
 /**
  * Options for fetching AI response
@@ -68,6 +71,10 @@ export interface RouteRequestParams {
   baseUrl: string;
   mintUrl: string;
   modelId?: string;
+}
+
+export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
+  res: ServerResponse;
 }
 
 export class RoutstrClient {
@@ -177,6 +184,100 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
+    const prepared = await this._prepareRoutedRequest(params);
+    const satsSpent = await this._handlePostResponseBalanceUpdate({
+      token: prepared.tokenUsed,
+      baseUrl: prepared.baseUrlUsed,
+      initialTokenBalance: prepared.tokenBalanceInSats,
+      response: prepared.response,
+      modelId: prepared.modelId,
+      usage: prepared.capturedUsage,
+      requestId: prepared.capturedResponseId,
+    });
+
+    (prepared.response as any).satsSpent = satsSpent;
+    (prepared.response as any).usage = prepared.capturedUsage;
+    (prepared.response as any).requestId = prepared.capturedResponseId;
+
+    return prepared.response;
+  }
+
+  async routeRequestToNodeResponse(
+    params: RouteRequestToNodeResponseParams
+  ): Promise<void> {
+    const { res } = params;
+    const prepared = await this._prepareRoutedRequest(params);
+
+    res.statusCode = prepared.response.status;
+    prepared.response.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+
+    const body = prepared.response.body;
+    if (!body) {
+      const satsSpent = await this._handlePostResponseBalanceUpdate({
+        token: prepared.tokenUsed,
+        baseUrl: prepared.baseUrlUsed,
+        initialTokenBalance: prepared.tokenBalanceInSats,
+        response: prepared.response,
+        modelId: prepared.modelId,
+        usage: prepared.capturedUsage,
+        requestId: prepared.capturedResponseId,
+      });
+      (prepared.response as any).satsSpent = satsSpent;
+      res.end();
+      return;
+    }
+
+    const nodeReadable = Readable.fromWeb(body as any);
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = async () => {
+        if (settled) return;
+        settled = true;
+        try {
+          const satsSpent = await this._handlePostResponseBalanceUpdate({
+            token: prepared.tokenUsed,
+            baseUrl: prepared.baseUrlUsed,
+            initialTokenBalance: prepared.tokenBalanceInSats,
+            response: prepared.response,
+            modelId: prepared.modelId,
+            usage: prepared.capturedUsage,
+            requestId: prepared.capturedResponseId,
+          });
+          (prepared.response as any).satsSpent = satsSpent;
+          (prepared.response as any).usage = prepared.capturedUsage;
+          (prepared.response as any).requestId = prepared.capturedResponseId;
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      res.once("finish", finish);
+      res.once("close", finish);
+      res.once("error", fail);
+      nodeReadable.once("error", fail);
+
+      nodeReadable.pipe(res);
+    });
+  }
+
+  private async _prepareRoutedRequest(params: RouteRequestParams): Promise<{
+    response: Response;
+    tokenUsed: string;
+    baseUrlUsed: string;
+    tokenBalanceInSats: number;
+    modelId?: string;
+    capturedUsage?: UsageTrackingData;
+    capturedResponseId?: string;
+  }> {
     const {
       path,
       method,
@@ -240,15 +341,48 @@ export class RoutstrClient {
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
-    const satsSpent = await this._handlePostResponseBalanceUpdate({
-      token: tokenUsed,
-      baseUrl: baseUrlUsed,
-      initialTokenBalance: tokenBalanceInSats,
-      response,
-      modelId,
-    });
 
-    return response;
+    const contentType = response.headers.get("content-type") || "";
+    let processedResponse = response;
+    let capturedUsage: UsageTrackingData | undefined;
+    let capturedResponseId: string | undefined;
+
+    if (contentType.includes("text/event-stream") && response.body) {
+      const nodeReadable = Readable.fromWeb(response.body as any);
+      const sseParser = createSSEParserTransform(
+        (usage) => {
+          capturedUsage = usage;
+          (processedResponse as any).usage = usage;
+        },
+        (responseId) => {
+          capturedResponseId = responseId;
+          (processedResponse as any).requestId = responseId;
+        }
+      );
+      const transformed = nodeReadable.pipe(sseParser, { end: true });
+      const webStream = Readable.toWeb(
+        transformed
+      ) as globalThis.ReadableStream<Uint8Array>;
+
+      processedResponse = new Response(webStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+
+      (processedResponse as any).baseUrl = (response as any).baseUrl;
+      (processedResponse as any).token = (response as any).token;
+    }
+
+    return {
+      response: processedResponse,
+      tokenUsed,
+      baseUrlUsed,
+      tokenBalanceInSats,
+      modelId,
+      capturedUsage,
+      capturedResponseId,
+    };
   }
 
   /**
@@ -1086,24 +1220,33 @@ export class RoutstrClient {
       if (!usage || !requestId) {
         const contentType = response.headers.get("content-type") || "";
         if (contentType.includes("text/event-stream")) {
-          this._log(
-            "DEBUG",
-            "[_trackResponseUsage] Skipping - streaming response (text/event-stream)"
-          );
-          return;
-        }
+          usage = usage ?? (response as any).usage;
+          requestId =
+            requestId ??
+            (response as any).requestId ??
+            response.headers.get("x-routstr-request-id") ??
+            undefined;
 
-        const cloned = response.clone();
-        const responseBody = await cloned.json();
-        usage =
-          usage ??
-          extractUsageFromResponseBody(responseBody, satsSpent) ??
-          undefined;
-        requestId =
-          requestId ??
-          extractResponseId(responseBody) ??
-          response.headers.get("x-routstr-request-id") ??
-          undefined;
+          if (!usage) {
+            this._log(
+              "DEBUG",
+              "[_trackResponseUsage] No usage extracted from streaming response"
+            );
+            return;
+          }
+        } else {
+          const cloned = response.clone();
+          const responseBody = await cloned.json();
+          usage =
+            usage ??
+            extractUsageFromResponseBody(responseBody, satsSpent) ??
+            undefined;
+          requestId =
+            requestId ??
+            extractResponseId(responseBody) ??
+            response.headers.get("x-routstr-request-id") ??
+            undefined;
+        }
       }
 
       if (!usage) {

@@ -14,7 +14,11 @@ import type {
 } from "./wallet/interfaces";
 import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
-import { RoutstrClient, type DebugLevel } from "./client/RoutstrClient";
+import {
+  RoutstrClient,
+  type DebugLevel,
+  type RouteRequestToNodeResponseParams,
+} from "./client/RoutstrClient";
 
 /**
  * Options for routeRequests function
@@ -50,6 +54,10 @@ export interface RouteRequestOptions {
   mode?: "xcashu" | "lazyrefund" | "apikeys";
 }
 
+export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {
+  res: RouteRequestToNodeResponseParams["res"];
+}
+
 /**
  * Result from routeRequests function
  */
@@ -73,22 +81,14 @@ export interface RouteRequestResult {
   };
 }
 
-/**
- * Route an OpenAI-compatible request to the cheapest provider
- *
- * This function:
- * 1. Bootstraps providers and fetches models
- * 2. Discovers available mints
- * 3. Selects the cheapest provider for the requested model
- * 4. Handles Cashu send/receive via RoutstrClient
- * 5. Proxies the request and returns the response
- *
- * @param options - Routing options
- * @returns The provider response
- */
-export async function routeRequests(
-  options: RouteRequestOptions
-): Promise<Response> {
+async function resolveRouteRequestContext(options: RouteRequestOptions): Promise<{
+  client: RoutstrClient;
+  baseUrl: string;
+  mintUrl: string;
+  path: string;
+  modelId: string;
+  proxiedBody: Record<string, unknown>;
+}> {
   const {
     modelId,
     requestBody,
@@ -106,7 +106,6 @@ export async function routeRequests(
     mode = "apikeys",
   } = options;
 
-  // Use provided ModelManager or create a new one
   let modelManager: ModelManager;
   let providers: string[];
 
@@ -117,32 +116,26 @@ export async function routeRequests(
       throw new Error("No providers available - run bootstrap first");
     }
   } else {
-    // Initialize ModelManager
     modelManager = new ModelManager(discoveryAdapter, {
       includeProviderUrls: forcedProvider
         ? [forcedProvider, ...includeProviderUrls]
         : includeProviderUrls,
     });
 
-    // Bootstrap providers
     providers = await modelManager.bootstrapProviders(torMode);
     if (providers.length === 0) {
       throw new Error("No providers available");
     }
 
-    // Fetch models
     await modelManager.fetchModels(providers, forceRefresh);
   }
 
-  // Initialize ProviderManager
   const providerManager = new ProviderManager(providerRegistry);
 
-  // Determine cheapest provider
   let baseUrl: string;
   let selectedModel: Model;
 
   if (forcedProvider) {
-    // Use forced provider
     const normalizedProvider = forcedProvider.endsWith("/")
       ? forcedProvider
       : `${forcedProvider}/`;
@@ -157,7 +150,6 @@ export async function routeRequests(
     baseUrl = normalizedProvider;
     selectedModel = match;
   } else {
-    // Find cheapest provider
     const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
       torMode,
       includeDisabled: false,
@@ -170,7 +162,6 @@ export async function routeRequests(
     selectedModel = cheapest.model;
   }
 
-  // Get wallet balance
   const balances = await walletAdapter.getBalances();
   const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
 
@@ -180,7 +171,6 @@ export async function routeRequests(
     );
   }
 
-  // Get mint URL
   const providerMints = providerRegistry.getProviderMints(baseUrl);
   const mintUrl =
     walletAdapter.getActiveMintUrl() ||
@@ -191,13 +181,11 @@ export async function routeRequests(
     throw new Error("No mint configured in wallet");
   }
 
-  // Initialize RoutstrClient
-  const alertLevel = "min";
   const client = new RoutstrClient(
     walletAdapter,
     storageAdapter,
     providerRegistry,
-    alertLevel,
+    "min",
     mode
   );
 
@@ -205,37 +193,51 @@ export async function routeRequests(
     client.setDebugLevel(debugLevel);
   }
 
-  // Extract options from request body
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
 
-  // Make the request using the simpler routeRequest method
-  let response: Response | null = null;
+  const proxiedBody: Record<string, unknown> =
+    requestBody && typeof requestBody === "object"
+      ? { ...(requestBody as Record<string, unknown>) }
+      : {};
+
+  proxiedBody.model = selectedModel.id;
+
+  if (stream !== undefined) {
+    proxiedBody.stream = stream;
+  }
+
+  if (maxTokens !== undefined) {
+    proxiedBody.max_tokens = maxTokens;
+  }
+
+  return {
+    client,
+    baseUrl,
+    mintUrl,
+    path,
+    modelId,
+    proxiedBody,
+  };
+}
+
+/**
+ * Route an OpenAI-compatible request to the cheapest provider
+ */
+export async function routeRequests(
+  options: RouteRequestOptions
+): Promise<Response> {
+  const { client, baseUrl, mintUrl, path, modelId, proxiedBody } =
+    await resolveRouteRequestContext(options);
 
   try {
-    const proxiedBody: Record<string, unknown> =
-      requestBody && typeof requestBody === "object"
-        ? { ...(requestBody as Record<string, unknown>) }
-        : {};
-
-    proxiedBody.model = selectedModel.id;
-
-    if (stream !== undefined) {
-      proxiedBody.stream = stream;
-    }
-
-    if (maxTokens !== undefined) {
-      proxiedBody.max_tokens = maxTokens;
-    }
-    console.log(modelId);
-
-    response = await client.routeRequest({
+    const response = await client.routeRequest({
       path,
       method: "POST",
       body: proxiedBody,
       baseUrl,
       mintUrl,
-      modelId: modelId,
+      modelId,
     });
 
     if (!response.ok) {
@@ -243,6 +245,36 @@ export async function routeRequests(
     }
 
     return response;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("401") ||
+        error.message.includes("402") ||
+        error.message.includes("403"))
+    ) {
+      throw new Error(`Authentication failed: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+export async function routeRequestsToNodeResponse(
+  options: RouteRequestToNodeResponseOptions
+): Promise<void> {
+  const { res } = options;
+  const { client, baseUrl, mintUrl, path, modelId, proxiedBody } =
+    await resolveRouteRequestContext(options);
+
+  try {
+    await client.routeRequestToNodeResponse({
+      path,
+      method: "POST",
+      body: proxiedBody,
+      baseUrl,
+      mintUrl,
+      modelId,
+      res,
+    });
   } catch (error) {
     if (
       error instanceof Error &&
@@ -271,7 +303,14 @@ function extractMessageHistory(requestBody: unknown): Message[] {
     return [];
   }
 
-  return messages as Message[];
+  return messages.filter(
+    (m): m is Message =>
+      m &&
+      typeof m === "object" &&
+      "role" in m &&
+      "content" in m &&
+      typeof (m as any).role === "string"
+  );
 }
 
 /**
@@ -285,23 +324,19 @@ function extractMaxTokens(requestBody: unknown): number | undefined {
   const body = requestBody as Record<string, unknown>;
   const maxTokens = body.max_tokens;
 
-  if (typeof maxTokens === "number") {
-    return maxTokens;
-  }
-
-  return undefined;
+  return typeof maxTokens === "number" ? maxTokens : undefined;
 }
 
 /**
- * Extract stream option from request body
+ * Extract stream flag from request body
  */
-function extractStream(requestBody: unknown): boolean {
+function extractStream(requestBody: unknown): boolean | undefined {
   if (!requestBody || typeof requestBody !== "object") {
-    return false;
+    return undefined;
   }
 
   const body = requestBody as Record<string, unknown>;
   const stream = body.stream;
 
-  return stream === true;
+  return typeof stream === "boolean" ? stream : undefined;
 }
