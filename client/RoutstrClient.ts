@@ -1059,7 +1059,23 @@ export class RoutstrClient {
       requestId: providedRequestId,
     } = params;
 
+    this._log("DEBUG", "[_trackResponseUsage] Starting", {
+      hasResponse: !!response,
+      modelId,
+      satsSpent,
+      hasProvidedUsage: !!providedUsage,
+      hasProvidedRequestId: !!providedRequestId,
+    });
+
     if (!response || !modelId) {
+      this._log(
+        "DEBUG",
+        "[_trackResponseUsage] Early return: missing response or modelId",
+        {
+          hasResponse: !!response,
+          modelId,
+        }
+      );
       return;
     }
 
@@ -1070,12 +1086,19 @@ export class RoutstrClient {
       if (!usage || !requestId) {
         const contentType = response.headers.get("content-type") || "";
         if (contentType.includes("text/event-stream")) {
+          this._log(
+            "DEBUG",
+            "[_trackResponseUsage] Skipping - streaming response (text/event-stream)"
+          );
           return;
         }
 
         const cloned = response.clone();
         const responseBody = await cloned.json();
-        usage = usage ?? extractUsageFromResponseBody(responseBody, satsSpent) ?? undefined;
+        usage =
+          usage ??
+          extractUsageFromResponseBody(responseBody, satsSpent) ??
+          undefined;
         requestId =
           requestId ??
           extractResponseId(responseBody) ??
@@ -1084,10 +1107,19 @@ export class RoutstrClient {
       }
 
       if (!usage) {
+        this._log(
+          "DEBUG",
+          "[_trackResponseUsage] No usage extracted, returning early"
+        );
         return;
       }
 
       const finalRequestId = requestId || "unknown";
+      this._log("DEBUG", "[_trackResponseUsage] Extracted usage", {
+        usage,
+        finalRequestId,
+      });
+
       const store = await getDefaultSdkStore();
       const state = store.getState();
       const matchingClient = state.clientIds.find(
@@ -1099,7 +1131,7 @@ export class RoutstrClient {
           : finalRequestId;
 
       const usageTracking = getDefaultUsageTrackingDriver();
-      await usageTracking.append({
+      const entry = {
         id: entryId,
         timestamp: Date.now(),
         modelId,
@@ -1107,9 +1139,19 @@ export class RoutstrClient {
         requestId: finalRequestId,
         client: matchingClient?.clientId,
         ...usage,
-      });
+      };
+      this._log("DEBUG", "[_trackResponseUsage] Appending usage entry", entry);
+      await usageTracking.append(entry);
+      this._log(
+        "DEBUG",
+        "[_trackResponseUsage] Successfully appended usage entry"
+      );
     } catch (error) {
-      this._log("WARN", "Failed to track response usage:", error);
+      this._log(
+        "WARN",
+        "[_trackResponseUsage] Failed to track response usage:",
+        error
+      );
     }
   }
 
