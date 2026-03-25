@@ -1283,6 +1283,11 @@ export class RoutstrClient {
         client: matchingClient?.clientId,
         ...usage,
       };
+
+      // For xcashu mode, use satsSpent directly for satsCost instead of calculating from usage
+      if (this.mode === "xcashu") {
+        entry.satsCost = satsSpent;
+      }
       this._log("DEBUG", "[_trackResponseUsage] Appending usage entry", entry);
       await usageTracking.append(entry);
       this._log(

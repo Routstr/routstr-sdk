@@ -428,7 +428,6 @@ export class ProviderManager {
     modelId: string,
     options: { torMode?: boolean; includeDisabled?: boolean } = {}
   ): ModelProviderPrice[] {
-    const normalizedId = this.normalizeModelId(modelId);
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
     const disabledProviders = new Set(
@@ -447,9 +446,7 @@ export class ProviderManager {
       )
         continue;
 
-      const match = models.find(
-        (model) => this.normalizeModelId(model.id) === normalizedId
-      );
+      const match = models.find((model) => model.id === modelId);
       if (!match?.sats_pricing) continue;
 
       const prompt = match.sats_pricing.prompt;

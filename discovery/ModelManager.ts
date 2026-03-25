@@ -406,12 +406,7 @@ export class ModelManager {
     }
 
     const json = await res.json();
-    const list = Array.isArray(json?.data)
-      ? json.data.map((m: Model) => ({
-          ...m,
-          id: m.id.split("/").pop() || m.id,
-        }))
-      : [];
+    const list = Array.isArray(json?.data) ? json.data : [];
 
     return list;
   }
