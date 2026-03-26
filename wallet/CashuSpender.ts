@@ -516,7 +516,8 @@ export class CashuSpender {
   async refundProviders(
     baseUrls: string[],
     mintUrl: string,
-    refundApiKeys: boolean = false
+    refundApiKeys: boolean = false,
+    forceRefund?: boolean
   ): Promise<{ baseUrl: string; success: boolean }[]> {
     const results: { baseUrl: string; success: boolean }[] = [];
 
@@ -580,6 +581,7 @@ export class CashuSpender {
             mintUrl,
             baseUrl: apiKeyEntry.baseUrl,
             apiKey: apiKeyEntryFull.key,
+            forceRefund,
           });
 
           if (refundResult.success) {

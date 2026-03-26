@@ -50,6 +50,9 @@ export interface RefundApiKeyOptions {
 
   /** The API key to use for authentication */
   apiKey: string;
+
+  /** If true, forces refund even if the API key was used recently */
+  forceRefund?: boolean;
 }
 
 /**
@@ -229,12 +232,31 @@ export class BalanceManager {
 
   /**
    * Refund API key balance - convert remaining API key balance to cashu token
+   * @param options - Refund options including forceRefund flag
+   * @returns Refund result
    */
   async refundApiKey(options: RefundApiKeyOptions): Promise<RefundResult> {
-    const { mintUrl, baseUrl, apiKey } = options;
+    const { mintUrl, baseUrl, apiKey, forceRefund } = options;
 
     if (!apiKey) {
       return { success: false, message: "No API key to refund" };
+    }
+
+    // If forceRefund is not true, skip refund if the API key was used in the last 5 minutes
+    if (!forceRefund) {
+      const apiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+      if (apiKeyEntry?.lastUsed) {
+        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+        if (apiKeyEntry.lastUsed > fiveMinutesAgo) {
+          console.log(
+            `[BalanceManager] Skipping refund for ${baseUrl} - used ${Math.round((Date.now() - apiKeyEntry.lastUsed) / 1000)}s ago`
+          );
+          return {
+            success: false,
+            message: "API key was used recently, skipping refund",
+          };
+        }
+      }
     }
 
     let fetchResult:
@@ -485,9 +507,9 @@ export class BalanceManager {
       totalMintBalance + targetProviderBalance < adjustedAmount &&
       totalMintBalance + targetProviderBalance + refundableProviderBalance >=
         adjustedAmount &&
-      retryCount < 1
+      retryCount < 2
     ) {
-      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl);
+      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount);
       return this.createProviderToken({
         ...options,
         retryCount: retryCount + 1,
@@ -688,11 +710,15 @@ export class BalanceManager {
 
   private async _refundOtherProvidersForTopUp(
     baseUrl: string,
-    mintUrl: string
+    mintUrl: string,
+    retryCount: number
   ): Promise<void> {
     const pendingDistribution =
       this.storageAdapter.getCachedTokenDistribution();
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
+
+    // If retryCount >= 2, force refund even if API keys were used recently
+    const forceRefund = retryCount >= 2;
 
     const toRefund = pendingDistribution.filter(
       (pending) => pending.baseUrl !== baseUrl
@@ -742,6 +768,7 @@ export class BalanceManager {
           mintUrl,
           baseUrl: apiKeyEntry.baseUrl,
           apiKey: fullApiKeyEntry.key,
+          forceRefund,
         });
 
         return { baseUrl: apiKeyEntry.baseUrl, success: result.success };

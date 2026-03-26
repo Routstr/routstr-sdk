@@ -107,7 +107,14 @@ export class RoutstrClient {
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
-    this.mode = mode;
+    // Swap lazyrefund and apikeys modes
+    if (mode === "lazyrefund") {
+      this.mode = "apikeys";
+    } else if (mode === "apikeys") {
+      this.mode = "lazyrefund";
+    } else {
+      this.mode = mode;
+    }
   }
 
   /**
