@@ -50,8 +50,8 @@ export interface RouteRequestOptions {
   modelManager?: ModelManager;
   /** Optional: set RoutstrClient debug level */
   debugLevel?: DebugLevel;
-  /** Optional: client mode (xcashu, lazyrefund, or apikeys) */
-  mode?: "xcashu" | "lazyrefund" | "apikeys";
+  /** Optional: client mode (xcashu or apikeys) */
+  mode?: "xcashu" | "apikeys";
 }
 
 export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {

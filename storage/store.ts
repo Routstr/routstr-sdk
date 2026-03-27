@@ -2,26 +2,11 @@ import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
 import type { ProviderInfo, Model } from "../core";
-import { getDecodedToken } from "@cashu/cashu-ts";
 import { SDK_STORAGE_KEYS } from "./keys";
 import type { StorageDriver, SdkStorageState } from "./types";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-
-const getCashuTokenBalance = (token: string): number => {
-  try {
-    const decoded = getDecodedToken(token);
-    const unitDivisor = decoded.unit === "msat" ? 1000 : 1;
-    let sum = 0;
-    for (const proof of decoded.proofs) {
-      sum += proof.amount / unitDivisor;
-    }
-    return sum;
-  } catch {
-    return 0;
-  }
-};
 
 export interface SdkStoreOptions {
   driver: StorageDriver;
@@ -36,18 +21,6 @@ export interface SdkStorageStore extends SdkStorageState {
   setMintsFromAllProviders: (value: Record<string, string[]>) => void;
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
-  setCachedTokens: (
-    value:
-      | Array<{
-          baseUrl: string;
-          token: string;
-          balance?: number;
-          lastUsed?: number | null;
-        }>
-      | ((
-          current: SdkStorageStore["cachedTokens"]
-        ) => SdkStorageStore["cachedTokens"])
-  ) => void;
   setApiKeys: (
     value:
       | Array<{
@@ -104,7 +77,6 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     mintsFromAllProviders: {},
     infoFromAllProviders: {},
     lastModelsUpdate: {},
-    cachedTokens: [],
     apiKeys: [],
     childKeys: [],
     routstr21Models: [],
@@ -168,23 +140,6 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
       }
       void driver.setItem(SDK_STORAGE_KEYS.LAST_MODELS_UPDATE, normalized);
       set({ lastModelsUpdate: normalized });
-    },
-    setCachedTokens: (value) => {
-      set((state) => {
-        const updates =
-          typeof value === "function" ? value(state.cachedTokens) : value;
-        const normalized = updates.map((entry) => ({
-          ...entry,
-          baseUrl: normalizeBaseUrl(entry.baseUrl),
-          balance:
-            typeof entry.balance === "number"
-              ? entry.balance
-              : getCashuTokenBalance(entry.token),
-          lastUsed: entry.lastUsed ?? null,
-        }));
-        void driver.setItem(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, normalized);
-        return { cachedTokens: normalized };
-      });
     },
     setApiKeys: (value) => {
       set((state) => {
@@ -275,7 +230,6 @@ const hydrateStoreFromDriver = async (
     rawMints,
     rawInfo,
     rawLastModelsUpdate,
-    rawCachedTokens,
     rawApiKeys,
     rawChildKeys,
     rawRoutstr21Models,
@@ -303,14 +257,6 @@ const hydrateStoreFromDriver = async (
       SDK_STORAGE_KEYS.LAST_MODELS_UPDATE,
       {}
     ),
-    driver.getItem<
-      Array<{
-        baseUrl: string;
-        token: string;
-        balance?: number;
-        lastUsed?: number | null;
-      }>
-    >(SDK_STORAGE_KEYS.LOCAL_CASHU_TOKENS, []),
     driver.getItem<
       Array<{
         baseUrl: string;
@@ -387,16 +333,6 @@ const hydrateStoreFromDriver = async (
     ])
   );
 
-  const cachedTokens = rawCachedTokens.map((entry) => ({
-    ...entry,
-    baseUrl: normalizeBaseUrl(entry.baseUrl),
-    balance:
-      typeof entry.balance === "number"
-        ? entry.balance
-        : getCashuTokenBalance(entry.token),
-    lastUsed: entry.lastUsed ?? null,
-  }));
-
   const apiKeys = rawApiKeys.map((entry) => ({
     ...entry,
     baseUrl: normalizeBaseUrl(entry.baseUrl),
@@ -438,7 +374,6 @@ const hydrateStoreFromDriver = async (
     mintsFromAllProviders,
     infoFromAllProviders,
     lastModelsUpdate,
-    cachedTokens,
     apiKeys,
     childKeys,
     routstr21Models,
@@ -499,72 +434,6 @@ export const createDiscoveryAdapterFromStore = (
 export const createStorageAdapterFromStore = (
   store: SdkStore
 ): StorageAdapter => ({
-  getToken: (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const entry = store
-      .getState()
-      .cachedTokens.find((token) => token.baseUrl === normalized);
-    if (!entry) return null;
-    const next = store
-      .getState()
-      .cachedTokens.map((token) =>
-        token.baseUrl === normalized
-          ? { ...token, lastUsed: Date.now() }
-          : token
-      );
-    store.getState().setCachedTokens(next);
-    return entry.token;
-  },
-  setToken: (baseUrl, token) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const tokens = store.getState().cachedTokens;
-    const balance = getCashuTokenBalance(token);
-    const existingIndex = tokens.findIndex(
-      (entry) => entry.baseUrl === normalized
-    );
-    if (existingIndex !== -1) {
-      throw new Error(`Token already exists for baseUrl: ${normalized}`);
-    }
-    const next = [...tokens];
-    next.push({
-      baseUrl: normalized,
-      token,
-      balance,
-      lastUsed: Date.now(),
-    });
-    store.getState().setCachedTokens(next);
-  },
-  removeToken: (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const next = store
-      .getState()
-      .cachedTokens.filter((entry) => entry.baseUrl !== normalized);
-    store.getState().setCachedTokens(next);
-  },
-  updateTokenBalance: (baseUrl, balance) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const tokens = store.getState().cachedTokens;
-    const next = tokens.map((entry) =>
-      entry.baseUrl === normalized ? { ...entry, balance } : entry
-    );
-    store.getState().setCachedTokens(next);
-  },
-  getCachedTokenDistribution: () => {
-    const cachedTokens = store.getState().cachedTokens;
-    const distributionMap: Record<string, number> = {};
-
-    for (const entry of cachedTokens) {
-      const sum = entry.balance || 0;
-      if (sum > 0) {
-        distributionMap[entry.baseUrl] =
-          (distributionMap[entry.baseUrl] || 0) + sum;
-      }
-    }
-
-    return Object.entries(distributionMap)
-      .map(([baseUrl, amt]) => ({ baseUrl, amount: amt }))
-      .sort((a, b) => b.amount - a.amount);
-  },
   getApiKeyDistribution: () => {
     const apiKeys = store.getState().apiKeys;
     const distributionMap: Record<string, number> = {};

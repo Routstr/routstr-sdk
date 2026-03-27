@@ -58,7 +58,7 @@ export interface FetchOptions {
  * RoutstrClient is the main SDK entry point
  */
 export type AlertLevel = "max" | "min";
-export type RoutstrClientMode = "xcashu" | "lazyrefund" | "apikeys";
+export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.2;
@@ -107,14 +107,7 @@ export class RoutstrClient {
     this.streamProcessor = new StreamProcessor();
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
-    // Swap lazyrefund and apikeys modes
-    if (mode === "lazyrefund") {
-      this.mode = "apikeys";
-    } else if (mode === "apikeys") {
-      this.mode = "lazyrefund";
-    } else {
-      this.mode = mode;
-    }
+    this.mode = mode;
   }
 
   /**
@@ -700,8 +693,6 @@ export class RoutstrClient {
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
         );
         tryNextProvider = true;
-        if (this.mode === "lazyrefund")
-          this.storageAdapter.removeToken(baseUrl);
       } else {
         this._log(
           "DEBUG",
@@ -752,32 +743,20 @@ export class RoutstrClient {
       }
     }
 
-    if (
-      status === 402 &&
-      !tryNextProvider &&
-      (this.mode === "apikeys" || this.mode === "lazyrefund")
-    ) {
+    if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
       this.storageAdapter.getApiKey(baseUrl);
 
       let topupAmount = params.requiredSats;
 
       try {
-        let currentBalance = 0;
-
-        if (this.mode === "apikeys") {
-          const currentBalanceInfo = await this.balanceManager.getTokenBalance(
-            params.token,
-            baseUrl
-          );
-          currentBalance =
-            currentBalanceInfo.unit === "msat"
-              ? currentBalanceInfo.amount / 1000
-              : currentBalanceInfo.amount;
-        } else if (this.mode === "lazyrefund") {
-          const distribution = this.storageAdapter.getCachedTokenDistribution();
-          const tokenEntry = distribution.find((t) => t.baseUrl === baseUrl);
-          currentBalance = tokenEntry?.amount ?? 0;
-        }
+        const currentBalanceInfo = await this.balanceManager.getTokenBalance(
+          params.token,
+          baseUrl
+        );
+        const currentBalance =
+          currentBalanceInfo.unit === "msat"
+            ? currentBalanceInfo.amount / 1000
+            : currentBalanceInfo.amount;
 
         const shortfall = Math.max(0, params.requiredSats - currentBalance);
         topupAmount = shortfall > 0 ? shortfall : params.requiredSats;
@@ -947,35 +926,7 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Status ${status} (auth/server error), attempting refund for ${baseUrl}, mode=${this.mode}`
       );
-      if (this.mode === "lazyrefund") {
-        try {
-          // Refund current token
-          const refundResult = await this.balanceManager.refund({
-            mintUrl,
-            baseUrl,
-            token: params.token,
-          });
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Lazyrefund result: success=${refundResult.success}`
-          );
-          if (refundResult.success) this.storageAdapter.removeToken(baseUrl);
-          else
-            throw new ProviderError(
-              baseUrl,
-              status,
-              "refund failed",
-              requestId
-            );
-        } catch (error) {
-          throw new ProviderError(
-            baseUrl,
-            status,
-            "Failed to refund token",
-            requestId
-          );
-        }
-      } else if (this.mode === "apikeys") {
+      if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
@@ -1121,17 +1072,6 @@ export class RoutstrClient {
           this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
         }
       }
-    } else if (this.mode === "lazyrefund") {
-      const latestBalanceInfo = await this.balanceManager.getTokenBalance(
-        token,
-        baseUrl
-      );
-      const latestTokenBalance =
-        latestBalanceInfo.unit === "msat"
-          ? latestBalanceInfo.amount / 1000
-          : latestBalanceInfo.amount;
-      this.storageAdapter.updateTokenBalance(baseUrl, latestTokenBalance);
-      satsSpent = initialTokenBalance - latestTokenBalance;
     } else if (this.mode === "apikeys") {
       try {
         const latestBalanceInfo = await this.balanceManager.getTokenBalance(
@@ -1349,11 +1289,11 @@ export class RoutstrClient {
   }
 
   /**
-   * Get pending cashu token amount
+   * Get pending API key amount
    */
   private _getPendingCashuTokenAmount(): number {
-    const distribution = this.storageAdapter.getCachedTokenDistribution();
-    return distribution.reduce((total, item) => total + item.amount, 0);
+    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
+    return apiKeyDistribution.reduce((total, item) => total + item.amount, 0);
   }
 
   /**
@@ -1536,8 +1476,8 @@ export class RoutstrClient {
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
       amount,
-      baseUrl: this.mode === "lazyrefund" ? baseUrl : "",
-      reuseToken: this.mode === "lazyrefund",
+      baseUrl: "",
+      reuseToken: false,
     });
 
     if (!spendResult.token) {

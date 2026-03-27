@@ -1,6 +1,9 @@
 import { localStorageDriver } from "./drivers/localStorage";
 import { createMemoryDriver } from "./drivers/memory";
-import { createSqliteDriver } from "./drivers/sqlite";
+import {
+  createSqliteDriver,
+  createBunSqliteDriver,
+} from "./drivers/sqlite";
 import { createIndexedDBDriver } from "./drivers/indexedDB";
 import {
   createIndexedDBUsageTrackingDriver,
@@ -37,6 +40,7 @@ export {
   localStorageDriver,
   createMemoryDriver,
   createSqliteDriver,
+  createBunSqliteDriver,
   createIndexedDBDriver,
 };
 export {

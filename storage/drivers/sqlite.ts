@@ -21,7 +21,7 @@ const isBun = (): boolean => {
 const createDatabase = (dbPath: string): BetterSqlite3Database => {
   if (isBun()) {
     throw new Error(
-      "SQLite driver not supported in Bun. Use createMemoryDriver() instead."
+      "SQLite driver not supported in Bun. Use createBunSqliteDriver() instead."
     );
   }
 
@@ -89,3 +89,58 @@ export const createSqliteDriver = (
     },
   };
 };
+
+// Bun-specific SQLite driver - requires bun:sqlite at runtime
+// This function is only meant to be used in Bun environments
+export async function createBunSqliteDriver(
+  dbPath: string
+): Promise<StorageDriver> {
+  // @ts-ignore - bun:sqlite is only available at runtime in Bun environments
+  const SQLite = (await import("bun:sqlite")).default;
+  const db = new SQLite(dbPath);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sdk_storage (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
+  return {
+    async getItem<T>(key: string, defaultValue: T): Promise<T> {
+      try {
+        const row = db
+          .query("SELECT value FROM sdk_storage WHERE key = ?")
+          .get(key) as { value: string } | undefined;
+        if (!row || typeof row.value !== "string") return defaultValue;
+        try {
+          return JSON.parse(row.value) as T;
+        } catch (parseError) {
+          if (typeof defaultValue === "string") {
+            return row.value as T;
+          }
+          throw parseError;
+        }
+      } catch (error) {
+        console.error(`SQLite getItem failed for key "${key}":`, error);
+        return defaultValue;
+      }
+    },
+    async setItem<T>(key: string, value: T): Promise<void> {
+      try {
+        db.query(
+          "INSERT INTO sdk_storage (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        ).run(key, JSON.stringify(value));
+      } catch (error) {
+        console.error(`SQLite setItem failed for key "${key}":`, error);
+      }
+    },
+    async removeItem(key: string): Promise<void> {
+      try {
+        db.query("DELETE FROM sdk_storage WHERE key = ?").run(key);
+      } catch (error) {
+        console.error(`SQLite removeItem failed for key "${key}":`, error);
+      }
+    },
+  };
+}

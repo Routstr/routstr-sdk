@@ -13,12 +13,6 @@ export interface SdkStorageState {
   infoFromAllProviders: Record<string, import("../core").ProviderInfo>;
   lastModelsUpdate: Record<string, number>;
   lastBaseUrlsUpdate: number | null;
-  cachedTokens: Array<{
-    baseUrl: string;
-    token: string;
-    balance: number;
-    lastUsed: number | null;
-  }>;
   apiKeys: Array<{
     baseUrl: string;
     key: string;

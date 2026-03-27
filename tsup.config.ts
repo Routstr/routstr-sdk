@@ -13,6 +13,6 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  external: ["better-sqlite3"],
+  external: ["better-sqlite3", "bun:sqlite"],
   treeshake: true,
 });

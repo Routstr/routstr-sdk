@@ -69,21 +69,6 @@ export interface ChildKeyEntry {
 }
 
 export interface StorageAdapter {
-  /** Get stored API token for a provider */
-  getToken(baseUrl: string): string | null;
-
-  /** Store API token for a provider */
-  setToken(baseUrl: string, token: string): void;
-
-  /** Remove API token for a provider */
-  removeToken(baseUrl: string): void;
-
-  /** Update balance for an existing stored token */
-  updateTokenBalance(baseUrl: string, balance: number): void;
-
-  /** Get all stored tokens as distribution (baseUrl -> amount in sats) */
-  getCachedTokenDistribution(): Array<{ baseUrl: string; amount: number }>;
-
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
 

@@ -111,15 +111,8 @@ export class CashuSpender {
       totalMintBalance += balanceInSats;
     }
 
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
     const providerBalances: Record<string, number> = {};
     let totalProviderBalance = 0;
-    for (const pending of pendingDistribution) {
-      providerBalances[pending.baseUrl] =
-        (providerBalances[pending.baseUrl] || 0) + pending.amount;
-      totalProviderBalance += pending.amount;
-    }
 
     const apiKeys = this.storageAdapter.getAllApiKeys();
     for (const apiKey of apiKeys) {
@@ -388,30 +381,11 @@ export class CashuSpender {
     }
 
     // Store token and return
-    if (token && baseUrl) {
-      try {
-        this.storageAdapter.setToken(baseUrl, token);
-      } catch (error) {
-        if (
-          error instanceof Error &&
-          error.message.includes("Token already exists")
-        ) {
-          this._log(
-            "DEBUG",
-            `[CashuSpender] _spendInternal: Token already exists for ${baseUrl}, receiving newly created token and using existing`
-          );
-          const receiveResult = await this.receiveToken(token);
-          if (receiveResult.success) {
-            this._log(
-              "DEBUG",
-              `[CashuSpender] _spendInternal: Token restored successfully, amount=${receiveResult.amount}`
-            );
-          }
-          token = this.storageAdapter.getToken(baseUrl);
-        } else {
-          throw error;
-        }
-      }
+    if (token) {
+      this._log(
+        "DEBUG",
+        `[CashuSpender] _spendInternal: Successfully spent ${spentAmount}, returning token with balance=${spentAmount}`
+      );
     }
 
     this._logTransaction("spend", {
@@ -438,42 +412,43 @@ export class CashuSpender {
   }
 
   /**
-   * Try to reuse an existing token
+   * Try to reuse an existing API key
    */
   private async _tryReuseToken(
     baseUrl: string,
     amount: number,
     mintUrl: string
   ): Promise<SpendResult | null> {
-    const storedToken = this.storageAdapter.getToken(baseUrl);
-    if (!storedToken) return null;
+    const apiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+    if (!apiKeyEntry) return null;
 
     // Get pending distribution to check balance
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
+    const apiKeyDistribution =
+      this.storageAdapter.getApiKeyDistribution();
     const balanceForBaseUrl =
-      pendingDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
+      apiKeyDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
-    this._log("DEBUG", "RESUINGDSR GSODGNSD", balanceForBaseUrl, amount);
+    this._log("DEBUG", "Reusing API key", balanceForBaseUrl, amount);
 
     if (balanceForBaseUrl > amount) {
       const units = this.walletAdapter.getMintUnits();
       const unit = units[mintUrl] || "sat";
       return {
-        token: storedToken,
+        token: apiKeyEntry.key,
         status: "success",
         balance: balanceForBaseUrl,
         unit,
       };
     }
 
-    // Token exists but insufficient balance - attempt topup
+    // API key exists but insufficient balance - attempt topup
     if (this.balanceManager) {
       const topUpAmount = Math.ceil(amount * 1.2 - balanceForBaseUrl);
       const topUpResult = await this.balanceManager.topUp({
         mintUrl,
         baseUrl,
         amount: topUpAmount,
+        token: apiKeyEntry.key,
       });
       this._log("DEBUG", "TOPUP ", topUpResult);
 
@@ -490,7 +465,7 @@ export class CashuSpender {
         });
 
         return {
-          token: storedToken,
+          token: apiKeyEntry.key,
           status: "success",
           balance: newBalance,
           unit,
@@ -499,11 +474,11 @@ export class CashuSpender {
 
       const providerBalance = await this._getProviderTokenBalance(
         baseUrl,
-        storedToken
+        apiKeyEntry.key
       );
       this._log("DEBUG", providerBalance);
       if (providerBalance <= 0) {
-        this.storageAdapter.removeToken(baseUrl);
+        this.storageAdapter.removeApiKey(baseUrl);
       }
     }
 
@@ -520,51 +495,6 @@ export class CashuSpender {
     forceRefund?: boolean
   ): Promise<{ baseUrl: string; success: boolean }[]> {
     const results: { baseUrl: string; success: boolean }[] = [];
-
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
-
-    const toRefund = pendingDistribution.filter((p) =>
-      baseUrls.includes(p.baseUrl)
-    );
-
-    const refundResults = await Promise.allSettled(
-      toRefund.map(async (pending) => {
-        const token = this.storageAdapter.getToken(pending.baseUrl);
-        this._log("DEBUG", token, this.balanceManager);
-        if (!token || !this.balanceManager) {
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-
-        const tokenBalance = await this.balanceManager.getTokenBalance(
-          token,
-          pending.baseUrl
-        );
-
-        if (tokenBalance.reserved > 0) {
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-
-        const result = await this.balanceManager.refund({
-          mintUrl,
-          baseUrl: pending.baseUrl,
-          token,
-        });
-        this._log("DEBUG", result);
-
-        if (result.success) {
-          this.storageAdapter.removeToken(pending.baseUrl);
-        }
-
-        return { baseUrl: pending.baseUrl, success: result.success };
-      })
-    );
-
-    results.push(
-      ...refundResults.map((r) =>
-        r.status === "fulfilled" ? r.value : { baseUrl: "", success: false }
-      )
-    );
 
     if (refundApiKeys) {
       const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();

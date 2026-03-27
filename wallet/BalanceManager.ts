@@ -25,20 +25,6 @@ import {
 } from "./tokenUtils";
 
 /**
- * Options for refunding tokens
- */
-export interface RefundOptions {
-  /** The mint URL (for NIP-60 wallet operations) */
-  mintUrl: string;
-
-  /** The provider base URL */
-  baseUrl: string;
-
-  /** Optional specific token to refund (if not provided, uses stored token) */
-  token?: string;
-}
-
-/**
  * Options for refunding API key balance
  */
 export interface RefundApiKeyOptions {
@@ -133,15 +119,8 @@ export class BalanceManager {
       totalMintBalance += balanceInSats;
     }
 
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
     const providerBalances: Record<string, number> = {};
     let totalProviderBalance = 0;
-    for (const pending of pendingDistribution) {
-      providerBalances[pending.baseUrl] =
-        (providerBalances[pending.baseUrl] || 0) + pending.amount;
-      totalProviderBalance += pending.amount;
-    }
 
     const apiKeys = this.storageAdapter.getAllApiKeys();
     for (const apiKey of apiKeys) {
@@ -157,77 +136,6 @@ export class BalanceManager {
       providerBalances,
       mintBalances: normalizedMintBalances,
     };
-  }
-
-  /**
-   * Unified refund - handles both NIP-60 and legacy wallet refunds
-   */
-  async refund(options: RefundOptions): Promise<RefundResult> {
-    const { mintUrl, baseUrl, token: providedToken } = options;
-
-    const storedToken = providedToken || this.storageAdapter.getToken(baseUrl);
-
-    if (!storedToken) {
-      console.log("[BalanceManager] No token to refund, returning early");
-      return { success: true, message: "No API key to refund" };
-    }
-
-    let fetchResult:
-      | { success: boolean; token?: string; requestId?: string; error?: string }
-      | undefined;
-
-    try {
-      // Fetch refund token from provider
-      fetchResult = await this._fetchRefundToken(baseUrl, storedToken);
-
-      if (!fetchResult.success) {
-        return {
-          success: false,
-          message: fetchResult.error || "Refund failed",
-          requestId: fetchResult.requestId,
-        };
-      }
-
-      if (!fetchResult.token) {
-        return {
-          success: false,
-          message: "No token received from refund",
-          requestId: fetchResult.requestId,
-        };
-      }
-
-      // Check if this is a "no balance to refund" case
-      if (fetchResult.error === "No balance to refund") {
-        console.log(
-          "[BalanceManager] No balance to refund, removing stored token"
-        );
-        this.storageAdapter.removeToken(baseUrl);
-        return { success: true, message: "No balance to refund" };
-      }
-
-      // Receive the refunded token
-      const receiveResult = await this.cashuSpender.receiveToken(
-        fetchResult.token
-      );
-      const totalAmountMsat =
-        receiveResult.unit === "msat"
-          ? receiveResult.amount
-          : receiveResult.amount * 1000;
-
-      // Remove the stored token if we used it from storage
-      if (!providedToken) {
-        this.storageAdapter.removeToken(baseUrl);
-      }
-
-      return {
-        success: receiveResult.success,
-        refundedAmount: totalAmountMsat,
-        requestId: fetchResult.requestId,
-      };
-    } catch (error) {
-      console.error("[BalanceManager] Refund error", error);
-      return this._handleRefundError(error, mintUrl, fetchResult?.requestId);
-    }
   }
 
   /**
@@ -405,8 +313,12 @@ export class BalanceManager {
       return { success: false, message: "Invalid top up amount" };
     }
 
-    const storedToken = providedToken || this.storageAdapter.getToken(baseUrl);
-    if (!storedToken) {
+    const apiKeyEntry = providedToken 
+      ? null  // providedToken is now the apiKey for apikeys mode
+      : this.storageAdapter.getApiKey(baseUrl);
+    const apiKey = providedToken || apiKeyEntry?.key;
+    
+    if (!apiKey) {
       return { success: false, message: "No API key available for top up" };
     }
 
@@ -431,7 +343,7 @@ export class BalanceManager {
 
       const topUpResult = await this._postTopUp(
         baseUrl,
-        storedToken,
+        apiKey,
         cashuToken
       );
       requestId = topUpResult.requestId;
@@ -713,47 +625,14 @@ export class BalanceManager {
     mintUrl: string,
     retryCount: number
   ): Promise<void> {
-    const pendingDistribution =
-      this.storageAdapter.getCachedTokenDistribution();
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
 
     // If retryCount >= 2, force refund even if API keys were used recently
     const forceRefund = retryCount >= 2;
 
-    const toRefund = pendingDistribution.filter(
-      (pending) => pending.baseUrl !== baseUrl
-    );
     const apiKeysToRefund = apiKeyDistribution.filter(
       (apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0
     );
-
-    const tokenRefundResults = await Promise.allSettled(
-      toRefund.map(async (pending) => {
-        const token = this.storageAdapter.getToken(pending.baseUrl);
-        if (!token) {
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-
-        const tokenBalance = await this.getTokenBalance(token, pending.baseUrl);
-        if (tokenBalance.reserved > 0) {
-          return { baseUrl: pending.baseUrl, success: false };
-        }
-
-        const result = await this.refund({
-          mintUrl,
-          baseUrl: pending.baseUrl,
-          token,
-        });
-
-        return { baseUrl: pending.baseUrl, success: result.success };
-      })
-    );
-
-    for (const result of tokenRefundResults) {
-      if (result.status === "fulfilled" && result.value.success) {
-        this.storageAdapter.removeToken(result.value.baseUrl);
-      }
-    }
 
     const apiKeyRefundResults = await Promise.allSettled(
       apiKeysToRefund.map(async (apiKeyEntry) => {
@@ -779,105 +658,6 @@ export class BalanceManager {
       if (result.status === "fulfilled" && result.value.success) {
         this.storageAdapter.updateApiKeyBalance(result.value.baseUrl, 0);
       }
-    }
-  }
-
-  /**
-   * Fetch refund token from provider API
-   */
-  private async _fetchRefundToken(
-    baseUrl: string,
-    storedToken: string
-  ): Promise<{
-    success: boolean;
-    token?: string;
-    requestId?: string;
-    error?: string;
-  }> {
-    if (!baseUrl) {
-      return {
-        success: false,
-        error: "No base URL configured",
-      };
-    }
-
-    const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-
-    const url = `${normalizedBaseUrl}v1/wallet/refund`;
-
-    // Create an AbortController for timeout handling
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, 60000); // 1 minute timeout
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${storedToken}`,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      const requestId =
-        response.headers.get("x-routstr-request-id") || undefined;
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-
-        if (
-          response.status === 400 &&
-          errorData?.detail === "No balance to refund"
-        ) {
-          this.storageAdapter.removeToken(baseUrl);
-          return {
-            success: false,
-            requestId,
-            error: "No balance to refund",
-          };
-        }
-
-        return {
-          success: false,
-          requestId,
-          error: `Refund request failed with status ${response.status}: ${
-            errorData?.detail || response.statusText
-          }`,
-        };
-      }
-
-      const data = await response.json();
-      console.log("refund rsule", data);
-      return {
-        success: true,
-        token: data.token,
-        requestId,
-      };
-    } catch (error) {
-      clearTimeout(timeoutId);
-      console.error("[BalanceManager._fetchRefundToken] Fetch error", error);
-
-      if (error instanceof Error) {
-        if (error.name === "AbortError") {
-          return {
-            success: false,
-            error: "Request timed out after 1 minute",
-          };
-        }
-        return {
-          success: false,
-          error: error.message,
-        };
-      }
-
-      return {
-        success: false,
-        error: "Unknown error occurred during refund request",
-      };
     }
   }
 
