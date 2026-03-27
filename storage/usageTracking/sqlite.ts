@@ -88,6 +88,8 @@ export const createSqliteUsageTrackingDriver = (
 ): UsageTrackingDriver => {
   const dbPath = options.dbPath || "routstr.sqlite";
   const tableName = options.tableName || "usage_tracking";
+  console.log("[USAGE_TRACKING_SQLITE] Creating SQLite driver with dbPath:", dbPath);
+  console.log("[USAGE_TRACKING_SQLITE] Current working directory:", process.cwd());
   const db = createDatabase(dbPath);
   const legacyStorageDriver = options.legacyStorageDriver;
 
@@ -125,6 +127,7 @@ export const createSqliteUsageTrackingDriver = (
   let migrationComplete = false;
 
   const appendOne = (entry: UsageTrackingEntry): void => {
+    console.log("[USAGE_TRACKING_SQLITE] appendOne called with:", JSON.stringify(entry, null, 2));
     insertStmt.run(
       entry.id,
       entry.timestamp,
@@ -140,6 +143,7 @@ export const createSqliteUsageTrackingDriver = (
       entry.sessionId ?? null,
       JSON.stringify(entry.tags ?? [])
     );
+    console.log("[USAGE_TRACKING_SQLITE] Successfully inserted into SQLite DB");
   };
 
   const ensureMigrated = async (): Promise<void> => {
@@ -188,15 +192,18 @@ export const createSqliteUsageTrackingDriver = (
 
   return {
     async migrate(): Promise<void> {
+      console.log("[USAGE_TRACKING_SQLITE] migrate() called");
       await ensureMigrated();
     },
 
     async append(entry: UsageTrackingEntry): Promise<void> {
+      console.log("[USAGE_TRACKING_SQLITE] append() called");
       await ensureMigrated();
       appendOne(entry);
     },
 
     async appendMany(entries: UsageTrackingEntry[]): Promise<void> {
+      console.log("[USAGE_TRACKING_SQLITE] appendMany() called with", entries.length, "entries");
       await ensureMigrated();
       for (const entry of entries) {
         appendOne(entry);
@@ -204,6 +211,7 @@ export const createSqliteUsageTrackingDriver = (
     },
 
     async list(options: ListUsageTrackingOptions = {}): Promise<UsageTrackingEntry[]> {
+      console.log("[USAGE_TRACKING_SQLITE] list() called with options:", options);
       await ensureMigrated();
       const { sql, params } = buildWhereClause(options);
       const limitSql = typeof options.limit === "number" ? " LIMIT ?" : "";
@@ -213,6 +221,7 @@ export const createSqliteUsageTrackingDriver = (
       const rows = stmt.all(
         ...(typeof options.limit === "number" ? [...params, options.limit] : params)
       );
+      console.log("[USAGE_TRACKING_SQLITE] list() returned", rows.length, "entries");
       return rows.map(mapRow);
     },
 

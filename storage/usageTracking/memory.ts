@@ -44,7 +44,9 @@ export const createMemoryUsageTrackingDriver = (
     },
 
     async append(entry: UsageTrackingEntry): Promise<void> {
+      console.log("[USAGE_TRACKING_MEMORY] append() called with:", JSON.stringify(entry, null, 2));
       store.set(entry.id, { ...entry, baseUrl: normalizeBaseUrl(entry.baseUrl) });
+      console.log("[USAGE_TRACKING_MEMORY] store now has", store.size, "entries");
     },
 
     async appendMany(entries: UsageTrackingEntry[]): Promise<void> {
