@@ -68,6 +68,12 @@ export interface ChildKeyEntry {
   createdAt: number;
 }
 
+export interface XCashuTokenEntry {
+  baseUrl: string;
+  token: string;
+  createdAt: number;
+}
+
 export interface StorageAdapter {
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
@@ -135,6 +141,23 @@ export interface StorageAdapter {
       createdAt?: number;
     }>
   ): void;
+
+  // ========== XCashu Tokens (multiple tokens per baseUrl) ==========
+
+  /** Get all stored xcashu tokens */
+  getXcashuTokens(): Record<string, XCashuTokenEntry[]>;
+
+  /** Get xcashu tokens for a specific baseUrl */
+  getXcashuTokensForBaseUrl(baseUrl: string): XCashuTokenEntry[];
+
+  /** Add an xcashu token for a baseUrl */
+  addXcashuToken(baseUrl: string, token: string): void;
+
+  /** Remove an xcashu token */
+  removeXcashuToken(baseUrl: string, token: string): void;
+
+  /** Clear all xcashu tokens for a baseUrl */
+  clearXcashuTokensForBaseUrl(baseUrl: string): void;
 }
 
 /**

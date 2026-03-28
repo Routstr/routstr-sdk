@@ -27,6 +27,11 @@ export interface SdkStorageState {
     validityDate?: number;
     createdAt: number;
   }>;
+  xcashuTokens: Record<string, Array<{
+    baseUrl: string;
+    token: string;
+    createdAt: number;
+  }>>;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
   cachedReceiveTokens: Array<{

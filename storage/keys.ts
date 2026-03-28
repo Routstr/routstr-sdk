@@ -9,6 +9,7 @@ export const SDK_STORAGE_KEYS = {
   LAST_BASE_URLS_UPDATE: "lastBaseUrlsUpdate",
   API_KEYS: "api_keys",
   CHILD_KEYS: "child_keys",
+  XCASHU_TOKENS: "xcashu_tokens",
   ROUTSTR21_MODELS: "routstr21Models",
   LAST_ROUTSTR21_MODELS_UPDATE: "lastRoutstr21ModelsUpdate",
   CACHED_RECEIVE_TOKENS: "cached_receive_tokens",

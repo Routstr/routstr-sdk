@@ -24,7 +24,7 @@ import {
 export type { StorageDriver } from "./types";
 export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
-export type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
+export type { StorageAdapter, ProviderRegistry, XCashuTokenEntry } from "../wallet/interfaces";
 export type {
   UsageTrackingDriver,
   UsageTrackingEntry,

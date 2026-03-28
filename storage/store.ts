@@ -41,6 +41,11 @@ export interface SdkStorageStore extends SdkStorageState {
       createdAt?: number;
     }>
   ) => void;
+  setXcashuTokens: (value: Record<string, Array<{
+    baseUrl: string;
+    token: string;
+    createdAt?: number;
+  }>>) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
   setCachedReceiveTokens: (
@@ -79,6 +84,7 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     lastModelsUpdate: {},
     apiKeys: [],
     childKeys: [],
+    xcashuTokens: {},
     routstr21Models: [],
     lastRoutstr21ModelsUpdate: null,
     cachedReceiveTokens: [],
@@ -184,6 +190,22 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
         return { childKeys: normalized };
       });
     },
+    setXcashuTokens: (value) => {
+      const normalized: Record<string, Array<{
+        baseUrl: string;
+        token: string;
+        createdAt: number;
+      }>> = {};
+      for (const [baseUrl, tokens] of Object.entries(value)) {
+        normalized[normalizeBaseUrl(baseUrl)] = tokens.map((entry) => ({
+          ...entry,
+          baseUrl: normalizeBaseUrl(entry.baseUrl),
+          createdAt: entry.createdAt ?? Date.now(),
+        }));
+      }
+      void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, normalized);
+      set({ xcashuTokens: normalized });
+    },
     setRoutstr21Models: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
       set({ routstr21Models: value });
@@ -232,6 +254,7 @@ const hydrateStoreFromDriver = async (
     rawLastModelsUpdate,
     rawApiKeys,
     rawChildKeys,
+    rawXcashuTokens,
     rawRoutstr21Models,
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
@@ -275,6 +298,13 @@ const hydrateStoreFromDriver = async (
         createdAt?: number;
       }>
     >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
+    driver.getItem<
+      Record<string, Array<{
+        baseUrl: string;
+        token: string;
+        createdAt?: number;
+      }>>
+    >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
     driver.getItem<number | null>(
       SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
@@ -349,6 +379,17 @@ const hydrateStoreFromDriver = async (
     createdAt: entry.createdAt ?? Date.now(),
   }));
 
+  const xcashuTokens = Object.fromEntries(
+    Object.entries(rawXcashuTokens).map(([baseUrl, tokens]) => [
+      normalizeBaseUrl(baseUrl),
+      tokens.map((entry) => ({
+        baseUrl: normalizeBaseUrl(entry.baseUrl),
+        token: entry.token,
+        createdAt: entry.createdAt ?? Date.now(),
+      })),
+    ])
+  );
+
   const routstr21Models = rawRoutstr21Models;
   const lastRoutstr21ModelsUpdate = rawLastRoutstr21ModelsUpdate;
 
@@ -376,6 +417,7 @@ const hydrateStoreFromDriver = async (
     lastModelsUpdate,
     apiKeys,
     childKeys,
+    xcashuTokens,
     routstr21Models,
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens,
@@ -613,6 +655,49 @@ export const createStorageAdapterFromStore = (
 
   setCachedReceiveTokens: (tokens) => {
     store.getState().setCachedReceiveTokens(tokens);
+  },
+
+  // ========== XCashu Tokens (multiple tokens per baseUrl) ==========
+
+  getXcashuTokens: () => {
+    return store.getState().xcashuTokens;
+  },
+
+  getXcashuTokensForBaseUrl: (baseUrl) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    return store.getState().xcashuTokens[normalized] || [];
+  },
+
+  addXcashuToken: (baseUrl, token) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const tokens = store.getState().xcashuTokens;
+    const existing = tokens[normalized] || [];
+    const next = { ...tokens };
+    next[normalized] = [
+      ...existing,
+      { baseUrl: normalized, token, createdAt: Date.now() },
+    ];
+    store.getState().setXcashuTokens(next);
+  },
+
+  removeXcashuToken: (baseUrl, token) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const tokens = store.getState().xcashuTokens;
+    const existing = tokens[normalized] || [];
+    const next = { ...tokens };
+    next[normalized] = existing.filter((entry) => entry.token !== token);
+    if (next[normalized].length === 0) {
+      delete next[normalized];
+    }
+    store.getState().setXcashuTokens(next);
+  },
+
+  clearXcashuTokensForBaseUrl: (baseUrl) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const tokens = store.getState().xcashuTokens;
+    const next = { ...tokens };
+    delete next[normalized];
+    store.getState().setXcashuTokens(next);
   },
 });
 
