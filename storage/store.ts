@@ -45,7 +45,9 @@ export interface SdkStorageStore extends SdkStorageState {
     baseUrl: string;
     token: string;
     createdAt?: number;
+    tryCount?: number;
   }>>) => void;
+  updateXcashuTokenTryCount: (token: string, tryCount: number) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
   setCachedReceiveTokens: (
@@ -195,16 +197,36 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
         baseUrl: string;
         token: string;
         createdAt: number;
+        tryCount: number;
       }>> = {};
       for (const [baseUrl, tokens] of Object.entries(value)) {
         normalized[normalizeBaseUrl(baseUrl)] = tokens.map((entry) => ({
           ...entry,
           baseUrl: normalizeBaseUrl(entry.baseUrl),
           createdAt: entry.createdAt ?? Date.now(),
+          tryCount: entry.tryCount ?? 0,
         }));
       }
       void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, normalized);
       set({ xcashuTokens: normalized });
+    },
+    updateXcashuTokenTryCount: (token, tryCount) => {
+      const currentTokens = get().xcashuTokens;
+      const updatedTokens: Record<string, Array<{
+        baseUrl: string;
+        token: string;
+        createdAt: number;
+        tryCount: number;
+      }>> = {};
+      
+      for (const [baseUrl, tokens] of Object.entries(currentTokens)) {
+        updatedTokens[baseUrl] = tokens.map((entry) =>
+          entry.token === token ? { ...entry, tryCount } : entry
+        );
+      }
+      
+      void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, updatedTokens);
+      set({ xcashuTokens: updatedTokens });
     },
     setRoutstr21Models: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
@@ -303,6 +325,7 @@ const hydrateStoreFromDriver = async (
         baseUrl: string;
         token: string;
         createdAt?: number;
+        tryCount?: number;
       }>>
     >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
@@ -386,6 +409,7 @@ const hydrateStoreFromDriver = async (
         baseUrl: normalizeBaseUrl(entry.baseUrl),
         token: entry.token,
         createdAt: entry.createdAt ?? Date.now(),
+        tryCount: entry.tryCount ?? 0,
       })),
     ])
   );
@@ -675,7 +699,7 @@ export const createStorageAdapterFromStore = (
     const next = { ...tokens };
     next[normalized] = [
       ...existing,
-      { baseUrl: normalized, token, createdAt: Date.now() },
+      { baseUrl: normalized, token, createdAt: Date.now(), tryCount: 0 },
     ];
     store.getState().setXcashuTokens(next);
   },
@@ -698,6 +722,10 @@ export const createStorageAdapterFromStore = (
     const next = { ...tokens };
     delete next[normalized];
     store.getState().setXcashuTokens(next);
+  },
+
+  updateXcashuTokenTryCount: (token, tryCount) => {
+    store.getState().updateXcashuTokenTryCount(token, tryCount);
   },
 });
 

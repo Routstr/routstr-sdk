@@ -201,6 +201,7 @@ export class RoutstrClient {
     const satsSpent = await this._handlePostResponseBalanceUpdate({
       token: prepared.tokenUsed,
       baseUrl: prepared.baseUrlUsed,
+      mintUrl: params.mintUrl,
       initialTokenBalance: prepared.tokenBalanceInSats,
       response: prepared.response,
       modelId: prepared.modelId,
@@ -232,6 +233,7 @@ export class RoutstrClient {
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
+        mintUrl: params.mintUrl,
         initialTokenBalance: prepared.tokenBalanceInSats,
         response: prepared.response,
         modelId: prepared.modelId,
@@ -255,6 +257,7 @@ export class RoutstrClient {
           const satsSpent = await this._handlePostResponseBalanceUpdate({
             token: prepared.tokenUsed,
             baseUrl: prepared.baseUrlUsed,
+            mintUrl: params.mintUrl,
             initialTokenBalance: prepared.tokenBalanceInSats,
             response: prepared.response,
             modelId: prepared.modelId,
@@ -568,6 +571,7 @@ export class RoutstrClient {
         let satsSpent = await this._handlePostResponseBalanceUpdate({
           token,
           baseUrl: baseUrlUsed,
+          mintUrl,
           initialTokenBalance: tokenBalanceInSats,
           fallbackSatsSpent: isApikeysEstimate
             ? this._getEstimatedCosts(selectedModel, streamingResult)
@@ -1075,6 +1079,7 @@ export class RoutstrClient {
   private async _handlePostResponseBalanceUpdate(params: {
     token: string;
     baseUrl: string;
+    mintUrl: string;
     initialTokenBalance: number;
     fallbackSatsSpent?: number;
     response?: Response;
@@ -1086,6 +1091,7 @@ export class RoutstrClient {
     const {
       token,
       baseUrl,
+      mintUrl,
       initialTokenBalance,
       fallbackSatsSpent,
       response,
@@ -1103,9 +1109,13 @@ export class RoutstrClient {
         try {
           const receiveResult =
             await this.cashuSpender.receiveToken(refundToken);
-          satsSpent =
-            initialTokenBalance -
-            receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          if (receiveResult.success) {
+            // Remove the spent token from storage
+            this.storageAdapter.removeXcashuToken(baseUrl, token);
+            satsSpent =
+              initialTokenBalance -
+              receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          }
         } catch (error) {
           this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
         }
@@ -1156,6 +1166,16 @@ export class RoutstrClient {
       requestId,
       clientApiKey,
     });
+
+    // Fire-and-forget async spinoff - does not block
+    (async () => {
+      try {
+        const results = await this.cashuSpender.refundProviders(mintUrl);
+        this._log("DEBUG", "Refund providers results:", results);
+      } catch (error) {
+        this._log("ERROR", "Failed to refund providers:", error);
+      }
+    })();
 
     return satsSpent;
   }
@@ -1539,6 +1559,8 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
+      // Store xcashu token using the storage adapter
+      this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);
     }
 
     return {

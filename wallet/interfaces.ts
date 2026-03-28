@@ -72,6 +72,7 @@ export interface XCashuTokenEntry {
   baseUrl: string;
   token: string;
   createdAt: number;
+  tryCount: number;
 }
 
 export interface StorageAdapter {
@@ -158,6 +159,9 @@ export interface StorageAdapter {
 
   /** Clear all xcashu tokens for a baseUrl */
   clearXcashuTokensForBaseUrl(baseUrl: string): void;
+
+  /** Update try count for a specific token */
+  updateXcashuTokenTryCount(token: string, tryCount: number): void;
 }
 
 /**

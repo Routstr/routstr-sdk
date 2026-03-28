@@ -489,45 +489,40 @@ export class CashuSpender {
    * Refund specific providers without retrying spend
    */
   async refundProviders(
-    baseUrls: string[],
     mintUrl: string,
-    refundApiKeys: boolean = false,
     forceRefund?: boolean
   ): Promise<{ baseUrl: string; success: boolean }[]> {
     const results: { baseUrl: string; success: boolean }[] = [];
 
-    if (refundApiKeys) {
-      const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
-      const apiKeysToRefund = apiKeyDistribution.filter((p) =>
-        baseUrls.includes(p.baseUrl)
+    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
+
+    for (const apiKeyEntry of apiKeyDistribution) {
+      const apiKeyEntryFull = this.storageAdapter.getApiKey(
+        apiKeyEntry.baseUrl
       );
+      if (apiKeyEntryFull && this.balanceManager) {
+        const refundResult = await this.balanceManager.refundApiKey({
+          mintUrl,
+          baseUrl: apiKeyEntry.baseUrl,
+          apiKey: apiKeyEntryFull.key,
+          forceRefund,
+        });
 
-      for (const apiKeyEntry of apiKeysToRefund) {
-        const apiKeyEntryFull = this.storageAdapter.getApiKey(
-          apiKeyEntry.baseUrl
-        );
-        if (apiKeyEntryFull && this.balanceManager) {
-          const refundResult = await this.balanceManager.refundApiKey({
-            mintUrl,
-            baseUrl: apiKeyEntry.baseUrl,
-            apiKey: apiKeyEntryFull.key,
-            forceRefund,
-          });
-
-          if (refundResult.success) {
-            this.storageAdapter.updateApiKeyBalance(apiKeyEntry.baseUrl, 0);
-          }
-
-          results.push({
-            baseUrl: apiKeyEntry.baseUrl,
-            success: refundResult.success,
-          });
+        if (refundResult.success) {
+          this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
         } else {
-          results.push({
-            baseUrl: apiKeyEntry.baseUrl,
-            success: false,
-          });
+          this.storageAdapter.updateApiKeyBalance(apiKeyEntry.baseUrl, apiKeyEntry.amount); // just so that we only try to refund every 5 mins. 
         }
+
+        results.push({
+          baseUrl: apiKeyEntry.baseUrl,
+          success: refundResult.success,
+        });
+      } else {
+        results.push({
+          baseUrl: apiKeyEntry.baseUrl,
+          success: false,
+        });
       }
     }
 

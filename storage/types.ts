@@ -31,6 +31,7 @@ export interface SdkStorageState {
     baseUrl: string;
     token: string;
     createdAt: number;
+    tryCount: number;
   }>>;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
