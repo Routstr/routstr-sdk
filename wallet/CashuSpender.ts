@@ -486,6 +486,80 @@ export class CashuSpender {
   }
 
   /**
+   * Refund all xcashu tokens from storage and increment tryCounts on failure.
+   * Reuses receiveToken from BalanceManager/CashuSpender for receiving refunds.
+   * @param mintUrl - The mint URL for receiving tokens
+   * @param excludeBaseUrls - Base URLs to exclude from refund (optional)
+   * @returns Results for each xcashu token refund attempt
+   */
+  async refundXcashuTokens(
+    mintUrl: string,
+    excludeBaseUrls?: string[]
+  ): Promise<{ baseUrl: string; token: string; success: boolean; error?: string }[]> {
+    const results: { baseUrl: string; token: string; success: boolean; error?: string }[] = [];
+    const xcashuTokens = this.storageAdapter.getXcashuTokens();
+    const excludedUrls = new Set(excludeBaseUrls || []);
+
+    for (const [baseUrl, tokens] of Object.entries(xcashuTokens)) {
+      if (excludedUrls.has(baseUrl)) continue;
+
+      for (const xcashuToken of tokens) {
+        try {
+          // Try to receive the xcashu token (refund it to wallet)
+          const receiveResult = await this.receiveToken(xcashuToken.token);
+
+          if (receiveResult.success) {
+            // Remove successfully refunded token from storage
+            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: true,
+            });
+            this._log(
+              "DEBUG",
+              `[CashuSpender] refundXcashuTokens: Successfully refunded xcashu token for ${baseUrl}, amount=${receiveResult.amount}`
+            );
+          } else {
+            // Refund failed - increment tryCount
+            const currentTryCount = xcashuToken.tryCount ?? 0;
+            const newTryCount = currentTryCount + 1;
+            this.storageAdapter.updateXcashuTokenTryCount(xcashuToken.token, newTryCount);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: receiveResult.message ?? "Refund failed",
+            });
+            this._log(
+              "DEBUG",
+              `[CashuSpender] refundXcashuTokens: Failed to refund xcashu token for ${baseUrl}, incremented tryCount to ${newTryCount}`
+            );
+          }
+        } catch (error) {
+          // Exception occurred - increment tryCount
+          const currentTryCount = xcashuToken.tryCount ?? 0;
+          const newTryCount = currentTryCount + 1;
+          this.storageAdapter.updateXcashuTokenTryCount(xcashuToken.token, newTryCount);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          results.push({
+            baseUrl,
+            token: xcashuToken.token,
+            success: false,
+            error: errorMessage,
+          });
+          this._log(
+            "ERROR",
+            `[CashuSpender] refundXcashuTokens: Exception during refund for ${baseUrl}: ${errorMessage}, incremented tryCount to ${newTryCount}`
+          );
+        }
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Refund specific providers without retrying spend
    */
   async refundProviders(

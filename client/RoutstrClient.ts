@@ -1170,6 +1170,11 @@ export class RoutstrClient {
     // Fire-and-forget async spinoff - does not block
     (async () => {
       try {
+        // Refund all xcashu tokens
+        const xcashuResults = await this.cashuSpender.refundXcashuTokens(mintUrl);
+        this._log("DEBUG", "Refund xcashu tokens results:", xcashuResults);
+
+        // Also refund API keys (apikeys mode)
         const results = await this.cashuSpender.refundProviders(mintUrl);
         this._log("DEBUG", "Refund providers results:", results);
       } catch (error) {
