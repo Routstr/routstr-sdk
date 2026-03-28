@@ -197,18 +197,7 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
-    console.log("[USAGE_TRACKING] === routeRequest called ===", {
-      path: params.path,
-      baseUrl: params.baseUrl,
-      modelId: params.modelId,
-    });
     const prepared = await this._prepareRoutedRequest(params);
-    console.log("[USAGE_TRACKING] routeRequest - prepared:", {
-      hasResponse: !!prepared.response,
-      capturedUsage: prepared.capturedUsage,
-      capturedResponseId: prepared.capturedResponseId,
-      modelId: prepared.modelId,
-    });
     const satsSpent = await this._handlePostResponseBalanceUpdate({
       token: prepared.tokenUsed,
       baseUrl: prepared.baseUrlUsed,
@@ -230,15 +219,8 @@ export class RoutstrClient {
   async routeRequestToNodeResponse(
     params: RouteRequestToNodeResponseParams
   ): Promise<void> {
-    console.log("[USAGE_TRACKING] === routeRequestToNodeResponse called ===");
     const { res } = params;
     const prepared = await this._prepareRoutedRequest(params);
-    console.log("[USAGE_TRACKING] routeRequestToNodeResponse - prepared:", {
-      status: prepared.response.status,
-      capturedUsage: prepared.capturedUsage,
-      capturedResponseId: prepared.capturedResponseId,
-      modelId: prepared.modelId,
-    });
 
     res.statusCode = prepared.response.status;
     prepared.response.headers.forEach((value, key) => {
@@ -247,7 +229,6 @@ export class RoutstrClient {
 
     const body = prepared.response.body;
     if (!body) {
-      console.log("[USAGE_TRACKING] routeRequestToNodeResponse - no body, calling _handlePostResponseBalanceUpdate");
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
@@ -271,7 +252,6 @@ export class RoutstrClient {
         if (settled) return;
         settled = true;
         try {
-          console.log("[USAGE_TRACKING] routeRequestToNodeResponse - stream finished, calling _handlePostResponseBalanceUpdate");
           const satsSpent = await this._handlePostResponseBalanceUpdate({
             token: prepared.tokenUsed,
             baseUrl: prepared.baseUrlUsed,
@@ -326,13 +306,10 @@ export class RoutstrClient {
       clientApiKey: providedClientApiKey,
     } = params;
 
-    this._log("DEBUG", `[PipeLineHeaders] _prepareRoutedRequest - received headers: ${JSON.stringify(headers)}`);
-
     // Extract clientApiKey from incoming headers then discard them — they must
     // not be forwarded upstream (the client's Authorization Bearer key would
     // overwrite the Cashu/API-key auth we attach ourselves).
     const clientApiKey = providedClientApiKey ?? this._extractClientApiKey(headers);
-    this._log("DEBUG", `[PipeLineHeaders] _prepareRoutedRequest - headers consumed, will not forward downstream`);
 
     await this._checkBalance();
 
@@ -357,7 +334,6 @@ export class RoutstrClient {
       amount: requiredSats,
       baseUrl,
     });
-    this._log("DEBUG", token, baseUrl);
 
     let requestBody = body;
     if (body && typeof body === "object") {
@@ -437,14 +413,11 @@ export class RoutstrClient {
    * Extract clientApiKey from Authorization Bearer token if present
    */
   private _extractClientApiKey(headers: Record<string, string>): string | undefined {
-    this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - Received headers: ${JSON.stringify(headers)}`);
     const authHeader = headers["Authorization"] || headers["authorization"];
     if (authHeader?.startsWith("Bearer ")) {
       const extractedKey = authHeader.slice(7);
-      this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - Extracted clientApiKey: ${extractedKey.substring(0, 10)}...`);
       return extractedKey;
     }
-    this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - No Bearer token found in Authorization header`);
     return undefined;
   }
 
@@ -654,7 +627,6 @@ export class RoutstrClient {
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
-      this._log("DEBUG", "HEADERS,", headers);
       const response = await fetch(url, {
         method,
         headers,
@@ -1123,18 +1095,6 @@ export class RoutstrClient {
       clientApiKey,
     } = params;
 
-    console.log("[USAGE_TRACKING] === _handlePostResponseBalanceUpdate called ===");
-    console.log("[USAGE_TRACKING] params:", {
-      token: token?.substring(0, 20) + "...",
-      baseUrl,
-      initialTokenBalance,
-      fallbackSatsSpent,
-      hasResponse: !!response,
-      modelId,
-      hasUsage: !!usage,
-      requestId,
-    });
-
     let satsSpent: number = initialTokenBalance;
 
     if (this.mode === "xcashu" && response) {
@@ -1186,7 +1146,6 @@ export class RoutstrClient {
       }
     }
 
-    console.log("[USAGE_TRACKING] Before _trackResponseUsage - satsSpent:", satsSpent);
     await this._trackResponseUsage({
       token,
       baseUrl,
@@ -1197,7 +1156,6 @@ export class RoutstrClient {
       requestId,
       clientApiKey,
     });
-    console.log("[USAGE_TRACKING] After _trackResponseUsage call");
 
     return satsSpent;
   }
@@ -1223,22 +1181,7 @@ export class RoutstrClient {
       clientApiKey,
     } = params;
 
-    console.log("[USAGE_TRACKING] === _trackResponseUsage called ===");
-    console.log("[USAGE_TRACKING] params:", {
-      token: token?.substring(0, 20) + "...",
-      baseUrl,
-      hasResponse: !!response,
-      modelId,
-      satsSpent,
-      hasProvidedUsage: !!providedUsage,
-      providedRequestId,
-    });
-
     if (!response || !modelId) {
-      console.log("[USAGE_TRACKING] EARLY RETURN: missing response or modelId", {
-        hasResponse: !!response,
-        modelId,
-      });
       return;
     }
 
@@ -1248,10 +1191,8 @@ export class RoutstrClient {
 
       if (!usage || !requestId) {
         const contentType = response.headers.get("content-type") || "";
-        console.log("[USAGE_TRACKING] contentType:", contentType);
 
         if (contentType.includes("text/event-stream")) {
-          console.log("[USAGE_TRACKING] SSE stream detected, checking (response as any).usage and (response as any).requestId");
           usage = usage ?? (response as any).usage;
           requestId =
             requestId ??
@@ -1259,21 +1200,12 @@ export class RoutstrClient {
             response.headers.get("x-routstr-request-id") ??
             undefined;
 
-          console.log("[USAGE_TRACKING] After SSE extraction:", {
-            hasUsage: !!usage,
-            usage,
-            requestId,
-          });
-
           if (!usage) {
-            console.log("[USAGE_TRACKING] EARLY RETURN: no usage found for SSE stream");
             return;
           }
         } else {
-          console.log("[USAGE_TRACKING] Non-SSE response, attempting to extract from body");
           const cloned = response.clone();
           const responseBody = await cloned.json();
-          console.log("[USAGE_TRACKING] responseBody keys:", Object.keys(responseBody));
           usage =
             usage ??
             extractUsageFromResponseBody(responseBody, satsSpent) ??
@@ -1283,34 +1215,23 @@ export class RoutstrClient {
             extractResponseId(responseBody) ??
             response.headers.get("x-routstr-request-id") ??
             undefined;
-
-          console.log("[USAGE_TRACKING] After body extraction:", {
-            hasUsage: !!usage,
-            usage,
-            requestId,
-          });
         }
       }
 
       if (!usage) {
-        console.log("[USAGE_TRACKING] EARLY RETURN: no usage after all extraction attempts");
         return;
       }
 
       const finalRequestId = requestId || "unknown";
-      console.log("[USAGE_TRACKING] Final requestId:", finalRequestId);
 
       const store = this.sdkStore ?? await getDefaultSdkStore();
       const state = store.getState();
-      console.log("[USAGE_TRACKING] store state keys:", Object.keys(state));
-      console.log("[USAGE_TRACKING] clientIds count:", state.clientIds?.length);
 
       // Use clientApiKey for matching if provided, otherwise fall back to token
       const matchKey = clientApiKey ?? token;
       const matchingClient = state.clientIds.find(
         (client) => client.apiKey === matchKey
       );
-      console.log("[USAGE_TRACKING] matchingClient:", matchingClient, "using matchKey:", matchKey?.substring(0, 20) + "...");
 
       const entryId =
         finalRequestId === "unknown"
@@ -1318,7 +1239,6 @@ export class RoutstrClient {
           : finalRequestId;
 
       const usageTracking = this.usageTrackingDriver ?? getDefaultUsageTrackingDriver();
-      console.log("[USAGE_TRACKING] usageTracking driver type:", usageTracking.constructor.name);
 
       const entry = {
         id: entryId,
@@ -1330,18 +1250,13 @@ export class RoutstrClient {
         ...usage,
       };
 
-      console.log("[USAGE_TRACKING] Entry to append:", JSON.stringify(entry, null, 2));
-
       // For xcashu mode, use satsSpent directly for satsCost instead of calculating from usage
       if (this.mode === "xcashu") {
         entry.satsCost = satsSpent;
-        console.log("[USAGE_TRACKING] xcashu mode - set satsCost to satsSpent:", satsSpent);
       }
 
       await usageTracking.append(entry);
-      console.log("[USAGE_TRACKING] Successfully appended entry to usage tracking");
     } catch (error) {
-      console.error("[USAGE_TRACKING] ERROR in _trackResponseUsage:", error);
       // Silently ignore tracking failures
     }
   }

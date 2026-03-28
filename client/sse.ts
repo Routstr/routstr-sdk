@@ -14,15 +14,12 @@ export function createSSEParserTransform(
       const data = JSON.parse(jsonText) as any;
       const responseId = data.id;
       if (typeof responseId === "string" && responseId.trim().length > 0) {
-        console.log("[SSE_PARSER] Found responseId:", responseId.trim());
         onResponseId?.(responseId.trim());
         responseIdCaptured = true;
       }
 
       const usage = extractUsageFromSSEJson(data);
-      console.log("[SSE_PARSER] Extracted usage from SSE:", usage, "data keys:", Object.keys(data));
       if (usage) {
-        console.log("[SSE_PARSER] Calling onUsage callback with:", usage);
         onUsage(usage);
         usageCaptured = true;
       }
@@ -38,7 +35,6 @@ export function createSSEParserTransform(
     }
 
     if (trimmed === "data: [DONE]" || trimmed === "[DONE]") {
-      console.log("[SSE_PARSER] Received [DONE], usageCaptured:", usageCaptured, "responseIdCaptured:", responseIdCaptured);
       self.push("data: [DONE]\n\n");
       return;
     }
@@ -48,7 +44,6 @@ export function createSSEParserTransform(
         ? trimmed.slice(6)
         : trimmed.slice(5).trimStart();
       if (dataStr === "[DONE]") {
-        console.log("[SSE_PARSER] Received data: [DONE], usageCaptured:", usageCaptured);
         self.push("data: [DONE]\n\n");
         return;
       }

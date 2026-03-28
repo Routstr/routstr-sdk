@@ -99,7 +99,6 @@ export const createBunSqliteUsageTrackingDriver = (
   db.run(`CREATE INDEX IF NOT EXISTS idx_${tableName}_base_url ON ${tableName}(base_url)`);
 
   const appendOne = (entry: UsageTrackingEntry): void => {
-    console.log("[USAGE_TRACKING_BUN_SQLITE] appendOne called with:", JSON.stringify(entry, null, 2));
     db.query(`
       INSERT OR REPLACE INTO ${tableName} (
         id, timestamp, model_id, base_url, request_id,
@@ -121,7 +120,6 @@ export const createBunSqliteUsageTrackingDriver = (
       entry.sessionId ?? null,
       JSON.stringify(entry.tags ?? [])
     );
-    console.log("[USAGE_TRACKING_BUN_SQLITE] Successfully inserted into Bun SQLite DB");
   };
 
   const mapRow = (row: any): UsageTrackingEntry => ({

@@ -241,11 +241,9 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<Response> {
-  console.log(`[PipeLineHeaders] routeRequests - received headers: ${JSON.stringify(options.headers ?? {})}`);
   const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody } =
     await resolveRouteRequestContext(options);
 
-  console.log(`[PipeLineHeaders] routeRequests - after resolveRouteRequestContext, headers: ${JSON.stringify(headers)}`);
 
   try {
     const response = await client.routeRequest({
