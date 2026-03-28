@@ -328,8 +328,11 @@ export class RoutstrClient {
 
     this._log("DEBUG", `[PipeLineHeaders] _prepareRoutedRequest - received headers: ${JSON.stringify(headers)}`);
 
-    // Extract clientApiKey from Authorization Bearer token if present
+    // Extract clientApiKey from incoming headers then discard them — they must
+    // not be forwarded upstream (the client's Authorization Bearer key would
+    // overwrite the Cashu/API-key auth we attach ourselves).
     const clientApiKey = providedClientApiKey ?? this._extractClientApiKey(headers);
+    this._log("DEBUG", `[PipeLineHeaders] _prepareRoutedRequest - headers consumed, will not forward downstream`);
 
     await this._checkBalance();
 
@@ -364,7 +367,8 @@ export class RoutstrClient {
       }
     }
 
-    const baseHeaders = this._buildBaseHeaders(headers);
+    // Build clean outgoing headers — do NOT pass the incoming client headers here
+    const baseHeaders = this._buildBaseHeaders();
     const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
     const response = await this._makeRequest({
