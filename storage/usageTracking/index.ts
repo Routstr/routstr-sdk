@@ -8,4 +8,5 @@ export {
   createSqliteUsageTrackingDriver,
   type SqliteUsageTrackingDriverOptions,
 } from "./sqlite";
+export { createBunSqliteUsageTrackingDriver } from "./bunSqlite";
 export { createMemoryUsageTrackingDriver } from "./memory";

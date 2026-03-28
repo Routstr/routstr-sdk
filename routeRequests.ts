@@ -19,6 +19,7 @@ import {
   type DebugLevel,
   type RouteRequestToNodeResponseParams,
 } from "./client/RoutstrClient";
+import type { UsageTrackingDriver } from "./storage/usageTracking";
 
 /**
  * Options for routeRequests function
@@ -54,6 +55,8 @@ export interface RouteRequestOptions {
   debugLevel?: DebugLevel;
   /** Optional: client mode (xcashu, apikeys, or lazyrefund) */
   mode?: "xcashu" | "apikeys" | "lazyrefund";
+  /** Optional: explicit usage tracking driver */
+  usageTrackingDriver?: UsageTrackingDriver;
 }
 
 export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {
@@ -108,6 +111,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     modelManager: providedModelManager,
     debugLevel,
     mode = "apikeys",
+    usageTrackingDriver,
   } = options;
 
   let modelManager: ModelManager;
@@ -190,7 +194,8 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     storageAdapter,
     providerRegistry,
     "min",
-    mode
+    mode,
+    { usageTrackingDriver }
   );
 
   if (debugLevel) {

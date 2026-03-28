@@ -9,6 +9,7 @@ import {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
   createSqliteUsageTrackingDriver,
+  createBunSqliteUsageTrackingDriver,
   type UsageTrackingDriver,
 } from "./usageTracking";
 import type { StorageDriver } from "./types";
@@ -47,6 +48,7 @@ export {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
   createSqliteUsageTrackingDriver,
+  createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
 
 const isBrowser = (): boolean => {
@@ -119,7 +121,7 @@ export const getDefaultUsageTrackingDriver = (): UsageTrackingDriver => {
   }
 
   if (isBun()) {
-    defaultUsageTrackingDriver = createMemoryUsageTrackingDriver();
+    defaultUsageTrackingDriver = createBunSqliteUsageTrackingDriver();
     return defaultUsageTrackingDriver;
   }
 
@@ -132,6 +134,13 @@ export const getDefaultUsageTrackingDriver = (): UsageTrackingDriver => {
 
   defaultUsageTrackingDriver = createMemoryUsageTrackingDriver();
   return defaultUsageTrackingDriver;
+};
+
+/**
+ * Allow setting a custom usage tracking driver (useful for routstrd to use proper DB path)
+ */
+export const setDefaultUsageTrackingDriver = (driver: UsageTrackingDriver): void => {
+  defaultUsageTrackingDriver = driver;
 };
 
 export const getDefaultDiscoveryAdapter = async () =>

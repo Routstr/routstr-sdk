@@ -19,6 +19,7 @@ import type {
   ProviderRegistry,
   StreamingCallbacks,
 } from "../wallet/interfaces";
+import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { ServerResponse } from "http";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
@@ -77,6 +78,10 @@ export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
   res: ServerResponse;
 }
 
+export interface RoutstrClientConfig {
+  usageTrackingDriver?: UsageTrackingDriver;
+}
+
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private balanceManager: BalanceManager;
@@ -85,13 +90,15 @@ export class RoutstrClient {
   private alertLevel: AlertLevel;
   private mode: RoutstrClientMode;
   private debugLevel: DebugLevel = "WARN";
+  private usageTrackingDriver?: UsageTrackingDriver;
 
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
     private providerRegistry: ProviderRegistry,
     alertLevel: AlertLevel,
-    mode: RoutstrClientMode = "xcashu"
+    mode: RoutstrClientMode = "xcashu",
+    options: RoutstrClientConfig = {}
   ) {
     this.balanceManager = new BalanceManager(
       walletAdapter,
@@ -108,6 +115,7 @@ export class RoutstrClient {
     this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
     this.mode = mode;
+    this.usageTrackingDriver = options.usageTrackingDriver;
   }
 
   /**
@@ -1266,7 +1274,7 @@ export class RoutstrClient {
           ? `req-${Date.now()}-${modelId}`
           : finalRequestId;
 
-      const usageTracking = getDefaultUsageTrackingDriver();
+      const usageTracking = this.usageTrackingDriver ?? getDefaultUsageTrackingDriver();
       console.log("[USAGE_TRACKING] usageTracking driver type:", usageTracking.constructor.name);
 
       const entry = {
