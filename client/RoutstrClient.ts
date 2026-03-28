@@ -326,6 +326,8 @@ export class RoutstrClient {
       clientApiKey: providedClientApiKey,
     } = params;
 
+    this._log("DEBUG", `[PipeLineHeaders] _prepareRoutedRequest - received headers: ${JSON.stringify(headers)}`);
+
     // Extract clientApiKey from Authorization Bearer token if present
     const clientApiKey = providedClientApiKey ?? this._extractClientApiKey(headers);
 
@@ -431,12 +433,14 @@ export class RoutstrClient {
    * Extract clientApiKey from Authorization Bearer token if present
    */
   private _extractClientApiKey(headers: Record<string, string>): string | undefined {
-    this._log("DEBUG", 
-      `[RoutstrClient] HEADERSERSFDDSFSD: status=${headers}`)
+    this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - Received headers: ${JSON.stringify(headers)}`);
     const authHeader = headers["Authorization"] || headers["authorization"];
     if (authHeader?.startsWith("Bearer ")) {
-      return authHeader.slice(7);
+      const extractedKey = authHeader.slice(7);
+      this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - Extracted clientApiKey: ${extractedKey.substring(0, 10)}...`);
+      return extractedKey;
     }
+    this._log("DEBUG", `[PipeLineHeaders] _extractClientApiKey - No Bearer token found in Authorization header`);
     return undefined;
   }
 
@@ -998,6 +1002,7 @@ export class RoutstrClient {
           mintUrl,
           baseUrl,
           apiKey: token,
+          forceRefund: true
         });
         this._log(
           "DEBUG",

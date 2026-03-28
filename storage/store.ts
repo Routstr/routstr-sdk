@@ -469,14 +469,7 @@ export const createStorageAdapterFromStore = (
       .getState()
       .apiKeys.find((key) => key.baseUrl === normalized);
     if (!entry) return null;
-    // Update lastUsed timestamp
-    const next = store
-      .getState()
-      .apiKeys.map((key) =>
-        key.baseUrl === normalized ? { ...key, lastUsed: Date.now() } : key
-      );
-    store.getState().setApiKeys(next);
-    return entry;
+   return entry;
   },
 
   setApiKey: (baseUrl, key) => {
@@ -502,7 +495,9 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const keys = store.getState().apiKeys;
     const next = keys.map((entry) =>
-      entry.baseUrl === normalized ? { ...entry, balance } : entry
+      entry.baseUrl === normalized
+        ? { ...entry, balance, lastUsed: Date.now() }
+        : entry
     );
     store.getState().setApiKeys(next);
   },
