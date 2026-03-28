@@ -73,6 +73,7 @@ export interface RouteRequestParams {
   baseUrl: string;
   mintUrl: string;
   modelId?: string;
+  clientApiKey?: string;
 }
 
 export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
@@ -216,6 +217,7 @@ export class RoutstrClient {
       modelId: prepared.modelId,
       usage: prepared.capturedUsage,
       requestId: prepared.capturedResponseId,
+      clientApiKey: prepared.clientApiKey,
     });
 
     (prepared.response as any).satsSpent = satsSpent;
@@ -254,6 +256,7 @@ export class RoutstrClient {
         modelId: prepared.modelId,
         usage: prepared.capturedUsage,
         requestId: prepared.capturedResponseId,
+        clientApiKey: prepared.clientApiKey,
       });
       (prepared.response as any).satsSpent = satsSpent;
       res.end();
@@ -277,6 +280,7 @@ export class RoutstrClient {
             modelId: prepared.modelId,
             usage: prepared.capturedUsage,
             requestId: prepared.capturedResponseId,
+            clientApiKey: prepared.clientApiKey,
           });
           (prepared.response as any).satsSpent = satsSpent;
           (prepared.response as any).usage = prepared.capturedUsage;
@@ -309,6 +313,7 @@ export class RoutstrClient {
     modelId?: string;
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
+    clientApiKey?: string;
   }> {
     const {
       path,
@@ -318,7 +323,11 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       modelId,
+      clientApiKey: providedClientApiKey,
     } = params;
+
+    // Extract clientApiKey from Authorization Bearer token if present
+    const clientApiKey = providedClientApiKey ?? this._extractClientApiKey(headers);
 
     await this._checkBalance();
 
@@ -414,7 +423,21 @@ export class RoutstrClient {
       modelId,
       capturedUsage,
       capturedResponseId,
+      clientApiKey,
     };
+  }
+
+  /**
+   * Extract clientApiKey from Authorization Bearer token if present
+   */
+  private _extractClientApiKey(headers: Record<string, string>): string | undefined {
+    this._log("DEBUG", 
+      `[RoutstrClient] HEADERSERSFDDSFSD: status=${headers}`)
+    const authHeader = headers["Authorization"] || headers["authorization"];
+    if (authHeader?.startsWith("Bearer ")) {
+      return authHeader.slice(7);
+    }
+    return undefined;
   }
 
   /**
@@ -1077,6 +1100,7 @@ export class RoutstrClient {
     modelId?: string;
     usage?: UsageTrackingData;
     requestId?: string;
+    clientApiKey?: string;
   }): Promise<number> {
     const {
       token,
@@ -1087,6 +1111,7 @@ export class RoutstrClient {
       modelId,
       usage,
       requestId,
+      clientApiKey,
     } = params;
 
     console.log("[USAGE_TRACKING] === _handlePostResponseBalanceUpdate called ===");
@@ -1161,6 +1186,7 @@ export class RoutstrClient {
       satsSpent,
       usage,
       requestId,
+      clientApiKey,
     });
     console.log("[USAGE_TRACKING] After _trackResponseUsage call");
 
@@ -1175,6 +1201,7 @@ export class RoutstrClient {
     satsSpent: number;
     usage?: UsageTrackingData;
     requestId?: string;
+    clientApiKey?: string;
   }): Promise<void> {
     const {
       token,
@@ -1184,6 +1211,7 @@ export class RoutstrClient {
       satsSpent,
       usage: providedUsage,
       requestId: providedRequestId,
+      clientApiKey,
     } = params;
 
     console.log("[USAGE_TRACKING] === _trackResponseUsage called ===");
@@ -1268,10 +1296,12 @@ export class RoutstrClient {
       console.log("[USAGE_TRACKING] store state keys:", Object.keys(state));
       console.log("[USAGE_TRACKING] clientIds count:", state.clientIds?.length);
 
+      // Use clientApiKey for matching if provided, otherwise fall back to token
+      const matchKey = clientApiKey ?? token;
       const matchingClient = state.clientIds.find(
-        (client) => client.apiKey === token
+        (client) => client.apiKey === matchKey
       );
-      console.log("[USAGE_TRACKING] matchingClient:", matchingClient);
+      console.log("[USAGE_TRACKING] matchingClient:", matchingClient, "using matchKey:", matchKey?.substring(0, 20) + "...");
 
       const entryId =
         finalRequestId === "unknown"
