@@ -312,7 +312,8 @@ export class RoutstrClient {
     // Extract clientApiKey from incoming headers then discard them — they must
     // not be forwarded upstream (the client's Authorization Bearer key would
     // overwrite the Cashu/API-key auth we attach ourselves).
-    const clientApiKey = providedClientApiKey ?? this._extractClientApiKey(headers);
+    const clientApiKey =
+      providedClientApiKey ?? this._extractClientApiKey(headers);
 
     await this._checkBalance();
 
@@ -415,7 +416,9 @@ export class RoutstrClient {
   /**
    * Extract clientApiKey from Authorization Bearer token if present
    */
-  private _extractClientApiKey(headers: Record<string, string>): string | undefined {
+  private _extractClientApiKey(
+    headers: Record<string, string>
+  ): string | undefined {
     const authHeader = headers["Authorization"] || headers["authorization"];
     if (authHeader?.startsWith("Bearer ")) {
       const extractedKey = authHeader.slice(7);
@@ -982,7 +985,7 @@ export class RoutstrClient {
           mintUrl,
           baseUrl,
           apiKey: token,
-          forceRefund: true
+          forceRefund: true,
         });
         this._log(
           "DEBUG",
@@ -1171,12 +1174,12 @@ export class RoutstrClient {
     (async () => {
       try {
         // Refund all xcashu tokens
-        const xcashuResults = await this.cashuSpender.refundXcashuTokens(mintUrl);
+        const xcashuResults =
+          await this.cashuSpender.refundXcashuTokens(mintUrl);
         this._log("DEBUG", "Refund xcashu tokens results:", xcashuResults);
 
         // Also refund API keys (apikeys mode)
         const results = await this.cashuSpender.refundProviders(mintUrl);
-        this._log("DEBUG", "Refund providers results:", results);
       } catch (error) {
         this._log("ERROR", "Failed to refund providers:", error);
       }
@@ -1249,7 +1252,7 @@ export class RoutstrClient {
 
       const finalRequestId = requestId || "unknown";
 
-      const store = this.sdkStore ?? await getDefaultSdkStore();
+      const store = this.sdkStore ?? (await getDefaultSdkStore());
       const state = store.getState();
 
       // Use clientApiKey for matching if provided, otherwise fall back to token
@@ -1263,7 +1266,8 @@ export class RoutstrClient {
           ? `req-${Date.now()}-${modelId}`
           : finalRequestId;
 
-      const usageTracking = this.usageTrackingDriver ?? getDefaultUsageTrackingDriver();
+      const usageTracking =
+        this.usageTrackingDriver ?? getDefaultUsageTrackingDriver();
 
       const entry = {
         id: entryId,
