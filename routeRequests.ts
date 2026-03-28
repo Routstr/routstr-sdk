@@ -20,6 +20,7 @@ import {
   type RouteRequestToNodeResponseParams,
 } from "./client/RoutstrClient";
 import type { UsageTrackingDriver } from "./storage/usageTracking";
+import type { SdkStore } from "./storage/store";
 
 /**
  * Options for routeRequests function
@@ -57,6 +58,8 @@ export interface RouteRequestOptions {
   mode?: "xcashu" | "apikeys";
   /** Optional: explicit usage tracking driver */
   usageTrackingDriver?: UsageTrackingDriver;
+  /** Optional: explicit SDK store (for using correct DB path) */
+  sdkStore?: SdkStore;
 }
 
 export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {
@@ -112,6 +115,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     debugLevel,
     mode = "apikeys",
     usageTrackingDriver,
+    sdkStore,
   } = options;
 
   let modelManager: ModelManager;
@@ -195,7 +199,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     providerRegistry,
     "min",
     mode,
-    { usageTrackingDriver }
+    { usageTrackingDriver, sdkStore }
   );
 
   if (debugLevel) {

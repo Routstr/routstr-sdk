@@ -20,6 +20,7 @@ import type {
   StreamingCallbacks,
 } from "../wallet/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
+import type { SdkStore } from "../storage/store";
 import type { ServerResponse } from "http";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
@@ -80,6 +81,7 @@ export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
 
 export interface RoutstrClientConfig {
   usageTrackingDriver?: UsageTrackingDriver;
+  sdkStore?: SdkStore;
 }
 
 export class RoutstrClient {
@@ -91,6 +93,7 @@ export class RoutstrClient {
   private mode: RoutstrClientMode;
   private debugLevel: DebugLevel = "WARN";
   private usageTrackingDriver?: UsageTrackingDriver;
+  private sdkStore?: SdkStore;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -116,6 +119,7 @@ export class RoutstrClient {
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
+    this.sdkStore = options.sdkStore;
   }
 
   /**
@@ -1259,7 +1263,7 @@ export class RoutstrClient {
       const finalRequestId = requestId || "unknown";
       console.log("[USAGE_TRACKING] Final requestId:", finalRequestId);
 
-      const store = await getDefaultSdkStore();
+      const store = this.sdkStore ?? await getDefaultSdkStore();
       const state = store.getState();
       console.log("[USAGE_TRACKING] store state keys:", Object.keys(state));
       console.log("[USAGE_TRACKING] clientIds count:", state.clientIds?.length);

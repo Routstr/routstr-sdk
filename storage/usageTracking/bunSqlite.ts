@@ -1,8 +1,12 @@
+import { SDK_STORAGE_KEYS } from "../keys";
+import type { StorageDriver } from "../types";
 import type {
   ListUsageTrackingOptions,
   UsageTrackingDriver,
 } from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+
+const MIGRATION_MARKER_KEY = "usage_tracking_migration_v1";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
@@ -47,6 +51,7 @@ const buildWhereClause = (
 export interface BunSqliteUsageTrackingDriverOptions {
   dbPath?: string;
   tableName?: string;
+  legacyStorageDriver?: StorageDriver;
   sqlite?: {
     Database: any;
   };
@@ -58,7 +63,10 @@ export const createBunSqliteUsageTrackingDriver = (
 ): UsageTrackingDriver => {
   const dbPath = options.dbPath || "routstr.sqlite";
   const tableName = options.tableName || "usage_tracking";
+  const legacyStorageDriver = options.legacyStorageDriver;
   const SQLiteDatabase = options.sqlite?.Database;
+
+  let migrationPromise: Promise<void> | null = null;
 
   if (!SQLiteDatabase) {
     throw new Error(
@@ -132,22 +140,53 @@ export const createBunSqliteUsageTrackingDriver = (
     tags: typeof row.tags === "string" ? JSON.parse(row.tags) : undefined,
   });
 
+  const ensureMigrated = async (): Promise<void> => {
+    if (!legacyStorageDriver) return;
+    if (!migrationPromise) {
+      migrationPromise = (async () => {
+        const migrated = await legacyStorageDriver.getItem<boolean>(
+          MIGRATION_MARKER_KEY,
+          false
+        );
+        if (migrated) return;
+
+        const legacyEntries = await legacyStorageDriver.getItem<UsageTrackingEntry[]>(
+          SDK_STORAGE_KEYS.USAGE_TRACKING,
+          []
+        );
+
+        if (legacyEntries.length > 0) {
+          for (const entry of legacyEntries) {
+            appendOne(entry);
+          }
+          await legacyStorageDriver.removeItem(SDK_STORAGE_KEYS.USAGE_TRACKING);
+        }
+
+        await legacyStorageDriver.setItem(MIGRATION_MARKER_KEY, true);
+      })();
+    }
+    await migrationPromise;
+  };
+
   return {
     async migrate(): Promise<void> {
-      return;
+      await ensureMigrated();
     },
 
     async append(entry: UsageTrackingEntry): Promise<void> {
+      await ensureMigrated();
       appendOne(entry);
     },
 
     async appendMany(entries: UsageTrackingEntry[]): Promise<void> {
+      await ensureMigrated();
       for (const entry of entries) {
         appendOne(entry);
       }
     },
 
     async list(options: ListUsageTrackingOptions = {}): Promise<UsageTrackingEntry[]> {
+      await ensureMigrated();
       const { sql, params } = buildWhereClause(options);
       const limitSql = typeof options.limit === "number" ? " LIMIT ?" : "";
       const query = `SELECT * FROM ${tableName} ${sql} ORDER BY timestamp DESC${limitSql}`;
@@ -170,12 +209,14 @@ export const createBunSqliteUsageTrackingDriver = (
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {
+      await ensureMigrated();
       const before = timestamp;
       const result = db.query(`DELETE FROM ${tableName} WHERE timestamp < ?`).run(before);
       return result.changes ?? 0;
     },
 
     async clear(): Promise<void> {
+      await ensureMigrated();
       db.query(`DELETE FROM ${tableName}`).run();
     },
   };
