@@ -60,8 +60,6 @@ export const createBunSqliteUsageTrackingDriver = (
   const tableName = options.tableName || "usage_tracking";
   const SQLiteDatabase = options.sqlite?.Database;
 
-  console.log("[USAGE_TRACKING_BUN_SQLITE] Creating Bun SQLite driver with dbPath:", dbPath);
-
   if (!SQLiteDatabase) {
     throw new Error(
       "Bun SQLite Database constructor is required. Pass { sqlite: { Database } } when creating the driver."
@@ -136,24 +134,20 @@ export const createBunSqliteUsageTrackingDriver = (
 
   return {
     async migrate(): Promise<void> {
-      console.log("[USAGE_TRACKING_BUN_SQLITE] migrate() called - no-op for Bun SQLite");
       return;
     },
 
     async append(entry: UsageTrackingEntry): Promise<void> {
-      console.log("[USAGE_TRACKING_BUN_SQLITE] append() called");
       appendOne(entry);
     },
 
     async appendMany(entries: UsageTrackingEntry[]): Promise<void> {
-      console.log("[USAGE_TRACKING_BUN_SQLITE] appendMany() called with", entries.length, "entries");
       for (const entry of entries) {
         appendOne(entry);
       }
     },
 
     async list(options: ListUsageTrackingOptions = {}): Promise<UsageTrackingEntry[]> {
-      console.log("[USAGE_TRACKING_BUN_SQLITE] list() called with options:", options);
       const { sql, params } = buildWhereClause(options);
       const limitSql = typeof options.limit === "number" ? " LIMIT ?" : "";
       const query = `SELECT * FROM ${tableName} ${sql} ORDER BY timestamp DESC${limitSql}`;
@@ -164,8 +158,7 @@ export const createBunSqliteUsageTrackingDriver = (
       } else {
         rows = db.query(query).all(...params);
       }
-      
-      console.log("[USAGE_TRACKING_BUN_SQLITE] list() returned", rows.length, "entries");
+
       return rows.map(mapRow);
     },
 

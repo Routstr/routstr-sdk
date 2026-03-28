@@ -70,10 +70,9 @@ await client.fetchAIResponse(fetchOptions, streamingCallbacks);
 
 ## Client Modes
 
-The `RoutstrClient` supports three modes via the constructor `mode` parameter (defaults to `"xcashu"` if unspecified):
+The `RoutstrClient` supports two modes via the constructor `mode` parameter (defaults to `"xcashu"` if unspecified):
 
 - `"xcashu"` — Default mode. Uses standard Cashu token spending with refunds.
-- `"lazyrefund"` — Defers refund processing to reduce mint load; may retain tokens longer before refunding.
 - `"apikeys"` — Uses API key authentication instead of Cashu tokens; no token spending or refund flow.
 
 ```ts
