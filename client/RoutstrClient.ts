@@ -952,6 +952,21 @@ export class RoutstrClient {
       }
     }
 
+    if (status === 401 && this.mode === "apikeys") {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
+      );
+      const latestBalanceInfo = await this.balanceManager.getTokenBalance(
+        token,
+        baseUrl
+      );
+      if (latestBalanceInfo.isInvalidApiKey) {
+        this.storageAdapter.removeApiKey(baseUrl);
+        tryNextProvider = true;
+      }
+    }
+
     if (
       (status === 401 ||
         status === 403 ||
@@ -973,13 +988,13 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
         );
-        const initialBalance = await this.balanceManager.getTokenBalance(
+        const latestBalanceInfo = await this.balanceManager.getTokenBalance(
           token,
           baseUrl
         );
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${initialBalance.amount}`
+          `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
         );
         const refundResult = await this.balanceManager.refundApiKey({
           mintUrl,
@@ -991,7 +1006,7 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
-        if (!refundResult.success && initialBalance.amount > 0) {
+        if (!refundResult.success && latestBalanceInfo.amount > 0) {
           throw new ProviderError(
             baseUrl,
             status,

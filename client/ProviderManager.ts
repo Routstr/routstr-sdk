@@ -253,9 +253,23 @@ export class ProviderManager {
     const now = Date.now();
     const lastFailure = this.lastFailed.get(baseUrl);
 
+    console.log(`[markFailed] baseUrl: ${baseUrl}`);
+    console.log(`[markFailed] lastFailure from map: ${lastFailure}`);
+    console.log(`[markFailed] current timestamp (now): ${now}`);
+    console.log(`[markFailed] COOLDOWN_DURATION_MS: ${ProviderManager.COOLDOWN_DURATION_MS}`);
+
+    if (lastFailure !== undefined) {
+      const timeSinceLastFailure = now - lastFailure;
+      console.log(`[markFailed] timeSinceLastFailure: ${timeSinceLastFailure}ms`);
+      console.log(`[markFailed] isWithinCooldownWindow: ${timeSinceLastFailure < ProviderManager.COOLDOWN_DURATION_MS}`);
+    }
+
     // Track this failure
     this.lastFailed.set(baseUrl, now);
     this.failedProviders.add(baseUrl);
+
+    console.log(`[markFailed] Updated lastFailed map for ${baseUrl} to ${now}`);
+    console.log(`[markFailed] failedProviders set size: ${this.failedProviders.size}`);
 
     // Check if this is a second failure within the cooldown window
     if (
@@ -263,11 +277,20 @@ export class ProviderManager {
       now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
     ) {
       // Second failure within 5 minutes - add to cooldown
+      console.log(`[markFailed] Second failure detected within cooldown window for ${baseUrl}`);
       if (!this.isOnCooldown(baseUrl)) {
         this.providersOnCoolDown.push([baseUrl, now]);
         console.log(
           `Provider ${baseUrl} added to cooldown after second failure within 5 minutes`
         );
+      } else {
+        console.log(`[markFailed] Provider ${baseUrl} is already on cooldown`);
+      }
+    } else {
+      if (lastFailure === undefined) {
+        console.log(`[markFailed] First failure for ${baseUrl} - not adding to cooldown yet`);
+      } else {
+        console.log(`[markFailed] Failure outside cooldown window for ${baseUrl} (timeSinceLastFailure: ${now - lastFailure}ms)`);
       }
     }
   }
