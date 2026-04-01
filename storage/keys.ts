@@ -15,6 +15,9 @@ export const SDK_STORAGE_KEYS = {
   CACHED_RECEIVE_TOKENS: "cached_receive_tokens",
   USAGE_TRACKING: "usage_tracking",
   CLIENT_IDS: "client_ids",
+  FAILED_PROVIDERS: "failed_providers",
+  LAST_FAILED: "last_failed",
+  PROVIDERS_ON_COOLDOWN: "providers_on_cooldown",
 } as const;
 
 export type SdkStorageKey =

@@ -116,11 +116,12 @@ export class RoutstrClient {
       this.balanceManager
     );
     this.streamProcessor = new StreamProcessor();
-    this.providerManager = new ProviderManager(providerRegistry);
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
+    // Pass store to ProviderManager for persistent failure tracking
+    this.providerManager = new ProviderManager(providerRegistry, this.sdkStore);
   }
 
   /**

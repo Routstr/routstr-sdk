@@ -48,4 +48,10 @@ export interface SdkStorageState {
     createdAt: number;
     lastUsed?: number | null;
   }>;
+  /** Set of failed provider URLs */
+  failedProviders: string[];
+  /** Map of provider URL -> timestamp of last failure */
+  lastFailed: Record<string, number>;
+  /** Providers currently on cooldown: [baseUrl, timestamp][] */
+  providersOnCooldown: Array<{ baseUrl: string; timestamp: number }>;
 }

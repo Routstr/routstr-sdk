@@ -12,6 +12,7 @@
 
 import type { ProviderRegistry } from "../wallet/interfaces";
 import type { Model } from "../core/types";
+import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext } from "../utils/torUtils";
 
 export interface ModelProviderPrice {
@@ -188,8 +189,50 @@ export class ProviderManager {
   private providersOnCoolDown: [string, number][] = [];
   /** Cooldown duration in milliseconds (5 minutes) */
   private static readonly COOLDOWN_DURATION_MS = 5 * 60 * 1000;
+  /** Optional persistent store for failure tracking */
+  private store: SdkStore | null = null;
+  /** Instance ID for debugging */
+  private readonly instanceId: string;
 
-  constructor(private providerRegistry: ProviderRegistry) {}
+  constructor(private providerRegistry: ProviderRegistry, store?: SdkStore) {
+    this.instanceId = `pm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    if (store) {
+      this.store = store;
+      this.hydrateFromStore();
+    }
+  }
+
+  /**
+   * Hydrate in-memory state from persistent store
+   */
+  private hydrateFromStore(): void {
+    if (!this.store) return;
+    const state = this.store.getState();
+    
+    // Hydrate failedProviders
+    this.failedProviders = new Set(state.failedProviders);
+    
+    // Hydrate lastFailed
+    this.lastFailed = new Map(Object.entries(state.lastFailed));
+    
+    // Hydrate providersOnCooldown (filter out expired)
+    const now = Date.now();
+    this.providersOnCoolDown = state.providersOnCooldown
+      .filter((entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS)
+      .map((entry) => [entry.baseUrl, entry.timestamp] as [string, number]);
+    
+    console.log(`[ProviderManager:${this.instanceId}] Hydrated from store:`);
+    console.log(`  failedProviders: ${this.failedProviders.size}`);
+    console.log(`  lastFailed: ${this.lastFailed.size}`);
+    console.log(`  providersOnCooldown: ${this.providersOnCoolDown.length}`);
+  }
+
+  /**
+   * Get instance ID for debugging
+   */
+  getInstanceId(): string {
+    return this.instanceId;
+  }
 
   /**
    * Clean up expired cooldown entries
@@ -229,6 +272,10 @@ export class ProviderManager {
    */
   resetFailedProviders(): void {
     this.failedProviders.clear();
+    // Persist to store
+    if (this.store) {
+      this.store.getState().setFailedProviders([]);
+    }
   }
 
   /**
@@ -253,23 +300,29 @@ export class ProviderManager {
     const now = Date.now();
     const lastFailure = this.lastFailed.get(baseUrl);
 
-    console.log(`[markFailed] baseUrl: ${baseUrl}`);
-    console.log(`[markFailed] lastFailure from map: ${lastFailure}`);
-    console.log(`[markFailed] current timestamp (now): ${now}`);
-    console.log(`[markFailed] COOLDOWN_DURATION_MS: ${ProviderManager.COOLDOWN_DURATION_MS}`);
+    console.log(`[markFailed:${this.instanceId}] baseUrl: ${baseUrl}`);
+    console.log(`[markFailed:${this.instanceId}] lastFailure from map: ${lastFailure}`);
+    console.log(`[markFailed:${this.instanceId}] current timestamp (now): ${now}`);
+    console.log(`[markFailed:${this.instanceId}] COOLDOWN_DURATION_MS: ${ProviderManager.COOLDOWN_DURATION_MS}`);
 
     if (lastFailure !== undefined) {
       const timeSinceLastFailure = now - lastFailure;
-      console.log(`[markFailed] timeSinceLastFailure: ${timeSinceLastFailure}ms`);
-      console.log(`[markFailed] isWithinCooldownWindow: ${timeSinceLastFailure < ProviderManager.COOLDOWN_DURATION_MS}`);
+      console.log(`[markFailed:${this.instanceId}] timeSinceLastFailure: ${timeSinceLastFailure}ms`);
+      console.log(`[markFailed:${this.instanceId}] isWithinCooldownWindow: ${timeSinceLastFailure < ProviderManager.COOLDOWN_DURATION_MS}`);
     }
 
-    // Track this failure
+    // Track this failure in memory
     this.lastFailed.set(baseUrl, now);
     this.failedProviders.add(baseUrl);
 
-    console.log(`[markFailed] Updated lastFailed map for ${baseUrl} to ${now}`);
-    console.log(`[markFailed] failedProviders set size: ${this.failedProviders.size}`);
+    // Persist to store
+    if (this.store) {
+      this.store.getState().setLastFailedTimestamp(baseUrl, now);
+      this.store.getState().addFailedProvider(baseUrl);
+    }
+
+    console.log(`[markFailed:${this.instanceId}] Updated lastFailed map for ${baseUrl} to ${now}`);
+    console.log(`[markFailed:${this.instanceId}] failedProviders set size: ${this.failedProviders.size}`);
 
     // Check if this is a second failure within the cooldown window
     if (
@@ -277,20 +330,24 @@ export class ProviderManager {
       now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
     ) {
       // Second failure within 5 minutes - add to cooldown
-      console.log(`[markFailed] Second failure detected within cooldown window for ${baseUrl}`);
+      console.log(`[markFailed:${this.instanceId}] Second failure detected within cooldown window for ${baseUrl}`);
       if (!this.isOnCooldown(baseUrl)) {
         this.providersOnCoolDown.push([baseUrl, now]);
+        // Persist to store
+        if (this.store) {
+          this.store.getState().addProviderOnCooldown(baseUrl, now);
+        }
         console.log(
-          `Provider ${baseUrl} added to cooldown after second failure within 5 minutes`
+          `[markFailed:${this.instanceId}] Provider ${baseUrl} added to cooldown after second failure within 5 minutes`
         );
       } else {
-        console.log(`[markFailed] Provider ${baseUrl} is already on cooldown`);
+        console.log(`[markFailed:${this.instanceId}] Provider ${baseUrl} is already on cooldown`);
       }
     } else {
       if (lastFailure === undefined) {
-        console.log(`[markFailed] First failure for ${baseUrl} - not adding to cooldown yet`);
+        console.log(`[markFailed:${this.instanceId}] First failure for ${baseUrl} - not adding to cooldown yet`);
       } else {
-        console.log(`[markFailed] Failure outside cooldown window for ${baseUrl} (timeSinceLastFailure: ${now - lastFailure}ms)`);
+        console.log(`[markFailed:${this.instanceId}] Failure outside cooldown window for ${baseUrl} (timeSinceLastFailure: ${now - lastFailure}ms)`);
       }
     }
   }
@@ -302,6 +359,10 @@ export class ProviderManager {
     this.providersOnCoolDown = this.providersOnCoolDown.filter(
       ([url]) => url !== baseUrl
     );
+    // Persist to store
+    if (this.store) {
+      this.store.getState().removeProviderFromCooldown(baseUrl);
+    }
   }
 
   /**
@@ -309,6 +370,10 @@ export class ProviderManager {
    */
   clearCooldowns(): void {
     this.providersOnCoolDown = [];
+    // Persist to store
+    if (this.store) {
+      this.store.getState().clearProvidersOnCooldown();
+    }
   }
 
   /**
@@ -316,6 +381,10 @@ export class ProviderManager {
    */
   clearFailureHistory(): void {
     this.lastFailed.clear();
+    // Persist to store
+    if (this.store) {
+      this.store.getState().setLastFailed({});
+    }
   }
 
   /**

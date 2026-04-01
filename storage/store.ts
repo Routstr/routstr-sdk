@@ -69,6 +69,16 @@ export interface SdkStorageStore extends SdkStorageState {
         }>
       | ((current: SdkStorageStore["clientIds"]) => SdkStorageStore["clientIds"])
   ) => void;
+  // ========== Failure Tracking ==========
+  setFailedProviders: (value: string[]) => void;
+  addFailedProvider: (baseUrl: string) => void;
+  removeFailedProvider: (baseUrl: string) => void;
+  setLastFailed: (value: Record<string, number>) => void;
+  setLastFailedTimestamp: (baseUrl: string, timestamp: number) => void;
+  setProvidersOnCooldown: (value: Array<{ baseUrl: string; timestamp: number }>) => void;
+  addProviderOnCooldown: (baseUrl: string, timestamp: number) => void;
+  removeProviderFromCooldown: (baseUrl: string) => void;
+  clearProvidersOnCooldown: () => void;
 }
 
 /** Store type returned after async initialization */
@@ -91,6 +101,9 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     lastRoutstr21ModelsUpdate: null,
     cachedReceiveTokens: [],
     clientIds: [],
+    failedProviders: [],
+    lastFailed: {},
+    providersOnCooldown: [],
     setModelsFromAllProviders: (value) => {
       const normalized: Record<string, Model[]> = {};
       for (const [baseUrl, models] of Object.entries(value)) {
@@ -259,6 +272,71 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
         return { clientIds: normalized };
       });
     },
+    // ========== Failure Tracking ==========
+    setFailedProviders: (value) => {
+      const normalized = value.map((url) => normalizeBaseUrl(url));
+      void driver.setItem(SDK_STORAGE_KEYS.FAILED_PROVIDERS, normalized);
+      set({ failedProviders: normalized });
+    },
+    addFailedProvider: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().failedProviders;
+      if (!current.includes(normalized)) {
+        const updated = [...current, normalized];
+        void driver.setItem(SDK_STORAGE_KEYS.FAILED_PROVIDERS, updated);
+        set({ failedProviders: updated });
+      }
+    },
+    removeFailedProvider: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().failedProviders;
+      const updated = current.filter((url) => url !== normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.FAILED_PROVIDERS, updated);
+      set({ failedProviders: updated });
+    },
+    setLastFailed: (value) => {
+      const normalized: Record<string, number> = {};
+      for (const [baseUrl, timestamp] of Object.entries(value)) {
+        normalized[normalizeBaseUrl(baseUrl)] = timestamp;
+      }
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_FAILED, normalized);
+      set({ lastFailed: normalized });
+    },
+    setLastFailedTimestamp: (baseUrl, timestamp) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().lastFailed;
+      const updated = { ...current, [normalized]: timestamp };
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_FAILED, updated);
+      set({ lastFailed: updated });
+    },
+    setProvidersOnCooldown: (value) => {
+      const normalized = value.map((entry) => ({
+        baseUrl: normalizeBaseUrl(entry.baseUrl),
+        timestamp: entry.timestamp,
+      }));
+      void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, normalized);
+      set({ providersOnCooldown: normalized });
+    },
+    addProviderOnCooldown: (baseUrl, timestamp) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().providersOnCooldown;
+      if (!current.some((entry) => entry.baseUrl === normalized)) {
+        const updated = [...current, { baseUrl: normalized, timestamp }];
+        void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
+        set({ providersOnCooldown: updated });
+      }
+    },
+    removeProviderFromCooldown: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().providersOnCooldown;
+      const updated = current.filter((entry) => entry.baseUrl !== normalized);
+      void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
+      set({ providersOnCooldown: updated });
+    },
+    clearProvidersOnCooldown: () => {
+      void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, []);
+      set({ providersOnCooldown: [] });
+    },
   }));
 
 const hydrateStoreFromDriver = async (
@@ -281,6 +359,9 @@ const hydrateStoreFromDriver = async (
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
     rawClientIds,
+    rawFailedProviders,
+    rawLastFailed,
+    rawProvidersOnCooldown,
   ] = await Promise.all([
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
@@ -350,6 +431,11 @@ const hydrateStoreFromDriver = async (
         lastUsed?: number | null;
       }>
     >(SDK_STORAGE_KEYS.CLIENT_IDS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.FAILED_PROVIDERS, []),
+    driver.getItem<Record<string, number>>(SDK_STORAGE_KEYS.LAST_FAILED, {}),
+    driver.getItem<
+      Array<{ baseUrl: string; timestamp: number }>
+    >(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, []),
   ]);
 
   const modelsFromAllProviders = Object.fromEntries(
@@ -430,6 +516,18 @@ const hydrateStoreFromDriver = async (
     lastUsed: entry.lastUsed ?? null,
   }));
 
+  const failedProviders = rawFailedProviders.map((url) => normalizeBaseUrl(url));
+  const lastFailed = Object.fromEntries(
+    Object.entries(rawLastFailed).map(([baseUrl, timestamp]) => [
+      normalizeBaseUrl(baseUrl),
+      timestamp,
+    ])
+  );
+  const providersOnCooldown = rawProvidersOnCooldown.map((entry) => ({
+    baseUrl: normalizeBaseUrl(entry.baseUrl),
+    timestamp: entry.timestamp,
+  }));
+
   store.setState({
     modelsFromAllProviders,
     lastUsedModel,
@@ -446,6 +544,9 @@ const hydrateStoreFromDriver = async (
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens,
     clientIds,
+    failedProviders,
+    lastFailed,
+    providersOnCooldown,
   });
 };
 
