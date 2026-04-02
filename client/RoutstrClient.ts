@@ -970,7 +970,6 @@ export class RoutstrClient {
         token,
         baseUrl
       );
-      this._log("DEBUG", "SDOIFGJSFIONDFONBODFNVOFD", latestBalanceInfo);
       if (latestBalanceInfo.isInvalidApiKey) {
         this.storageAdapter.removeApiKey(baseUrl);
         tryNextProvider = true;
