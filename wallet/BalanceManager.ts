@@ -203,7 +203,7 @@ export class BalanceManager {
           : receiveResult.amount * 1000;
 
       if (receiveResult.success) {
-        this.storageAdapter.removeApiKey(baseUrl); 
+        this.storageAdapter.removeApiKey(baseUrl);
       }
 
       return {
@@ -313,11 +313,11 @@ export class BalanceManager {
       return { success: false, message: "Invalid top up amount" };
     }
 
-    const apiKeyEntry = providedToken 
-      ? null  // providedToken is now the apiKey for apikeys mode
+    const apiKeyEntry = providedToken
+      ? null // providedToken is now the apiKey for apikeys mode
       : this.storageAdapter.getApiKey(baseUrl);
     const apiKey = providedToken || apiKeyEntry?.key;
-    
+
     if (!apiKey) {
       return { success: false, message: "No API key available for top up" };
     }
@@ -341,11 +341,7 @@ export class BalanceManager {
 
       cashuToken = tokenResult.token;
 
-      const topUpResult = await this._postTopUp(
-        baseUrl,
-        apiKey,
-        cashuToken
-      );
+      const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
       console.log(topUpResult);
 
@@ -831,8 +827,8 @@ export class BalanceManager {
         // Check for invalid/expired API key error (proofs already spent)
         const isInvalidApiKey =
           response.status === 401 &&
-          data?.code === "invalid_api_key" &&
-          data?.message?.includes("proofs already spent");
+          data?.detail?.error?.code === "invalid_api_key" &&
+          data?.detail?.error?.message?.includes("proofs already spent");
 
         return {
           amount: -1,

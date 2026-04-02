@@ -276,19 +276,9 @@ export class ProviderManager {
    * Check if a provider is currently on cooldown
    */
   isOnCooldown(baseUrl: string): boolean {
-    console.log(
-      `[isOnCooldown:${this.instanceId}] Checking cooldown for: ${baseUrl}`
-    );
-    console.log(
-      `[isOnCooldown:${this.instanceId}] Current providersOnCoolDown: [${this.providersOnCoolDown.map(([url, ts]) => `${url}(age: ${Date.now() - ts}ms)`).join(", ")}]`
-    );
-
     this.cleanupExpiredCooldowns();
 
     const result = this.providersOnCoolDown.some(([url]) => url === baseUrl);
-    console.log(
-      `[isOnCooldown:${this.instanceId}] Result for ${baseUrl}: ${result}`
-    );
     return result;
   }
 

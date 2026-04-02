@@ -964,12 +964,13 @@ export class RoutstrClient {
     if (status === 401 && this.mode === "apikeys") {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
+        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${token}`
       );
       const latestBalanceInfo = await this.balanceManager.getTokenBalance(
         token,
         baseUrl
       );
+      this._log("DEBUG", "SDOIFGJSFIONDFONBODFNVOFD", latestBalanceInfo);
       if (latestBalanceInfo.isInvalidApiKey) {
         this.storageAdapter.removeApiKey(baseUrl);
         tryNextProvider = true;
