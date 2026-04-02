@@ -60,10 +60,14 @@ export interface RouteRequestOptions {
   usageTrackingDriver?: UsageTrackingDriver;
   /** Optional: explicit SDK store (for using correct DB path) */
   sdkStore?: SdkStore;
+  /** Optional: shared ProviderManager instance for consistent failure tracking */
+  providerManager?: ProviderManager;
 }
 
 export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {
   res: RouteRequestToNodeResponseParams["res"];
+  /** Optional: shared ProviderManager instance for consistent failure tracking */
+  providerManager?: ProviderManager;
 }
 
 /**
@@ -116,6 +120,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     mode = "apikeys",
     usageTrackingDriver,
     sdkStore,
+    providerManager: providedProviderManager,
   } = options;
 
   let modelManager: ModelManager;
@@ -142,7 +147,8 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     await modelManager.fetchModels(providers, forceRefresh);
   }
 
-  const providerManager = new ProviderManager(providerRegistry);
+  // Use provided ProviderManager or create a new one
+  const providerManager = providedProviderManager ?? new ProviderManager(providerRegistry, sdkStore);
 
   let baseUrl: string;
   let selectedModel: Model;
@@ -199,7 +205,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     providerRegistry,
     "min",
     mode,
-    { usageTrackingDriver, sdkStore }
+    { usageTrackingDriver, sdkStore, providerManager }
   );
 
   if (debugLevel) {

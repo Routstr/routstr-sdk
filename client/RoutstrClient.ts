@@ -83,6 +83,8 @@ export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
 export interface RoutstrClientConfig {
   usageTrackingDriver?: UsageTrackingDriver;
   sdkStore?: SdkStore;
+  /** Optional: shared ProviderManager instance for consistent failure tracking across requests */
+  providerManager?: ProviderManager;
 }
 
 export class RoutstrClient {
@@ -120,8 +122,10 @@ export class RoutstrClient {
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
-    // Pass store to ProviderManager for persistent failure tracking
-    this.providerManager = new ProviderManager(providerRegistry, this.sdkStore);
+    // Use provided ProviderManager or create a new one
+    this.providerManager =
+      options.providerManager ??
+      new ProviderManager(providerRegistry, this.sdkStore);
   }
 
   /**
@@ -803,6 +807,10 @@ export class RoutstrClient {
 
         const shortfall = Math.max(0, params.requiredSats - currentBalance);
         topupAmount = shortfall > 0 ? shortfall : params.requiredSats;
+        this._log(
+          "DEBUG",
+          `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance} `
+        );
       } catch (e) {
         this._log(
           "WARN",
