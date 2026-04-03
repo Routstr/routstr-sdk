@@ -511,7 +511,7 @@ export class ModelManager {
     }
 
     const DEFAULT_RELAYS = [
-      "wss://relay.primal.net",
+      "wss://relay.damus.io",
       "wss://nos.lol",
       "wss://relay.routstr.com",
     ];
