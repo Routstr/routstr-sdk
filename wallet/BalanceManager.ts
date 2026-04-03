@@ -172,7 +172,7 @@ export class BalanceManager {
       | undefined;
 
     try {
-      fetchResult = await this._fetchRefundTokenWithApiKey(baseUrl, apiKey);
+      fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
       if (!fetchResult.success) {
         return {
@@ -218,11 +218,11 @@ export class BalanceManager {
   }
 
   /**
-   * Fetch refund token from provider API using API key authentication
+   * Fetch refund token from provider API using API key (or xcashu token) authentication
    */
-  private async _fetchRefundTokenWithApiKey(
+  async fetchRefundToken(
     baseUrl: string,
-    apiKey: string
+    apiKeyOrToken: string
   ): Promise<{
     success: boolean;
     token?: string;
@@ -248,7 +248,7 @@ export class BalanceManager {
       const response = await fetch(url, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKeyOrToken}`,
           "Content-Type": "application/json",
         },
         signal: controller.signal,
@@ -279,7 +279,7 @@ export class BalanceManager {
     } catch (error) {
       clearTimeout(timeoutId);
       console.error(
-        "[BalanceManager._fetchRefundTokenWithApiKey] Fetch error",
+        "[BalanceManager.fetchRefundToken] Fetch error",
         error
       );
 

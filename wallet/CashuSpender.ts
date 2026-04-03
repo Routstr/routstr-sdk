@@ -486,8 +486,9 @@ export class CashuSpender {
   }
 
   /**
-   * Refund all xcashu tokens from storage and increment tryCounts on failure.
-   * Reuses receiveToken from BalanceManager/CashuSpender for receiving refunds.
+   * Refund all xcashu tokens from storage by calling the provider's refund endpoint.
+   * The xcashu token acts as an API key to claim the refund, and the response contains
+   * the actual refunded Cashu token which is then received into the wallet.
    * @param mintUrl - The mint URL for receiving tokens
    * @param excludeBaseUrls - Base URLs to exclude from refund (optional)
    * @returns Results for each xcashu token refund attempt
@@ -505,8 +506,24 @@ export class CashuSpender {
 
       for (const xcashuToken of tokens) {
         try {
-          // Try to receive the xcashu token (refund it to wallet)
-          const receiveResult = await this.receiveToken(xcashuToken.token);
+          // XCashu tokens need to be sent to the provider's refund endpoint
+          // The xcashu token acts as an API key, and the response contains the actual refunded token
+          if (!this.balanceManager) {
+            throw new Error("BalanceManager not available for xcashu refund");
+          }
+
+          // Call the refund endpoint using the xcashu token as the API key
+          const fetchResult = await this.balanceManager.fetchRefundToken(
+            baseUrl,
+            xcashuToken.token
+          );
+
+          if (!fetchResult.success || !fetchResult.token) {
+            throw new Error(fetchResult.error || "Failed to fetch refund token from provider");
+          }
+
+          // Receive the refunded Cashu token into the wallet
+          const receiveResult = await this.receiveToken(fetchResult.token);
 
           if (receiveResult.success) {
             // Remove successfully refunded token from storage
@@ -533,7 +550,7 @@ export class CashuSpender {
             });
             this._log(
               "DEBUG",
-              `[CashuSpender] refundXcashuTokens: Failed to refund xcashu token for ${baseUrl}, incremented tryCount to ${newTryCount}`
+              `[CashuSpender] refundXcashuTokens: Failed to receive refund token for ${baseUrl}, incremented tryCount to ${newTryCount}`
             );
           }
         } catch (error) {
