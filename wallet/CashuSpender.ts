@@ -423,8 +423,7 @@ export class CashuSpender {
     if (!apiKeyEntry) return null;
 
     // Get pending distribution to check balance
-    const apiKeyDistribution =
-      this.storageAdapter.getApiKeyDistribution();
+    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
     const balanceForBaseUrl =
       apiKeyDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
 
@@ -496,8 +495,15 @@ export class CashuSpender {
   async refundXcashuTokens(
     mintUrl: string,
     excludeBaseUrls?: string[]
-  ): Promise<{ baseUrl: string; token: string; success: boolean; error?: string }[]> {
-    const results: { baseUrl: string; token: string; success: boolean; error?: string }[] = [];
+  ): Promise<
+    { baseUrl: string; token: string; success: boolean; error?: string }[]
+  > {
+    const results: {
+      baseUrl: string;
+      token: string;
+      success: boolean;
+      error?: string;
+    }[] = [];
     const xcashuTokens = this.storageAdapter.getXcashuTokens();
     const excludedUrls = new Set(excludeBaseUrls || []);
 
@@ -515,11 +521,14 @@ export class CashuSpender {
           // Call the refund endpoint using the xcashu token as the API key
           const fetchResult = await this.balanceManager.fetchRefundToken(
             baseUrl,
-            xcashuToken.token
+            xcashuToken.token,
+            true
           );
 
           if (!fetchResult.success || !fetchResult.token) {
-            throw new Error(fetchResult.error || "Failed to fetch refund token from provider");
+            throw new Error(
+              fetchResult.error || "Failed to fetch refund token from provider"
+            );
           }
 
           // Receive the refunded Cashu token into the wallet
@@ -541,7 +550,10 @@ export class CashuSpender {
             // Refund failed - increment tryCount
             const currentTryCount = xcashuToken.tryCount ?? 0;
             const newTryCount = currentTryCount + 1;
-            this.storageAdapter.updateXcashuTokenTryCount(xcashuToken.token, newTryCount);
+            this.storageAdapter.updateXcashuTokenTryCount(
+              xcashuToken.token,
+              newTryCount
+            );
             results.push({
               baseUrl,
               token: xcashuToken.token,
@@ -557,8 +569,12 @@ export class CashuSpender {
           // Exception occurred - increment tryCount
           const currentTryCount = xcashuToken.tryCount ?? 0;
           const newTryCount = currentTryCount + 1;
-          this.storageAdapter.updateXcashuTokenTryCount(xcashuToken.token, newTryCount);
-          const errorMessage = error instanceof Error ? error.message : String(error);
+          this.storageAdapter.updateXcashuTokenTryCount(
+            xcashuToken.token,
+            newTryCount
+          );
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
           results.push({
             baseUrl,
             token: xcashuToken.token,
@@ -602,7 +618,10 @@ export class CashuSpender {
         if (refundResult.success) {
           this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
         } else {
-          this.storageAdapter.updateApiKeyBalance(apiKeyEntry.baseUrl, apiKeyEntry.amount); // just so that we only try to refund every 5 mins. 
+          this.storageAdapter.updateApiKeyBalance(
+            apiKeyEntry.baseUrl,
+            apiKeyEntry.amount
+          ); // just so that we only try to refund every 5 mins.
         }
 
         results.push({

@@ -222,7 +222,8 @@ export class BalanceManager {
    */
   async fetchRefundToken(
     baseUrl: string,
-    apiKeyOrToken: string
+    apiKeyOrToken: string,
+    xCashu: boolean = false
   ): Promise<{
     success: boolean;
     token?: string;
@@ -245,12 +246,18 @@ export class BalanceManager {
     }, 60000);
 
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (xCashu) {
+        headers["X-Cashu"] = apiKeyOrToken;
+      } else {
+        headers["Authorization"] = `Bearer ${apiKeyOrToken}`;
+      }
+
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKeyOrToken}`,
-          "Content-Type": "application/json",
-        },
+        headers,
         signal: controller.signal,
       });
 
@@ -278,10 +285,7 @@ export class BalanceManager {
       };
     } catch (error) {
       clearTimeout(timeoutId);
-      console.error(
-        "[BalanceManager.fetchRefundToken] Fetch error",
-        error
-      );
+      console.error("[BalanceManager.fetchRefundToken] Fetch error", error);
 
       if (error instanceof Error) {
         if (error.name === "AbortError") {
