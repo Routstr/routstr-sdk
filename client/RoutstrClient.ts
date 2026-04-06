@@ -1202,8 +1202,8 @@ export class RoutstrClient {
           await this.cashuSpender.refundXcashuTokens(mintUrl);
         this._log("DEBUG", "Refund xcashu tokens results:", xcashuResults);
 
-        // Also refund API keys (apikeys mode)
-        const results = await this.cashuSpender.refundProviders(mintUrl);
+        // Also refund API keys (apikeys mode) DISABLED FOR NOW
+        // const results = await this.cashuSpaender.refundProviders(mintUrl);
       } catch (error) {
         this._log("ERROR", "Failed to refund providers:", error);
       }
