@@ -209,6 +209,7 @@ export class BalanceManager {
       return {
         success: receiveResult.success,
         refundedAmount: totalAmountMsat,
+        message: receiveResult.message,
         requestId: fetchResult.requestId,
       };
     } catch (error) {

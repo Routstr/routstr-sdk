@@ -731,19 +731,19 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
     );
     if (params.token.startsWith("cashu")) {
-      const tryReceiveTokenResult = await this.cashuSpender.receiveToken(
+      const receiveResult = await this.cashuSpender.receiveToken(
         params.token
       );
-      if (tryReceiveTokenResult.success) {
+      if (receiveResult.success) {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+          `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
         tryNextProvider = true;
       } else {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Failed to receive token. `
+          `[RoutstrClient] _handleErrorResponse: Failed to receive token: ${receiveResult.message}`
         );
       }
     }
@@ -754,24 +754,19 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
         );
-        try {
-          const receiveResult =
-            await this.cashuSpender.receiveToken(xCashuRefundToken);
-          if (receiveResult.success) {
-            this._log(
-              "DEBUG",
-              `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
-            );
-            tryNextProvider = true;
-          } else
-            throw new ProviderError(
-              baseUrl,
-              status,
-              "xcashu refund failed",
-              requestId
-            );
-        } catch (error) {
-          this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
+        const receiveResult =
+          await this.cashuSpender.receiveToken(xCashuRefundToken);
+        if (receiveResult.success) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
+          );
+          tryNextProvider = true;
+        } else {
+          this._log(
+            "ERROR",
+            `[xcashu] Failed to receive refund token: ${receiveResult.message}`
+          );
           throw new ProviderError(
             baseUrl,
             status,
@@ -1133,18 +1128,19 @@ export class RoutstrClient {
     if (this.mode === "xcashu" && response) {
       const refundToken = response.headers.get("x-cashu") ?? undefined;
       if (refundToken) {
-        try {
-          const receiveResult =
-            await this.cashuSpender.receiveToken(refundToken);
-          if (receiveResult.success) {
-            // Remove the spent token from storage
-            this.storageAdapter.removeXcashuToken(baseUrl, token);
-            satsSpent =
-              initialTokenBalance -
-              receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
-          }
-        } catch (error) {
-          this._log("ERROR", "[xcashu] Failed to receive refund token:", error);
+        const receiveResult =
+          await this.cashuSpender.receiveToken(refundToken);
+        if (receiveResult.success) {
+          // Remove the spent token from storage
+          this.storageAdapter.removeXcashuToken(baseUrl, token);
+          satsSpent =
+            initialTokenBalance -
+            receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+        } else {
+          this._log(
+            "ERROR",
+            `[xcashu] Failed to receive refund token: ${receiveResult.message}`
+          );
         }
       }
     } else if (this.mode === "apikeys") {
@@ -1504,18 +1500,18 @@ export class RoutstrClient {
             error instanceof Error &&
             error.message.includes("ApiKey already exists")
           ) {
-            const tryReceiveTokenResult = await this.cashuSpender.receiveToken(
+            const receiveResult = await this.cashuSpender.receiveToken(
               spendResult.token
             );
-            if (tryReceiveTokenResult.success) {
+            if (receiveResult.success) {
               this._log(
                 "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${tryReceiveTokenResult.amount}`
+                `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
               );
             } else {
               this._log(
                 "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restore failed or not needed`
+                `[RoutstrClient] _handleErrorResponse: Token restore failed: ${receiveResult.message}`
               );
             }
             this._log(

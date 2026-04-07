@@ -16,6 +16,7 @@ import { InsufficientBalanceError } from "../core/errors";
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
+import { getDecodedToken } from "@cashu/cashu-ts";
 
 /**
  * Options for spending cashu tokens
@@ -68,25 +69,50 @@ export class CashuSpender {
     unit: "sat" | "msat";
     message?: string;
   }> {
-    const result = await this.walletAdapter.receiveToken(token);
+    try {
+      const result = await this.walletAdapter.receiveToken(token);
+      return result;
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
 
-    if (!result.success && result.message?.includes("Failed to fetch mint")) {
-      const cachedTokens = this.storageAdapter.getCachedReceiveTokens();
-      const existingIndex = cachedTokens.findIndex((t) => t.token === token);
-      if (existingIndex === -1) {
-        this.storageAdapter.setCachedReceiveTokens([
-          ...cachedTokens,
-          {
-            token,
-            amount: result.amount,
-            unit: result.unit,
-            createdAt: Date.now(),
-          },
-        ]);
+      if (errorMessage.includes("Failed to fetch mint")) {
+        const cachedTokens = this.storageAdapter.getCachedReceiveTokens();
+        const existingIndex = cachedTokens.findIndex((t) => t.token === token);
+        if (existingIndex === -1) {
+          const { amount, unit } = this._decodeTokenAmount(token);
+          this.storageAdapter.setCachedReceiveTokens([
+            ...cachedTokens,
+            {
+              token,
+              amount,
+              unit,
+              createdAt: Date.now(),
+            },
+          ]);
+        }
       }
-    }
 
-    return result;
+      const { amount, unit } = this._decodeTokenAmount(token);
+      return { success: false, amount, unit, message: errorMessage };
+    }
+  }
+
+  private _decodeTokenAmount(token: string): {
+    amount: number;
+    unit: "sat" | "msat";
+  } {
+    try {
+      const decoded = getDecodedToken(token);
+      const amount = decoded.proofs.reduce(
+        (acc, proof) => acc + proof.amount,
+        0
+      );
+      const unit = (decoded.unit as "sat" | "msat") || "sat";
+      return { amount, unit };
+    } catch {
+      return { amount: 0, unit: "sat" };
+    }
   }
 
   private async _getBalanceState(): Promise<{
@@ -562,7 +588,7 @@ export class CashuSpender {
             });
             this._log(
               "DEBUG",
-              `[CashuSpender] refundXcashuTokens: Failed to receive refund token for ${baseUrl}, incremented tryCount to ${newTryCount}`
+              `[CashuSpender] refundXcashuTokens: Failed to receive refund token for ${baseUrl}, incremented tryCount to ${newTryCount}: ${receiveResult.message}`
             );
           }
         } catch (error) {
