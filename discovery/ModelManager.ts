@@ -127,7 +127,7 @@ export class ModelManager {
     const DEFAULT_RELAYS = [
       "wss://relay.primal.net",
       "wss://nos.lol",
-      "wss://relay.routstr.com",
+      "wss://relay.damus.io",
     ];
 
     const pool = new RelayPool();

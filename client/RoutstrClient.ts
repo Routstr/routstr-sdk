@@ -1194,9 +1194,9 @@ export class RoutstrClient {
     (async () => {
       try {
         // Refund all xcashu tokens
-        const xcashuResults =
-          await this.cashuSpender.refundXcashuTokens(mintUrl);
-        this._log("DEBUG", "Refund xcashu tokens results:", xcashuResults);
+        // const xcashuResults =
+        //  await this.cashuSpender.refundXcashuTokens(mintUrl);
+        // this._log("DEBUG", "Refund xcashu tokens results:", xcashuResults);
 
         // Also refund API keys (apikeys mode) DISABLED FOR NOW
         // const results = await this.cashuSpaender.refundProviders(mintUrl);
