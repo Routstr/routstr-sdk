@@ -721,9 +721,11 @@ export class RoutstrClient {
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
 
+    const errorMessage = responseBody;
+
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorMessage=${errorMessage}`
     );
 
     this._log(

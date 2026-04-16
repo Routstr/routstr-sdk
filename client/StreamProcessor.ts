@@ -181,11 +181,16 @@ export class StreamProcessor {
       }
 
       // Extract usage (usually in final chunk)
-      if (parsed.usage) {
-        result.usage = toUsageStats(extractUsageFromSSEJson(parsed)) ?? {
-          total_tokens: parsed.usage.total_tokens,
-          prompt_tokens: parsed.usage.prompt_tokens,
-          completion_tokens: parsed.usage.completion_tokens,
+      // extractUsageFromSSEJson handles both usage chunks and standalone cost chunks
+      const extractedUsage = extractUsageFromSSEJson(parsed);
+      if (extractedUsage) {
+        result.usage = toUsageStats(extractedUsage);
+      } else if (parsed.usage) {
+        // Fallback: raw usage without cost
+        result.usage = {
+          total_tokens: parsed.usage.total_tokens ?? parsed.usage.input_tokens + parsed.usage.output_tokens,
+          prompt_tokens: parsed.usage.prompt_tokens ?? parsed.usage.input_tokens,
+          completion_tokens: parsed.usage.completion_tokens ?? parsed.usage.output_tokens,
         };
       }
 
