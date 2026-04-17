@@ -459,41 +459,78 @@ export class ProviderManager {
         this.providerRegistry.getDisabledProviders()
       );
 
+      console.log(`[findNextBestProvider:${this.instanceId}] Starting search for model: ${modelId}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] currentBaseUrl: ${currentBaseUrl}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] torMode: ${torMode}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] disabledProviders: ${[...disabledProviders]}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] failedProviders: ${[...this.failedProviders]}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] providersOnCooldown: ${this.providersOnCoolDown.map(([url]) => url)}`);
+
       // Get all providers with their models
       const allProviders = this.providerRegistry.getAllProvidersModels();
+      console.log(`[findNextBestProvider:${this.instanceId}] Total providers in registry: ${Object.keys(allProviders).length}`);
 
       // Find all candidate providers
       const candidates: CandidateProvider[] = [];
+      let skippedCurrent = 0, skippedFailed = 0, skippedDisabled = 0, skippedCooldown = 0, skippedOnion = 0, skippedNoModel = 0;
 
       for (const [baseUrl, models] of Object.entries(allProviders)) {
         // Skip current, failed, disabled, and cooldown providers
-        if (
-          baseUrl === currentBaseUrl ||
-          this.failedProviders.has(baseUrl) ||
-          disabledProviders.has(baseUrl) ||
-          this.isOnCooldown(baseUrl)
-        ) {
+        if (baseUrl === currentBaseUrl) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (current): ${baseUrl}`);
+          skippedCurrent++;
+          continue;
+        }
+        if (this.failedProviders.has(baseUrl)) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (failed): ${baseUrl}`);
+          skippedFailed++;
+          continue;
+        }
+        if (disabledProviders.has(baseUrl)) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (disabled): ${baseUrl}`);
+          skippedDisabled++;
+          continue;
+        }
+        if (this.isOnCooldown(baseUrl)) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (cooldown): ${baseUrl}`);
+          skippedCooldown++;
           continue;
         }
 
         // Skip onion URLs and insecure http URLs if not in Tor mode
         if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl))) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (onion/http): ${baseUrl}`);
+          skippedOnion++;
           continue;
         }
 
         // Find the model in this provider's list
         const model = models.find((m: Model) => m.id === modelId);
-        if (!model) continue;
+        if (!model) {
+          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (no model ${modelId}): ${baseUrl} has models: ${models.map((m: Model) => m.id).join(', ')}`);
+          skippedNoModel++;
+          continue;
+        }
 
         // Calculate cost (using completion price as the metric)
         const cost = model.sats_pricing?.completion ?? 0;
+        console.log(`[findNextBestProvider:${this.instanceId}] CANDIDATE: ${baseUrl} cost: ${cost}`);
         candidates.push({ baseUrl, model, cost });
       }
+
+      console.log(`[findNextBestProvider:${this.instanceId}] Skipped: current=${skippedCurrent}, failed=${skippedFailed}, disabled=${skippedDisabled}, cooldown=${skippedCooldown}, onion=${skippedOnion}, noModel=${skippedNoModel}`);
+      console.log(`[findNextBestProvider:${this.instanceId}] Total candidates: ${candidates.length}`);
 
       // Sort by price (lowest first)
       candidates.sort((a, b) => a.cost - b.cost);
 
-      return candidates.length > 0 ? candidates[0].baseUrl : null;
+      if (candidates.length > 0) {
+        console.log(`[findNextBestProvider:${this.instanceId}] Selected provider: ${candidates[0].baseUrl} with cost: ${candidates[0].cost}`);
+        return candidates[0].baseUrl;
+      } else {
+        console.log(`[findNextBestProvider:${this.instanceId}] No candidate providers found`);
+        return null;
+      }
     } catch (error) {
       console.error("Error finding next best provider:", error);
       return null;
