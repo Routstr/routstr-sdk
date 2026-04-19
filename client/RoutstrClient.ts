@@ -40,7 +40,10 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { createSSEParserTransform } from "./sse";
-import { Readable } from "stream";
+import { Readable, Transform } from "stream";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 /**
  * Options for fetching AI response
@@ -304,7 +307,7 @@ export class RoutstrClient {
     clientApiKey?: string;
   }> {
     const {
-      path,
+      path: requestPath,
       method,
       body,
       headers = {},
@@ -357,7 +360,7 @@ export class RoutstrClient {
     const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
     const response = await this._makeRequest({
-      path,
+      path: requestPath,
       method,
       body: method === "GET" ? undefined : requestBody,
       baseUrl,
@@ -380,7 +383,23 @@ export class RoutstrClient {
     let capturedResponseId: string | undefined;
 
     if (contentType.includes("text/event-stream") && response.body) {
+      const logDir = path.join(os.homedir(), ".routstrd", "stream-response");
+      if (!fs.existsSync(logDir)) {
+        fs.mkdirSync(logDir, { recursive: true });
+      }
+      const logFile = path.join(logDir, `${Date.now()}.jsonl`);
+      const logStream = fs.createWriteStream(logFile);
+
       const nodeReadable = Readable.fromWeb(response.body as any);
+
+      const loggingTransform = new Transform({
+        transform(chunk, encoding, callback) {
+          const raw = chunk.toString();
+          logStream.write(JSON.stringify({ raw, timestamp: Date.now() }) + "\n");
+          callback(null, chunk);
+        },
+      });
+
       const sseParser = createSSEParserTransform(
         (usage) => {
           capturedUsage = usage;
@@ -391,7 +410,9 @@ export class RoutstrClient {
           (processedResponse as any).requestId = responseId;
         }
       );
-      const transformed = nodeReadable.pipe(sseParser, { end: true });
+      const transformed = nodeReadable
+        .pipe(loggingTransform)
+        .pipe(sseParser, { end: true });
       const webStream = Readable.toWeb(
         transformed
       ) as globalThis.ReadableStream<Uint8Array>;
