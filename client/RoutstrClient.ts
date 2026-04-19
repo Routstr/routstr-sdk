@@ -506,9 +506,6 @@ export class RoutstrClient {
       const baseHeaders = this._buildBaseHeaders(headers);
       const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
-      // Reset failed providers for new request
-      this.providerManager.resetFailedProviders();
-
       // Get provider info for version compatibility
       const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
       const providerVersion = providerInfo?.version ?? "";

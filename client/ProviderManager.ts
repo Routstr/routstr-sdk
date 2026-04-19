@@ -241,6 +241,7 @@ export class ProviderManager {
 
   /**
    * Clean up expired cooldown entries
+   * Also removes the provider from failedProviders so it can be retried
    */
   private cleanupExpiredCooldowns(): void {
     const now = Date.now();
@@ -253,6 +254,12 @@ export class ProviderManager {
           console.log(
             `[cleanupExpiredCooldowns:${this.instanceId}] Removing expired cooldown for ${url} (age: ${age}ms, cooldown: ${ProviderManager.COOLDOWN_DURATION_MS}ms)`
           );
+          // Also remove from failedProviders so the provider can be retried
+          this.failedProviders.delete(url);
+          // Persist to store
+          if (this.store) {
+            this.store.getState().removeFailedProvider(url);
+          }
         }
         return !isExpired;
       }
