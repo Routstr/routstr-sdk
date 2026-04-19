@@ -488,11 +488,11 @@ export class ProviderManager {
           skippedCurrent++;
           continue;
         }
-        if (this.failedProviders.has(baseUrl)) {
-          console.log(`[findNextBestProvider:${this.instanceId}] SKIP (failed): ${baseUrl}`);
-          skippedFailed++;
-          continue;
-        }
+        // if (this.failedProviders.has(baseUrl)) {
+        //   console.log(`[findNextBestProvider:${this.instanceId}] SKIP (failed): ${baseUrl}`);
+        //   skippedFailed++;
+        //   continue;
+        // }
         if (disabledProviders.has(baseUrl)) {
           console.log(`[findNextBestProvider:${this.instanceId}] SKIP (disabled): ${baseUrl}`);
           skippedDisabled++;
