@@ -21,11 +21,46 @@ export function createSSEParserTransform(
   onResponseId?: (responseId: string) => void
 ): Transform {
   let buffer = "";
-  let usageCaptured = false;
+  let capturedUsage: UsageTrackingData | null = null;
   let responseIdCaptured = false;
 
+  const mergeUsage = (
+    previous: UsageTrackingData | null,
+    next: UsageTrackingData
+  ): UsageTrackingData => {
+    if (!previous) return next;
+
+    return {
+      promptTokens:
+        next.promptTokens > 0 ? next.promptTokens : previous.promptTokens,
+      completionTokens:
+        next.completionTokens > 0
+          ? next.completionTokens
+          : previous.completionTokens,
+      totalTokens: next.totalTokens > 0 ? next.totalTokens : previous.totalTokens,
+      cost: next.cost > 0 ? next.cost : previous.cost,
+      satsCost: next.satsCost > 0 ? next.satsCost : previous.satsCost,
+    };
+  };
+
+  const hasUsageChanged = (
+    previous: UsageTrackingData | null,
+    next: UsageTrackingData
+  ): boolean => {
+    if (!previous) return true;
+    return (
+      previous.promptTokens !== next.promptTokens ||
+      previous.completionTokens !== next.completionTokens ||
+      previous.totalTokens !== next.totalTokens ||
+      previous.cost !== next.cost ||
+      previous.satsCost !== next.satsCost
+    );
+  };
+
   const inspectDataPayload = (jsonText: string): void => {
-    if (usageCaptured && responseIdCaptured) return;
+    if (responseIdCaptured && capturedUsage?.satsCost && capturedUsage.totalTokens) {
+      return;
+    }
     const trimmed = jsonText.trim();
     if (!trimmed || trimmed === "[DONE]") return;
     if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return;
@@ -41,11 +76,12 @@ export function createSSEParserTransform(
         }
       }
 
-      if (!usageCaptured) {
-        const usage = extractUsageFromSSEJson(data);
-        if (usage) {
-          onUsage(usage);
-          usageCaptured = true;
+      const usage = extractUsageFromSSEJson(data);
+      if (usage) {
+        const mergedUsage = mergeUsage(capturedUsage, usage);
+        if (hasUsageChanged(capturedUsage, mergedUsage)) {
+          capturedUsage = mergedUsage;
+          onUsage(mergedUsage);
         }
       }
     } catch {
@@ -59,7 +95,9 @@ export function createSSEParserTransform(
    * event are concatenated with `\n` to form the payload.
    */
   const inspectEventBlock = (eventBlock: string): void => {
-    if (usageCaptured && responseIdCaptured) return;
+    if (responseIdCaptured && capturedUsage?.satsCost && capturedUsage.totalTokens) {
+      return;
+    }
 
     const lines = eventBlock.split(/\r?\n/);
     const dataParts: string[] = [];
