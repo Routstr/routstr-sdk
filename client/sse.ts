@@ -1,26 +1,30 @@
 import { Transform } from "stream";
+import { StringDecoder } from "string_decoder";
 import { extractUsageFromSSEJson, type UsageTrackingData } from "./usage";
 
 /**
- * SSE parser transform that preserves event boundaries verbatim.
+ * SSE parser transform that preserves the original byte stream.
  *
- * Unlike a naive line-splitter, this buffers until a full SSE event is
- * received (terminated by a blank line, per the SSE spec), then forwards the
- * entire event unchanged downstream. This means:
+ * Incoming chunks are forwarded downstream unchanged so chunk boundaries and
+ * timing remain identical to the upstream source. In parallel, a streaming text
+ * decoder buffers just enough data to detect complete SSE event blocks for
+ * usage/responseId inspection.
+ *
+ * This means:
+ *   - The client sees the original stream bytes without parser-induced
+ *     re-chunking.
  *   - Multi-line events (multiple `data:` lines, plus `event:`/`id:`/`retry:`
- *     fields) are preserved.
- *   - Comments / keepalives (lines beginning with `:`) are preserved.
+ *     fields) are still parsed correctly for inspection.
  *   - Chunks that contain multiple events, or events split across chunks, are
  *     handled correctly without merging or losing packets.
- *
- * As a side-effect, it inspects `data:` payloads for usage/responseId and
- * invokes the provided callbacks the first time each is seen.
+ *   - UTF-8 split across chunk boundaries is decoded safely.
  */
 export function createSSEParserTransform(
   onUsage: (usage: UsageTrackingData) => void,
   onResponseId?: (responseId: string) => void
 ): Transform {
   let buffer = "";
+  const decoder = new StringDecoder("utf8");
   let capturedUsage: UsageTrackingData | null = null;
   let responseIdCaptured = false;
 
@@ -117,46 +121,43 @@ export function createSSEParserTransform(
     inspectDataPayload(payload);
   };
 
-  /**
-   * Emit an event block verbatim downstream, re-appending the blank-line
-   * terminator the SSE spec requires.
-   */
-  const emitEventBlock = (self: Transform, eventBlock: string): void => {
-    // Skip purely empty blocks (can arise from leading blank lines).
-    if (eventBlock.length === 0) return;
-    inspectEventBlock(eventBlock);
-    self.push(eventBlock + "\n\n");
+  const processBufferedEvents = (): void => {
+    // Events are terminated by a blank line: either \n\n or \r\n\r\n.
+    // Scan the decoded text buffer for complete events and inspect them.
+    const terminator = /\r?\n\r?\n/g;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = terminator.exec(buffer)) !== null) {
+      const block = buffer.slice(lastIndex, match.index);
+      lastIndex = match.index + match[0].length;
+      if (block.length > 0) {
+        inspectEventBlock(block);
+      }
+    }
+
+    if (lastIndex > 0) {
+      buffer = buffer.slice(lastIndex);
+    }
   };
 
   return new Transform({
     transform(chunk, _encoding, callback) {
-      buffer += chunk.toString();
-
-      // Events are terminated by a blank line: either \n\n or \r\n\r\n.
-      // Scan the buffer for the next terminator and emit complete events.
-      const terminator = /\r?\n\r?\n/g;
-      let lastIndex = 0;
-      let match: RegExpExecArray | null;
-
-      while ((match = terminator.exec(buffer)) !== null) {
-        const block = buffer.slice(lastIndex, match.index);
-        lastIndex = match.index + match[0].length;
-        emitEventBlock(this, block);
-      }
-
-      if (lastIndex > 0) {
-        buffer = buffer.slice(lastIndex);
-      }
-
+      this.push(chunk);
+      buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      processBufferedEvents();
       callback();
     },
     flush(callback) {
-      // Emit any remaining buffered content as a final event block. Upstreams
-      // that close without a trailing blank line still deliver a final event.
+      buffer += decoder.end();
+      processBufferedEvents();
+
+      // Inspect any remaining buffered content as a final event block. Upstreams
+      // that close without a trailing blank line can still contain a final event.
       if (buffer.length > 0) {
         const tail = buffer.replace(/\r?\n+$/, "");
         if (tail.length > 0) {
-          emitEventBlock(this, tail);
+          inspectEventBlock(tail);
         }
         buffer = "";
       }
