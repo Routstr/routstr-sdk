@@ -821,7 +821,8 @@ export class RoutstrClient {
             : currentBalanceInfo.amount;
 
         const shortfall = Math.max(0, params.requiredSats - currentBalance);
-        topupAmount = shortfall > 0 ? shortfall : params.requiredSats;
+        topupAmount = shortfall > (0.21 * params.requiredSats) ? shortfall : (0.21 * params.requiredSats);
+
         this._log(
           "DEBUG",
           `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance} `

@@ -512,7 +512,7 @@ export class BalanceManager {
           p2pkPubkey
         );
         console.log(
-          `[BalanceManager.createProviderToken] SUCCESS: Token created from mint ${candidateMint}`
+          `[BalanceManager.createProviderToken] SUCCESS: Token created from mint ${candidateMint}, all mint balances: ${JSON.stringify(Object.fromEntries(Object.entries(balances).map(([mint, balance]) => [mint, getBalanceInSats(balance, units[mint])])))}`
         );
         return {
           success: true,
