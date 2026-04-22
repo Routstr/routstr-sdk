@@ -14,11 +14,7 @@ import type {
 } from "./wallet/interfaces";
 import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
-import {
-  RoutstrClient,
-  type DebugLevel,
-  type RouteRequestToNodeResponseParams,
-} from "./client/RoutstrClient";
+import { RoutstrClient, type DebugLevel } from "./client/RoutstrClient";
 import type { UsageTrackingDriver } from "./storage/usageTracking";
 import type { SdkStore } from "./storage/store";
 
@@ -60,12 +56,6 @@ export interface RouteRequestOptions {
   usageTrackingDriver?: UsageTrackingDriver;
   /** Optional: explicit SDK store (for using correct DB path) */
   sdkStore?: SdkStore;
-  /** Optional: shared ProviderManager instance for consistent failure tracking */
-  providerManager?: ProviderManager;
-}
-
-export interface RouteRequestToNodeResponseOptions extends RouteRequestOptions {
-  res: RouteRequestToNodeResponseParams["res"];
   /** Optional: shared ProviderManager instance for consistent failure tracking */
   providerManager?: ProviderManager;
 }
@@ -267,37 +257,6 @@ export async function routeRequests(
     }
 
     return response;
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      (error.message.includes("401") ||
-        error.message.includes("402") ||
-        error.message.includes("403"))
-    ) {
-      throw new Error(`Authentication failed: ${error.message}`);
-    }
-    throw error;
-  }
-}
-
-export async function routeRequestsToNodeResponse(
-  options: RouteRequestToNodeResponseOptions
-): Promise<void> {
-  const { res } = options;
-  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody } =
-    await resolveRouteRequestContext(options);
-
-  try {
-    await client.routeRequestToNodeResponse({
-      path,
-      method: "POST",
-      body: proxiedBody,
-      headers,
-      baseUrl,
-      mintUrl,
-      modelId,
-      res,
-    });
   } catch (error) {
     if (
       error instanceof Error &&

@@ -21,7 +21,6 @@ import type {
 } from "../wallet/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
-import type { ServerResponse } from "http";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { StreamProcessor } from "./StreamProcessor";
@@ -39,11 +38,7 @@ import {
   extractUsageFromResponseBody,
   type UsageTrackingData,
 } from "./usage";
-import { createSSEParserTransform } from "./sse";
-import { Readable, Transform } from "stream";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
+import { inspectSSEWebStream } from "./sse";
 
 /**
  * Options for fetching AI response
@@ -77,10 +72,6 @@ export interface RouteRequestParams {
   mintUrl: string;
   modelId?: string;
   clientApiKey?: string;
-}
-
-export interface RouteRequestToNodeResponseParams extends RouteRequestParams {
-  res: ServerResponse;
 }
 
 export interface RoutstrClientConfig {
@@ -206,38 +197,21 @@ export class RoutstrClient {
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
     const prepared = await this._prepareRoutedRequest(params);
-    const satsSpent = await this._handlePostResponseBalanceUpdate({
-      token: prepared.tokenUsed,
-      baseUrl: prepared.baseUrlUsed,
-      mintUrl: params.mintUrl,
-      initialTokenBalance: prepared.tokenBalanceInSats,
-      response: prepared.response,
-      modelId: prepared.modelId,
-      usage: prepared.capturedUsage,
-      requestId: prepared.capturedResponseId,
-      clientApiKey: prepared.clientApiKey,
-    });
+    const contentType =
+      prepared.response.headers.get("content-type") || "";
+    const isSSE = contentType.includes("text/event-stream");
 
-    (prepared.response as any).satsSpent = satsSpent;
-    (prepared.response as any).usage = prepared.capturedUsage;
-    (prepared.response as any).requestId = prepared.capturedResponseId;
-
-    return prepared.response;
-  }
-
-  async routeRequestToNodeResponse(
-    params: RouteRequestToNodeResponseParams
-  ): Promise<void> {
-    const { res } = params;
-    const prepared = await this._prepareRoutedRequest(params);
-
-    res.statusCode = prepared.response.status;
-    prepared.response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
-
-    const body = prepared.response.body;
-    if (!body) {
+    // For SSE, defer accounting until the inspector (tee'd branch) has seen
+    // usage — which only happens as the client consumes the stream. We expose
+    // the finalization as `(response).finalize` so callers that want to block
+    // on accounting (e.g. a proxy after it finished piping) can `await` it.
+    // Non-SSE responses can be finalized inline since the body is fully
+    // available (the clone-and-read path inside `_trackResponseUsage` handles
+    // JSON bodies without consuming the client-facing copy).
+    const runFinalize = async (): Promise<number> => {
+      const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
+      const usage = capturedUsage ?? prepared.capturedUsage;
+      const requestId = capturedResponseId ?? prepared.capturedResponseId;
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
@@ -245,55 +219,30 @@ export class RoutstrClient {
         initialTokenBalance: prepared.tokenBalanceInSats,
         response: prepared.response,
         modelId: prepared.modelId,
-        usage: prepared.capturedUsage,
-        requestId: prepared.capturedResponseId,
+        usage,
+        requestId,
         clientApiKey: prepared.clientApiKey,
       });
       (prepared.response as any).satsSpent = satsSpent;
-      res.end();
-      return;
+      (prepared.response as any).usage = usage;
+      (prepared.response as any).requestId = requestId;
+      return satsSpent;
+    };
+
+    if (isSSE) {
+      // Expose a finalize() that the caller can await after it's done piping
+      // the stream to its client. Also fire-and-forget so accounting still
+      // happens even if the caller ignores it.
+      const finalizePromise = runFinalize().catch((error) => {
+        this._log("ERROR", "[RoutstrClient] SSE finalize failed:", error);
+        return 0;
+      });
+      (prepared.response as any).finalize = () => finalizePromise;
+      return prepared.response;
     }
 
-    const nodeReadable = Readable.fromWeb(body as any);
-
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = async () => {
-        if (settled) return;
-        settled = true;
-        try {
-          const satsSpent = await this._handlePostResponseBalanceUpdate({
-            token: prepared.tokenUsed,
-            baseUrl: prepared.baseUrlUsed,
-            mintUrl: params.mintUrl,
-            initialTokenBalance: prepared.tokenBalanceInSats,
-            response: prepared.response,
-            modelId: prepared.modelId,
-            usage: prepared.capturedUsage,
-            requestId: prepared.capturedResponseId,
-            clientApiKey: prepared.clientApiKey,
-          });
-          (prepared.response as any).satsSpent = satsSpent;
-          (prepared.response as any).usage = prepared.capturedUsage;
-          (prepared.response as any).requestId = prepared.capturedResponseId;
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      };
-      const fail = (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
-      };
-
-      res.once("finish", finish);
-      res.once("close", finish);
-      res.once("error", fail);
-      nodeReadable.once("error", fail);
-
-      nodeReadable.pipe(res);
-    });
+    await runFinalize();
+    return prepared.response;
   }
 
   private async _prepareRoutedRequest(params: RouteRequestParams): Promise<{
@@ -305,6 +254,10 @@ export class RoutstrClient {
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
     clientApiKey?: string;
+    usagePromise: Promise<{
+      capturedUsage?: UsageTrackingData;
+      capturedResponseId?: string;
+    }>;
   }> {
     const {
       path: requestPath,
@@ -381,26 +334,27 @@ export class RoutstrClient {
     let processedResponse = response;
     let capturedUsage: UsageTrackingData | undefined;
     let capturedResponseId: string | undefined;
+    let usagePromise: Promise<{
+      capturedUsage?: UsageTrackingData;
+      capturedResponseId?: string;
+    }> = Promise.resolve({});
 
     if (contentType.includes("text/event-stream") && response.body) {
-      const logDir = path.join(os.homedir(), ".routstrd", "stream-response");
-      if (!fs.existsSync(logDir)) {
-        fs.mkdirSync(logDir, { recursive: true });
-      }
-      const logFile = path.join(logDir, `${Date.now()}.jsonl`);
-      const logStream = fs.createWriteStream(logFile);
+      // Tee the upstream Web stream: one branch goes untouched to the client,
+      // the other is consumed by an inspector that extracts usage / responseId.
+      const [clientStream, inspectStream] = response.body.tee();
 
-      const nodeReadable = Readable.fromWeb(response.body as any);
-
-      const loggingTransform = new Transform({
-        transform(chunk, encoding, callback) {
-          const raw = chunk.toString();
-          logStream.write(JSON.stringify({ raw, timestamp: Date.now() }) + "\n");
-          callback(null, chunk);
-        },
+      processedResponse = new Response(clientStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
       });
 
-      const sseParser = createSSEParserTransform(
+      (processedResponse as any).baseUrl = (response as any).baseUrl;
+      (processedResponse as any).token = (response as any).token;
+
+      usagePromise = inspectSSEWebStream(
+        inspectStream,
         (usage) => {
           capturedUsage = usage;
           (processedResponse as any).usage = usage;
@@ -410,21 +364,8 @@ export class RoutstrClient {
           (processedResponse as any).requestId = responseId;
         }
       );
-      const transformed = nodeReadable
-        .pipe(loggingTransform)
-        .pipe(sseParser, { end: true });
-      const webStream = Readable.toWeb(
-        transformed
-      ) as globalThis.ReadableStream<Uint8Array>;
 
-      processedResponse = new Response(webStream, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      });
-
-      (processedResponse as any).baseUrl = (response as any).baseUrl;
-      (processedResponse as any).token = (response as any).token;
+      (processedResponse as any).usagePromise = usagePromise;
     }
 
     return {
@@ -436,6 +377,7 @@ export class RoutstrClient {
       capturedUsage,
       capturedResponseId,
       clientApiKey,
+      usagePromise,
     };
   }
 
