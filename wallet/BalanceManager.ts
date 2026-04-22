@@ -86,6 +86,13 @@ export interface BalanceState {
  */
 export class BalanceManager {
   private cashuSpender: CashuSpender;
+  /** In-memory guard for per-provider wallet mutations (topup / refund) */
+  private providerWalletOps: Map<
+    string,
+    { type: "topup" | "refund"; startTime: number; endTime?: number }
+  > = new Map();
+  /** Cooldown (ms) between opposite operations on the same provider */
+  private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -102,6 +109,57 @@ export class BalanceManager {
         providerRegistry,
         this
       );
+    }
+  }
+
+  /**
+   * Check whether a wallet operation (topup/refund) may run for a provider.
+   * Returns the reason when blocked.
+   */
+  private _canRunProviderWalletOperation(
+    baseUrl: string,
+    type: "topup" | "refund"
+  ): { allowed: boolean; reason?: string } {
+    const existing = this.providerWalletOps.get(baseUrl);
+    if (!existing) {
+      return { allowed: true };
+    }
+    if (existing.type === type) {
+      return { allowed: true };
+    }
+    // Opposite type in progress or recently completed
+    if (!existing.endTime) {
+      return {
+        allowed: false,
+        reason: `Provider wallet operation locked; ${existing.type} in progress`,
+      };
+    }
+    const elapsed = Date.now() - existing.endTime;
+    if (elapsed < BalanceManager.PROVIDER_WALLET_COOLDOWN_MS) {
+      return {
+        allowed: false,
+        reason: `Provider wallet operation locked; recent ${existing.type} completed ${Math.round(elapsed / 1000)}s ago`,
+      };
+    }
+    // Cooldown expired — clean up stale entry
+    this.providerWalletOps.delete(baseUrl);
+    return { allowed: true };
+  }
+
+  private _beginProviderWalletOperation(
+    baseUrl: string,
+    type: "topup" | "refund"
+  ): void {
+    this.providerWalletOps.set(baseUrl, { type, startTime: Date.now() });
+  }
+
+  private _endProviderWalletOperation(
+    baseUrl: string,
+    type: "topup" | "refund"
+  ): void {
+    const existing = this.providerWalletOps.get(baseUrl);
+    if (existing && existing.type === type) {
+      existing.endTime = Date.now();
     }
   }
 
@@ -144,6 +202,24 @@ export class BalanceManager {
    * @returns Refund result
    */
   async refundApiKey(options: RefundApiKeyOptions): Promise<RefundResult> {
+    const { mintUrl, baseUrl, apiKey, forceRefund } = options;
+
+    const guard = this._canRunProviderWalletOperation(baseUrl, "refund");
+    if (!guard.allowed) {
+      console.log(`[BalanceManager] Skipping refund for ${baseUrl} - ${guard.reason}`);
+      return { success: false, message: guard.reason };
+    }
+
+    this._beginProviderWalletOperation(baseUrl, "refund");
+
+    try {
+      return await this._refundApiKeyImpl({ mintUrl, baseUrl, apiKey, forceRefund });
+    } finally {
+      this._endProviderWalletOperation(baseUrl, "refund");
+    }
+  }
+
+  private async _refundApiKeyImpl(options: RefundApiKeyOptions): Promise<RefundResult> {
     const { mintUrl, baseUrl, apiKey, forceRefund } = options;
 
     if (!apiKey) {
@@ -312,6 +388,24 @@ export class BalanceManager {
    * Top up API key balance with a cashu token
    */
   async topUp(options: TopUpOptions): Promise<TopUpResult> {
+    const { mintUrl, baseUrl, amount, token: providedToken } = options;
+
+    const guard = this._canRunProviderWalletOperation(baseUrl, "topup");
+    if (!guard.allowed) {
+      console.log(`[BalanceManager] Skipping topup for ${baseUrl} - ${guard.reason}`);
+      return { success: false, message: guard.reason };
+    }
+
+    this._beginProviderWalletOperation(baseUrl, "topup");
+
+    try {
+      return await this._topUpImpl({ mintUrl, baseUrl, amount, token: providedToken });
+    } finally {
+      this._endProviderWalletOperation(baseUrl, "topup");
+    }
+  }
+
+  private async _topUpImpl(options: TopUpOptions): Promise<TopUpResult> {
     const { mintUrl, baseUrl, amount, token: providedToken } = options;
 
     if (!amount || amount <= 0) {
