@@ -287,9 +287,30 @@ export class RoutstrClient {
       );
       selectedModel = providerModel ?? undefined;
       if (selectedModel) {
+        const requestMessages = Array.isArray(
+          (body as { messages?: unknown })?.messages
+        )
+          ? ((body as { messages?: unknown }).messages as any[])
+          : [];
+        const requestMaxTokens =
+          typeof (body as { max_tokens?: unknown })?.max_tokens === "number"
+            ? ((body as { max_tokens?: unknown }).max_tokens as number)
+            : undefined;
+
+        this._log(
+          "DEBUG",
+          "[RoutstrClient] generic request pricing input",
+          {
+            modelId: selectedModel.id,
+            messageCount: requestMessages.length,
+            maxTokens: requestMaxTokens,
+          }
+        );
+
         requiredSats = this.providerManager.getRequiredSatsForModel(
           selectedModel,
-          []
+          requestMessages,
+          requestMaxTokens
         );
       }
     }
