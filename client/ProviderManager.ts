@@ -687,37 +687,6 @@ export class ProviderManager {
     maxTokens?: number
   ): number {
     try {
-      console.log("[ProviderManager.getRequiredSatsForModel] start", {
-        modelId: (model as any)?.id,
-        maxTokens,
-        apiMessagesType: apiMessages == null ? String(apiMessages) : typeof apiMessages,
-        isArray: Array.isArray(apiMessages),
-        messageCount: Array.isArray(apiMessages)
-          ? apiMessages.length
-          : apiMessages && typeof apiMessages === "object"
-            ? Object.keys(apiMessages).length
-            : 0,
-        apiMessagesPreview: Array.isArray(apiMessages)
-          ? apiMessages.slice(0, 2).map((msg: any, index: number) => ({
-              index,
-              role: msg?.role,
-              contentType: Array.isArray(msg?.content)
-                ? "array"
-                : msg?.content == null
-                  ? String(msg?.content)
-                  : typeof msg?.content,
-              contentLength:
-                typeof msg?.content === "string"
-                  ? msg.content.length
-                  : Array.isArray(msg?.content)
-                    ? msg.content.length
-                    : undefined,
-              keys:
-                msg && typeof msg === "object" ? Object.keys(msg).slice(0, 10) : [],
-            }))
-          : apiMessages,
-      });
-
       let imageTokens = 0;
       if (apiMessages) {
         for (const msg of apiMessages as any[]) {
@@ -775,32 +744,6 @@ export class ProviderManager {
           })
         : undefined;
 
-      console.log("[ProviderManager.getRequiredSatsForModel] normalized apiMessages", {
-        originalIsArray: Array.isArray(apiMessages),
-        normalizedIsArray: Array.isArray(apiMessagesNoImages),
-        originalCount: Array.isArray(apiMessages) ? apiMessages.length : undefined,
-        normalizedCount: Array.isArray(apiMessagesNoImages)
-          ? apiMessagesNoImages.length
-          : undefined,
-        normalizedPreview: Array.isArray(apiMessagesNoImages)
-          ? apiMessagesNoImages.slice(0, 2).map((msg: any, index: number) => ({
-              index,
-              role: msg?.role,
-              contentType: Array.isArray(msg?.content)
-                ? "array"
-                : msg?.content == null
-                  ? String(msg?.content)
-                  : typeof msg?.content,
-              contentLength:
-                typeof msg?.content === "string"
-                  ? msg.content.length
-                  : Array.isArray(msg?.content)
-                    ? msg.content.length
-                    : undefined,
-            }))
-          : apiMessagesNoImages,
-      });
-
       const approximateTokens = apiMessagesNoImages // SWITCH AFTER NODE UPDAATES
         ? Math.ceil(JSON.stringify(apiMessagesNoImages, null, 2).length / 2.84)
         : 10000; // Assumed tokens for minimum balance calculation
@@ -810,24 +753,12 @@ export class ProviderManager {
       const sp: any = model?.sats_pricing as any;
 
       if (!sp) {
-        console.log("[ProviderManager.getRequiredSatsForModel] no sats_pricing", {
-          modelId: (model as any)?.id,
-        });
         return 0;
       }
 
       // If we don't have max_completion_cost, fall back to max_cost
       if (!sp.max_completion_cost) {
-        const fallback = sp.max_cost ?? 50;
-        console.log("[ProviderManager.getRequiredSatsForModel] fallback pricing", {
-          modelId: (model as any)?.id,
-          approximateTokens,
-          imageTokens,
-          totalInputTokens,
-          max_cost: sp.max_cost,
-          returnedSats: fallback,
-        });
-        return fallback;
+        return sp.max_cost ?? 50;
       }
 
       // Calculate based on token usage (similar to getTokenAmountForModel in apiUtils.ts)
@@ -837,18 +768,6 @@ export class ProviderManager {
         completionCost = sp.completion * maxTokens;
       }
       const totalEstimatedCosts = (promptCosts + completionCost) * 1.05;
-      console.log("[ProviderManager.getRequiredSatsForModel] computed pricing", {
-        modelId: (model as any)?.id,
-        approximateTokens,
-        imageTokens,
-        totalInputTokens,
-        promptRate: sp.prompt || 0,
-        promptCosts,
-        completionRate: sp.completion,
-        maxCompletionCost: sp.max_completion_cost,
-        completionCost,
-        returnedSats: totalEstimatedCosts,
-      });
       // return totalEstimatedCosts > sp.max_cost ? sp.max_cost : totalEstimatedCosts; // in some image input calculations, this cost balloons up. Now includes image tokens via 32px patches.
       return totalEstimatedCosts; // Backend has a bug here.it's calculating image tokens wrong. gotta switch to different logic once its fixed
     } catch (e) {
