@@ -187,8 +187,8 @@ export class ProviderManager {
   private lastFailed = new Map<string, number>();
   /** Providers on cooldown: [provider_url, cooldown_started_timestamp][] */
   private providersOnCoolDown: [string, number][] = [];
-  /** Cooldown duration in milliseconds (5 minutes) */
-  private static readonly COOLDOWN_DURATION_MS = 5 * 60 * 1000;
+  /** Cooldown duration in milliseconds (42 seconds) */
+  private static readonly COOLDOWN_DURATION_MS = 42 * 1000;
   /** Optional persistent store for failure tracking */
   private store: SdkStore | null = null;
   /** Instance ID for debugging */
