@@ -635,7 +635,7 @@ export const createStorageAdapterFromStore = (
       .getState()
       .apiKeys.find((key) => key.baseUrl === normalized);
     if (!entry) return null;
-   return entry;
+    return entry;
   },
 
   setApiKey: (baseUrl, key) => {

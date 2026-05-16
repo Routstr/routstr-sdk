@@ -111,7 +111,8 @@ export class BalanceManager {
         walletAdapter,
         storageAdapter,
         providerRegistry,
-        this
+        this,
+        this.logger
       );
     }
   }
@@ -227,6 +228,7 @@ export class BalanceManager {
     const { mintUrl, baseUrl, apiKey, forceRefund } = options;
 
     if (!apiKey) {
+      this.logger.warn(`refundApiKey: aborting for ${baseUrl} - no API key`);
       return { success: false, message: "No API key to refund" };
     }
 
@@ -236,7 +238,9 @@ export class BalanceManager {
       if (apiKeyEntry?.lastUsed) {
         const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
         if (apiKeyEntry.lastUsed > fiveMinutesAgo) {
-          this.logger.log(`Skipping refund for ${baseUrl} - used ${Math.round((Date.now() - apiKeyEntry.lastUsed) / 1000)}s ago`);
+          this.logger.log(
+            `refundApiKey: skipping ${baseUrl} - used ${Math.round((Date.now() - apiKeyEntry.lastUsed) / 1000)}s ago`
+          );
           return {
             success: false,
             message: "API key was used recently, skipping refund",
@@ -252,7 +256,16 @@ export class BalanceManager {
     try {
       fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
+      if (fetchResult.error === "No balance to refund") {
+        this.logger.log(`refundApiKey: provider says no balance for ${baseUrl}; removing API key`);
+        this.storageAdapter.removeApiKey(baseUrl);
+        return { success: true, message: "No balance to refund, key cleaned up" };
+      }
+
       if (!fetchResult.success) {
+        this.logger.warn(
+          `refundApiKey: fetch failed for ${baseUrl}: ${fetchResult.error || "API key refund failed"}`
+        );
         return {
           success: false,
           message: fetchResult.error || "API key refund failed",
@@ -261,16 +274,12 @@ export class BalanceManager {
       }
 
       if (!fetchResult.token) {
+        this.logger.warn(`refundApiKey: no token received for ${baseUrl}`);
         return {
           success: false,
           message: "No token received from API key refund",
           requestId: fetchResult.requestId,
         };
-      }
-
-      if (fetchResult.error === "No balance to refund") {
-        this.storageAdapter.removeApiKey(baseUrl);
-        return { success: true, message: "No balance to refund, key cleaned up" };
       }
 
       const receiveResult = await this.cashuSpender.receiveToken(
@@ -283,6 +292,10 @@ export class BalanceManager {
 
       if (receiveResult.success) {
         this.storageAdapter.removeApiKey(baseUrl);
+      } else {
+        this.logger.warn(
+          `refundApiKey: receive failed for ${baseUrl}; keeping API key. message=${receiveResult.message ?? "none"}`
+        );
       }
 
       return {
@@ -348,6 +361,10 @@ export class BalanceManager {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        this.logger.warn(
+          `fetchRefundToken: non-ok response for ${url} status=${response.status} statusText=${response.statusText}`,
+          errorData
+        );
         return {
           success: false,
           requestId,

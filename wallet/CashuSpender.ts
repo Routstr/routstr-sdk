@@ -639,6 +639,7 @@ export class CashuSpender {
       const apiKeyEntryFull = this.storageAdapter.getApiKey(
         apiKeyEntry.baseUrl
       );
+
       if (apiKeyEntryFull && this.balanceManager) {
         try {
           const balanceResult = await this.balanceManager.getTokenBalance(
@@ -648,6 +649,9 @@ export class CashuSpender {
 
           if (balanceResult.isInvalidApiKey) {
             // Key is invalid/expired on the provider side — clean it up
+            this.logger.warn(
+              `refundProviders: ${apiKeyEntry.baseUrl} returned invalid API key; removing local key and treating as success`
+            );
             this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
             results.push({
               baseUrl: apiKeyEntry.baseUrl,
@@ -664,16 +668,26 @@ export class CashuSpender {
               apiKeyEntry.baseUrl,
               balanceSat
             );
+          } else {
+            this.logger.warn(
+              `refundProviders: balance refresh for ${apiKeyEntry.baseUrl} returned negative amount; keeping stale local balance=${apiKeyEntryFull.balance}`
+            );
           }
-        } catch {
+        } catch (error) {
           // Balance check failed — proceed with stale local balance
+          this.logger.warn(
+            `refundProviders: balance refresh threw for ${apiKeyEntry.baseUrl}; proceeding with stale local balance`,
+            error
+          );
         }
 
         // Re-read the entry after balance refresh (may have been removed above)
         const refreshedEntry = this.storageAdapter.getApiKey(
           apiKeyEntry.baseUrl
         );
-        if (!refreshedEntry) continue;
+        if (!refreshedEntry) {
+          continue;
+        }
 
         const refundResult = await this.balanceManager.refundApiKey({
           mintUrl,
@@ -688,6 +702,9 @@ export class CashuSpender {
           const currentEntry = this.storageAdapter.getApiKey(
             apiKeyEntry.baseUrl
           );
+          this.logger.warn(
+            `refundProviders: refund failed for ${apiKeyEntry.baseUrl}; currentEntry=${Boolean(currentEntry)} balance=${currentEntry?.balance ?? "none"}. Touching lastUsed to rate-limit retries.`
+          );
           if (currentEntry) {
             this.storageAdapter.updateApiKeyBalance(
               apiKeyEntry.baseUrl,
@@ -701,6 +718,9 @@ export class CashuSpender {
           success: refundResult.success,
         });
       } else {
+        this.logger.warn(
+          `refundProviders: cannot refund ${apiKeyEntry.baseUrl}; apiKeyEntryFull=${Boolean(apiKeyEntryFull)} balanceManager=${Boolean(this.balanceManager)}`
+        );
         results.push({
           baseUrl: apiKeyEntry.baseUrl,
           success: false,

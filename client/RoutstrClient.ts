@@ -108,13 +108,16 @@ export class RoutstrClient {
     this.balanceManager = new BalanceManager(
       walletAdapter,
       storageAdapter,
-      providerRegistry
+      providerRegistry,
+      undefined,
+      this.logger
     );
     this.cashuSpender = new CashuSpender(
       walletAdapter,
       storageAdapter,
       providerRegistry,
-      this.balanceManager
+      this.balanceManager,
+      this.logger
     );
     this.streamProcessor = new StreamProcessor();
     this.alertLevel = alertLevel;
