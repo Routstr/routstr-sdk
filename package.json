@@ -73,6 +73,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/routstr/routstr-chat"
+    "url": "https://github.com/routstr/routstr-sdk"
   }
 }
