@@ -1,0 +1,498 @@
+{
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "headers": {
+    "host": "localhost:8009",
+    "connection": "keep-alive",
+    "accept": "application/json",
+    "user-agent": "OpenAI/JS 6.26.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-lang": "js",
+    "x-stainless-package-version": "6.26.0",
+    "x-stainless-os": "MacOS",
+    "x-stainless-arch": "arm64",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v22.17.0",
+    "content-type": "application/json",
+    "accept-language": "*",
+    "sec-fetch-mode": "cors",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "21956"
+  },
+  "body": {
+    "model": "gemini-3-flash-preview",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute bash commands (ls, grep, find, etc.)\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n- Use bash for file operations like ls, rg, find\n- Use read to examine files instead of cat or sed.\n- Use edit for precise changes (edits[].oldText must match exactly)\n- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n- Use write only for new files or complete rewrites.\n- Be concise in your responses\n- Show file paths clearly when working with files\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /Users/r/.nvm/versions/node/v22.17.0/lib/node_modules/@mariozechner/pi-coding-agent/README.md\n- Additional docs: /Users/r/.nvm/versions/node/v22.17.0/lib/node_modules/@mariozechner/pi-coding-agent/docs\n- Examples: /Users/r/.nvm/versions/node/v22.17.0/lib/node_modules/@mariozechner/pi-coding-agent/examples (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>routstr-sdk-integration</name>\n    <description>Guide for integrating the @routstr/sdk npm package to route OpenAI-compatible API requests with automatic payment handling</description>\n    <location>/Users/r/.agents/skills/routstr-sdk-integration/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>skills-management</name>\n    <description>Guide for creating, structuring, and managing agent skills in the knightclaw project</description>\n    <location>/Users/r/.agents/skills/skills-management/SKILL.md</location>\n  </skill>\n</available_skills>\nCurrent date: 2026-04-16\nCurrent working directory: /Users/r/projects/routstr_main/routstrd"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "look at how routstrd logs command works here. and for -f flag we should jsut be doing tail -f ~/.routstrd/logs/<today> ig, wahtd o you tihnk?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "\n\nLet me look at the current implementation of the logs command.",
+        "tool_calls": [
+          {
+            "id": "toolu_bdrk_01VzEuGu2WDqK7whDosHTNEx",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"grep -r \\\"logs\\\" /Users/r/projects/routstr_main/routstrd/cmd/ --include=\\\"*.go\\\" -l\"}"
+            }
+          },
+          {
+            "id": "toolu_bdrk_01A6oSpcHtX9WGp2wnouXJHV",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"find /Users/r/projects/routstr_main/routstrd -name \\\"*.go\\\" | xargs grep -l -i \\\"logs\\\\|log.*command\\\\|LogsCmd\\\" 2>/dev/null\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "(no output)\n\nCommand exited with code 1",
+        "tool_call_id": "toolu_bdrk_01VzEuGu2WDqK7whDosHTNEx"
+      },
+      {
+        "role": "tool",
+        "content": "(no output)",
+        "tool_call_id": "toolu_bdrk_01A6oSpcHtX9WGp2wnouXJHV"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "toolu_bdrk_01TyoGx1zyQ5pbXDhyEki6fm",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"ls /Users/r/projects/routstr_main/routstrd/\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "audit.log\nbun.lock\ndist\nnode_modules\npackage-lock.json\npackage.json\nREADME.md\nrefund_new.js\nrefund.js\nroutstr-cost-logging.md\nSKILL.md\nsrc\ntest_box.ts\ntest_chat.sh\ntest_curl.sh\ntest_split_box.ts\ntest_split_box2.ts\ntsconfig.json\nv1-messages-format-report.md\n",
+        "tool_call_id": "toolu_bdrk_01TyoGx1zyQ5pbXDhyEki6fm"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "toolu_bdrk_01Sjsh3cbZKGuNppvmWs2WSF",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"find /Users/r/projectrc s/routstr_main/routstrd/s-type f -name \\\"*.ts\\\" | head -40\"}"
+            }
+          },
+          {
+            "id": "toolu_bdrk_01WGzqU5J2tLnXTJFVm3apJd",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"grep -r \\\"logs\\\" /Users/r/projects/routstr_main/routstrd/src/ --include=\\\"*.ts\\\" -l\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "find: /Users/r/projectrc: No such file or directory\nfind: s/routstr_main/routstrd/s-type: No such file or directory\nfind: f: No such file or directory\n",
+        "tool_call_id": "toolu_bdrk_01Sjsh3cbZKGuNppvmWs2WSF"
+      },
+      {
+        "role": "tool",
+        "content": "/Users/r/projects/routstr_main/routstrd/src/cli-shared.ts\n/Users/r/projects/routstr_main/routstrd/src/cli.ts\n/Users/r/projects/routstr_main/routstrd/src/utils/logger.ts\n/Users/r/projects/routstr_main/routstrd/src/utils/config.ts\n/Users/r/projects/routstr_main/routstrd/src/start-daemon.ts\n",
+        "tool_call_id": "toolu_bdrk_01WGzqU5J2tLnXTJFVm3apJd"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "",
+            "type": "function",
+            "function": {
+              "name": "",
+              "arguments": "{}"
+            }
+          },
+          {
+            "id": "toolu_bdrk_01AzKjs9zrSgDoh2jfq4PemX",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "\": \""
+            }
+          },
+          {
+            "id": "toolu_bdrk_01Da4SeARsXnbSv5PZd4pAgN",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"grep -n \\\"logs\\\" /Users/r/projects/routstr_main/routstrd/src/cli.ts\"}"
+            }
+          },
+          {
+            "id": "toolu_bdrk_0112h1qGXXSfQqmU2otnFDzA",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"grep -n \\\"logs\\\" /Users/r/projects/routstr_main/routstrd/src/cli-shared.ts\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "Tool  not found",
+        "tool_call_id": ""
+      },
+      {
+        "role": "tool",
+        "content": "Validation failed for tool \"bash\":\n  - root: must be object\n\nReceived arguments:\n\": \"",
+        "tool_call_id": "toolu_bdrk_01AzKjs9zrSgDoh2jfq4PemX"
+      },
+      {
+        "role": "tool",
+        "content": "460:  .description(\"Show recent usage logs and total sats cost\")\n931:      console.log(\"\\nTo view logs:\");\n932:      console.log(\"  pm2 logs routstrd\");\n954:  .command(\"logs\")\n955:  .description(\"View PM2 logs for routstrd\")\n958:      execSync(\"pm2 logs routstrd\", { stdio: \"inherit\" });\n1093:  .command(\"logs\")\n1094:  .description(\"View daemon logs\")\n",
+        "tool_call_id": "toolu_bdrk_01Da4SeARsXnbSv5PZd4pAgN"
+      },
+      {
+        "role": "tool",
+        "content": "59:  // Ensure logs directory exists (logger handles date-based files)\n",
+        "tool_call_id": "toolu_bdrk_0112h1qGXXSfQqmU2otnFDzA"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "go"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "go"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "go"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": " Let me read the cli.ts file to see the logs command implementation."
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "yews"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": " The user seems to approve of the plan and wants me to implement it. Let me read the full cli.ts file to understand the logs command structure better, and also look at logger.ts to understand how logs are stored. Let me look at the full logs command implementation: the",
+        "tool_calls": [
+          {
+            "id": "functions.read:0",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\":\"/Users/r/projects/routstr_main/routstrd/src/cli.ts\",\"offset\":1090}"
+            }
+          },
+          {
+            "id": "",
+            "type": "function",
+            "function": {
+              "name": "",
+              "arguments": "{}"
+            }
+          },
+          {
+            "id": "functions.read:1",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\":\"/Users/r/projects/routstr_main/routstrd/src/utils/logger.ts\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "Tool  not found",
+        "tool_call_id": ""
+      },
+      {
+        "role": "tool",
+        "content": "}\n\nprogram\n  .command(\"logs\")\n  .description(\"View daemon logs\")\n  .option(\"-f, --follow\", \"Follow log output\", false)\n  .option(\"-n, --lines <number>\", \"Number of lines to show\", \"50\")\n  .action(async (options: { follow: boolean; lines: string }) => {\n    const todayFile = getLogFileForDate();\n    const yesterday = new Date();\n    yesterday.setDate(yesterday.getDate() - 1);\n    const yesterdayFile = getLogFileForDate(yesterday);\n\n    if (!existsSync(todayFile) && !existsSync(yesterdayFile)) {\n      console.log(\"No log files found. Daemon may not have started yet.\");\n      console.log(`Logs directory: ${LOGS_DIR}`);\n      process.exit(1);\n    }\n\n    const lines = parseInt(options.lines, 10);\n\n    const readLastLines = async (): Promise<string[]> => {\n      let allLines: string[] = [];\n\n      // Read yesterday's log first if it exists\n      if (existsSync(yesterdayFile)) {\n        const yesterdayContent = await Bun.file(yesterdayFile).text();\n        allLines = yesterdayContent.split(\"\\n\").filter(Boolean);\n      }\n\n      // Then read today's log\n      if (existsSync(todayFile)) {\n        const todayContent = await Bun.file(todayFile).text();\n        allLines = allLines.concat(todayContent.split(\"\\n\").filter(Boolean));\n      }\n\n      return allLines.slice(-lines);\n    };\n\n    const printLines = async (): Promise<void> => {\n      const lastLines = await readLastLines();\n      for (const line of lastLines) {\n        console.log(line);\n      }\n    };\n\n    if (options.follow) {\n      let currentLogFile = todayFile;\n      let lastSize = 0;\n\n      if (existsSync(currentLogFile)) {\n        lastSize = (await Bun.file(currentLogFile).text()).length;\n      }\n\n      await printLines();\n\n      const interval = setInterval(async () => {\n        // Check if we need to switch to a new date file\n        const newLogFile = getLogFileForDate();\n        if (newLogFile !== currentLogFile) {\n          console.log(`\\n--- Switched to ${newLogFile} ---\\n`);\n          currentLogFile = newLogFile;\n          lastSize = existsSync(currentLogFile)\n            ? (await Bun.file(currentLogFile).text()).length\n            : 0;\n        }\n\n        if (existsSync(currentLogFile)) {\n          const content = await Bun.file(currentLogFile).text();\n          const currentSize = content.length;\n          if (currentSize > lastSize) {\n            const allLines = content.split(\"\\n\").filter(Boolean);\n            const newLines = allLines.slice(\n              Math.floor(lastSize === 0 ? 0 : -1),\n              -1,\n            );\n            for (const line of newLines) {\n              console.log(line);\n            }\n            lastSize = currentSize;\n          }\n        }\n      }, 1000);\n\n      process.on(\"SIGINT\", () => {\n        clearInterval(interval);\n        process.exit(0);\n      });\n    } else {\n      await printLines();\n    }\n  });\n\nexport function cli(args: string[]) {\n  program.parse(args);\n}\n",
+        "tool_call_id": "functions.read:0"
+      },
+      {
+        "role": "tool",
+        "content": "import { appendFile, mkdir } from \"fs/promises\";\nimport { existsSync } from \"fs\";\nimport { join } from \"path\";\n\nconst HOME = process.env.HOME || process.env.USERPROFILE || \"\";\nconst LOG_DIR = process.env.ROUTSTRD_DIR || `${HOME}/.routstrd`;\nconst LOGS_DIR = join(LOG_DIR, \"logs\");\n\nfunction getLogFileForDate(date: Date = new Date()): string {\n  const year = date.getFullYear();\n  const month = String(date.getMonth() + 1).padStart(2, \"0\");\n  const day = String(date.getDate()).padStart(2, \"0\");\n  return join(LOGS_DIR, `${year}-${month}-${day}.log`);\n}\n\nasync function ensureLogDir() {\n  if (!existsSync(LOGS_DIR)) {\n    await mkdir(LOGS_DIR, { recursive: true });\n  }\n}\n\nasync function writeLog(level: string, ...args: unknown[]) {\n  await ensureLogDir();\n  const timestamp = new Date().toISOString();\n  const message = args\n    .map((a) => {\n      if (a instanceof Error) {\n        return `${a.message}${a.stack ? `\\n${a.stack}` : \"\"}`;\n      }\n      if (typeof a === \"object\") {\n        try {\n          return JSON.stringify(a);\n        } catch {\n          return String(a);\n        }\n      }\n      return String(a);\n    })\n    .join(\" \");\n  const line = `[${timestamp}] [${level}] ${message}\\n`;\n  const logFile = getLogFileForDate(new Date(timestamp));\n  try {\n    await appendFile(logFile, line);\n  } catch (error) {\n    console.error(\"Failed to write log:\", error);\n  }\n}\n\nexport const logger = {\n  log: (...args: unknown[]) => {\n    console.log(...args);\n    writeLog(\"INFO\", ...args);\n  },\n  debug: (...args: unknown[]) => {\n    writeLog(\"DEBUG\", ...args);\n  },\n  error: (...args: unknown[]) => {\n    console.error(...args);\n    writeLog(\"ERROR\", ...args);\n  },\n  info: (...args: unknown[]) => {\n    console.log(...args);\n    writeLog(\"INFO\", ...args);\n  },\n};\n",
+        "tool_call_id": "functions.read:1"
+      },
+      {
+        "role": "assistant",
+        "content": " The user is suggesting that for the `-f` flag, instead of the current polling-based implementation with `setInterval`, we should just use `tail -f ~/.routstrd/<today>.log`. This is a good idea because:\n\n1. It's simpler\n2. `tail -f` is more efficient and reliable than polling with JavaScript\n3./logs It rotation automatically (when the date changes)\n\nLet me check the current implementation again and propose a change. The log file path would be:\n- `~/.routstrd/logs handles log/01-09.log` (or whatever today's date is)\n\nSo the command would be something like:\n```bash\ntail -f ~/.routstrd/logs/$(date +2025-%d).log\n```\n\nBut we need to also handle:\n1. Reading historical lines (the `-n` flag equivalent)\n2. Supporting multiple files (yesterday + today)\n\nActually, lookingY-%m-% attail -f` is great for following, but we'd still need to handle:\n1. Combining yesterday + today for the `-n` option\n2. Following across this more carefully, ` date, we could use `tail -F` (which follows by filename and handles rotation), or manually detect when the date changes.\n\nBut the simplest approach for `- changes\n\nFor the follow modef -f` (or maybe `tail -F`).\n\nLet me propose:\n1. For non-follow mode: Keep current implementation\n2. For` would indeed be to just exec `tail followtoday's log>` (and maybe also yesterday if we want recent context? Actually, `tail -f` on today's file is fine since it will mode: Use `tail -f < start might want to see the last N lines AND follow. With `tail -n 50 -f`, we can do both.\n\nSo the command would from the end)\n\nWait, but the user be -n <lines> -f <today's log>\n\n\n```\n\nBut I need to also consider yesterday's file for getting enough lines when requested. If today only has:\n```bash\ntail  to pull from yesterday's file too. We could just tail from both files - `tail -n <lines> -f <today10 lines but the user requested 50, we'd need>` handles it simply and efficiently. Looking at the current implementation, it's doing manual polling with `setInterval` every 1000ms to check for file changes. Your suggestion makes will output the last N lines then follow new entries, which total the follow mode. It's simpler, more efficient, and handles log rotation better.\n\nHere's what I'm thinking:\n\n1. **Non-follow mode** (`-n 50`): Keep current implementation (combines sense - we should just use `tail -f` for yesterday `tail -n <lines> -f <today's log>` directly\n\nFor follow mode, we could even use `tail -F` (capital F) which handles file rotation (when the date + today logs)\n2. **Follow mode** (`-f`): Use? The key edit would be in the `-f` branch around line 1115-1155 - instead of the polling logic, we'd just:\n\n```typescript\nif (options.follow) changes and a new log file is created).\n\nWant me to make this change {\n -n ${lines} -f ${logFile}`, { stdio: \"inherit\" });\n}\n```\n\nThis would:\n- Show last N lines (like the current `-n` behavior  const logFile = getLogFileForDate();\n  execSync(`tail)\n naturally (the shell `tail` follows the inode; we might want `-F` to follow by filename for date rotation)\n\nOr we could even combine both files for follow mode:\n```bash\ntail- Follow new entries efficiently via `tail`\n- Handle midnight date changes - I implement this?"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "say hi to me pls"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "store": false,
+    "max_completion_tokens": 16384,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "description": "Path to the file to read (relative or absolute)",
+                "type": "string"
+              },
+              "offset": {
+                "description": "Line number to start reading from (1-indexed)",
+                "type": "number"
+              },
+              "limit": {
+                "description": "Maximum number of lines to read",
+                "type": "number"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "command": {
+                "description": "Bash command to execute",
+                "type": "string"
+              },
+              "timeout": {
+                "description": "Timeout in seconds (optional, no default timeout)",
+                "type": "number"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit",
+          "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+          "parameters": {
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "path",
+              "edits"
+            ],
+            "properties": {
+              "path": {
+                "description": "Path to the file to edit (relative or absolute)",
+                "type": "string"
+              },
+              "edits": {
+                "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+                "type": "array",
+                "items": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "oldText",
+                    "newText"
+                  ],
+                  "properties": {
+                    "oldText": {
+                      "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
+                      "type": "string"
+                    },
+                    "newText": {
+                      "description": "Replacement text for this targeted edit.",
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "write",
+          "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "path",
+              "content"
+            ],
+            "properties": {
+              "path": {
+                "description": "Path to the file to write (relative or absolute)",
+                "type": "string"
+              },
+              "content": {
+                "description": "Content to write to the file",
+                "type": "string"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "subagent",
+          "description": "Delegate tasks to specialized subagents with isolated context. Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder). Default agent scope is \"user\" (from ~/.pi/agent/agents). To enable project-local agents in .pi/agents, set agentScope: \"both\" (or \"project\").",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "agent": {
+                "description": "Name of the agent to invoke (for single mode)",
+                "type": "string"
+              },
+              "task": {
+                "description": "Task to delegate (for single mode)",
+                "type": "string"
+              },
+              "tasks": {
+                "description": "Array of {agent, task} for parallel execution",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "agent",
+                    "task"
+                  ],
+                  "properties": {
+                    "agent": {
+                      "description": "Name of the agent to invoke",
+                      "type": "string"
+                    },
+                    "task": {
+                      "description": "Task to delegate to the agent",
+                      "type": "string"
+                    },
+                    "cwd": {
+                      "description": "Working directory for the agent process",
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "chain": {
+                "description": "Array of {agent, task} for sequential execution",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "agent",
+                    "task"
+                  ],
+                  "properties": {
+                    "agent": {
+                      "description": "Name of the agent to invoke",
+                      "type": "string"
+                    },
+                    "task": {
+                      "description": "Task with optional {previous} placeholder for prior output",
+                      "type": "string"
+                    },
+                    "cwd": {
+                      "description": "Working directory for the agent process",
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "agentScope": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "project",
+                  "both"
+                ],
+                "description": "Which agent directories to use. Default: \"user\". Use \"both\" to include project-local agents.",
+                "default": "user"
+              },
+              "confirmProjectAgents": {
+                "description": "Prompt before running project-local agents. Default: true.",
+                "default": true,
+                "type": "boolean"
+              },
+              "cwd": {
+                "description": "Working directory for the agent process (single mode)",
+                "type": "string"
+              }
+            }
+          },
+          "strict": false
+        }
+      }
+    ]
+  }
+}

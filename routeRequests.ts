@@ -62,6 +62,8 @@ export interface RouteRequestOptions {
   routstrPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;
+  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, and providerManager. */
+  client?: RoutstrClient;
 }
 
 /**
@@ -196,7 +198,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     throw new Error("No mint configured in wallet");
   }
 
-  const client = new RoutstrClient(
+  const client = options.client ?? new RoutstrClient(
     walletAdapter,
     storageAdapter,
     providerRegistry,
@@ -204,10 +206,6 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     mode,
     { usageTrackingDriver, sdkStore, providerManager, logger }
   );
-
-  if (debugLevel) {
-    client.setDebugLevel(debugLevel);
-  }
 
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);

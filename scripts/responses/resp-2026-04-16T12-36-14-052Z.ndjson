@@ -1,0 +1,3 @@
+{"type":"meta","status":400,"headers":{"content-length":"176","content-type":"application/json","date":"Thu, 16 Apr 2026 12:42:40 GMT","server":"uvicorn","x-routstr-request-id":"1d6e61c6-a1c0-4556-8aac-6c7067035bdf"},"startedAt":"2026-04-16T12:42:41.393Z"}
+{"type":"chunk","index":0,"timestamp":"2026-04-16T12:42:41.396Z","data":"{\"error\": {\"message\": \"Tool message must have either name or tool_call_id\", \"type\": \"invalid_request_error\", \"code\": 400}, \"request_id\": \"1d6e61c6-a1c0-4556-8aac-6c7067035bdf\"}"}
+{"type":"end","chunkCount":1,"endedAt":"2026-04-16T12:42:41.397Z"}
