@@ -80,6 +80,13 @@ export interface DiscoveryAdapter {
   getDisabledProviders(): string[];
 
   /**
+   * Save list of disabled provider base URLs
+   * Optional because some read-only adapters can only expose current disabled state.
+   * @param urls Array of disabled provider URLs
+   */
+  setDisabledProviders?(urls: string[]): void;
+
+  /**
    * Get list of configured provider base URLs
    * @returns Array of provider base URLs
    */

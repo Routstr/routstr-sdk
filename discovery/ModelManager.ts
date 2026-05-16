@@ -27,6 +27,8 @@ export interface ModelManagerConfig {
   excludeProviderUrls?: string[];
   /** Cache TTL in milliseconds (default: 21 minutes) */
   cacheTTL?: number;
+  /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
+  routstrPubkey?: string;
   /** Optional injectable logger */
   logger?: SdkLogger;
 }
@@ -40,7 +42,9 @@ export class ModelManager {
   private readonly providerDirectoryUrl: string;
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
+  private readonly routstrPubkey: string;
   private readonly logger: SdkLogger;
+  private providerNodePubkeysByUrl = new Map<string, Set<string>>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -51,6 +55,9 @@ export class ModelManager {
     this.cacheTTL = config.cacheTTL || 210 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
+    this.routstrPubkey =
+      config.routstrPubkey ||
+      "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
   }
 
@@ -95,8 +102,13 @@ export class ModelManager {
         const cacheValid =
           lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
         if (cacheValid) {
+          const filteredCachedUrls = this.filterBaseUrlsForTor(
+            cachedUrls,
+            torMode
+          );
           await this.fetchRoutstr21Models(forceRefresh);
-          return this.filterBaseUrlsForTor(cachedUrls, torMode);
+          await this.syncReviewedProvidersFromNostr(filteredCachedUrls);
+          return filteredCachedUrls;
         }
       }
     }
@@ -109,6 +121,7 @@ export class ModelManager {
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await this.fetchRoutstr21Models(forceRefresh);
+        await this.syncReviewedProvidersFromNostr(filtered);
         return filtered;
       }
     } catch (e) {
@@ -166,6 +179,7 @@ export class ModelManager {
     const timeline = localEventStore.getTimeline({ kinds: [kind] });
 
     const bases = new Set<string>();
+    this.providerNodePubkeysByUrl = new Map();
 
     for (const event of timeline) {
       const eventUrls: string[] = [];
@@ -181,6 +195,11 @@ export class ModelManager {
           const normalized = this.normalizeUrl(url);
           if (!torMode || normalized.includes(".onion")) {
             bases.add(normalized);
+            this.addProviderNode(
+              this.providerNodePubkeysByUrl,
+              normalized,
+              event.pubkey
+            );
           }
         }
         continue;
@@ -196,6 +215,11 @@ export class ModelManager {
           const endpoints = this.getProviderEndpoints(p, torMode);
           for (const endpoint of endpoints) {
             bases.add(endpoint);
+            this.addProviderNode(
+              this.providerNodePubkeysByUrl,
+              endpoint,
+              p?.pubkey || event.pubkey
+            );
           }
         }
       } catch {
@@ -206,11 +230,19 @@ export class ModelManager {
               const endpoints = this.getProviderEndpoints(p, torMode);
               for (const endpoint of endpoints) {
                 bases.add(endpoint);
+                this.addProviderNode(
+                  this.providerNodePubkeysByUrl,
+                  endpoint,
+                  p?.pubkey || event.pubkey
+                );
               }
             }
           }
         } catch {
-          this.logger.warn("NostrBootstrap: failed to parse event content:", event.id);
+          this.logger.warn(
+            "NostrBootstrap: failed to parse event content:",
+            event.id
+          );
         }
       }
     }
@@ -252,10 +284,12 @@ export class ModelManager {
       const providers = Array.isArray(data?.providers) ? data.providers : [];
 
       const bases = new Set<string>();
+      this.providerNodePubkeysByUrl = new Map();
       for (const p of providers) {
         const endpoints = this.getProviderEndpoints(p, torMode);
         for (const endpoint of endpoints) {
           bases.add(endpoint);
+          this.addProviderNode(this.providerNodePubkeysByUrl, endpoint, p?.pubkey);
         }
       }
 
@@ -276,6 +310,7 @@ export class ModelManager {
         this.adapter.setBaseUrlsList(list);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await this.fetchRoutstr21Models(forceRefresh);
+        await this.syncReviewedProvidersFromNostr(list);
       }
 
       return list;
@@ -284,6 +319,114 @@ export class ModelManager {
       throw new ProviderBootstrapError([], `Provider bootstrap failed: ${e}`);
     }
   }
+
+  /**
+   * Fetch Routstr review events from Nostr (kind 38425) and disable providers
+   * whose 38421 node pubkey does not have at least one review tagged `t=lgtm`.
+   *
+   * Review events are expected to have:
+   * - `node`: the reviewed 38421 provider event pubkey
+   * - `t`: review label, where `lgtm` means the node looks good
+   *
+   * @param baseUrls Current provider base URLs to evaluate
+   * @returns Array of provider base URLs disabled by the review set
+   */
+  async syncReviewedProvidersFromNostr(
+    baseUrls: string[] = this.adapter.getBaseUrlsList(),
+    providerNodes: Map<string, Set<string>> = this.providerNodePubkeysByUrl
+  ): Promise<string[]> {
+    if (baseUrls.length === 0) return [];
+
+    if (!this.adapter.setDisabledProviders) {
+      this.logger.warn(
+        "NostrReviews: adapter does not support setDisabledProviders; skipping provider disable sync"
+      );
+      return [];
+    }
+
+    // Fetch kind 38425 lgtm reviews
+    const LGTM_RELAYS = [
+      "wss://relay.primal.net",
+      "wss://nos.lol",
+      "wss://relay.damus.io",
+      "wss://relay.routstr.com",
+    ];
+    const reviewedNodePubkeys = new Set<string>();
+    {
+      const pool = new RelayPool();
+      const store = new EventStore();
+      const timeoutMs = 5000;
+      await new Promise<void>((resolve) => {
+        pool
+          .req(LGTM_RELAYS, {
+            kinds: [38425],
+            "#t": ["lgtm"],
+            limit: 500,
+            authors: [this.routstrPubkey],
+          })
+          .pipe(
+            onlyEvents(),
+            tap((event) => store.add(event))
+          )
+          .subscribe({ complete: () => resolve() });
+        setTimeout(() => resolve(), timeoutMs);
+      });
+      for (const event of store.getTimeline({ kinds: [38425] })) {
+        const hasLgtmTag = event.tags.some(
+          (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
+        );
+        if (!hasLgtmTag) continue;
+        for (const tag of event.tags) {
+          if (tag[0] === "node" && typeof tag[1] === "string" && tag[1]) {
+            reviewedNodePubkeys.add(tag[1]);
+          }
+        }
+      }
+    }
+
+    if (reviewedNodePubkeys.size === 0) {
+      this.logger.warn(
+        "NostrReviews: no kind 38425 lgtm reviews found; keeping disabled providers unchanged"
+      );
+      return [];
+    }
+
+    if (providerNodes.size === 0) {
+      this.logger.warn(
+        "NostrReviews: no kind 38421 provider node metadata found; keeping disabled providers unchanged"
+      );
+      return [];
+    }
+
+    const disabledByReview: string[] = [];
+    for (const url of baseUrls) {
+      const normalized = this.normalizeUrl(url);
+      const nodePubkeys = providerNodes.get(normalized) || new Set<string>();
+      const hasLgtmReview = Array.from(nodePubkeys).some((pubkey) =>
+        reviewedNodePubkeys.has(pubkey)
+      );
+      if (!hasLgtmReview) {
+        disabledByReview.push(normalized);
+      }
+    }
+
+    this.adapter.setDisabledProviders(Array.from(new Set(disabledByReview)));
+
+    return disabledByReview;
+  }
+
+  private addProviderNode(
+    map: Map<string, Set<string>>,
+    url: string,
+    pubkey?: string
+  ): void {
+    if (!pubkey) return;
+    const normalized = this.normalizeUrl(url);
+    const existing = map.get(normalized) || new Set<string>();
+    existing.add(pubkey);
+    map.set(normalized, existing);
+  }
+
 
   /**
    * Fetch models from all providers and select best-priced options
@@ -530,9 +673,7 @@ export class ModelManager {
           kinds: [38423],
           "#d": ["routstr-21-models"],
           limit: 1,
-          authors: [
-            "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8",
-          ],
+          authors: [this.routstrPubkey],
         })
         .pipe(
           onlyEvents(),
@@ -566,7 +707,10 @@ export class ModelManager {
       this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
       return models;
     } catch {
-      this.logger.warn("Routstr21Models: failed to parse Nostr event content:", event.id);
+      this.logger.warn(
+        "Routstr21Models: failed to parse Nostr event content:",
+        event.id
+      );
       return cachedModels.length > 0 ? cachedModels : [];
     }
   }

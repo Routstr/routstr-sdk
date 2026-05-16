@@ -42,12 +42,17 @@ export interface SdkStorageStore extends SdkStorageState {
       createdAt?: number;
     }>
   ) => void;
-  setXcashuTokens: (value: Record<string, Array<{
-    baseUrl: string;
-    token: string;
-    createdAt?: number;
-    tryCount?: number;
-  }>>) => void;
+  setXcashuTokens: (
+    value: Record<
+      string,
+      Array<{
+        baseUrl: string;
+        token: string;
+        createdAt?: number;
+        tryCount?: number;
+      }>
+    >
+  ) => void;
   updateXcashuTokenTryCount: (token: string, tryCount: number) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
@@ -68,7 +73,9 @@ export interface SdkStorageStore extends SdkStorageState {
           createdAt?: number;
           lastUsed?: number | null;
         }>
-      | ((current: SdkStorageStore["clientIds"]) => SdkStorageStore["clientIds"])
+      | ((
+          current: SdkStorageStore["clientIds"]
+        ) => SdkStorageStore["clientIds"])
   ) => void;
   // ========== Failure Tracking ==========
   setFailedProviders: (value: string[]) => void;
@@ -76,7 +83,9 @@ export interface SdkStorageStore extends SdkStorageState {
   removeFailedProvider: (baseUrl: string) => void;
   setLastFailed: (value: Record<string, number>) => void;
   setLastFailedTimestamp: (baseUrl: string, timestamp: number) => void;
-  setProvidersOnCooldown: (value: Array<{ baseUrl: string; timestamp: number }>) => void;
+  setProvidersOnCooldown: (
+    value: Array<{ baseUrl: string; timestamp: number }>
+  ) => void;
   addProviderOnCooldown: (baseUrl: string, timestamp: number) => void;
   removeProviderFromCooldown: (baseUrl: string) => void;
   clearProvidersOnCooldown: () => void;
@@ -207,12 +216,15 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
       });
     },
     setXcashuTokens: (value) => {
-      const normalized: Record<string, Array<{
-        baseUrl: string;
-        token: string;
-        createdAt: number;
-        tryCount: number;
-      }>> = {};
+      const normalized: Record<
+        string,
+        Array<{
+          baseUrl: string;
+          token: string;
+          createdAt: number;
+          tryCount: number;
+        }>
+      > = {};
       for (const [baseUrl, tokens] of Object.entries(value)) {
         normalized[normalizeBaseUrl(baseUrl)] = tokens.map((entry) => ({
           ...entry,
@@ -226,19 +238,22 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     },
     updateXcashuTokenTryCount: (token, tryCount) => {
       const currentTokens = get().xcashuTokens;
-      const updatedTokens: Record<string, Array<{
-        baseUrl: string;
-        token: string;
-        createdAt: number;
-        tryCount: number;
-      }>> = {};
-      
+      const updatedTokens: Record<
+        string,
+        Array<{
+          baseUrl: string;
+          token: string;
+          createdAt: number;
+          tryCount: number;
+        }>
+      > = {};
+
       for (const [baseUrl, tokens] of Object.entries(currentTokens)) {
         updatedTokens[baseUrl] = tokens.map((entry) =>
           entry.token === token ? { ...entry, tryCount } : entry
         );
       }
-      
+
       void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, updatedTokens);
       set({ xcashuTokens: updatedTokens });
     },
@@ -403,12 +418,15 @@ const hydrateStoreFromDriver = async (
       }>
     >(SDK_STORAGE_KEYS.CHILD_KEYS, []),
     driver.getItem<
-      Record<string, Array<{
-        baseUrl: string;
-        token: string;
-        createdAt?: number;
-        tryCount?: number;
-      }>>
+      Record<
+        string,
+        Array<{
+          baseUrl: string;
+          token: string;
+          createdAt?: number;
+          tryCount?: number;
+        }>
+      >
     >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
     driver.getItem<number | null>(
@@ -434,9 +452,10 @@ const hydrateStoreFromDriver = async (
     >(SDK_STORAGE_KEYS.CLIENT_IDS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.FAILED_PROVIDERS, []),
     driver.getItem<Record<string, number>>(SDK_STORAGE_KEYS.LAST_FAILED, {}),
-    driver.getItem<
-      Array<{ baseUrl: string; timestamp: number }>
-    >(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, []),
+    driver.getItem<Array<{ baseUrl: string; timestamp: number }>>(
+      SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN,
+      []
+    ),
   ]);
 
   const modelsFromAllProviders = Object.fromEntries(
@@ -517,7 +536,9 @@ const hydrateStoreFromDriver = async (
     lastUsed: entry.lastUsed ?? null,
   }));
 
-  const failedProviders = rawFailedProviders.map((url) => normalizeBaseUrl(url));
+  const failedProviders = rawFailedProviders.map((url) =>
+    normalizeBaseUrl(url)
+  );
   const lastFailed = Object.fromEntries(
     Object.entries(rawLastFailed).map(([baseUrl, timestamp]) => [
       normalizeBaseUrl(baseUrl),
@@ -586,6 +607,7 @@ export const createDiscoveryAdapterFromStore = (
   getLastUsedModel: () => store.getState().lastUsedModel,
   setLastUsedModel: (modelId) => store.getState().setLastUsedModel(modelId),
   getDisabledProviders: () => store.getState().disabledProviders,
+  setDisabledProviders: (urls) => store.getState().setDisabledProviders(urls),
   getBaseUrlsList: () => store.getState().baseUrlsList,
   setBaseUrlsList: (urls) => store.getState().setBaseUrlsList(urls),
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
@@ -834,35 +856,35 @@ export const createProviderRegistryFromStore = (
   logger?: SdkLogger
 ): ProviderRegistry => {
   const log = (logger ?? consoleLogger).child("ProviderRegistry");
-  return ({
-  getModelsForProvider: (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    return store.getState().modelsFromAllProviders[normalized] || [];
-  },
-  getDisabledProviders: () => store.getState().disabledProviders,
-  getProviderMints: (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    return store.getState().mintsFromAllProviders[normalized] || [];
-  },
-  getProviderInfo: async (baseUrl) => {
-    const normalized = normalizeBaseUrl(baseUrl);
-    const cached = store.getState().infoFromAllProviders[normalized];
-    if (cached) return cached;
-    try {
-      const response = await fetch(`${normalized}v1/info`);
-      if (!response.ok) {
-        throw new Error(`Failed ${response.status}`);
+  return {
+    getModelsForProvider: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      return store.getState().modelsFromAllProviders[normalized] || [];
+    },
+    getDisabledProviders: () => store.getState().disabledProviders,
+    getProviderMints: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      return store.getState().mintsFromAllProviders[normalized] || [];
+    },
+    getProviderInfo: async (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const cached = store.getState().infoFromAllProviders[normalized];
+      if (cached) return cached;
+      try {
+        const response = await fetch(`${normalized}v1/info`);
+        if (!response.ok) {
+          throw new Error(`Failed ${response.status}`);
+        }
+        const info = (await response.json()) as ProviderInfo;
+        const next = { ...store.getState().infoFromAllProviders };
+        next[normalized] = info;
+        store.getState().setInfoFromAllProviders(next);
+        return info;
+      } catch (error) {
+        log.warn(`Failed to fetch provider info from ${normalized}:`, error);
+        return null;
       }
-      const info = (await response.json()) as ProviderInfo;
-      const next = { ...store.getState().infoFromAllProviders };
-      next[normalized] = info;
-      store.getState().setInfoFromAllProviders(next);
-      return info;
-    } catch (error) {
-      log.warn(`Failed to fetch provider info from ${normalized}:`, error);
-      return null;
-    }
-  },
-  getAllProvidersModels: () => store.getState().modelsFromAllProviders,
-});
+    },
+    getAllProvidersModels: () => store.getState().modelsFromAllProviders,
+  };
 };
