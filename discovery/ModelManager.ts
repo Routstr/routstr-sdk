@@ -519,7 +519,7 @@ export class ModelManager {
         if (this.isProviderDownError(error)) {
           this.logger.warn(`Provider ${base} is down right now.`);
         } else {
-          this.logger.warn(`Failed to fetch models from ${base}:`, error);
+          this.logger.warn(`Provider ${base} unreachable: ${(error as Error).message}`);
         }
         this.adapter.setProviderLastUpdate(base, Date.now());
         return { success: false, base };
