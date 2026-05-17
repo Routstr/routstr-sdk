@@ -153,6 +153,11 @@ export class ModelManager {
 
     const timeoutMs = 5000;
 
+    this.logger.debug(
+      `bootstrapFromNostr: requesting kind ${kind} from relays`,
+      DEFAULT_RELAYS
+    );
+
     await new Promise<void>((resolve) => {
       pool
         .req(DEFAULT_RELAYS, {
@@ -178,10 +183,17 @@ export class ModelManager {
 
     const timeline = localEventStore.getTimeline({ kinds: [kind] });
 
+    this.logger.debug(
+      `bootstrapFromNostr: got ${timeline.length} kind-${kind} events from relays`
+    );
+
     const bases = new Set<string>();
     this.providerNodePubkeysByUrl = new Map();
 
     for (const event of timeline) {
+      this.logger.debug(
+        `bootstrapFromNostr: processing event id=${event.id.slice(0, 8)}... pubkey=${event.pubkey.slice(0, 8)}... tags=${event.tags.length} contentLen=${event.content.length}`
+      );
       const eventUrls: string[] = [];
 
       for (const tag of event.tags) {
@@ -191,6 +203,10 @@ export class ModelManager {
       }
 
       if (eventUrls.length > 0) {
+        this.logger.debug(
+          `bootstrapFromNostr: event has ${eventUrls.length} u-tag urls`,
+          eventUrls
+        );
         for (const url of eventUrls) {
           const normalized = this.normalizeUrl(url);
           if (!torMode || normalized.includes(".onion")) {
@@ -199,6 +215,11 @@ export class ModelManager {
               this.providerNodePubkeysByUrl,
               normalized,
               event.pubkey
+            );
+          } else {
+            this.logger.debug(
+              `bootstrapFromNostr: skipping url (torMode=${torMode}, onion=${normalized.includes(".onion")})`,
+              normalized
             );
           }
         }
@@ -211,37 +232,63 @@ export class ModelManager {
           ? content
           : content.providers || [];
 
+        this.logger.debug(
+          `bootstrapFromNostr: event content parsed — using ${
+            Array.isArray(content) ? "top-level array" : ".providers"
+          }, ${providers.length} provider(s)`
+        );
+
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
           for (const endpoint of endpoints) {
             bases.add(endpoint);
+            const nodePubkey = p?.pubkey || event.pubkey;
+            this.logger.debug(
+              `bootstrapFromNostr: adding provider endpoint=${endpoint} nodePubkey=${nodePubkey?.slice(0, 8)}...`
+            );
             this.addProviderNode(
               this.providerNodePubkeysByUrl,
               endpoint,
-              p?.pubkey || event.pubkey
+              nodePubkey
             );
           }
         }
-      } catch {
+      } catch (e1) {
+        this.logger.debug(
+          `bootstrapFromNostr: first JSON parse failed (will retry), event id=${event.id.slice(0, 8)}...`,
+          e1
+        );
         try {
           const providers = JSON.parse(event.content);
           if (Array.isArray(providers)) {
+            this.logger.debug(
+              `bootstrapFromNostr: event content is plain array of ${providers.length} provider(s)`
+            );
             for (const p of providers) {
               const endpoints = this.getProviderEndpoints(p, torMode);
               for (const endpoint of endpoints) {
                 bases.add(endpoint);
+                const nodePubkey = p?.pubkey || event.pubkey;
+                this.logger.debug(
+                  `bootstrapFromNostr: adding provider endpoint=${endpoint} nodePubkey=${nodePubkey?.slice(0, 8)}...`
+                );
                 this.addProviderNode(
                   this.providerNodePubkeysByUrl,
                   endpoint,
-                  p?.pubkey || event.pubkey
+                  nodePubkey
                 );
               }
             }
+          } else {
+            this.logger.debug(
+              `bootstrapFromNostr: event content parsed but not an array`
+            );
           }
-        } catch {
+        } catch (e2) {
           this.logger.warn(
             "NostrBootstrap: failed to parse event content:",
-            event.id
+            event.id,
+            e2
           );
         }
       }
@@ -260,6 +307,10 @@ export class ModelManager {
     );
 
     const result = Array.from(bases).filter((base) => !excluded.has(base));
+
+    this.logger.debug(
+      `bootstrapFromNostr: done. bases=${bases.size} excluded=${excluded.size} result=${result.length} providerNodes=${this.providerNodePubkeysByUrl.size}`
+    );
 
     return result;
   }
@@ -420,11 +471,19 @@ export class ModelManager {
     url: string,
     pubkey?: string
   ): void {
-    if (!pubkey) return;
+    if (!pubkey) {
+      this.logger.debug(
+        `addProviderNode: skipping url=${url} (no pubkey provided)`
+      );
+      return;
+    }
     const normalized = this.normalizeUrl(url);
     const existing = map.get(normalized) || new Set<string>();
     existing.add(pubkey);
     map.set(normalized, existing);
+    this.logger.debug(
+      `addProviderNode: url=${normalized} pubkey=${pubkey.slice(0, 8)}... (node count for url now: ${existing.size})`
+    );
   }
 
 
