@@ -328,12 +328,6 @@ export class RoutstrClient {
       }
     }
 
-    const { token, tokenBalance, tokenBalanceUnit } = await this._spendToken({
-      mintUrl,
-      amount: requiredSats,
-      baseUrl,
-    });
-
     let requestBody = body;
     if (body && typeof body === "object") {
       const bodyObj = body as Record<string, unknown>;
@@ -344,10 +338,17 @@ export class RoutstrClient {
 
     // Build clean outgoing headers — do NOT pass the incoming client headers here
     const baseHeaders = this._buildBaseHeaders();
-    let requestHeaders = this._withAuthHeader(baseHeaders, token);
 
-    // ─── Venice E2EE: prepare encrypted request ───────────
+    // ─── Venice E2EE: attest BEFORE spending tokens ──────
     let e2eeSessionEcdh: any = undefined;
+    let e2eeHeaders: Record<string, string> = {};
+    let e2eeSpendResult:
+      | {
+          token: string;
+          tokenBalance: number;
+          tokenBalanceUnit: "sat" | "msat";
+        }
+      | undefined;
 
     if (modelId && isE2EEModel(modelId)) {
       if (!requestBody || typeof requestBody !== "object") {
@@ -356,25 +357,57 @@ export class RoutstrClient {
 
       this._log(
         "DEBUG",
-        `[RoutstrClient] Preparing E2EE request for model ${modelId}`
+        `[RoutstrClient] Attesting E2EE model ${modelId} before spend`
       );
+
+      const attestAuth = await this._getAttestationAuth({
+        baseUrl,
+        mintUrl,
+      });
+      e2eeSpendResult = attestAuth.spendResult;
 
       const e2eePrep = await prepareE2EERequest({
         baseUrl,
-        authHeaders: requestHeaders,
+        authHeaders: attestAuth.authHeaders,
         modelId,
         body: requestBody as Record<string, unknown>,
       });
 
       requestBody = e2eePrep.modifiedBody;
-      requestHeaders = { ...requestHeaders, ...e2eePrep.e2eeHeaders };
+      e2eeHeaders = e2eePrep.e2eeHeaders;
       e2eeSessionEcdh = e2eePrep.sessionEcdh;
 
       this._log(
         "DEBUG",
-        `[RoutstrClient] E2EE request prepared for routeRequest`
+        `[RoutstrClient] E2EE attestation passed, messages encrypted`
       );
     }
+
+    // Spend tokens (skip for xcashu if already done during attestation)
+    let spendResult: {
+      token: string;
+      tokenBalance: number;
+      tokenBalanceUnit: "sat" | "msat";
+    };
+
+    if (e2eeSpendResult && this.mode === "xcashu") {
+      // Reuse the attestation spend so we don't spend twice
+      spendResult = e2eeSpendResult;
+    } else {
+      spendResult = await this._spendToken({
+        mintUrl,
+        amount: requiredSats,
+        baseUrl,
+      });
+    }
+
+    const { token, tokenBalance, tokenBalanceUnit } = spendResult;
+
+    // Build final request headers (auth + E2EE)
+    const requestHeaders = this._withAuthHeader(baseHeaders, token);
+    const finalHeaders = e2eeSessionEcdh
+      ? { ...requestHeaders, ...e2eeHeaders }
+      : requestHeaders;
 
     const response = await this._makeRequest({
       path: requestPath,
@@ -384,7 +417,7 @@ export class RoutstrClient {
       mintUrl,
       token,
       requiredSats,
-      headers: requestHeaders,
+      headers: finalHeaders,
       baseHeaders,
       selectedModel,
     });
@@ -498,26 +531,7 @@ export class RoutstrClient {
       // Check balance first
       await this._checkBalance();
 
-      // Spend tokens
-      callbacks.onPaymentProcessing?.(true);
-
-      const spendResult = await this._spendToken({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-      });
-
-      let token = spendResult.token;
-      let tokenBalance = spendResult.tokenBalance;
-      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
-
-      const tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-
-      callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
-
       const baseHeaders = this._buildBaseHeaders(headers);
-      const requestHeaders = this._withAuthHeader(baseHeaders, token);
 
       // Get provider info for version compatibility
       const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
@@ -548,34 +562,81 @@ export class RoutstrClient {
         body.tools = [{ type: "web_search" }];
       }
 
-      // ─── Venice E2EE: prepare encrypted request ───────────
+      // ─── Venice E2EE: attest BEFORE spending tokens ──────
       let e2eeSessionEcdh: any = undefined;
+      let e2eeHeaders: Record<string, string> = {};
       let finalBody = body;
-      let finalHeaders = requestHeaders;
+      let e2eeSpendResult:
+        | {
+            token: string;
+            tokenBalance: number;
+            tokenBalanceUnit: "sat" | "msat";
+          }
+        | undefined;
 
       if (isE2EEModel(modelIdForRequest)) {
         this._log(
           "DEBUG",
-          `[RoutstrClient] Preparing E2EE request for model ${modelIdForRequest}`
+          `[RoutstrClient] Attesting E2EE model ${modelIdForRequest} before spend`
         );
+
+        const attestAuth = await this._getAttestationAuth({
+          baseUrl,
+          mintUrl,
+        });
+        e2eeSpendResult = attestAuth.spendResult;
 
         const e2eePrep = await prepareE2EERequest({
           baseUrl,
-          authHeaders: finalHeaders,
+          authHeaders: attestAuth.authHeaders,
           modelId: modelIdForRequest,
           body: finalBody,
         });
 
         finalBody = e2eePrep.modifiedBody;
-        // Merge E2EE headers into request headers
-        finalHeaders = { ...finalHeaders, ...e2eePrep.e2eeHeaders };
+        e2eeHeaders = e2eePrep.e2eeHeaders;
         e2eeSessionEcdh = e2eePrep.sessionEcdh;
 
         this._log(
           "DEBUG",
-          `[RoutstrClient] E2EE request prepared, messages encrypted`
+          `[RoutstrClient] E2EE attestation passed, messages encrypted`
         );
       }
+
+      // Spend tokens (skip for xcashu if already done during attestation)
+      callbacks.onPaymentProcessing?.(true);
+
+      let spendResult: {
+        token: string;
+        tokenBalance: number;
+        tokenBalanceUnit: "sat" | "msat";
+      };
+
+      if (e2eeSpendResult && this.mode === "xcashu") {
+        // Reuse the attestation spend so we don't spend twice
+        spendResult = e2eeSpendResult;
+      } else {
+        spendResult = await this._spendToken({
+          mintUrl,
+          amount: requiredSats,
+          baseUrl,
+        });
+      }
+
+      let token = spendResult.token;
+      let tokenBalance = spendResult.tokenBalance;
+      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
+
+      const tokenBalanceInSats =
+        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+
+      callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
+
+      // Build final request headers (auth + E2EE)
+      const requestHeaders = this._withAuthHeader(baseHeaders, token);
+      const finalHeaders = e2eeSessionEcdh
+        ? { ...requestHeaders, ...e2eeHeaders }
+        : requestHeaders;
 
       // Make API request
       const response = await this._makeRequest({
@@ -1716,5 +1777,82 @@ export class RoutstrClient {
     }
 
     return nextHeaders;
+  }
+
+  /**
+   * Get auth headers for Venice E2EE attestation WITHOUT the main request spend.
+   *
+   * - apikeys mode: uses the stored API key (no spend at all).
+   * - xcashu mode:  does a minimal spend; the returned spendResult can be
+   *   reused for the actual request so we don't spend twice.
+   */
+  private async _getAttestationAuth(params: {
+    baseUrl: string;
+    mintUrl: string;
+    additionalHeaders?: Record<string, string>;
+  }): Promise<{
+    authHeaders: Record<string, string>;
+    spendResult?: {
+      token: string;
+      tokenBalance: number;
+      tokenBalanceUnit: "sat" | "msat";
+    };
+  }> {
+    const { baseUrl, mintUrl, additionalHeaders = {} } = params;
+    const baseHeaders = this._buildBaseHeaders(additionalHeaders);
+
+    if (this.mode === "apikeys") {
+      const apiKey = this.storageAdapter.getApiKey(baseUrl);
+      if (apiKey?.key) {
+        return {
+          authHeaders: this._withAuthHeader(baseHeaders, apiKey.key),
+          // no spendResult — _spendToken will be called as usual for lookup
+        };
+      }
+      // No stored key yet — do a minimal spend to create one
+      const spendResult = await this.cashuSpender.spend({
+        mintUrl,
+        amount: 1,
+        baseUrl: "",
+        reuseToken: false,
+      });
+      if (!spendResult.token) {
+        throw new Error(
+          `Failed to get API key for attestation: ${spendResult.error}`
+        );
+      }
+      return {
+        authHeaders: this._withAuthHeader(baseHeaders, spendResult.token),
+        spendResult: {
+          token: spendResult.token,
+          tokenBalance: spendResult.balance,
+          tokenBalanceUnit: spendResult.unit ?? "sat",
+        },
+      };
+    }
+
+    // xcashu mode: minimal spend so attestation happens before the main spend.
+    // The token is returned so we can reuse it for the actual request.
+    const spendResult = await this.cashuSpender.spend({
+      mintUrl,
+      amount: 1,
+      baseUrl: "",
+      reuseToken: false,
+    });
+
+    if (!spendResult.token) {
+      throw new Error(
+        `Failed to get xcashu token for attestation: ${spendResult.error}`
+      );
+    }
+
+    return {
+      authHeaders: this._withAuthHeader(baseHeaders, spendResult.token),
+      spendResult: {
+        token: spendResult.token,
+        tokenBalance: spendResult.balance,
+        tokenBalanceUnit: spendResult.unit ?? "sat",
+      },
+    };
   }
 }

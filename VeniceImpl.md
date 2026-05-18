@@ -59,13 +59,28 @@ e2ee-qwen3-5-122b-a10b
 
 ## Request flow
 
+### 0. Ordering guarantee
+
+**Attestation always happens *before* `_spendToken()`.** If attestation
+fails (wrong nonce, unverified key, model mismatch, server error), no
+tokens have been spent yet — the error surfaces before any cashu or API
+key deduction.
+
+This is enforced in both `fetchAIResponse()` and `_prepareRoutedRequest()`.
+
 ### 1. Attestation
 
-Before encrypting, the SDK verifies the model's identity:
+Before encrypting — and before spending — the SDK verifies the model's
+identity:
 
 ```
 GET {baseUrl}/tee/attestation?model={model}&nonce={random32bytes}
 ```
+
+For `apikeys` mode the stored API key is used; for `xcashu` mode a
+minimal (1 sat) spend provides the auth header. If attestation passes,
+the same xcashu token is reused for the main request to avoid a double
+spend.
 
 The server returns a signed attestation containing the model's secp256k1
 public key. The SDK verifies:
@@ -174,13 +189,27 @@ or non-content SSE fields).
 ### `fetchAIResponse()` — streaming via `StreamProcessor`
 
 ```ts
-// Before _makeRequest():
-if (isE2EEModel(modelId)) {
-  const prep = await prepareE2EERequest({ baseUrl, authHeaders, modelId, body });
+// E2EE attestation happens BEFORE _spendToken():
+if (isE2EEModel(modelIdForRequest)) {
+  const attestAuth = await this._getAttestationAuth({ baseUrl, mintUrl });
+  const prep = await prepareE2EERequest({
+    baseUrl, authHeaders: attestAuth.authHeaders, modelId, body,
+  });
   finalBody = prep.modifiedBody;       // encrypted messages + venice_parameters
-  finalHeaders = { ...finalHeaders, ...prep.e2eeHeaders };
+  e2eeHeaders = prep.e2eeHeaders;
   e2eeSessionEcdh = prep.sessionEcdh;
+  e2eeSpendResult = attestAuth.spendResult; // reused for xcashu to avoid double spend
 }
+
+// Then spend (reuses attestation spend for xcashu mode):
+spendResult = e2eeSpendResult && mode === "xcashu"
+  ? e2eeSpendResult
+  : await this._spendToken({ ... });
+
+// Build final headers:
+finalHeaders = e2eeSessionEcdh
+  ? { ..._withAuthHeader(baseHeaders, token), ...e2eeHeaders }
+  : _withAuthHeader(baseHeaders, token);
 
 // After _makeRequest(), before StreamProcessor:
 if (e2eeSessionEcdh) {
@@ -196,8 +225,8 @@ unchanged.
 
 ### `_prepareRoutedRequest()` — for `routeRequest()`
 
-Same pre-request encryption. For SSE responses, the tee'd client stream is
-piped through the decrypt transform:
+Same attestation-before-spend ordering. For SSE responses, the tee'd client
+stream is piped through the decrypt transform:
 
 ```ts
 const [rawClientStream, inspectStream] = response.body.tee();
