@@ -40,6 +40,11 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
+import {
+  isE2EEModel,
+  prepareE2EERequest,
+  createE2EEDecryptTransform,
+} from "./VeniceE2EE";
 
 /**
  * Options for fetching AI response
@@ -339,7 +344,37 @@ export class RoutstrClient {
 
     // Build clean outgoing headers — do NOT pass the incoming client headers here
     const baseHeaders = this._buildBaseHeaders();
-    const requestHeaders = this._withAuthHeader(baseHeaders, token);
+    let requestHeaders = this._withAuthHeader(baseHeaders, token);
+
+    // ─── Venice E2EE: prepare encrypted request ───────────
+    let e2eeSessionEcdh: any = undefined;
+
+    if (modelId && isE2EEModel(modelId)) {
+      if (!requestBody || typeof requestBody !== "object") {
+        throw new Error("E2EE requires a request body with messages");
+      }
+
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] Preparing E2EE request for model ${modelId}`
+      );
+
+      const e2eePrep = await prepareE2EERequest({
+        baseUrl,
+        authHeaders: requestHeaders,
+        modelId,
+        body: requestBody as Record<string, unknown>,
+      });
+
+      requestBody = e2eePrep.modifiedBody;
+      requestHeaders = { ...requestHeaders, ...e2eePrep.e2eeHeaders };
+      e2eeSessionEcdh = e2eePrep.sessionEcdh;
+
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] E2EE request prepared for routeRequest`
+      );
+    }
 
     const response = await this._makeRequest({
       path: requestPath,
@@ -369,9 +404,16 @@ export class RoutstrClient {
     }> = Promise.resolve({});
 
     if (contentType.includes("text/event-stream") && response.body) {
+      // ─── Venice E2EE: wrap client stream with decrypt transform ──
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
-      const [clientStream, inspectStream] = response.body.tee();
+      const [rawClientStream, inspectStream] = response.body.tee();
+
+      const clientStream = e2eeSessionEcdh
+        ? rawClientStream.pipeThrough(
+            createE2EEDecryptTransform(e2eeSessionEcdh)
+          )
+        : rawClientStream;
 
       processedResponse = new Response(clientStream, {
         status: response.status,
@@ -506,18 +548,47 @@ export class RoutstrClient {
         body.tools = [{ type: "web_search" }];
       }
 
+      // ─── Venice E2EE: prepare encrypted request ───────────
+      let e2eeSessionEcdh: any = undefined;
+      let finalBody = body;
+      let finalHeaders = requestHeaders;
+
+      if (isE2EEModel(modelIdForRequest)) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] Preparing E2EE request for model ${modelIdForRequest}`
+        );
+
+        const e2eePrep = await prepareE2EERequest({
+          baseUrl,
+          authHeaders: finalHeaders,
+          modelId: modelIdForRequest,
+          body: finalBody,
+        });
+
+        finalBody = e2eePrep.modifiedBody;
+        // Merge E2EE headers into request headers
+        finalHeaders = { ...finalHeaders, ...e2eePrep.e2eeHeaders };
+        e2eeSessionEcdh = e2eePrep.sessionEcdh;
+
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] E2EE request prepared, messages encrypted`
+        );
+      }
+
       // Make API request
       const response = await this._makeRequest({
         path: "/v1/chat/completions",
         method: "POST",
-        body,
+        body: finalBody,
         selectedModel,
         baseUrl,
         mintUrl,
         token,
         requiredSats,
         maxTokens,
-        headers: requestHeaders,
+        headers: finalHeaders,
         baseHeaders,
       });
 
@@ -525,12 +596,29 @@ export class RoutstrClient {
         throw new Error("Response body is not available");
       }
 
+      // ─── Venice E2EE: wrap response body with decrypt transform ──
+      let processedResponse = response;
+      if (e2eeSessionEcdh) {
+        const decryptedBody = response.body.pipeThrough(
+          createE2EEDecryptTransform(e2eeSessionEcdh)
+        );
+        processedResponse = new Response(decryptedBody, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] E2EE decrypt transform applied to response stream`
+        );
+      }
+
       // Process streaming response
       if (response.status === 200) {
         const baseUrlUsed = (response as any).baseUrl || baseUrl;
 
         const streamingResult = await this.streamProcessor.process(
-          response,
+          processedResponse,
           {
             onContent: callbacks.onStreamingUpdate,
             onThinking: callbacks.onThinkingUpdate,
