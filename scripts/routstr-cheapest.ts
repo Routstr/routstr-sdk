@@ -176,7 +176,6 @@ async function main(): Promise<void> {
       : `${forcedProvider}/`;
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
-    console.log(models);
     const match = models.find((model) => model.id === resolvedModelId);
     if (!match) {
       console.error(
