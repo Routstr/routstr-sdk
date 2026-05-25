@@ -45,6 +45,8 @@ import {
   prepareE2EERequest,
   createE2EEDecryptTransform,
 } from "./VeniceE2EE";
+import { promises as fs } from "fs";
+import path from "path";
 
 /**
  * Options for fetching AI response
@@ -342,13 +344,6 @@ export class RoutstrClient {
     // ─── Venice E2EE: attest BEFORE spending tokens ──────
     let e2eeSessionEcdh: any = undefined;
     let e2eeHeaders: Record<string, string> = {};
-    let e2eeSpendResult:
-      | {
-          token: string;
-          tokenBalance: number;
-          tokenBalanceUnit: "sat" | "msat";
-        }
-      | undefined;
 
     if (modelId && isE2EEModel(modelId)) {
       if (!requestBody || typeof requestBody !== "object") {
@@ -364,7 +359,6 @@ export class RoutstrClient {
         baseUrl,
         mintUrl,
       });
-      e2eeSpendResult = attestAuth.spendResult;
 
       const e2eePrep = await prepareE2EERequest({
         baseUrl,
@@ -383,23 +377,12 @@ export class RoutstrClient {
       );
     }
 
-    // Spend tokens (skip for xcashu if already done during attestation)
-    let spendResult: {
-      token: string;
-      tokenBalance: number;
-      tokenBalanceUnit: "sat" | "msat";
-    };
-
-    if (e2eeSpendResult && this.mode === "xcashu") {
-      // Reuse the attestation spend so we don't spend twice
-      spendResult = e2eeSpendResult;
-    } else {
-      spendResult = await this._spendToken({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-      });
-    }
+    // Spend tokens for the actual request
+    const spendResult = await this._spendToken({
+      mintUrl,
+      amount: requiredSats,
+      baseUrl,
+    });
 
     const { token, tokenBalance, tokenBalanceUnit } = spendResult;
 
@@ -566,13 +549,6 @@ export class RoutstrClient {
       let e2eeSessionEcdh: any = undefined;
       let e2eeHeaders: Record<string, string> = {};
       let finalBody = body;
-      let e2eeSpendResult:
-        | {
-            token: string;
-            tokenBalance: number;
-            tokenBalanceUnit: "sat" | "msat";
-          }
-        | undefined;
 
       if (isE2EEModel(modelIdForRequest)) {
         this._log(
@@ -584,7 +560,6 @@ export class RoutstrClient {
           baseUrl,
           mintUrl,
         });
-        e2eeSpendResult = attestAuth.spendResult;
 
         const e2eePrep = await prepareE2EERequest({
           baseUrl,
@@ -603,25 +578,14 @@ export class RoutstrClient {
         );
       }
 
-      // Spend tokens (skip for xcashu if already done during attestation)
+      // Spend tokens for the actual request
       callbacks.onPaymentProcessing?.(true);
 
-      let spendResult: {
-        token: string;
-        tokenBalance: number;
-        tokenBalanceUnit: "sat" | "msat";
-      };
-
-      if (e2eeSpendResult && this.mode === "xcashu") {
-        // Reuse the attestation spend so we don't spend twice
-        spendResult = e2eeSpendResult;
-      } else {
-        spendResult = await this._spendToken({
-          mintUrl,
-          amount: requiredSats,
-          baseUrl,
-        });
-      }
+      const spendResult = await this._spendToken({
+        mintUrl,
+        amount: requiredSats,
+        baseUrl,
+      });
 
       let token = spendResult.token;
       let tokenBalance = spendResult.tokenBalance;
@@ -777,6 +741,12 @@ export class RoutstrClient {
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+
+      // Store request to reqs/ folder before fetch
+      this._storeRequest({ url, method, headers, body, baseUrl }).catch(
+        (err) => this._log("WARN", "Failed to store request:", err)
+      );
+
       const response = await fetch(url, {
         method,
         headers,
@@ -829,6 +799,38 @@ export class RoutstrClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * Store request details to a file in the reqs/ folder before fetch.
+   */
+  private async _storeRequest(params: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: unknown;
+    baseUrl: string;
+  }): Promise<void> {
+    const { url, method, headers, body, baseUrl } = params;
+
+    const reqsDir = path.join(process.cwd(), "reqs");
+    await fs.mkdir(reqsDir, { recursive: true });
+
+    const timestamp = Date.now();
+    const filename = `req-${timestamp}.json`;
+    const filepath = path.join(reqsDir, filename);
+
+    const entry = {
+      timestamp: new Date(timestamp).toISOString(),
+      url,
+      method,
+      baseUrl,
+      headers,
+      body,
+    };
+
+    await fs.writeFile(filepath, JSON.stringify(entry, null, 2), "utf-8");
+    this._log("DEBUG", `Request stored to ${filepath}`);
   }
 
   /**
