@@ -898,6 +898,10 @@ export class BalanceManager {
     unit: "sat" | "msat";
     apiKey: string;
     isInvalidApiKey?: boolean;
+    /** True when the balance could not be determined (network error, non-OK
+     *  response, etc.).  Callers MUST NOT use `amount` in arithmetic when
+     *  this flag is set — it is 0, not a real balance. */
+    balanceUnknown?: boolean;
   }> {
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
@@ -926,19 +930,38 @@ export class BalanceManager {
           data?.detail?.error?.message?.includes("proofs already spent");
 
         return {
-          amount: -1,
+          /* [REMOVE] Was: `return { amount: -1, reserved: data.reserved ?? 0,
+           * unit: "msat", apiKey: data.api_key, isInvalidApiKey };`
+           *
+           * Bug: Using -1 as a sentinel for "balance fetch failed" meant the
+           * value participated in arithmetic like satsSpent =
+           * initialTokenBalance - (-1/1000) = wrong answer.  Even worse,
+           * when initialTokenBalance was also -0.001 (another failed fetch)
+           * and the failover provider had a normal balance, subtraction
+           * produced a large negative cost.
+           *
+           * Fix: amount=0 + balanceUnknown=true.  Callers must check
+           * balanceUnknown before using amount in arithmetic.  A zero balance
+           * is harmless in comparisons (>=0), and the flag explicitly
+           * signals "don't use this number."
+           */
+          amount: 0,
           reserved: data.reserved ?? 0,
           unit: "msat",
           apiKey: data.api_key,
           isInvalidApiKey,
+          balanceUnknown: true,
         };
       }
     } catch (error) {
       this.logger.error("getTokenBalance error", error);
-      // Fall through to default
     }
 
-    return { amount: -1, reserved: 0, unit: "sat", apiKey: "" };
+    /* [REMOVE] Was: `return { amount: -1, reserved: 0, unit: "sat", apiKey: "" };`
+     * Same sentinel problem as the non-OK branch above — -1 looked like a
+     * valid (negative) balance.  0 + balanceUnknown is semantically correct.
+     */
+    return { amount: 0, reserved: 0, unit: "sat", apiKey: "", balanceUnknown: true };
   }
 
   /**

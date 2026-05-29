@@ -354,10 +354,55 @@ export class RoutstrClient {
       selectedModel,
     });
 
-    const tokenBalanceInSats =
+    let tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    /* [REMOVE] Was: `const tokenBalanceInSats = ...`
+     *
+     * Bug: when _makeRequest triggers provider failover (first provider
+     * returns 401, _handleErrorResponse calls _spendToken for a new provider
+     * and recursively calls _makeRequest), the response's .baseUrl and .token
+     * point to the failover provider but tokenBalanceInSats is still the
+     * stale initial balance from the first (failed) provider.
+     *
+     * Flow:
+     *   1. _spendToken("bad-provider") → getTokenBalance returns -1 msat
+     *         (now: 0 + balanceUnknown=true) → tokenBalanceInSats = -0.001
+     *   2. _makeRequest → 401 → _handleErrorResponse → failover to
+     *         "good-provider" with fresh token (balance ≈ 1660 sat)
+     *   3. Back here: tokenBalanceInSats still = -0.001
+     *   4. _handlePostResponseBalanceUpdate: satsSpent = (-0.001) - 1659.748
+     *         = -1659.75 ← NEGATIVE!
+     *
+     * Fix: re-derive the balance from the actual failover token before
+     * passing it to _handlePostResponseBalanceUpdate.
+     */
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
+
+    // If failover occurred, re-derive the balance for the actual token used.
+    // Otherwise _handlePostResponseBalanceUpdate will compute satsSpent using
+    // the stale initial balance from the first (failed) provider, producing a
+    // negative sats cost.
+    if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
+      try {
+        const actualBalance = await this.balanceManager.getTokenBalance(
+          tokenUsed,
+          baseUrlUsed
+        );
+        if (actualBalance.amount >= 0 && !actualBalance.balanceUnknown) {
+          tokenBalanceInSats =
+            actualBalance.unit === "msat"
+              ? actualBalance.amount / 1000
+              : actualBalance.amount;
+        }
+      } catch (e) {
+        this._log(
+          "WARN",
+          "[RoutstrClient] Failed to get balance for failover token:",
+          e
+        );
+      }
+    }
 
     const contentType = response.headers.get("content-type") || "";
     let processedResponse = response;
@@ -469,8 +514,15 @@ export class RoutstrClient {
       let tokenBalance = spendResult.tokenBalance;
       let tokenBalanceUnit = spendResult.tokenBalanceUnit;
 
-      const tokenBalanceInSats =
+      let tokenBalanceInSats =
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+      /* [REMOVE] Was: `const tokenBalanceInSats = ...`
+       * Same stale-balance-after-failover bug as in _prepareRoutedRequest.
+       * When _makeRequest fails over in _handleErrorResponse, the response's
+       * .baseUrl and .token reflect the failover provider but
+       * tokenBalanceInSats is still from the initial _spendToken call.
+       * Let → let and the block below re-derives the correct balance.
+       */
 
       callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
 
@@ -528,6 +580,32 @@ export class RoutstrClient {
       // Process streaming response
       if (response.status === 200) {
         const baseUrlUsed = (response as any).baseUrl || baseUrl;
+        const responseToken = (response as any).token || token;
+
+        // If failover occurred, re-derive the balance for the actual token
+        // used.  This guards against the same stale-balance bug described in
+        // _prepareRoutedRequest.
+        if (baseUrlUsed !== baseUrl || responseToken !== token) {
+          token = responseToken;
+          try {
+            const actualBalance = await this.balanceManager.getTokenBalance(
+              responseToken,
+              baseUrlUsed
+            );
+            if (actualBalance.amount >= 0 && !actualBalance.balanceUnknown) {
+              tokenBalanceInSats =
+                actualBalance.unit === "msat"
+                  ? actualBalance.amount / 1000
+                  : actualBalance.amount;
+            }
+          } catch (e) {
+            this._log(
+              "WARN",
+              "[RoutstrClient] Failed to get balance for failover token:",
+              e
+            );
+          }
+        }
 
         const streamingResult = await this.streamProcessor.process(
           response,
@@ -901,10 +979,19 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           tryNextProvider = true;
         } else {
-          const latestTokenBalance =
-            latestBalanceInfo.unit === "msat"
+          const latestTokenBalance = latestBalanceInfo.balanceUnknown
+            ? undefined
+            : latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
+          /* [REMOVE] Was: `const latestTokenBalance = latestBalanceInfo.unit
+           * === "msat" ? latestBalanceInfo.amount / 1000 : latestBalanceInfo.amount;`
+           *
+           * With the old sentinel (-1), this would produce negative values
+           * when the balance couldn't be fetched. Now getTokenBalance returns
+           * amount=0 + balanceUnknown=true for failure cases, so we must gate
+           * on balanceUnknown to avoid treating 0 as a real balance.
+           */
 
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
@@ -917,7 +1004,11 @@ export class RoutstrClient {
             retryToken = latestBalanceInfo.apiKey;
           }
 
-          if (latestTokenBalance >= 0) {
+          if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
+            /* [REMOVE] Was: `if (latestTokenBalance >= 0) {`
+             * When balanceUnknown, latestTokenBalance is undefined, not a
+             * number.  Skip the balance update instead of writing stale data.
+             */
             this.storageAdapter.updateApiKeyBalance(
               baseUrl,
               latestTokenBalance
@@ -1008,7 +1099,13 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
-        if (!refundResult.success && latestBalanceInfo.amount > 0) {
+        if (!refundResult.success && latestBalanceInfo.amount > 0 && !latestBalanceInfo.balanceUnknown) {
+          /* [REMOVE] Was: `if (!refundResult.success && latestBalanceInfo.amount > 0) {`
+           * Old sentinel (-1) was < 0 so this branch never fired for failed
+           * balance lookups.  Now amount=0 + balanceUnknown, so we must also
+           * skip when the balance is unknown — we shouldn't throw a
+           * ProviderError based on a balance we couldn't fetch.
+           */
           throw new ProviderError(
             baseUrl,
             status,
@@ -1155,10 +1252,29 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey,
           baseUrl
         );
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
+        const latestTokenBalance = latestBalanceInfo.balanceUnknown
+          ? undefined
+          : latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
+        /* [REMOVE] Was: `const latestTokenBalance = latestBalanceInfo.unit
+         * === "msat" ? latestBalanceInfo.amount / 1000 : latestBalanceInfo.amount;`
+         *
+         * This is _handlePostResponseBalanceUpdate — the critical path where
+         * satsSpent = initialTokenBalance - latestTokenBalance is computed.
+         *
+         * Old flow with sentinel (-1):
+         *   - Bad provider returns 401 → getTokenBalance returns amount=-1
+         *   - Failover to good provider, but initialTokenBalance captured
+         *     from the stale _spendToken is -0.001
+         *   - Good provider's balance is 1659.748
+         *   - satsSpent = -0.001 - 1659.748 = -1659.749 ← NEGATIVE BUG
+         *
+         * Fix: when balanceUnknown, fall back to fallbackSatsSpent (the
+         * estimated cost based on usage) instead of computing garbage.
+         * The failover re-derive blocks in _prepareRoutedRequest and
+         * fetchAIResponse handle the common case; this is defense-in-depth.
+         */
 
         const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
         if (
@@ -1168,9 +1284,14 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
-        this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        if (latestTokenBalance !== undefined) {
+          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        }
 
-        satsSpent = initialTokenBalance - latestTokenBalance;
+        satsSpent =
+          latestTokenBalance !== undefined
+            ? initialTokenBalance - latestTokenBalance
+            : (fallbackSatsSpent ?? initialTokenBalance);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
         satsSpent = fallbackSatsSpent ?? initialTokenBalance;
@@ -1547,6 +1668,11 @@ export class RoutstrClient {
           );
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
+          // Don't treat a zero/unknown balance as authoritative; we'll rely
+          // on the failover re-derive in the calling function instead.
+          if (balanceInfo.balanceUnknown) {
+            tokenBalance = 0;
+          }
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }

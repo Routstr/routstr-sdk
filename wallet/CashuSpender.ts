@@ -660,7 +660,14 @@ export class CashuSpender {
             continue;
           }
 
-          if (balanceResult.amount >= 0) {
+          /* [REMOVE] Was: `if (balanceResult.amount >= 0) {`
+           * With the old sentinel (-1), this would be false when the balance
+           * couldn't be fetched, falling through to the stale-local-balance
+           * warning.  Now amount=0 + balanceUnknown, so we must also skip
+           * when the balance is unknown — don't overwrite stored balance
+           * with 0.
+           */
+          if (balanceResult.amount >= 0 && !balanceResult.balanceUnknown) {
             const balanceSat = balanceResult.unit === "msat"
               ? Math.floor(balanceResult.amount / 1000)
               : balanceResult.amount;
