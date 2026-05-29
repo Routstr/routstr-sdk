@@ -95,6 +95,35 @@ export const createModelsDatabaseBun = (
   // Create schema
   db.run(SCHEMA_DDL(tableName));
 
+  const runTransaction = (fn: () => void): void => {
+    db.run("BEGIN");
+    try {
+      fn();
+      db.run("COMMIT");
+    } catch (error) {
+      db.run("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const replaceProviderModels = (
+    baseUrl: string,
+    models: Model[],
+    cachedAt: number,
+  ): void => {
+    runTransaction(() => {
+      db.query(`DELETE FROM ${tableName} WHERE base_url = ?`).run(baseUrl);
+      for (const model of models) {
+        db.query(
+          `INSERT OR REPLACE INTO ${tableName} (id, base_url, data) VALUES (?, ?, ?)`,
+        ).run(model.id, baseUrl, JSON.stringify(model));
+      }
+      db.query(
+        `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update) VALUES (?, ?)`,
+      ).run(baseUrl, cachedAt);
+    });
+  };
+
   // ---- Migration ----
 
   let migrationComplete = false;
@@ -122,22 +151,8 @@ export const createModelsDatabaseBun = (
     if (Object.keys(legacyModels).length > 0) {
       for (const [baseUrl, models] of Object.entries(legacyModels)) {
         const normalized = normalizeBaseUrl(baseUrl);
-
-        // Delete existing, then insert
-        db.query(`DELETE FROM ${tableName} WHERE base_url = ?`).run(
-          normalized,
-        );
-        for (const model of models) {
-          db.query(
-            `INSERT OR REPLACE INTO ${tableName} (id, base_url, data) VALUES (?, ?, ?)`,
-          ).run(model.id, normalized, JSON.stringify(model));
-        }
-
-        if (legacyTimestamps[normalized]) {
-          db.query(
-            `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update) VALUES (?, ?)`,
-          ).run(normalized, legacyTimestamps[normalized]);
-        }
+        const cachedAt = legacyTimestamps[normalized] ?? Date.now();
+        replaceProviderModels(normalized, models, cachedAt);
       }
 
       await legacyStorageDriver.removeItem(
@@ -161,19 +176,7 @@ export const createModelsDatabaseBun = (
       cachedAt: number,
     ): void {
       const normalized = normalizeBaseUrl(baseUrl);
-
-      // Delete existing, then insert
-      db.query(`DELETE FROM ${tableName} WHERE base_url = ?`).run(normalized);
-      for (const model of models) {
-        db.query(
-          `INSERT OR REPLACE INTO ${tableName} (id, base_url, data) VALUES (?, ?, ?)`,
-        ).run(model.id, normalized, JSON.stringify(model));
-      }
-
-      // Update timestamp
-      db.query(
-        `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update) VALUES (?, ?)`,
-      ).run(normalized, cachedAt);
+      replaceProviderModels(normalized, models, cachedAt);
     },
 
     getProviderModels(baseUrl: string): Model[] {
@@ -206,11 +209,19 @@ export const createModelsDatabaseBun = (
 
     clearProvider(baseUrl: string): void {
       const normalized = normalizeBaseUrl(baseUrl);
-      db.query(`DELETE FROM ${tableName} WHERE base_url = ?`).run(normalized);
+      runTransaction(() => {
+        db.query(`DELETE FROM ${tableName} WHERE base_url = ?`).run(normalized);
+        db.query(`DELETE FROM ${timestampsTable} WHERE base_url = ?`).run(
+          normalized,
+        );
+      });
     },
 
     clearAll(): void {
-      db.query(`DELETE FROM ${tableName}`).run();
+      runTransaction(() => {
+        db.query(`DELETE FROM ${tableName}`).run();
+        db.query(`DELETE FROM ${timestampsTable}`).run();
+      });
     },
 
     deleteStale(maxAgeMs: number): number {
@@ -242,12 +253,14 @@ export const createModelsDatabaseBun = (
     },
 
     setAllProviderLastUpdates(updates: Record<string, number>): void {
-      for (const [baseUrl, timestamp] of Object.entries(updates)) {
-        const normalized = normalizeBaseUrl(baseUrl);
-        db.query(
-          `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update) VALUES (?, ?)`,
-        ).run(normalized, timestamp);
-      }
+      runTransaction(() => {
+        for (const [baseUrl, timestamp] of Object.entries(updates)) {
+          const normalized = normalizeBaseUrl(baseUrl);
+          db.query(
+            `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update) VALUES (?, ?)`,
+          ).run(normalized, timestamp);
+        }
+      });
     },
   };
 };

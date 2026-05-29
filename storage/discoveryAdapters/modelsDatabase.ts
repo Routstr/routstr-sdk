@@ -115,10 +115,10 @@ export interface ModelsDatabase {
   /** Get all models grouped by base_url */
   getAllModels(): Record<string, Model[]>;
 
-  /** Remove all models for a single provider */
+  /** Remove all models and timestamp metadata for a single provider */
   clearProvider(baseUrl: string): void;
 
-  /** Remove every model */
+  /** Remove every model and timestamp metadata */
   clearAll(): void;
 
   /** Delete models older than `maxAgeMs` (based on per-row cached_at derived from timestamp table) */
@@ -161,9 +161,19 @@ export const createModelsDatabase = (
   let selectAllStmt: ReturnType<BetterSqlite3Database["prepare"]>;
   let deleteByBaseStmt: ReturnType<BetterSqlite3Database["prepare"]>;
   let deleteAllStmt: ReturnType<BetterSqlite3Database["prepare"]>;
+  let deleteAllTsStmt: ReturnType<BetterSqlite3Database["prepare"]>;
+  let deleteTsByBaseStmt: ReturnType<BetterSqlite3Database["prepare"]>;
   let deleteStaleStmt: ReturnType<BetterSqlite3Database["prepare"]>;
   let selectTsStmt: ReturnType<BetterSqlite3Database["prepare"]>;
   let upsertTsStmt: ReturnType<BetterSqlite3Database["prepare"]>;
+  let replaceProviderModelsTx: (
+    baseUrl: string,
+    models: Model[],
+    cachedAt: number,
+  ) => void;
+  let clearProviderTx: (baseUrl: string) => void;
+  let clearAllTx: () => void;
+  let setAllProviderLastUpdatesTx: (updates: Record<string, number>) => void;
 
   const initDb = async () => {
     if (db) return;
@@ -182,6 +192,10 @@ export const createModelsDatabase = (
       `DELETE FROM ${tableName} WHERE base_url = ?`,
     );
     deleteAllStmt = db.prepare(`DELETE FROM ${tableName}`);
+    deleteAllTsStmt = db.prepare(`DELETE FROM ${timestampsTable}`);
+    deleteTsByBaseStmt = db.prepare(
+      `DELETE FROM ${timestampsTable} WHERE base_url = ?`,
+    );
     deleteStaleStmt = db.prepare(
       `DELETE FROM ${tableName}
        WHERE base_url IN (
@@ -196,6 +210,46 @@ export const createModelsDatabase = (
       `INSERT OR REPLACE INTO ${timestampsTable} (base_url, last_update)
        VALUES (?, ?)`,
     );
+
+    replaceProviderModelsTx = db.transaction(
+      (...args: unknown[]): void => {
+        const [baseUrl, models, cachedAt] = args as [string, Model[], number];
+        deleteByBaseStmt.run(baseUrl);
+        for (const model of models) {
+          upsertStmt.run(model.id, baseUrl, JSON.stringify(model));
+        }
+        upsertTsStmt.run(baseUrl, cachedAt);
+      },
+    ) as (baseUrl: string, models: Model[], cachedAt: number) => void;
+
+    clearProviderTx = db.transaction((...args: unknown[]): void => {
+      const [baseUrl] = args as [string];
+      deleteByBaseStmt.run(baseUrl);
+      deleteTsByBaseStmt.run(baseUrl);
+    }) as (baseUrl: string) => void;
+
+    clearAllTx = db.transaction((): void => {
+      deleteAllStmt.run();
+      deleteAllTsStmt.run();
+    }) as () => void;
+
+    setAllProviderLastUpdatesTx = db.transaction(
+      (...args: unknown[]): void => {
+        const [updates] = args as [Record<string, number>];
+        for (const [baseUrl, timestamp] of Object.entries(updates)) {
+          const normalized = normalizeBaseUrl(baseUrl);
+          upsertTsStmt.run(normalized, timestamp);
+        }
+      },
+    ) as (updates: Record<string, number>) => void;
+  };
+
+  const assertInitialized = (): void => {
+    if (!db) {
+      throw new Error(
+        "ModelsDatabase is not initialized. Call await modelsDb.migrate() before using synchronous methods.",
+      );
+    }
   };
 
   const ensureInit = async () => {
@@ -240,11 +294,8 @@ export const createModelsDatabase = (
     if (Object.keys(legacyModels).length > 0) {
       for (const [baseUrl, models] of Object.entries(legacyModels)) {
         const normalized = normalizeBaseUrl(baseUrl);
-        upsertProviderModelsInternal(normalized, models);
-
-        if (legacyTimestamps[normalized]) {
-          upsertTsStmt.run(normalized, legacyTimestamps[normalized]);
-        }
+        const cachedAt = legacyTimestamps[normalized] ?? Date.now();
+        replaceProviderModelsTx(normalized, models, cachedAt);
       }
 
       // Clear old data after migration
@@ -263,12 +314,9 @@ export const createModelsDatabase = (
   const upsertProviderModelsInternal = (
     baseUrl: string,
     models: Model[],
+    cachedAt: number,
   ): void => {
-    // Delete existing rows for this provider first, then insert
-    deleteByBaseStmt.run(baseUrl);
-    for (const model of models) {
-      upsertStmt.run(model.id, baseUrl, JSON.stringify(model));
-    }
+    replaceProviderModelsTx(baseUrl, models, cachedAt);
   };
 
   // ---- Public API ----
@@ -284,12 +332,13 @@ export const createModelsDatabase = (
       models: Model[],
       cachedAt: number,
     ): void {
+      assertInitialized();
       const normalized = normalizeBaseUrl(baseUrl);
-      upsertProviderModelsInternal(normalized, models);
-      upsertTsStmt.run(normalized, cachedAt);
+      upsertProviderModelsInternal(normalized, models, cachedAt);
     },
 
     getProviderModels(baseUrl: string): Model[] {
+      assertInitialized();
       const normalized = normalizeBaseUrl(baseUrl);
       const rows = selectByBaseStmt.all(normalized) as { data: string }[];
       const models: Model[] = [];
@@ -301,6 +350,7 @@ export const createModelsDatabase = (
     },
 
     getAllModels(): Record<string, Model[]> {
+      assertInitialized();
       const rows = selectAllStmt.all() as {
         id: string;
         base_url: string;
@@ -318,21 +368,25 @@ export const createModelsDatabase = (
     },
 
     clearProvider(baseUrl: string): void {
+      assertInitialized();
       const normalized = normalizeBaseUrl(baseUrl);
-      deleteByBaseStmt.run(normalized);
+      clearProviderTx(normalized);
     },
 
     clearAll(): void {
-      deleteAllStmt.run();
+      assertInitialized();
+      clearAllTx();
     },
 
     deleteStale(maxAgeMs: number): number {
+      assertInitialized();
       const cutoff = Date.now() - maxAgeMs;
       const result = deleteStaleStmt.run(cutoff);
       return result.changes;
     },
 
     getProviderLastUpdate(baseUrl: string): number | null {
+      assertInitialized();
       const normalized = normalizeBaseUrl(baseUrl);
       const row = selectTsStmt.get(normalized) as
         | { last_update: number }
@@ -341,15 +395,14 @@ export const createModelsDatabase = (
     },
 
     setProviderLastUpdate(baseUrl: string, timestamp: number): void {
+      assertInitialized();
       const normalized = normalizeBaseUrl(baseUrl);
       upsertTsStmt.run(normalized, timestamp);
     },
 
     setAllProviderLastUpdates(updates: Record<string, number>): void {
-      for (const [baseUrl, timestamp] of Object.entries(updates)) {
-        const normalized = normalizeBaseUrl(baseUrl);
-        upsertTsStmt.run(normalized, timestamp);
-      }
+      assertInitialized();
+      setAllProviderLastUpdatesTx(updates);
     },
   };
 };

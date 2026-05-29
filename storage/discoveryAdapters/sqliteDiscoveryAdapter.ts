@@ -109,6 +109,17 @@ export const createSqliteDiscoveryAdapter = async (
     getCachedModels: () => modelsDb.getAllModels(),
 
     setCachedModels: (models: Record<string, Model[]>) => {
+      const existing = modelsDb.getAllModels();
+      const nextKeys = new Set(
+        Object.keys(models).map((baseUrl) => normalizeBaseUrl(baseUrl)),
+      );
+
+      for (const baseUrl of Object.keys(existing)) {
+        if (!nextKeys.has(normalizeBaseUrl(baseUrl))) {
+          modelsDb.clearProvider(baseUrl);
+        }
+      }
+
       for (const [baseUrl, modelList] of Object.entries(models)) {
         const normalized = normalizeBaseUrl(baseUrl);
         const ts = modelsDb.getProviderLastUpdate(normalized) ?? Date.now();
