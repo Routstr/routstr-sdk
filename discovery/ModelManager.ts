@@ -13,7 +13,9 @@ import {
 } from "../core/errors";
 import { onlyEvents, RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
+import type { NostrEvent } from "applesauce-core/helpers";
 import { tap } from "rxjs";
+import { BetterSqlite3EventDatabase } from "applesauce-sqlite/better-sqlite3";
 
 /**
  * Configuration for ModelManager
@@ -31,6 +33,10 @@ export interface ModelManagerConfig {
   routstrPubkey?: string;
   /** Optional injectable logger */
   logger?: SdkLogger;
+  /** Path to SQLite database for persistent Nostr event storage.
+   * If provided, relay-fetched events (kinds 38421, 38423, 38425) are
+   * persisted and survive process restarts. */
+  eventStoreDbPath?: string;
 }
 
 /**
@@ -45,6 +51,8 @@ export class ModelManager {
   private readonly routstrPubkey: string;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
+  /** Persistent event store for relay-fetched events (null if not configured) */
+  private readonly eventStore: EventStore | null = null;
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -59,6 +67,13 @@ export class ModelManager {
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
+
+    // Initialize persistent event store if db path provided
+    if (config.eventStoreDbPath) {
+      const db = new BetterSqlite3EventDatabase(config.eventStoreDbPath);
+      this.eventStore = new EventStore({ database: db });
+      this.logger.log(`Persistent event store initialized at ${config.eventStoreDbPath}`);
+    }
   }
 
   /**
@@ -67,6 +82,36 @@ export class ModelManager {
    */
   getBaseUrls(): string[] {
     return this.adapter.getBaseUrlsList();
+  }
+
+  /**
+   * Get the persistent event store, if configured.
+   * Returns null if no eventStoreDbPath was provided.
+   */
+  getEventStore(): EventStore | null {
+    return this.eventStore;
+  }
+
+  /**
+   * Check the persistent event store for fresh cached events.
+   * Returns events from SQLite if they are newer than `cacheTTL` ago,
+   * otherwise returns empty array (caller should hit relays).
+   */
+  private getCachedNostrEvents(
+    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[] },
+    maxAge: number
+  ): NostrEvent[] {
+    if (!this.eventStore) return [];
+
+    const timeline = this.eventStore.getTimeline(filter);
+    if (timeline.length === 0) return [];
+
+    // Check freshness: at least one event must be newer than maxAge ago
+    const cutoff = Date.now() - maxAge;
+    const freshest = Math.max(...timeline.map((e) => e.created_at * 1000));
+    if (freshest < cutoff) return [];
+
+    return timeline;
   }
 
   static async init(
@@ -148,40 +193,47 @@ export class ModelManager {
       "wss://relay.damus.io",
     ];
 
-    const pool = new RelayPool();
-    const localEventStore = new EventStore();
+    // Check persistent store first
+    const cached = this.getCachedNostrEvents({ kinds: [kind] }, this.cacheTTL);
+    let sessionEvents: NostrEvent[] = cached;
 
-    const timeoutMs = 5000;
+    if (cached.length === 0) {
+      const pool = new RelayPool();
 
-    await new Promise<void>((resolve) => {
-      pool
-        .req(DEFAULT_RELAYS, {
-          kinds: [kind],
-          limit: 100,
-        })
-        .pipe(
-          onlyEvents(),
-          tap((event) => {
-            localEventStore.add(event);
+      const timeoutMs = 5000;
+
+      await new Promise<void>((resolve) => {
+        pool
+          .req(DEFAULT_RELAYS, {
+            kinds: [kind],
+            limit: 100,
           })
-        )
-        .subscribe({
-          complete: () => {
-            resolve();
-          },
-        });
+          .pipe(
+            onlyEvents(),
+            tap((event) => {
+              sessionEvents.push(event);
+              // Persist to durable store if configured
+              this.eventStore?.add(event);
+            })
+          )
+          .subscribe({
+            complete: () => {
+              resolve();
+            },
+          });
 
-      setTimeout(() => {
-        resolve();
-      }, timeoutMs);
-    });
-
-    const timeline = localEventStore.getTimeline({ kinds: [kind] });
+        setTimeout(() => {
+          resolve();
+        }, timeoutMs);
+      });
+    } else {
+      this.logger.log(`Using ${cached.length} cached kind ${kind} events from persistent store`);
+    }
 
     const bases = new Set<string>();
     this.providerNodePubkeysByUrl = new Map();
 
-    for (const event of timeline) {
+    for (const event of sessionEvents) {
       const eventUrls: string[] = [];
 
       for (const tag of event.tags) {
@@ -345,33 +397,46 @@ export class ModelManager {
     }
 
     // Fetch kind 38425 lgtm reviews
-    const LGTM_RELAYS = [
-      "wss://relay.primal.net",
-      "wss://nos.lol",
-      "wss://relay.damus.io",
-      "wss://relay.routstr.com",
-    ];
     const reviewedNodePubkeys = new Set<string>();
     {
-      const pool = new RelayPool();
-      const store = new EventStore();
-      const timeoutMs = 5000;
-      await new Promise<void>((resolve) => {
-        pool
-          .req(LGTM_RELAYS, {
-            kinds: [38425],
-            "#t": ["lgtm"],
-            limit: 500,
-            authors: [this.routstrPubkey],
-          })
-          .pipe(
-            onlyEvents(),
-            tap((event) => store.add(event))
-          )
-          .subscribe({ complete: () => resolve() });
-        setTimeout(() => resolve(), timeoutMs);
-      });
-      for (const event of store.getTimeline({ kinds: [38425] })) {
+      // Check persistent store first
+      const cached = this.getCachedNostrEvents(
+        { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
+        this.cacheTTL
+      );
+      let sessionEvents: NostrEvent[] = cached;
+
+      if (cached.length === 0) {
+        const LGTM_RELAYS = [
+          "wss://relay.primal.net",
+          "wss://nos.lol",
+          "wss://relay.damus.io",
+          "wss://relay.routstr.com",
+        ];
+        const pool = new RelayPool();
+        const timeoutMs = 5000;
+        await new Promise<void>((resolve) => {
+          pool
+            .req(LGTM_RELAYS, {
+              kinds: [38425],
+              "#t": ["lgtm"],
+              limit: 500,
+              authors: [this.routstrPubkey],
+            })
+            .pipe(
+              onlyEvents(),
+              tap((event) => {
+                sessionEvents.push(event);
+                this.eventStore?.add(event);
+              })
+            )
+            .subscribe({ complete: () => resolve() });
+          setTimeout(() => resolve(), timeoutMs);
+        });
+      } else {
+        this.logger.log(`Using ${cached.length} cached kind 38425 events from persistent store`);
+      }
+      for (const event of sessionEvents) {
         const hasLgtmTag = event.tags.some(
           (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
         );
@@ -662,43 +727,53 @@ export class ModelManager {
       "wss://relay.routstr.com",
     ];
 
-    const pool = new RelayPool();
-    const localEventStore = new EventStore();
+    // Check persistent store first
+    const cached = this.getCachedNostrEvents(
+      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
+      this.cacheTTL
+    );
+    let sessionEvents: NostrEvent[] = cached;
 
-    const timeoutMs = 5000;
+    if (cached.length === 0) {
+      const pool = new RelayPool();
 
-    await new Promise<void>((resolve) => {
-      pool
-        .req(DEFAULT_RELAYS, {
-          kinds: [38423],
-          "#d": ["routstr-21-models"],
-          limit: 1,
-          authors: [this.routstrPubkey],
-        })
-        .pipe(
-          onlyEvents(),
-          tap((event) => {
-            localEventStore.add(event);
+      const timeoutMs = 5000;
+
+      await new Promise<void>((resolve) => {
+        pool
+          .req(DEFAULT_RELAYS, {
+            kinds: [38423],
+            "#d": ["routstr-21-models"],
+            limit: 1,
+            authors: [this.routstrPubkey],
           })
-        )
-        .subscribe({
-          complete: () => {
-            resolve();
-          },
-        });
+          .pipe(
+            onlyEvents(),
+            tap((event) => {
+              sessionEvents.push(event);
+              // Persist to durable store if configured
+              this.eventStore?.add(event);
+            })
+          )
+          .subscribe({
+            complete: () => {
+              resolve();
+            },
+          });
 
-      setTimeout(() => {
-        resolve();
-      }, timeoutMs);
-    });
+        setTimeout(() => {
+          resolve();
+        }, timeoutMs);
+      });
+    } else {
+      this.logger.log(`Using ${cached.length} cached kind 38423 events from persistent store`);
+    }
 
-    const timeline = localEventStore.getTimeline({ kinds: [38423] });
-
-    if (timeline.length === 0) {
+    if (sessionEvents.length === 0) {
       return cachedModels.length > 0 ? cachedModels : [];
     }
 
-    const event = timeline[0];
+    const event = sessionEvents[0];
 
     try {
       const content = JSON.parse(event.content);
