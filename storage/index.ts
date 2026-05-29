@@ -20,6 +20,7 @@ import {
   createStorageAdapterFromStore,
   type SdkStore,
 } from "./store";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 
 export type { StorageDriver } from "./types";
 export type { SdkStore } from "./store";
@@ -50,6 +51,16 @@ export {
   createSqliteUsageTrackingDriver,
   createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
+import {
+  createModelsDatabase,
+  createSqliteDiscoveryAdapter,
+} from "./discoveryAdapters";
+export {
+  createModelsDatabase,
+  createModelsDatabaseBun,
+  createSqliteDiscoveryAdapter,
+} from "./discoveryAdapters";
+export type { ModelsDatabase, SqliteDiscoveryAdapterOptions } from "./discoveryAdapters";
 
 const isBrowser = (): boolean => {
   try {
@@ -143,8 +154,30 @@ export const setDefaultUsageTrackingDriver = (driver: UsageTrackingDriver): void
   defaultUsageTrackingDriver = driver;
 };
 
-export const getDefaultDiscoveryAdapter = async () =>
-  createDiscoveryAdapterFromStore(await getDefaultSdkStore());
+let defaultDiscoveryAdapter: DiscoveryAdapter | null = null;
+
+export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> => {
+  if (defaultDiscoveryAdapter) return defaultDiscoveryAdapter;
+
+  const driver = getDefaultSdkDriver();
+
+  // In Node, use SQLite-backed adapter for efficient model storage
+  if (isNode() && !isBun()) {
+    try {
+      const modelsDb = createModelsDatabase({
+        legacyStorageDriver: driver,
+      });
+      defaultDiscoveryAdapter = await createSqliteDiscoveryAdapter({ modelsDb, kv: driver });
+      return defaultDiscoveryAdapter;
+    } catch {
+      // Fall back to store-based adapter if better-sqlite3 is unavailable
+    }
+  }
+
+  const store = await getDefaultSdkStore();
+  defaultDiscoveryAdapter = createDiscoveryAdapterFromStore(store);
+  return defaultDiscoveryAdapter;
+};
 
 export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
