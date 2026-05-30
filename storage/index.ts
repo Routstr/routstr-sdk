@@ -15,7 +15,6 @@ import {
 import type { StorageDriver } from "./types";
 import {
   createSdkStore,
-  createDiscoveryAdapterFromStore,
   createProviderRegistryFromStore,
   createStorageAdapterFromStore,
   type SdkStore,
@@ -52,21 +51,14 @@ export {
   createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
 import {
-  createModelsDatabase,
-  createModelsDatabaseIndexedDB,
-  createSqliteDiscoveryAdapter,
-} from "./discoveryAdapters";
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
 export {
-  createModelsDatabase,
-  createModelsDatabaseBun,
-  createModelsDatabaseIndexedDB,
-  createSqliteDiscoveryAdapter,
-} from "./discoveryAdapters";
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
 export type {
-  ModelsDatabase,
-  SqliteDiscoveryAdapterOptions,
-  IndexedDBModelsDatabaseOptions,
-} from "./discoveryAdapters";
+  ShardedDiscoveryAdapterOptions,
+} from "./shardedDiscoveryAdapter";
 
 const isBrowser = (): boolean => {
   try {
@@ -166,38 +158,7 @@ export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> =>
   if (defaultDiscoveryAdapter) return defaultDiscoveryAdapter;
 
   const driver = getDefaultSdkDriver();
-
-  // In browsers, use IndexedDB-backed adapter for efficient model storage
-  if (isBrowser()) {
-    try {
-      const modelsDb = createModelsDatabaseIndexedDB({
-        legacyStorageDriver: driver,
-      });
-      defaultDiscoveryAdapter = await createSqliteDiscoveryAdapter({
-        modelsDb,
-        kv: driver,
-      });
-      return defaultDiscoveryAdapter;
-    } catch {
-      // Fall back to store-based adapter if IndexedDB is unavailable
-    }
-  }
-
-  // In Node, use SQLite-backed adapter for efficient model storage
-  if (isNode() && !isBun()) {
-    try {
-      const modelsDb = createModelsDatabase({
-        legacyStorageDriver: driver,
-      });
-      defaultDiscoveryAdapter = await createSqliteDiscoveryAdapter({ modelsDb, kv: driver });
-      return defaultDiscoveryAdapter;
-    } catch {
-      // Fall back to store-based adapter if better-sqlite3 is unavailable
-    }
-  }
-
-  const store = await getDefaultSdkStore();
-  defaultDiscoveryAdapter = createDiscoveryAdapterFromStore(store);
+  defaultDiscoveryAdapter = await createShardedDiscoveryAdapter({ driver });
   return defaultDiscoveryAdapter;
 };
 
