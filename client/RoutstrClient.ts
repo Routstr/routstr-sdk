@@ -225,6 +225,8 @@ export class RoutstrClient {
         baseUrl: prepared.baseUrlUsed,
         mintUrl: params.mintUrl,
         initialTokenBalance: prepared.tokenBalanceInSats,
+        initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
+        fallbackSatsSpent: usage?.satsCost,
         response: prepared.response,
         modelId: prepared.modelId,
         usage,
@@ -258,6 +260,7 @@ export class RoutstrClient {
     tokenUsed: string;
     baseUrlUsed: string;
     tokenBalanceInSats: number;
+    tokenBalanceUnknown: boolean;
     modelId?: string;
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
@@ -323,7 +326,7 @@ export class RoutstrClient {
       }
     }
 
-    const { token, tokenBalance, tokenBalanceUnit } = await this._spendToken({
+    const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = await this._spendToken({
       mintUrl,
       amount: requiredSats,
       baseUrl,
@@ -354,10 +357,25 @@ export class RoutstrClient {
       selectedModel,
     });
 
-    const tokenBalanceInSats =
+    let tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    let initialTokenBalanceUnknown = tokenBalanceUnknown;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
+
+    // If failover occurred, use the initial balance captured when the
+    // failover token was created. Do not query here: by the time fetch returns,
+    // the provider may already have charged the request.
+    if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
+      if (typeof (response as any).initialTokenBalanceInSats === "number") {
+        tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
+        initialTokenBalanceUnknown = Boolean(
+          (response as any).initialTokenBalanceUnknown
+        );
+      } else {
+        initialTokenBalanceUnknown = true;
+      }
+    }
 
     const contentType = response.headers.get("content-type") || "";
     let processedResponse = response;
@@ -402,6 +420,7 @@ export class RoutstrClient {
       tokenUsed,
       baseUrlUsed,
       tokenBalanceInSats,
+      tokenBalanceUnknown: initialTokenBalanceUnknown,
       modelId,
       capturedUsage,
       capturedResponseId,
@@ -469,8 +488,9 @@ export class RoutstrClient {
       let tokenBalance = spendResult.tokenBalance;
       let tokenBalanceUnit = spendResult.tokenBalanceUnit;
 
-      const tokenBalanceInSats =
+      let tokenBalanceInSats =
         tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+      let initialTokenBalanceUnknown = spendResult.tokenBalanceUnknown;
 
       callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
 
@@ -528,6 +548,22 @@ export class RoutstrClient {
       // Process streaming response
       if (response.status === 200) {
         const baseUrlUsed = (response as any).baseUrl || baseUrl;
+        const responseToken = (response as any).token || token;
+
+        // If failover occurred, use the initial balance captured when the
+        // failover token was created. Do not query here: by the time fetch
+        // returns, the provider may already have charged the request.
+        if (baseUrlUsed !== baseUrl || responseToken !== token) {
+          token = responseToken;
+          if (typeof (response as any).initialTokenBalanceInSats === "number") {
+            tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
+            initialTokenBalanceUnknown = Boolean(
+              (response as any).initialTokenBalanceUnknown
+            );
+          } else {
+            initialTokenBalanceUnknown = true;
+          }
+        }
 
         const streamingResult = await this.streamProcessor.process(
           response,
@@ -570,6 +606,7 @@ export class RoutstrClient {
           baseUrl: baseUrlUsed,
           mintUrl,
           initialTokenBalance: tokenBalanceInSats,
+          initialTokenBalanceUnknown,
           fallbackSatsSpent: isApikeysEstimate
             ? this._getEstimatedCosts(selectedModel, streamingResult)
             : undefined,
@@ -786,22 +823,35 @@ export class RoutstrClient {
           params.token,
           baseUrl
         );
-        const currentBalance =
-          currentBalanceInfo.unit === "msat"
-            ? currentBalanceInfo.amount / 1000
-            : currentBalanceInfo.amount;
-        const reservedBalance =
-          currentBalanceInfo.unit === "msat"
-            ? (currentBalanceInfo.reserved ?? 0) / 1000
-            : (currentBalanceInfo.reserved ?? 0);
+        if (currentBalanceInfo.balanceUnknown) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Current balance unknown for ${baseUrl}; using default topup amount=${topupAmount}`
+          );
+        } else {
+          const currentBalance =
+            currentBalanceInfo.unit === "msat"
+              ? currentBalanceInfo.amount / 1000
+              : currentBalanceInfo.amount;
+          const reservedBalance =
+            currentBalanceInfo.unit === "msat"
+              ? (currentBalanceInfo.reserved ?? 0) / 1000
+              : (currentBalanceInfo.reserved ?? 0);
 
-        const shortfall = Math.max(0, params.requiredSats - currentBalance + reservedBalance);
-        topupAmount = shortfall > (0.21 * params.requiredSats) ? shortfall : (0.21 * params.requiredSats);
+          const shortfall = Math.max(
+            0,
+            params.requiredSats - currentBalance + reservedBalance
+          );
+          topupAmount =
+            shortfall > 0.21 * params.requiredSats
+              ? shortfall
+              : 0.21 * params.requiredSats;
 
-        this._log(
-          "DEBUG",
-          `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
-        );
+          this._log(
+            "DEBUG",
+            `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
+          );
+        }
       } catch (e) {
         this._log(
           "WARN",
@@ -901,8 +951,9 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           tryNextProvider = true;
         } else {
-          const latestTokenBalance =
-            latestBalanceInfo.unit === "msat"
+          const latestTokenBalance = latestBalanceInfo.balanceUnknown
+            ? undefined
+            : latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
 
@@ -917,7 +968,7 @@ export class RoutstrClient {
             retryToken = latestBalanceInfo.apiKey;
           }
 
-          if (latestTokenBalance >= 0) {
+          if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
             this.storageAdapter.updateApiKeyBalance(
               baseUrl,
               latestTokenBalance
@@ -1008,7 +1059,11 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
-        if (!refundResult.success && latestBalanceInfo.amount > 0) {
+        if (
+          !refundResult.success &&
+          latestBalanceInfo.amount > 0 &&
+          !latestBalanceInfo.balanceUnknown
+        ) {
           throw new ProviderError(
             baseUrl,
             status,
@@ -1071,8 +1126,10 @@ export class RoutstrClient {
         baseUrl: nextProvider,
       });
 
-      // Retry with new provider (reset retry count)
-      return this._makeRequest({
+      // Retry with new provider (reset retry count). Attach the balance that
+      // was observed before the retry request so callers do not have to query
+      // after the provider may already have charged the request.
+      const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
@@ -1084,6 +1141,13 @@ export class RoutstrClient {
         headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
         retryCount: 0,
       });
+      (retryResponse as any).initialTokenBalanceInSats =
+        spendResult.tokenBalanceUnit === "msat"
+          ? spendResult.tokenBalance / 1000
+          : spendResult.tokenBalance;
+      (retryResponse as any).initialTokenBalanceUnknown =
+        spendResult.tokenBalanceUnknown;
+      return retryResponse;
     }
 
     // No more providers to try
@@ -1101,6 +1165,7 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     initialTokenBalance: number;
+    initialTokenBalanceUnknown?: boolean;
     fallbackSatsSpent?: number;
     response?: Response;
     modelId?: string;
@@ -1113,6 +1178,7 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       initialTokenBalance,
+      initialTokenBalanceUnknown,
       fallbackSatsSpent,
       response,
       modelId,
@@ -1155,8 +1221,9 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey,
           baseUrl
         );
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
+        const latestTokenBalance = latestBalanceInfo.balanceUnknown
+          ? undefined
+          : latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
 
@@ -1168,12 +1235,17 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
-        this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        if (latestTokenBalance !== undefined) {
+          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        }
 
-        satsSpent = initialTokenBalance - latestTokenBalance;
+        satsSpent =
+          latestTokenBalance !== undefined && !initialTokenBalanceUnknown
+            ? Math.max(0, initialTokenBalance - latestTokenBalance)
+            : (fallbackSatsSpent ?? usage?.satsCost ?? 0);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
-        satsSpent = fallbackSatsSpent ?? initialTokenBalance;
+        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? 0;
       }
     }
 
@@ -1448,6 +1520,7 @@ export class RoutstrClient {
     token: string;
     tokenBalance: number;
     tokenBalanceUnit: "sat" | "msat";
+    tokenBalanceUnknown: boolean;
   }> {
     const { mintUrl, amount, baseUrl } = params;
 
@@ -1530,6 +1603,7 @@ export class RoutstrClient {
 
       let tokenBalance = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
+      let tokenBalanceUnknown = false;
 
       const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
       const distributionForBaseUrl = apiKeyDistribution.find(
@@ -1547,6 +1621,7 @@ export class RoutstrClient {
           );
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
+          tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
@@ -1561,6 +1636,7 @@ export class RoutstrClient {
         token: parentApiKey?.key ?? "",
         tokenBalance,
         tokenBalanceUnit,
+        tokenBalanceUnknown,
       };
     }
 
@@ -1594,6 +1670,7 @@ export class RoutstrClient {
       token: spendResult.token!,
       tokenBalance: spendResult.balance,
       tokenBalanceUnit: spendResult.unit ?? "sat",
+      tokenBalanceUnknown: false,
     };
   }
 
