@@ -15,11 +15,10 @@ import {
 import type { StorageDriver } from "./types";
 import {
   createSdkStore,
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
   type SdkStore,
 } from "./store";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 
 export type { StorageDriver } from "./types";
 export type { SdkStore } from "./store";
@@ -50,6 +49,17 @@ export {
   createSqliteUsageTrackingDriver,
   createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
+import {
+  createProviderRegistryFromDiscoveryAdapter,
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
+export {
+  createProviderRegistryFromDiscoveryAdapter,
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
+export type {
+  ShardedDiscoveryAdapterOptions,
+} from "./shardedDiscoveryAdapter";
 
 const isBrowser = (): boolean => {
   try {
@@ -143,11 +153,18 @@ export const setDefaultUsageTrackingDriver = (driver: UsageTrackingDriver): void
   defaultUsageTrackingDriver = driver;
 };
 
-export const getDefaultDiscoveryAdapter = async () =>
-  createDiscoveryAdapterFromStore(await getDefaultSdkStore());
+let defaultDiscoveryAdapter: DiscoveryAdapter | null = null;
+
+export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> => {
+  if (defaultDiscoveryAdapter) return defaultDiscoveryAdapter;
+
+  const driver = getDefaultSdkDriver();
+  defaultDiscoveryAdapter = await createShardedDiscoveryAdapter({ driver });
+  return defaultDiscoveryAdapter;
+};
 
 export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
 
 export const getDefaultProviderRegistry = async () =>
-  createProviderRegistryFromStore(await getDefaultSdkStore());
+  createProviderRegistryFromDiscoveryAdapter(await getDefaultDiscoveryAdapter());
