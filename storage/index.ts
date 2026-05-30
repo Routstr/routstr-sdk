@@ -15,7 +15,6 @@ import {
 import type { StorageDriver } from "./types";
 import {
   createSdkStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
   type SdkStore,
 } from "./store";
@@ -51,9 +50,11 @@ export {
   createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
 import {
+  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "./shardedDiscoveryAdapter";
 export {
+  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "./shardedDiscoveryAdapter";
 export type {
@@ -166,4 +167,4 @@ export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
 
 export const getDefaultProviderRegistry = async () =>
-  createProviderRegistryFromStore(await getDefaultSdkStore());
+  createProviderRegistryFromDiscoveryAdapter(await getDefaultDiscoveryAdapter());

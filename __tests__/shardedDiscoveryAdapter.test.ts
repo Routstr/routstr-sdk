@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   SDK_STORAGE_KEYS,
   createMemoryDriver,
+  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "../storage";
 import type { Model } from "../core/types";
@@ -151,6 +152,45 @@ describe("Sharded DiscoveryAdapter", () => {
     expect(
       adapter2.getProviderLastUpdate("https://provider-a.example.com"),
     ).toBe(999);
+  });
+
+  it("persists timestamp-only providers across re-creation", async () => {
+    const driver = createMemoryDriver();
+    const adapter1 = await createShardedDiscoveryAdapter({ driver });
+
+    adapter1.setProviderLastUpdate("https://provider-a.example.com", 1234);
+
+    const adapter2 = await createShardedDiscoveryAdapter({ driver });
+    expect(
+      adapter2.getProviderLastUpdate("https://provider-a.example.com"),
+    ).toBe(1234);
+  });
+
+  it("creates a provider registry backed by the sharded discovery adapter", async () => {
+    const driver = createMemoryDriver();
+    const adapter = await createShardedDiscoveryAdapter({ driver });
+    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
+
+    adapter.setCachedModels({
+      "https://provider-a.example.com": [model("model-a")],
+    });
+    adapter.setCachedMints({
+      "https://provider-a.example.com": ["https://mint.example.com"],
+    });
+    adapter.setDisabledProviders?.(["https://disabled.example.com"]);
+
+    expect(
+      registry.getModelsForProvider("https://provider-a.example.com"),
+    ).toEqual([model("model-a")]);
+    expect(registry.getAllProvidersModels()).toEqual({
+      "https://provider-a.example.com/": [model("model-a")],
+    });
+    expect(
+      registry.getProviderMints("https://provider-a.example.com"),
+    ).toEqual(["https://mint.example.com"]);
+    expect(registry.getDisabledProviders()).toEqual([
+      "https://disabled.example.com/",
+    ]);
   });
 
   it("passes through non-model fields from kv", async () => {

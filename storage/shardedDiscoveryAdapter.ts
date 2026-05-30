@@ -18,7 +18,9 @@
  */
 
 import type { DiscoveryAdapter } from "../discovery/interfaces";
-import type { Model, ProviderInfo } from "../core/types";
+import type { ProviderRegistry } from "../wallet/interfaces";
+import type { Model, ProviderInfo, SdkLogger } from "../core/types";
+import { consoleLogger } from "../core/types";
 import type { StorageDriver } from "./types";
 import { SDK_STORAGE_KEYS } from "./keys";
 
@@ -142,6 +144,7 @@ export const createShardedDiscoveryAdapter = async (
   // and the legacy blob (just migrated) in case a provider has been
   // configured but hasn't had models cached yet, or the index is
   // missing during migration.
+  const providerIndex = new Set<string>();
   const knownProviders = new Set<string>();
   for (const baseUrl of Object.keys(rawInfo)) {
     knownProviders.add(normalizeBaseUrl(baseUrl));
@@ -163,24 +166,31 @@ export const createShardedDiscoveryAdapter = async (
     [],
   );
   for (const baseUrl of indexProviders) {
-    knownProviders.add(normalizeBaseUrl(baseUrl));
+    const normalized = normalizeBaseUrl(baseUrl);
+    providerIndex.add(normalized);
+    knownProviders.add(normalized);
   }
 
   // Read sharded model data for each known provider
   for (const baseUrl of knownProviders) {
+    const normalized = normalizeBaseUrl(baseUrl);
     const models = await driver.getItem<Model[] | null>(
-      modelKey(baseUrl),
+      modelKey(normalized),
       null,
     );
-    if (models !== null) {
-      modelsByBaseUrl.set(normalizeBaseUrl(baseUrl), models);
-    }
     const ts = await driver.getItem<number | null>(
-      modelTsKey(baseUrl),
+      modelTsKey(normalized),
       null,
     );
+
+    if (models !== null) {
+      modelsByBaseUrl.set(normalized, models);
+    }
     if (ts !== null) {
-      timestampsByBaseUrl.set(normalizeBaseUrl(baseUrl), ts);
+      timestampsByBaseUrl.set(normalized, ts);
+    }
+    if (models !== null || ts !== null) {
+      providerIndex.add(normalized);
     }
   }
 
@@ -207,6 +217,10 @@ export const createShardedDiscoveryAdapter = async (
   let _routstr21Models: string[] = rawRoutstr21Models;
   let _lastRoutstr21ModelsUpdate: number | null = lastRoutstr21ModelsUpdate;
 
+  const persistProviderIndex = (): void => {
+    void driver.setItem(PROVIDER_INDEX_KEY, [...providerIndex]);
+  };
+
   // ---- Build the adapter ----
 
   return {
@@ -225,9 +239,12 @@ export const createShardedDiscoveryAdapter = async (
         Object.keys(models).map((baseUrl) => normalizeBaseUrl(baseUrl)),
       );
 
-      // Remove providers no longer present
+      // Remove providers with cached models that are no longer present.
+      // Providers that only have timestamps are left alone so failed-fetch
+      // backoff timestamps survive later model-cache writes.
       for (const baseUrl of [...modelsByBaseUrl.keys()]) {
         if (!nextKeys.has(normalizeBaseUrl(baseUrl))) {
+          providerIndex.delete(baseUrl);
           modelsByBaseUrl.delete(baseUrl);
           timestampsByBaseUrl.delete(baseUrl);
           void driver.removeItem(modelKey(baseUrl));
@@ -238,6 +255,7 @@ export const createShardedDiscoveryAdapter = async (
       // Write new/updated providers
       for (const [baseUrl, modelList] of Object.entries(models)) {
         const normalized = normalizeBaseUrl(baseUrl);
+        providerIndex.add(normalized);
         modelsByBaseUrl.set(normalized, modelList);
         const ts = timestampsByBaseUrl.get(normalized) ?? Date.now();
         timestampsByBaseUrl.set(normalized, ts);
@@ -245,9 +263,7 @@ export const createShardedDiscoveryAdapter = async (
         void driver.setItem(modelTsKey(normalized), ts);
       }
 
-      // Update the provider index
-      const updatedIndex = [...nextKeys].map(normalizeBaseUrl);
-      void driver.setItem(PROVIDER_INDEX_KEY, updatedIndex);
+      persistProviderIndex();
     },
 
     getProviderLastUpdate: (baseUrl: string): number | null => {
@@ -256,8 +272,10 @@ export const createShardedDiscoveryAdapter = async (
 
     setProviderLastUpdate: (baseUrl: string, timestamp: number): void => {
       const normalized = normalizeBaseUrl(baseUrl);
+      providerIndex.add(normalized);
       timestampsByBaseUrl.set(normalized, timestamp);
       void driver.setItem(modelTsKey(normalized), timestamp);
+      persistProviderIndex();
     },
 
     // -- Mints (kv) --
@@ -340,5 +358,51 @@ export const createShardedDiscoveryAdapter = async (
         timestamp,
       );
     },
+  };
+};
+
+export const createProviderRegistryFromDiscoveryAdapter = (
+  adapter: DiscoveryAdapter,
+  logger?: SdkLogger,
+): ProviderRegistry => {
+  const log = (logger ?? consoleLogger).child("ProviderRegistry");
+
+  return {
+    getModelsForProvider: (baseUrl: string): Model[] => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      return adapter.getCachedModels()[normalized] || [];
+    },
+
+    getDisabledProviders: (): string[] => adapter.getDisabledProviders(),
+
+    getProviderMints: (baseUrl: string): string[] => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      return adapter.getCachedMints()[normalized] || [];
+    },
+
+    getProviderInfo: async (baseUrl: string): Promise<ProviderInfo | null> => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const cached = adapter.getCachedProviderInfo()[normalized];
+      if (cached) return cached;
+
+      try {
+        const response = await fetch(`${normalized}v1/info`);
+        if (!response.ok) {
+          throw new Error(`Failed ${response.status}`);
+        }
+        const info = (await response.json()) as ProviderInfo;
+        adapter.setCachedProviderInfo({
+          ...adapter.getCachedProviderInfo(),
+          [normalized]: info,
+        });
+        return info;
+      } catch (error) {
+        log.warn(`Failed to fetch provider info from ${normalized}:`, error);
+        return null;
+      }
+    },
+
+    getAllProvidersModels: (): Record<string, Model[]> =>
+      adapter.getCachedModels(),
   };
 };
