@@ -53,14 +53,20 @@ export {
 } from "./usageTracking";
 import {
   createModelsDatabase,
+  createModelsDatabaseIndexedDB,
   createSqliteDiscoveryAdapter,
 } from "./discoveryAdapters";
 export {
   createModelsDatabase,
   createModelsDatabaseBun,
+  createModelsDatabaseIndexedDB,
   createSqliteDiscoveryAdapter,
 } from "./discoveryAdapters";
-export type { ModelsDatabase, SqliteDiscoveryAdapterOptions } from "./discoveryAdapters";
+export type {
+  ModelsDatabase,
+  SqliteDiscoveryAdapterOptions,
+  IndexedDBModelsDatabaseOptions,
+} from "./discoveryAdapters";
 
 const isBrowser = (): boolean => {
   try {
@@ -160,6 +166,22 @@ export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> =>
   if (defaultDiscoveryAdapter) return defaultDiscoveryAdapter;
 
   const driver = getDefaultSdkDriver();
+
+  // In browsers, use IndexedDB-backed adapter for efficient model storage
+  if (isBrowser()) {
+    try {
+      const modelsDb = createModelsDatabaseIndexedDB({
+        legacyStorageDriver: driver,
+      });
+      defaultDiscoveryAdapter = await createSqliteDiscoveryAdapter({
+        modelsDb,
+        kv: driver,
+      });
+      return defaultDiscoveryAdapter;
+    } catch {
+      // Fall back to store-based adapter if IndexedDB is unavailable
+    }
+  }
 
   // In Node, use SQLite-backed adapter for efficient model storage
   if (isNode() && !isBun()) {

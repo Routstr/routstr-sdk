@@ -10,6 +10,11 @@ export {
 } from "./modelsDatabaseBun";
 
 export {
+  createModelsDatabaseIndexedDB,
+  type IndexedDBModelsDatabaseOptions,
+} from "./modelsDatabaseIndexedDB";
+
+export {
   createSqliteDiscoveryAdapter,
   type SqliteDiscoveryAdapterOptions,
 } from "./sqliteDiscoveryAdapter";
