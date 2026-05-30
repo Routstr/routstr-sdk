@@ -13,6 +13,7 @@ import {
 } from "../core/errors";
 import { onlyEvents, RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
+import type { IEventDatabase } from "applesauce-core";
 import type { NostrEvent } from "applesauce-core/helpers";
 import { tap } from "rxjs";
 
@@ -21,13 +22,19 @@ type SqliteStatement = {
   get?: (...params: unknown[]) => any;
 };
 
-type PersistentEventDatabase = {
+type PersistentEventDatabase = IEventDatabase & {
   db?: {
     exec: (sql: string) => void;
     prepare: (sql: string) => SqliteStatement;
   };
   close?: () => void;
 };
+
+declare const Bun: unknown;
+
+function isBunRuntime(): boolean {
+  return typeof Bun !== "undefined";
+}
 
 /**
  * Configuration for ModelManager
@@ -106,11 +113,8 @@ export class ModelManager {
     if (!this.eventStoreInitPromise) {
       this.eventStoreInitPromise = (async () => {
         try {
-          const { BetterSqlite3EventDatabase } = await import(
-            "applesauce-sqlite/better-sqlite3"
-          );
-          const db = new BetterSqlite3EventDatabase(this.eventStoreDbPath);
-          this.eventStoreDb = db as PersistentEventDatabase;
+          const db = await this.createPersistentEventDatabase();
+          this.eventStoreDb = db;
           this.eventStore = new EventStore({ database: db });
           this.initializeEventStoreMetadata();
           this.logger.log(
@@ -120,7 +124,7 @@ export class ModelManager {
         } catch (error) {
           this.eventStoreInitPromise = null;
           throw new Error(
-            `applesauce-sqlite with better-sqlite3 is required for persistent Nostr event storage. Install optional dependencies or omit eventStoreDbPath. (${error})`
+            `applesauce-sqlite with a supported SQLite driver is required for persistent Nostr event storage. Bun uses bun:sqlite; Node.js uses better-sqlite3. Install optional dependencies or omit eventStoreDbPath. (${error})`
           );
         }
       })();
@@ -135,6 +139,22 @@ export class ModelManager {
    */
   async getEventStore(): Promise<EventStore | null> {
     return this.ensureEventStore();
+  }
+
+  private async createPersistentEventDatabase(): Promise<PersistentEventDatabase> {
+    if (isBunRuntime()) {
+      const { BunSqliteEventDatabase } = await import("applesauce-sqlite/bun");
+      return new BunSqliteEventDatabase(
+        this.eventStoreDbPath
+      ) as PersistentEventDatabase;
+    }
+
+    const { BetterSqlite3EventDatabase } = await import(
+      "applesauce-sqlite/better-sqlite3"
+    );
+    return new BetterSqlite3EventDatabase(
+      this.eventStoreDbPath
+    ) as PersistentEventDatabase;
   }
 
   /** Close the persistent event store database handle, if configured. */
