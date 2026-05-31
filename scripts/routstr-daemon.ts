@@ -3,10 +3,12 @@ import { Readable } from "stream";
 import {
   routeRequests,
   createSdkStore,
-  createSqliteDriver,
-  ModelManager,
   InsufficientBalanceError,
 } from "@routstr/sdk";
+import {
+  createSqliteDriver,
+  ModelManager,
+} from "@routstr/sdk/node";
 import {
   createShardedDiscoveryAdapter,
   createProviderRegistryFromDiscoveryAdapter,
