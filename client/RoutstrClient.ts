@@ -11,14 +11,13 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { Message, TransactionHistory, SdkLogger } from "../core/types";
+import type { SdkLogger } from "../core/types";
 import type { Model } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type {
   WalletAdapter,
   StorageAdapter,
   ProviderRegistry,
-  StreamingCallbacks,
 } from "../wallet/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
@@ -37,22 +36,7 @@ import {
   extractUsageFromResponseBody,
   type UsageTrackingData,
 } from "./usage";
-import { fetchAIResponse as fetchAIResponseHelper } from "./fetchAIResponse";
 import { inspectSSEWebStream } from "./sse";
-
-/**
- * Options for fetching AI response
- */
-export interface FetchOptions {
-  messageHistory: Message[];
-  selectedModel: Model;
-  baseUrl: string;
-  mintUrl: string;
-  balance: number;
-  transactionHistory: TransactionHistory[];
-  maxTokens?: number;
-  headers?: Record<string, string>;
-}
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -438,22 +422,6 @@ export class RoutstrClient {
       return extractedKey;
     }
     return undefined;
-  }
-
-  /**
-   * Fetch AI response with streaming
-   */
-  async fetchAIResponse(
-    options: FetchOptions,
-    callbacks: StreamingCallbacks
-  ): Promise<void> {
-    return fetchAIResponseHelper(options, callbacks, {
-      client: this,
-      providerRegistry: this.providerRegistry,
-      alertLevel: this.alertLevel,
-      logger: this.logger,
-      getPendingCashuTokenAmount: () => this._getPendingCashuTokenAmount(),
-    });
   }
 
   /**
@@ -1191,14 +1159,6 @@ export class RoutstrClient {
     } catch (error) {
       // Silently ignore tracking failures
     }
-  }
-
-  /**
-   * Get pending API key amount
-   */
-  private _getPendingCashuTokenAmount(): number {
-    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
-    return apiKeyDistribution.reduce((total, item) => total + item.amount, 0);
   }
 
   /**

@@ -1,7 +1,21 @@
-import type { Message, StreamingResult, SdkLogger } from "../core/types";
+import type { Message, Model, TransactionHistory, StreamingResult, SdkLogger } from "../core/types";
 import type { ProviderRegistry, StreamingCallbacks } from "../wallet/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
-import type { AlertLevel, FetchOptions, RoutstrClientMode } from "./RoutstrClient";
+import type { AlertLevel, RoutstrClientMode } from "./RoutstrClient";
+
+/**
+ * Options for fetching AI response
+ */
+export interface FetchOptions {
+  messageHistory: Message[];
+  selectedModel: Model;
+  baseUrl: string;
+  mintUrl: string;
+  balance: number;
+  transactionHistory: TransactionHistory[];
+  maxTokens?: number;
+  headers?: Record<string, string>;
+}
 
 interface FetchAIResponseClient {
   routeRequest(params: {
