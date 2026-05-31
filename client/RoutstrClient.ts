@@ -24,9 +24,7 @@ import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
-import { StreamProcessor } from "./StreamProcessor";
 import { ProviderManager } from "./ProviderManager";
-import type { StreamingResult } from "../core/types";
 import {
   ProviderError,
   FailoverError,
@@ -39,6 +37,7 @@ import {
   extractUsageFromResponseBody,
   type UsageTrackingData,
 } from "./usage";
+import { fetchAIResponse as fetchAIResponseHelper } from "./fetchAIResponse";
 import { inspectSSEWebStream } from "./sse";
 
 /**
@@ -87,7 +86,6 @@ export interface RoutstrClientConfig {
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private balanceManager: BalanceManager;
-  private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
   private mode: RoutstrClientMode;
@@ -119,7 +117,6 @@ export class RoutstrClient {
       this.balanceManager,
       this.logger
     );
-    this.streamProcessor = new StreamProcessor();
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
@@ -450,197 +447,13 @@ export class RoutstrClient {
     options: FetchOptions,
     callbacks: StreamingCallbacks
   ): Promise<void> {
-    const {
-      messageHistory,
-      selectedModel,
-      baseUrl,
-      mintUrl,
-      balance,
-      transactionHistory,
-      maxTokens,
-      headers,
-    } = options;
-
-    // Convert messages for API
-    const apiMessages = await this._convertMessages(messageHistory);
-
-    // Calculate required amount
-    const requiredSats = this.providerManager.getRequiredSatsForModel(
-      selectedModel,
-      apiMessages,
-      maxTokens
-    );
-
-    try {
-      // Check balance first
-      await this._checkBalance();
-
-      // Spend tokens
-      callbacks.onPaymentProcessing?.(true);
-
-      const spendResult = await this._spendToken({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-      });
-
-      let token = spendResult.token;
-      let tokenBalance = spendResult.tokenBalance;
-      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
-
-      let tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-      let initialTokenBalanceUnknown = spendResult.tokenBalanceUnknown;
-
-      callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
-
-      const baseHeaders = this._buildBaseHeaders(headers);
-      const requestHeaders = this._withAuthHeader(baseHeaders, token);
-
-      // Get provider info for version compatibility
-      const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
-      const providerVersion = providerInfo?.version ?? "";
-
-      // Handle v0.1.x providers (only send leaf ID)
-      let modelIdForRequest = selectedModel.id;
-      if (/^0\.1\./.test(providerVersion)) {
-        const newModel = await this.providerManager.getModelForProvider(
-          baseUrl,
-          selectedModel.id
-        );
-        modelIdForRequest = newModel?.id ?? selectedModel.id;
-      }
-
-      const body: any = {
-        model: modelIdForRequest,
-        messages: apiMessages,
-        stream: true,
-      };
-
-      if (maxTokens !== undefined) {
-        body.max_tokens = maxTokens;
-      }
-
-      // Only add tools for OpenAI models
-      if (selectedModel?.name?.startsWith("OpenAI:")) {
-        body.tools = [{ type: "web_search" }];
-      }
-
-      // Make API request
-      const response = await this._makeRequest({
-        path: "/v1/chat/completions",
-        method: "POST",
-        body,
-        selectedModel,
-        baseUrl,
-        mintUrl,
-        token,
-        requiredSats,
-        maxTokens,
-        headers: requestHeaders,
-        baseHeaders,
-      });
-
-      if (!response.body) {
-        throw new Error("Response body is not available");
-      }
-
-      // Process streaming response
-      if (response.status === 200) {
-        const baseUrlUsed = (response as any).baseUrl || baseUrl;
-        const responseToken = (response as any).token || token;
-
-        // If failover occurred, use the initial balance captured when the
-        // failover token was created. Do not query here: by the time fetch
-        // returns, the provider may already have charged the request.
-        if (baseUrlUsed !== baseUrl || responseToken !== token) {
-          token = responseToken;
-          if (typeof (response as any).initialTokenBalanceInSats === "number") {
-            tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
-            initialTokenBalanceUnknown = Boolean(
-              (response as any).initialTokenBalanceUnknown
-            );
-          } else {
-            initialTokenBalanceUnknown = true;
-          }
-        }
-
-        const streamingResult = await this.streamProcessor.process(
-          response,
-          {
-            onContent: callbacks.onStreamingUpdate,
-            onThinking: callbacks.onThinkingUpdate,
-          },
-          selectedModel.id
-        );
-
-        // Handle finish reason
-        if (streamingResult.finish_reason === "content_filter") {
-          callbacks.onMessageAppend({
-            role: "assistant",
-            content: "Your request was denied due to content filtering.",
-          });
-        } else if (
-          streamingResult.content ||
-          (streamingResult.images && streamingResult.images.length > 0)
-        ) {
-          // Create assistant message
-          const message = await this._createAssistantMessage(streamingResult);
-          callbacks.onMessageAppend(message);
-        } else {
-          // No content received
-          callbacks.onMessageAppend({
-            role: "system",
-            content: "The provider did not respond to this request.",
-          });
-        }
-
-        // Clear streaming
-        callbacks.onStreamingUpdate("");
-        callbacks.onThinkingUpdate("");
-
-        // Handle post-response refund (skip for xcashu mode - refund is in response)
-        const isApikeysEstimate = this.mode === "apikeys";
-        let satsSpent = await this._handlePostResponseBalanceUpdate({
-          token,
-          baseUrl: baseUrlUsed,
-          mintUrl,
-          initialTokenBalance: tokenBalanceInSats,
-          initialTokenBalanceUnknown,
-          fallbackSatsSpent: isApikeysEstimate
-            ? this._getEstimatedCosts(selectedModel, streamingResult)
-            : undefined,
-          response,
-          modelId: selectedModel.id,
-          usage: streamingResult.usage
-            ? {
-                promptTokens: Number(streamingResult.usage.prompt_tokens ?? 0),
-                completionTokens: Number(
-                  streamingResult.usage.completion_tokens ?? 0
-                ),
-                totalTokens: Number(streamingResult.usage.total_tokens ?? 0),
-                cost: Number(streamingResult.usage.cost ?? 0),
-                satsCost: Number(streamingResult.usage.sats_cost ?? 0),
-              }
-            : undefined,
-          requestId: streamingResult.responseId,
-        });
-        const estimatedCosts = this._getEstimatedCosts(
-          selectedModel,
-          streamingResult
-        );
-        const onLastMessageSatsUpdate = callbacks.onLastMessageSatsUpdate as
-          | ((satsSpent: number, estimatedCosts: number) => void)
-          | undefined;
-        onLastMessageSatsUpdate?.(satsSpent, estimatedCosts);
-      } else {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-    } catch (error) {
-      this._handleError(error, callbacks);
-    } finally {
-      callbacks.onPaymentProcessing?.(false);
-    }
+    return fetchAIResponseHelper(options, callbacks, {
+      client: this,
+      providerRegistry: this.providerRegistry,
+      alertLevel: this.alertLevel,
+      logger: this.logger,
+      getPendingCashuTokenAmount: () => this._getPendingCashuTokenAmount(),
+    });
   }
 
   /**
@@ -1381,120 +1194,11 @@ export class RoutstrClient {
   }
 
   /**
-   * Convert messages for API format
-   */
-  private async _convertMessages(messages: Message[]): Promise<any[]> {
-    return Promise.all(
-      messages
-        .filter((m) => m.role !== "system")
-        .map(async (m) => ({
-          role: m.role,
-          content: typeof m.content === "string" ? m.content : m.content,
-        }))
-    );
-  }
-
-  /**
-   * Create assistant message from streaming result
-   */
-  private async _createAssistantMessage(
-    result: StreamingResult
-  ): Promise<Message> {
-    if (result.images && result.images.length > 0) {
-      // Multimodal message with images
-      const content: any[] = [];
-
-      if (result.content) {
-        content.push({
-          type: "text",
-          text: result.content,
-          thinking: result.thinking,
-          citations: result.citations,
-          annotations: result.annotations,
-        });
-      }
-
-      for (const img of result.images) {
-        content.push({
-          type: "image_url",
-          image_url: {
-            url: img.image_url.url,
-          },
-        });
-      }
-
-      return {
-        role: "assistant",
-        content,
-      };
-    }
-
-    // Simple text message
-    return {
-      role: "assistant",
-      content: result.content || "",
-    };
-  }
-
-  /**
-   * Calculate estimated costs from usage
-   */
-  private _getEstimatedCosts(
-    selectedModel: Model,
-    streamingResult: StreamingResult
-  ): number {
-    let estimatedCosts = 0;
-    if (streamingResult.usage) {
-      const { completion_tokens, prompt_tokens } = streamingResult.usage;
-      if (completion_tokens !== undefined && prompt_tokens !== undefined) {
-        estimatedCosts =
-          (selectedModel.sats_pricing?.completion ?? 0) * completion_tokens +
-          (selectedModel.sats_pricing?.prompt ?? 0) * prompt_tokens;
-      }
-    }
-    return estimatedCosts;
-  }
-
-  /**
    * Get pending API key amount
    */
   private _getPendingCashuTokenAmount(): number {
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
     return apiKeyDistribution.reduce((total, item) => total + item.amount, 0);
-  }
-
-  /**
-   * Handle errors and notify callbacks
-   */
-  private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
-    this._log("ERROR", "[RoutstrClient] _handleError: Error occurred", error);
-
-    if (error instanceof Error) {
-      const isStreamError =
-        error.message.includes("Error in input stream") ||
-        error.message.includes("Load failed");
-      const modifiedErrorMsg = isStreamError
-        ? "AI stream was cut off, turn on Keep Active or please try again"
-        : error.message;
-
-      this._log(
-        "ERROR",
-        `[RoutstrClient] _handleError: Error type=${error.constructor.name}, message=${modifiedErrorMsg}, isStreamError=${isStreamError}`
-      );
-
-      callbacks.onMessageAppend({
-        role: "system",
-        content:
-          "Uncaught Error: " +
-          modifiedErrorMsg +
-          (this.alertLevel === "max" ? " | " + error.stack : ""),
-      });
-    } else {
-      callbacks.onMessageAppend({
-        role: "system",
-        content: "Unknown Error: Please tag Routstr on Nostr and/or retry.",
-      });
-    }
   }
 
   /**

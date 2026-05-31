@@ -1,9 +1,11 @@
-import type { Message } from "@/types/chat";
+import type { Message } from "@routstr/sdk";
 import {
   ModelManager,
   MintDiscovery,
   ProviderManager,
   RoutstrClient,
+  fetchAIResponse,
+  consoleLogger,
 } from "@routstr/sdk";
 import { getDecodedToken } from "@cashu/cashu-ts";
 import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
@@ -311,13 +313,14 @@ async function main(): Promise<void> {
       alertLevel,
       "xcashu"
     );
+    const logger = consoleLogger.child("routstr-cheapest");
 
     const messageHistory: Message[] = [{ role: "user", content: resolvedText }];
     let finalMessage = "";
     let errorMessage = "";
 
     try {
-      await client.fetchAIResponse(
+      await fetchAIResponse(
         {
           messageHistory,
           selectedModel,
@@ -361,6 +364,12 @@ async function main(): Promise<void> {
               console.error(`Estimated costs: ${estimatedCosts.toFixed(3)}`);
             }
           },
+        },
+        {
+          client,
+          providerRegistry,
+          alertLevel,
+          logger,
         }
       );
     } catch (error) {
