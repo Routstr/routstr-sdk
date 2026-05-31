@@ -3,7 +3,12 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: [
     "index.ts",
+    "browser.ts",
+    "node.ts",
+    "bun.ts",
     "storage/index.ts",
+    "storage/node.ts",
+    "storage/bun.ts",
     "wallet/index.ts",
     "discovery/index.ts",
     "client/index.ts",

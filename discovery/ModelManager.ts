@@ -18,11 +18,11 @@ import type { NostrEvent } from "applesauce-core/helpers";
 import { tap } from "rxjs";
 
 type SqliteStatement = {
-  run?: (...params: unknown[]) => unknown;
-  get?: (...params: unknown[]) => any;
+  run?: (...params: any[]) => unknown;
+  get?: (...params: any[]) => any;
 };
 
-type PersistentEventDatabase = IEventDatabase & {
+export type PersistentEventDatabase = IEventDatabase & {
   db?: {
     exec: (sql: string) => void;
     prepare: (sql: string) => SqliteStatement;
@@ -30,11 +30,9 @@ type PersistentEventDatabase = IEventDatabase & {
   close?: () => void;
 };
 
-declare const Bun: unknown;
-
-function isBunRuntime(): boolean {
-  return typeof Bun !== "undefined";
-}
+export type PersistentEventDatabaseFactory = (
+  dbPath: string
+) => Promise<PersistentEventDatabase> | PersistentEventDatabase;
 
 /**
  * Configuration for ModelManager
@@ -52,11 +50,18 @@ export interface ModelManagerConfig {
   routstrPubkey?: string;
   /** Optional injectable logger */
   logger?: SdkLogger;
-  /** Path to SQLite database for persistent Nostr event storage.
+  /** Path to database for persistent Nostr event storage.
    * If provided, events fetched by ModelManager from relays (kinds 38421,
    * 38423, 38425) are persisted and survive process restarts. The underlying
-   * EventStore can also be accessed for advanced/manual event management. */
+   * EventStore can also be accessed for advanced/manual event management.
+   *
+   * Runtime-specific SQLite implementations are intentionally not imported by
+   * the browser-safe default SDK entrypoint. Use @routstr/sdk/node or
+   * @routstr/sdk/bun to get a ModelManager preconfigured with a SQLite-backed
+   * persistentEventDatabaseFactory, or inject your own factory here. */
   eventStoreDbPath?: string;
+  /** Factory used with eventStoreDbPath to create the persistent event DB. */
+  persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 }
 
 /**
@@ -76,6 +81,7 @@ export class ModelManager {
   private eventStoreDb: PersistentEventDatabase | null = null;
   private eventStoreInitPromise: Promise<EventStore | null> | null = null;
   private readonly eventStoreDbPath?: string;
+  private readonly persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -92,6 +98,7 @@ export class ModelManager {
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
 
     this.eventStoreDbPath = config.eventStoreDbPath;
+    this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
   }
 
   /**
@@ -124,7 +131,7 @@ export class ModelManager {
         } catch (error) {
           this.eventStoreInitPromise = null;
           throw new Error(
-            `applesauce-sqlite with a supported SQLite driver is required for persistent Nostr event storage. Bun uses bun:sqlite; Node.js uses better-sqlite3. Install optional dependencies or omit eventStoreDbPath. (${error})`
+            `Persistent Nostr event storage requires a runtime-specific database factory. Use @routstr/sdk/node, @routstr/sdk/bun, inject persistentEventDatabaseFactory, or omit eventStoreDbPath. (${error})`
           );
         }
       })();
@@ -142,19 +149,15 @@ export class ModelManager {
   }
 
   private async createPersistentEventDatabase(): Promise<PersistentEventDatabase> {
-    if (isBunRuntime()) {
-      const { BunSqliteEventDatabase } = await import("applesauce-sqlite/bun");
-      return new BunSqliteEventDatabase(
-        this.eventStoreDbPath
-      ) as PersistentEventDatabase;
+    if (!this.eventStoreDbPath) {
+      throw new Error("eventStoreDbPath is required");
     }
-
-    const { BetterSqlite3EventDatabase } = await import(
-      "applesauce-sqlite/better-sqlite3"
-    );
-    return new BetterSqlite3EventDatabase(
-      this.eventStoreDbPath
-    ) as PersistentEventDatabase;
+    if (!this.persistentEventDatabaseFactory) {
+      throw new Error(
+        "persistentEventDatabaseFactory is required. Import ModelManager from @routstr/sdk/node or @routstr/sdk/bun for SQLite-backed persistent event storage."
+      );
+    }
+    return this.persistentEventDatabaseFactory(this.eventStoreDbPath);
   }
 
   /** Close the persistent event store database handle, if configured. */
