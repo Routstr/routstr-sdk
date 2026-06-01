@@ -660,7 +660,7 @@ export class CashuSpender {
             continue;
           }
 
-          if (balanceResult.amount >= 0) {
+          if (balanceResult.amount >= 0 && !balanceResult.balanceUnknown) {
             const balanceSat = balanceResult.unit === "msat"
               ? Math.floor(balanceResult.amount / 1000)
               : balanceResult.amount;

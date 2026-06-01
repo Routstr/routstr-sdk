@@ -11,22 +11,19 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { Message, TransactionHistory, SdkLogger } from "../core/types";
+import type { SdkLogger } from "../core/types";
 import type { Model } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type {
   WalletAdapter,
   StorageAdapter,
   ProviderRegistry,
-  StreamingCallbacks,
 } from "../wallet/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
-import { StreamProcessor } from "./StreamProcessor";
 import { ProviderManager } from "./ProviderManager";
-import type { StreamingResult } from "../core/types";
 import {
   ProviderError,
   FailoverError,
@@ -47,20 +44,6 @@ import {
 } from "./VeniceE2EE";
 import { promises as fs } from "fs";
 import path from "path";
-
-/**
- * Options for fetching AI response
- */
-export interface FetchOptions {
-  messageHistory: Message[];
-  selectedModel: Model;
-  baseUrl: string;
-  mintUrl: string;
-  balance: number;
-  transactionHistory: TransactionHistory[];
-  maxTokens?: number;
-  headers?: Record<string, string>;
-}
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -94,7 +77,6 @@ export interface RoutstrClientConfig {
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private balanceManager: BalanceManager;
-  private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
   private mode: RoutstrClientMode;
@@ -126,7 +108,6 @@ export class RoutstrClient {
       this.balanceManager,
       this.logger
     );
-    this.streamProcessor = new StreamProcessor();
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
@@ -232,6 +213,8 @@ export class RoutstrClient {
         baseUrl: prepared.baseUrlUsed,
         mintUrl: params.mintUrl,
         initialTokenBalance: prepared.tokenBalanceInSats,
+        initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
+        fallbackSatsSpent: usage?.satsCost,
         response: prepared.response,
         modelId: prepared.modelId,
         usage,
@@ -265,6 +248,7 @@ export class RoutstrClient {
     tokenUsed: string;
     baseUrlUsed: string;
     tokenBalanceInSats: number;
+    tokenBalanceUnknown: boolean;
     modelId?: string;
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
@@ -405,10 +389,25 @@ export class RoutstrClient {
       selectedModel,
     });
 
-    const tokenBalanceInSats =
+    let tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    let initialTokenBalanceUnknown = tokenBalanceUnknown;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
+
+    // If failover occurred, use the initial balance captured when the
+    // failover token was created. Do not query here: by the time fetch returns,
+    // the provider may already have charged the request.
+    if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
+      if (typeof (response as any).initialTokenBalanceInSats === "number") {
+        tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
+        initialTokenBalanceUnknown = Boolean(
+          (response as any).initialTokenBalanceUnknown
+        );
+      } else {
+        initialTokenBalanceUnknown = true;
+      }
+    }
 
     const contentType = response.headers.get("content-type") || "";
     let processedResponse = response;
@@ -460,6 +459,7 @@ export class RoutstrClient {
       tokenUsed,
       baseUrlUsed,
       tokenBalanceInSats,
+      tokenBalanceUnknown: initialTokenBalanceUnknown,
       modelId,
       capturedUsage,
       capturedResponseId,
@@ -480,243 +480,6 @@ export class RoutstrClient {
       return extractedKey;
     }
     return undefined;
-  }
-
-  /**
-   * Fetch AI response with streaming
-   */
-  async fetchAIResponse(
-    options: FetchOptions,
-    callbacks: StreamingCallbacks
-  ): Promise<void> {
-    const {
-      messageHistory,
-      selectedModel,
-      baseUrl,
-      mintUrl,
-      balance,
-      transactionHistory,
-      maxTokens,
-      headers,
-    } = options;
-
-    // Convert messages for API
-    const apiMessages = await this._convertMessages(messageHistory);
-
-    // Calculate required amount
-    const requiredSats = this.providerManager.getRequiredSatsForModel(
-      selectedModel,
-      apiMessages,
-      maxTokens
-    );
-
-    try {
-      // Check balance first
-      await this._checkBalance();
-
-      const baseHeaders = this._buildBaseHeaders(headers);
-
-      // Get provider info for version compatibility
-      const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
-      const providerVersion = providerInfo?.version ?? "";
-
-      // Handle v0.1.x providers (only send leaf ID)
-      let modelIdForRequest = selectedModel.id;
-      if (/^0\.1\./.test(providerVersion)) {
-        const newModel = await this.providerManager.getModelForProvider(
-          baseUrl,
-          selectedModel.id
-        );
-        modelIdForRequest = newModel?.id ?? selectedModel.id;
-      }
-
-      const body: any = {
-        model: modelIdForRequest,
-        messages: apiMessages,
-        stream: true,
-      };
-
-      if (maxTokens !== undefined) {
-        body.max_tokens = maxTokens;
-      }
-
-      // Only add tools for OpenAI models
-      if (selectedModel?.name?.startsWith("OpenAI:")) {
-        body.tools = [{ type: "web_search" }];
-      }
-
-      // ─── Venice E2EE: attest BEFORE spending tokens ──────
-      let e2eeSessionEcdh: any = undefined;
-      let e2eeHeaders: Record<string, string> = {};
-      let finalBody = body;
-
-      if (isE2EEModel(modelIdForRequest)) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] Attesting E2EE model ${modelIdForRequest} before spend`
-        );
-
-        const attestAuth = await this._getAttestationAuth({
-          baseUrl,
-          mintUrl,
-        });
-
-        const e2eePrep = await prepareE2EERequest({
-          baseUrl,
-          authHeaders: attestAuth.authHeaders,
-          modelId: modelIdForRequest,
-          body: finalBody,
-        });
-
-        finalBody = e2eePrep.modifiedBody;
-        e2eeHeaders = e2eePrep.e2eeHeaders;
-        e2eeSessionEcdh = e2eePrep.sessionEcdh;
-
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] E2EE attestation passed, messages encrypted`
-        );
-      }
-
-      // Spend tokens for the actual request
-      callbacks.onPaymentProcessing?.(true);
-
-      const spendResult = await this._spendToken({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-      });
-
-      let token = spendResult.token;
-      let tokenBalance = spendResult.tokenBalance;
-      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
-
-      const tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-
-      callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
-
-      // Build final request headers (auth + E2EE)
-      const requestHeaders = this._withAuthHeader(baseHeaders, token);
-      const finalHeaders = e2eeSessionEcdh
-        ? { ...requestHeaders, ...e2eeHeaders }
-        : requestHeaders;
-
-      // Make API request
-      const response = await this._makeRequest({
-        path: "/v1/chat/completions",
-        method: "POST",
-        body: finalBody,
-        selectedModel,
-        baseUrl,
-        mintUrl,
-        token,
-        requiredSats,
-        maxTokens,
-        headers: finalHeaders,
-        baseHeaders,
-      });
-
-      if (!response.body) {
-        throw new Error("Response body is not available");
-      }
-
-      // ─── Venice E2EE: wrap response body with decrypt transform ──
-      let processedResponse = response;
-      if (e2eeSessionEcdh) {
-        const decryptedBody = response.body.pipeThrough(
-          createE2EEDecryptTransform(e2eeSessionEcdh)
-        );
-        processedResponse = new Response(decryptedBody, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers,
-        });
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] E2EE decrypt transform applied to response stream`
-        );
-      }
-
-      // Process streaming response
-      if (response.status === 200) {
-        const baseUrlUsed = (response as any).baseUrl || baseUrl;
-
-        const streamingResult = await this.streamProcessor.process(
-          processedResponse,
-          {
-            onContent: callbacks.onStreamingUpdate,
-            onThinking: callbacks.onThinkingUpdate,
-          },
-          selectedModel.id
-        );
-
-        // Handle finish reason
-        if (streamingResult.finish_reason === "content_filter") {
-          callbacks.onMessageAppend({
-            role: "assistant",
-            content: "Your request was denied due to content filtering.",
-          });
-        } else if (
-          streamingResult.content ||
-          (streamingResult.images && streamingResult.images.length > 0)
-        ) {
-          // Create assistant message
-          const message = await this._createAssistantMessage(streamingResult);
-          callbacks.onMessageAppend(message);
-        } else {
-          // No content received
-          callbacks.onMessageAppend({
-            role: "system",
-            content: "The provider did not respond to this request.",
-          });
-        }
-
-        // Clear streaming
-        callbacks.onStreamingUpdate("");
-        callbacks.onThinkingUpdate("");
-
-        // Handle post-response refund (skip for xcashu mode - refund is in response)
-        const isApikeysEstimate = this.mode === "apikeys";
-        let satsSpent = await this._handlePostResponseBalanceUpdate({
-          token,
-          baseUrl: baseUrlUsed,
-          mintUrl,
-          initialTokenBalance: tokenBalanceInSats,
-          fallbackSatsSpent: isApikeysEstimate
-            ? this._getEstimatedCosts(selectedModel, streamingResult)
-            : undefined,
-          response,
-          modelId: selectedModel.id,
-          usage: streamingResult.usage
-            ? {
-                promptTokens: Number(streamingResult.usage.prompt_tokens ?? 0),
-                completionTokens: Number(
-                  streamingResult.usage.completion_tokens ?? 0
-                ),
-                totalTokens: Number(streamingResult.usage.total_tokens ?? 0),
-                cost: Number(streamingResult.usage.cost ?? 0),
-                satsCost: Number(streamingResult.usage.sats_cost ?? 0),
-              }
-            : undefined,
-          requestId: streamingResult.responseId,
-        });
-        const estimatedCosts = this._getEstimatedCosts(
-          selectedModel,
-          streamingResult
-        );
-        const onLastMessageSatsUpdate = callbacks.onLastMessageSatsUpdate as
-          | ((satsSpent: number, estimatedCosts: number) => void)
-          | undefined;
-        onLastMessageSatsUpdate?.(satsSpent, estimatedCosts);
-      } else {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-    } catch (error) {
-      this._handleError(error, callbacks);
-    } finally {
-      callbacks.onPaymentProcessing?.(false);
-    }
   }
 
   /**
@@ -937,22 +700,35 @@ export class RoutstrClient {
           params.token,
           baseUrl
         );
-        const currentBalance =
-          currentBalanceInfo.unit === "msat"
-            ? currentBalanceInfo.amount / 1000
-            : currentBalanceInfo.amount;
-        const reservedBalance =
-          currentBalanceInfo.unit === "msat"
-            ? (currentBalanceInfo.reserved ?? 0) / 1000
-            : (currentBalanceInfo.reserved ?? 0);
+        if (currentBalanceInfo.balanceUnknown) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Current balance unknown for ${baseUrl}; using default topup amount=${topupAmount}`
+          );
+        } else {
+          const currentBalance =
+            currentBalanceInfo.unit === "msat"
+              ? currentBalanceInfo.amount / 1000
+              : currentBalanceInfo.amount;
+          const reservedBalance =
+            currentBalanceInfo.unit === "msat"
+              ? (currentBalanceInfo.reserved ?? 0) / 1000
+              : (currentBalanceInfo.reserved ?? 0);
 
-        const shortfall = Math.max(0, params.requiredSats - currentBalance + reservedBalance);
-        topupAmount = shortfall > (0.21 * params.requiredSats) ? shortfall : (0.21 * params.requiredSats);
+          const shortfall = Math.max(
+            0,
+            params.requiredSats - currentBalance + reservedBalance
+          );
+          topupAmount =
+            shortfall > 0.21 * params.requiredSats
+              ? shortfall
+              : 0.21 * params.requiredSats;
 
-        this._log(
-          "DEBUG",
-          `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
-        );
+          this._log(
+            "DEBUG",
+            `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
+          );
+        }
       } catch (e) {
         this._log(
           "WARN",
@@ -1052,8 +828,9 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           tryNextProvider = true;
         } else {
-          const latestTokenBalance =
-            latestBalanceInfo.unit === "msat"
+          const latestTokenBalance = latestBalanceInfo.balanceUnknown
+            ? undefined
+            : latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
 
@@ -1068,7 +845,7 @@ export class RoutstrClient {
             retryToken = latestBalanceInfo.apiKey;
           }
 
-          if (latestTokenBalance >= 0) {
+          if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
             this.storageAdapter.updateApiKeyBalance(
               baseUrl,
               latestTokenBalance
@@ -1159,7 +936,11 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
-        if (!refundResult.success && latestBalanceInfo.amount > 0) {
+        if (
+          !refundResult.success &&
+          latestBalanceInfo.amount > 0 &&
+          !latestBalanceInfo.balanceUnknown
+        ) {
           throw new ProviderError(
             baseUrl,
             status,
@@ -1222,8 +1003,10 @@ export class RoutstrClient {
         baseUrl: nextProvider,
       });
 
-      // Retry with new provider (reset retry count)
-      return this._makeRequest({
+      // Retry with new provider (reset retry count). Attach the balance that
+      // was observed before the retry request so callers do not have to query
+      // after the provider may already have charged the request.
+      const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
@@ -1235,6 +1018,13 @@ export class RoutstrClient {
         headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
         retryCount: 0,
       });
+      (retryResponse as any).initialTokenBalanceInSats =
+        spendResult.tokenBalanceUnit === "msat"
+          ? spendResult.tokenBalance / 1000
+          : spendResult.tokenBalance;
+      (retryResponse as any).initialTokenBalanceUnknown =
+        spendResult.tokenBalanceUnknown;
+      return retryResponse;
     }
 
     // No more providers to try
@@ -1252,6 +1042,7 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     initialTokenBalance: number;
+    initialTokenBalanceUnknown?: boolean;
     fallbackSatsSpent?: number;
     response?: Response;
     modelId?: string;
@@ -1264,6 +1055,7 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       initialTokenBalance,
+      initialTokenBalanceUnknown,
       fallbackSatsSpent,
       response,
       modelId,
@@ -1306,8 +1098,9 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey,
           baseUrl
         );
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
+        const latestTokenBalance = latestBalanceInfo.balanceUnknown
+          ? undefined
+          : latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
 
@@ -1319,12 +1112,17 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
-        this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        if (latestTokenBalance !== undefined) {
+          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        }
 
-        satsSpent = initialTokenBalance - latestTokenBalance;
+        satsSpent =
+          latestTokenBalance !== undefined && !initialTokenBalanceUnknown
+            ? Math.max(0, initialTokenBalance - latestTokenBalance)
+            : (fallbackSatsSpent ?? usage?.satsCost ?? 0);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
-        satsSpent = fallbackSatsSpent ?? initialTokenBalance;
+        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? 0;
       }
     }
 
@@ -1460,123 +1258,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Convert messages for API format
-   */
-  private async _convertMessages(messages: Message[]): Promise<any[]> {
-    return Promise.all(
-      messages
-        .filter((m) => m.role !== "system")
-        .map(async (m) => ({
-          role: m.role,
-          content: typeof m.content === "string" ? m.content : m.content,
-        }))
-    );
-  }
-
-  /**
-   * Create assistant message from streaming result
-   */
-  private async _createAssistantMessage(
-    result: StreamingResult
-  ): Promise<Message> {
-    if (result.images && result.images.length > 0) {
-      // Multimodal message with images
-      const content: any[] = [];
-
-      if (result.content) {
-        content.push({
-          type: "text",
-          text: result.content,
-          thinking: result.thinking,
-          citations: result.citations,
-          annotations: result.annotations,
-        });
-      }
-
-      for (const img of result.images) {
-        content.push({
-          type: "image_url",
-          image_url: {
-            url: img.image_url.url,
-          },
-        });
-      }
-
-      return {
-        role: "assistant",
-        content,
-      };
-    }
-
-    // Simple text message
-    return {
-      role: "assistant",
-      content: result.content || "",
-    };
-  }
-
-  /**
-   * Calculate estimated costs from usage
-   */
-  private _getEstimatedCosts(
-    selectedModel: Model,
-    streamingResult: StreamingResult
-  ): number {
-    let estimatedCosts = 0;
-    if (streamingResult.usage) {
-      const { completion_tokens, prompt_tokens } = streamingResult.usage;
-      if (completion_tokens !== undefined && prompt_tokens !== undefined) {
-        estimatedCosts =
-          (selectedModel.sats_pricing?.completion ?? 0) * completion_tokens +
-          (selectedModel.sats_pricing?.prompt ?? 0) * prompt_tokens;
-      }
-    }
-    return estimatedCosts;
-  }
-
-  /**
-   * Get pending API key amount
-   */
-  private _getPendingCashuTokenAmount(): number {
-    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
-    return apiKeyDistribution.reduce((total, item) => total + item.amount, 0);
-  }
-
-  /**
-   * Handle errors and notify callbacks
-   */
-  private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
-    this._log("ERROR", "[RoutstrClient] _handleError: Error occurred", error);
-
-    if (error instanceof Error) {
-      const isStreamError =
-        error.message.includes("Error in input stream") ||
-        error.message.includes("Load failed");
-      const modifiedErrorMsg = isStreamError
-        ? "AI stream was cut off, turn on Keep Active or please try again"
-        : error.message;
-
-      this._log(
-        "ERROR",
-        `[RoutstrClient] _handleError: Error type=${error.constructor.name}, message=${modifiedErrorMsg}, isStreamError=${isStreamError}`
-      );
-
-      callbacks.onMessageAppend({
-        role: "system",
-        content:
-          "Uncaught Error: " +
-          modifiedErrorMsg +
-          (this.alertLevel === "max" ? " | " + error.stack : ""),
-      });
-    } else {
-      callbacks.onMessageAppend({
-        role: "system",
-        content: "Unknown Error: Please tag Routstr on Nostr and/or retry.",
-      });
-    }
-  }
-
-  /**
    * Check wallet balance and throw if insufficient
    */
   private async _checkBalance(): Promise<void> {
@@ -1599,6 +1280,7 @@ export class RoutstrClient {
     token: string;
     tokenBalance: number;
     tokenBalanceUnit: "sat" | "msat";
+    tokenBalanceUnknown: boolean;
   }> {
     const { mintUrl, amount, baseUrl } = params;
 
@@ -1681,6 +1363,7 @@ export class RoutstrClient {
 
       let tokenBalance = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
+      let tokenBalanceUnknown = false;
 
       const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
       const distributionForBaseUrl = apiKeyDistribution.find(
@@ -1698,6 +1381,7 @@ export class RoutstrClient {
           );
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
+          tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
@@ -1712,6 +1396,7 @@ export class RoutstrClient {
         token: parentApiKey?.key ?? "",
         tokenBalance,
         tokenBalanceUnit,
+        tokenBalanceUnknown,
       };
     }
 
@@ -1745,6 +1430,7 @@ export class RoutstrClient {
       token: spendResult.token!,
       tokenBalance: spendResult.balance,
       tokenBalanceUnit: spendResult.unit ?? "sat",
+      tokenBalanceUnknown: false,
     };
   }
 

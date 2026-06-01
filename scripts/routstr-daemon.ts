@@ -8,8 +8,8 @@ import {
   InsufficientBalanceError,
 } from "@routstr/sdk";
 import {
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
+  createShardedDiscoveryAdapter,
+  createProviderRegistryFromDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -44,6 +44,7 @@ if (process.env.NODE_ENV === "test" || process.env.MOCK_ERRORS) {
 }
 
 const REQUESTS_DIR = join(__dirname, "requests");
+const EVENT_STORE_DB_PATH = join(__dirname, "events.db");
 
 async function ensureRequestsDir(): Promise<void> {
   try {
@@ -247,18 +248,21 @@ function toForwardHeaders(
 async function main(): Promise<void> {
   const { port, provider, mode } = parseArgs(process.argv);
 
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
+  const driver = createSqliteDriver();
+  const { store, hydrate } = createSdkStore({ driver });
   await hydrate;
 
   // Set hardcoded disabled providers
   store.getState().setDisabledProviders(DISABLED_PROVIDERS);
 
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver });
+  const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
   const storageAdapter = createStorageAdapterFromStore(store);
 
   console.log("Bootstrapping providers...");
-  const modelManager = new ModelManager(discoveryAdapter);
+  const modelManager = new ModelManager(discoveryAdapter, {
+    eventStoreDbPath: EVENT_STORE_DB_PATH,
+  });
   const providers = await modelManager.bootstrapProviders(false);
   console.log(`Bootstrapped ${providers.length} providers`);
   await modelManager.fetchModels(providers);
