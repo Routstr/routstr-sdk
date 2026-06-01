@@ -1,5 +1,6 @@
 import { ModelManager, ProviderManager } from "@routstr/sdk";
-import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
+import { createSdkStore } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
   createDiscoveryAdapterFromStore,
   createProviderRegistryFromStore,

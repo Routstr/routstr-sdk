@@ -27,10 +27,12 @@ const openDatabase = (
   }
 
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
+    // Version 2 — both sdk_storage and usage_tracking stores need to coexist.
+    const request = indexedDB.open(dbName, 2);
 
     request.onupgradeneeded = () => {
       const db = request.result;
+      // Create our own store
       if (!db.objectStoreNames.contains(storeName)) {
         const store = db.createObjectStore(storeName, { keyPath: "id" });
         store.createIndex("timestamp", "timestamp", { unique: false });
@@ -39,10 +41,20 @@ const openDatabase = (
         store.createIndex("sessionId", "sessionId", { unique: false });
         store.createIndex("client", "client", { unique: false });
       }
+      // Also create sdk_storage if it doesn't exist (cross-driver init)
+      if (storeName !== "sdk_storage" && !db.objectStoreNames.contains("sdk_storage")) {
+        db.createObjectStore("sdk_storage");
+      }
     };
 
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+    request.onblocked = () => {
+      console.warn(
+        `[usageTracking IndexedDB] open blocked for "${dbName}" — close other tabs using this DB`
+      );
+      reject(new Error(`IndexedDB "${dbName}" blocked by another connection`));
+    };
   });
 };
 
