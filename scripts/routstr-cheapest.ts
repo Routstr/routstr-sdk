@@ -175,6 +175,16 @@ async function main(): Promise<void> {
     const normalizedProvider = forcedProvider.endsWith("/")
       ? forcedProvider
       : `${forcedProvider}/`;
+
+    // Honor disabled providers list even for forced providers
+    const disabledProviders = discoveryAdapter.getDisabledProviders();
+    if (disabledProviders.includes(normalizedProvider)) {
+      console.error(
+        `Provider ${normalizedProvider} is disabled. Use 'routstrd providers enable' to re-enable it.`
+      );
+      process.exit(1);
+    }
+
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
     const match = models.find((model) => model.id === resolvedModelId);

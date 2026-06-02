@@ -135,6 +135,17 @@ export async function resolveRequestContext(
     const normalizedProvider = forcedProvider.endsWith("/")
       ? forcedProvider
       : `${forcedProvider}/`;
+
+    // Honor disabled providers list even for forced providers.
+    // This includes manually-disabled providers that must never be
+    // re-enabled by a Nostr review sync cycle.
+    const disabledProviders = discoveryAdapter.getDisabledProviders();
+    if (disabledProviders.includes(normalizedProvider)) {
+      throw new Error(
+        `Provider ${normalizedProvider} is disabled. Use 'routstrd providers enable' to re-enable it.`
+      );
+    }
+
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
     const match = models.find((m) => m.id === modelId);

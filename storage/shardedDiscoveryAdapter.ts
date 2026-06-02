@@ -108,6 +108,7 @@ export const createShardedDiscoveryAdapter = async (
     rawInfo,
     lastUsedModel,
     rawDisabled,
+    rawManuallyDisabled,
     rawBaseUrls,
     lastBaseUrlsUpdate,
     rawRoutstr21Models,
@@ -123,6 +124,7 @@ export const createShardedDiscoveryAdapter = async (
     ),
     driver.getItem<string | null>(SDK_STORAGE_KEYS.LAST_USED_MODEL, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
@@ -210,6 +212,7 @@ export const createShardedDiscoveryAdapter = async (
 
   let _lastUsedModel: string | null = lastUsedModel;
   let _disabledProviders: string[] = rawDisabled.map(normalizeBaseUrl);
+  let _manuallyDisabledProviders: string[] = rawManuallyDisabled.map(normalizeBaseUrl);
   let _baseUrlsList: string[] = rawBaseUrls.map(normalizeBaseUrl);
   let _lastBaseUrlsUpdate: number | null = lastBaseUrlsUpdate;
   let _routstr21Models: string[] = rawRoutstr21Models;
@@ -314,12 +317,24 @@ export const createShardedDiscoveryAdapter = async (
 
     // -- Disabled providers (kv) --
 
-    getDisabledProviders: () => _disabledProviders,
+    getDisabledProviders: () => {
+      return [...new Set([..._disabledProviders, ..._manuallyDisabledProviders])];
+    },
 
     setDisabledProviders: (urls: string[]) => {
       const normalized = urls.map(normalizeBaseUrl);
       _disabledProviders = normalized;
       void driver.setItem(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, normalized);
+    },
+
+    // -- Manually disabled providers (kv) --
+
+    getManuallyDisabledProviders: () => _manuallyDisabledProviders,
+
+    setManuallyDisabledProviders: (urls: string[]) => {
+      const normalized = urls.map(normalizeBaseUrl);
+      _manuallyDisabledProviders = normalized;
+      void driver.setItem(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, normalized);
     },
 
     // -- Base URLs (kv) --
