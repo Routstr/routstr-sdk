@@ -80,11 +80,23 @@ export interface DiscoveryAdapter {
   getDisabledProviders(): string[];
 
   /**
-   * Save list of disabled provider base URLs
+   * Save list of disabled provider base URLs (review/auto-based)
    * Optional because some read-only adapters can only expose current disabled state.
    * @param urls Array of disabled provider URLs
    */
   setDisabledProviders?(urls: string[]): void;
+
+  /**
+   * Get list of manually disabled provider base URLs (user-intent)
+   * @returns Array of manually disabled provider URLs
+   */
+  getManuallyDisabledProviders(): string[];
+
+  /**
+   * Save list of manually disabled provider base URLs
+   * @param urls Array of manually disabled provider URLs
+   */
+  setManuallyDisabledProviders?(urls: string[]): void;
 
   /**
    * Get list of configured provider base URLs

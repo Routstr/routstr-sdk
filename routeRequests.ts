@@ -156,6 +156,15 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     const normalizedProvider = forcedProvider.endsWith("/")
       ? forcedProvider
       : `${forcedProvider}/`;
+
+    // Honor disabled providers list even for forced providers
+    const disabledProviders = discoveryAdapter.getDisabledProviders();
+    if (disabledProviders.includes(normalizedProvider)) {
+      throw new Error(
+        `Provider ${normalizedProvider} is disabled. Use 'routstrd providers enable' to re-enable it.`
+      );
+    }
+
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
     const match = models.find((m) => m.id === modelId);

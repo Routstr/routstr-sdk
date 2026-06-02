@@ -601,6 +601,10 @@ export class ModelManager {
       return [];
     }
 
+    // Build the review-disabled set: providers whose node pubkeys lack an lgtm review.
+    // This only updates the auto/review-based disabled list — manually disabled
+    // providers are tracked separately via setManuallyDisabledProviders and the
+    // effective disabled set is the union of both (returned by getDisabledProviders).
     const disabledByReview: string[] = [];
     for (const url of baseUrls) {
       const normalized = this.normalizeUrl(url);

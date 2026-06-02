@@ -254,8 +254,8 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver });
   await hydrate;
 
-  // Set hardcoded disabled providers
-  store.getState().setDisabledProviders(DISABLED_PROVIDERS);
+  // Set hardcoded disabled providers as manually disabled (persists across model refreshes)
+  store.getState().setManuallyDisabledProviders(DISABLED_PROVIDERS);
 
   const discoveryAdapter = await createShardedDiscoveryAdapter({ driver });
   const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
