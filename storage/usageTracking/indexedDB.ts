@@ -1,7 +1,13 @@
 import { SDK_STORAGE_KEYS } from "../keys";
 import type { StorageDriver } from "../types";
-import type { ListUsageTrackingOptions, UsageTrackingDriver } from "./interfaces";
+import type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageTrackingDriver,
+} from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+import { reduceAggregate } from "./aggregate";
 
 export interface IndexedDBUsageTrackingDriverOptions {
   dbName?: string;
@@ -66,6 +72,19 @@ const matchesFilters = (
     return false;
   }
   if (options.client && entry.client !== options.client) {
+    return false;
+  }
+  if (
+    options.clients &&
+    options.clients.length > 0 &&
+    (entry.client == null || !options.clients.includes(entry.client))
+  ) {
+    return false;
+  }
+  if (typeof options.minTotalTokens === "number" && entry.totalTokens < options.minTotalTokens) {
+    return false;
+  }
+  if (typeof options.maxTotalTokens === "number" && entry.totalTokens >= options.maxTotalTokens) {
     return false;
   }
   return true;
@@ -180,6 +199,11 @@ export const createIndexedDBUsageTrackingDriver = (
     async count(options: Omit<ListUsageTrackingOptions, "limit"> = {}): Promise<number> {
       const results = await this.list(options);
       return results.length;
+    },
+
+    async aggregate(options: AggregateUsageOptions = {}): Promise<UsageAggregateRow[]> {
+      const entries = await this.list(options);
+      return reduceAggregate(entries, options);
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {

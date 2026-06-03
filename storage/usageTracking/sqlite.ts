@@ -1,7 +1,13 @@
 import { SDK_STORAGE_KEYS } from "../keys";
 import type { StorageDriver } from "../types";
-import type { ListUsageTrackingOptions, UsageTrackingDriver } from "./interfaces";
+import type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageTrackingDriver,
+} from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+import { buildAggregateSql, mapAggregateRow } from "./aggregate";
 
 type BetterSqlite3Database = {
   prepare: (sql: string) => {
@@ -77,6 +83,19 @@ const buildWhereClause = (
   if (options.client) {
     clauses.push("client = ?");
     params.push(options.client);
+  }
+  if (options.clients && options.clients.length > 0) {
+    const placeholders = options.clients.map(() => "?").join(", ");
+    clauses.push(`client IN (${placeholders})`);
+    params.push(...options.clients);
+  }
+  if (typeof options.minTotalTokens === "number") {
+    clauses.push("total_tokens >= ?");
+    params.push(options.minTotalTokens);
+  }
+  if (typeof options.maxTotalTokens === "number") {
+    clauses.push("total_tokens < ?");
+    params.push(options.maxTotalTokens);
   }
 
   return {
@@ -242,6 +261,15 @@ export const createSqliteUsageTrackingDriver = (
       const stmt = db.prepare(`SELECT COUNT(*) as count FROM ${tableName} ${sql}`);
       const row = stmt.get(...params);
       return Number(row?.count ?? 0);
+    },
+
+    async aggregate(options: AggregateUsageOptions = {}): Promise<UsageAggregateRow[]> {
+      await ensureInit();
+      await ensureMigrated();
+      const where = buildWhereClause(options);
+      const { sql, params } = buildAggregateSql(tableName, where, options);
+      const rows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+      return rows.map(mapAggregateRow);
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {
