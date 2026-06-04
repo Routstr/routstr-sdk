@@ -26,6 +26,9 @@ const matchesFilters = (
   if (options.client && entry.client !== options.client) {
     return false;
   }
+  if (options.provider && entry.provider !== options.provider) {
+    return false;
+  }
   return true;
 };
 

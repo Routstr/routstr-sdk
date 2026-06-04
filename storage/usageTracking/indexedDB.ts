@@ -27,11 +27,12 @@ const openDatabase = (
   }
 
   return new Promise((resolve, reject) => {
-    // Version 2 — both sdk_storage and usage_tracking stores need to coexist.
-    const request = indexedDB.open(dbName, 2);
+    // Version 3 — adds a `provider` index on the usage_tracking store.
+    const request = indexedDB.open(dbName, 3);
 
     request.onupgradeneeded = () => {
       const db = request.result;
+      const tx = request.transaction;
       // Create our own store
       if (!db.objectStoreNames.contains(storeName)) {
         const store = db.createObjectStore(storeName, { keyPath: "id" });
@@ -40,6 +41,13 @@ const openDatabase = (
         store.createIndex("baseUrl", "baseUrl", { unique: false });
         store.createIndex("sessionId", "sessionId", { unique: false });
         store.createIndex("client", "client", { unique: false });
+        store.createIndex("provider", "provider", { unique: false });
+      } else if (tx) {
+        // Existing store from an older version — add the new index in place.
+        const store = tx.objectStore(storeName);
+        if (!store.indexNames.contains("provider")) {
+          store.createIndex("provider", "provider", { unique: false });
+        }
       }
       // Also create sdk_storage if it doesn't exist (cross-driver init)
       if (storeName !== "sdk_storage" && !db.objectStoreNames.contains("sdk_storage")) {
@@ -78,6 +86,9 @@ const matchesFilters = (
     return false;
   }
   if (options.client && entry.client !== options.client) {
+    return false;
+  }
+  if (options.provider && entry.provider !== options.provider) {
     return false;
   }
   return true;

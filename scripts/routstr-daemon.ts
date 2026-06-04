@@ -7,6 +7,7 @@ import {
 } from "@routstr/sdk";
 import {
   createSqliteDriver,
+  createSqliteUsageTrackingDriver,
   ModelManager,
 } from "@routstr/sdk/node";
 import {
@@ -261,6 +262,8 @@ async function main(): Promise<void> {
   const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
   const storageAdapter = createStorageAdapterFromStore(store);
 
+  const usageTrackingDriver = createSqliteUsageTrackingDriver(store);
+
   console.log("Bootstrapping providers...");
   const modelManager = new ModelManager(discoveryAdapter, {
     eventStoreDbPath: EVENT_STORE_DB_PATH,
@@ -419,6 +422,7 @@ async function main(): Promise<void> {
           providerRegistry,
           discoveryAdapter,
           modelManager,
+          usageTrackingDriver,
         });
 
         res.statusCode = response.status;
