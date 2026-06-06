@@ -8,6 +8,7 @@ export interface ListUsageTrackingOptions {
   baseUrl?: string;
   sessionId?: string;
   client?: string;
+  provider?: string;
 }
 
 export interface UsageTrackingDriver {

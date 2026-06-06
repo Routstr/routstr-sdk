@@ -8,6 +8,22 @@ import type { UsageTrackingEntry } from "./types";
 
 const MIGRATION_MARKER_KEY = "usage_tracking_migration_v1";
 
+// Columns added after the initial release. Added via ALTER TABLE only when
+// missing (checked with PRAGMA table_info) so migration is idempotent.
+const ADDED_COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
+  { name: "provider", type: "TEXT" },
+  { name: "base_msats", type: "REAL" },
+  { name: "input_msats", type: "REAL" },
+  { name: "output_msats", type: "REAL" },
+  { name: "total_msats", type: "REAL" },
+  { name: "total_usd", type: "REAL" },
+  { name: "cache_read_input_tokens", type: "INTEGER" },
+  { name: "cache_creation_input_tokens", type: "INTEGER" },
+  { name: "cache_read_msats", type: "REAL" },
+  { name: "cache_creation_msats", type: "REAL" },
+  { name: "remaining_balance_msats", type: "REAL" },
+];
+
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
@@ -40,6 +56,10 @@ const buildWhereClause = (
   if (options.client) {
     clauses.push("client = ?");
     params.push(options.client);
+  }
+  if (options.provider) {
+    clauses.push("provider = ?");
+    params.push(options.provider);
   }
 
   return {
@@ -94,17 +114,37 @@ export const createBunSqliteUsageTrackingDriver = (
     )
   `);
 
+  // Add columns introduced after the initial schema (idempotent).
+  const existingColumns = new Set<string>(
+    db
+      .query(`PRAGMA table_info(${tableName})`)
+      .all()
+      .map((row: any) => String(row.name))
+  );
+  for (const column of ADDED_COLUMNS) {
+    if (!existingColumns.has(column.name)) {
+      db.run(`ALTER TABLE ${tableName} ADD COLUMN ${column.name} ${column.type}`);
+    }
+  }
+
   db.run(`CREATE INDEX IF NOT EXISTS idx_${tableName}_timestamp ON ${tableName}(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_${tableName}_model_id ON ${tableName}(model_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_${tableName}_base_url ON ${tableName}(base_url)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_${tableName}_provider ON ${tableName}(provider)`);
 
   const appendOne = (entry: UsageTrackingEntry): void => {
     db.query(`
       INSERT OR REPLACE INTO ${tableName} (
         id, timestamp, model_id, base_url, request_id,
         cost, sats_cost, prompt_tokens, completion_tokens, total_tokens,
-        client, session_id, tags
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        client, session_id, tags,
+        provider, base_msats, input_msats, output_msats, total_msats,
+        total_usd, cache_read_input_tokens, cache_creation_input_tokens,
+        cache_read_msats, cache_creation_msats, remaining_balance_msats
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      )
     `).run(
       entry.id,
       entry.timestamp,
@@ -118,7 +158,18 @@ export const createBunSqliteUsageTrackingDriver = (
       entry.totalTokens,
       entry.client ?? null,
       entry.sessionId ?? null,
-      JSON.stringify(entry.tags ?? [])
+      JSON.stringify(entry.tags ?? []),
+      entry.provider ?? null,
+      entry.baseMsats ?? null,
+      entry.inputMsats ?? null,
+      entry.outputMsats ?? null,
+      entry.totalMsats ?? null,
+      entry.totalUsd ?? null,
+      entry.cacheReadInputTokens ?? null,
+      entry.cacheCreationInputTokens ?? null,
+      entry.cacheReadMsats ?? null,
+      entry.cacheCreationMsats ?? null,
+      entry.remainingBalanceMsats ?? null
     );
   };
 
@@ -136,6 +187,17 @@ export const createBunSqliteUsageTrackingDriver = (
     client: row.client ?? undefined,
     sessionId: row.session_id ?? undefined,
     tags: typeof row.tags === "string" ? JSON.parse(row.tags) : undefined,
+    provider: row.provider ?? undefined,
+    baseMsats: row.base_msats ?? undefined,
+    inputMsats: row.input_msats ?? undefined,
+    outputMsats: row.output_msats ?? undefined,
+    totalMsats: row.total_msats ?? undefined,
+    totalUsd: row.total_usd ?? undefined,
+    cacheReadInputTokens: row.cache_read_input_tokens ?? undefined,
+    cacheCreationInputTokens: row.cache_creation_input_tokens ?? undefined,
+    cacheReadMsats: row.cache_read_msats ?? undefined,
+    cacheCreationMsats: row.cache_creation_msats ?? undefined,
+    remainingBalanceMsats: row.remaining_balance_msats ?? undefined,
   });
 
   const ensureMigrated = async (): Promise<void> => {

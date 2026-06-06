@@ -27,10 +27,13 @@ const openDatabase = (
   }
 
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
+    // Version 3 — adds a `provider` index on the usage_tracking store.
+    const request = indexedDB.open(dbName, 3);
 
     request.onupgradeneeded = () => {
       const db = request.result;
+      const tx = request.transaction;
+      // Create our own store
       if (!db.objectStoreNames.contains(storeName)) {
         const store = db.createObjectStore(storeName, { keyPath: "id" });
         store.createIndex("timestamp", "timestamp", { unique: false });
@@ -38,11 +41,28 @@ const openDatabase = (
         store.createIndex("baseUrl", "baseUrl", { unique: false });
         store.createIndex("sessionId", "sessionId", { unique: false });
         store.createIndex("client", "client", { unique: false });
+        store.createIndex("provider", "provider", { unique: false });
+      } else if (tx) {
+        // Existing store from an older version — add the new index in place.
+        const store = tx.objectStore(storeName);
+        if (!store.indexNames.contains("provider")) {
+          store.createIndex("provider", "provider", { unique: false });
+        }
+      }
+      // Also create sdk_storage if it doesn't exist (cross-driver init)
+      if (storeName !== "sdk_storage" && !db.objectStoreNames.contains("sdk_storage")) {
+        db.createObjectStore("sdk_storage");
       }
     };
 
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+    request.onblocked = () => {
+      console.warn(
+        `[usageTracking IndexedDB] open blocked for "${dbName}" — close other tabs using this DB`
+      );
+      reject(new Error(`IndexedDB "${dbName}" blocked by another connection`));
+    };
   });
 };
 
@@ -66,6 +86,9 @@ const matchesFilters = (
     return false;
   }
   if (options.client && entry.client !== options.client) {
+    return false;
+  }
+  if (options.provider && entry.provider !== options.provider) {
     return false;
   }
   return true;

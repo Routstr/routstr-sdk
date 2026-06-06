@@ -11,6 +11,9 @@ importers:
       '@cashu/cashu-ts':
         specifier: ^3.1.1
         version: 3.7.0
+      '@routstr/sdk':
+        specifier: 'link:'
+        version: 'link:'
       applesauce-core:
         specifier: ^5.1.0
         version: 5.2.0(typescript@5.9.3)
