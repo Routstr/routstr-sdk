@@ -48,6 +48,10 @@ export interface ModelManagerConfig {
   cacheTTL?: number;
   /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
   routstrPubkey?: string;
+  /** Nostr relay URLs for provider/model discovery.
+   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
+   * When unset, each method uses its own default relay set. */
+  nostrRelays?: string[];
   /** Optional injectable logger */
   logger?: SdkLogger;
   /** Path to database for persistent Nostr event storage.
@@ -74,6 +78,7 @@ export class ModelManager {
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
   private readonly routstrPubkey: string;
+  private readonly nostrRelays: string[] | undefined;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
   /** Persistent event store for relay-fetched events (null if not configured/initialized) */
@@ -95,6 +100,7 @@ export class ModelManager {
     this.routstrPubkey =
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
+    this.nostrRelays = config.nostrRelays;
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
 
     this.eventStoreDbPath = config.eventStoreDbPath;
@@ -303,6 +309,14 @@ export class ModelManager {
   }
 
   /**
+   * Resolve Nostr relay URLs for a given use case.
+   * Returns user-configured relays if set, otherwise the provided defaults.
+   */
+  private getNostrRelays(defaults: string[]): string[] {
+    return this.nostrRelays && this.nostrRelays.length > 0 ? this.nostrRelays : defaults;
+  }
+
+  /**
    * Bootstrap providers from Nostr network (kind 38421)
    * @param kind The Nostr kind to fetch
    * @param torMode Whether running in Tor context
@@ -313,11 +327,11 @@ export class ModelManager {
     torMode: boolean,
     forceRefresh: boolean = false
   ): Promise<string[]> {
-    const DEFAULT_RELAYS = [
+    const relays = this.getNostrRelays([
       "wss://relay.primal.net",
       "wss://nos.lol",
       "wss://relay.damus.io",
-    ];
+    ]);
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
@@ -334,7 +348,7 @@ export class ModelManager {
 
       await new Promise<void>((resolve) => {
         pool
-          .req(DEFAULT_RELAYS, {
+          .req(relays, {
             kinds: [kind],
             limit: 100,
           })
@@ -544,17 +558,17 @@ export class ModelManager {
       let sessionEvents: NostrEvent[] = cached;
 
       if (cached.length === 0) {
-        const LGTM_RELAYS = [
+        const lgtmRelays = this.getNostrRelays([
           "wss://relay.primal.net",
           "wss://nos.lol",
           "wss://relay.damus.io",
           "wss://relay.routstr.com",
-        ];
+        ]);
         const pool = new RelayPool();
         const timeoutMs = 5000;
         await new Promise<void>((resolve) => {
           pool
-            .req(LGTM_RELAYS, {
+            .req(lgtmRelays, {
               kinds: [38425],
               "#t": ["lgtm"],
               limit: 500,
@@ -859,11 +873,11 @@ export class ModelManager {
       }
     }
 
-    const DEFAULT_RELAYS = [
+    const relays = this.getNostrRelays([
       "wss://relay.damus.io",
       "wss://nos.lol",
       "wss://relay.routstr.com",
-    ];
+    ]);
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
@@ -880,7 +894,7 @@ export class ModelManager {
 
       await new Promise<void>((resolve) => {
         pool
-          .req(DEFAULT_RELAYS, {
+          .req(relays, {
             kinds: [38423],
             "#d": ["routstr-21-models"],
             limit: 1,
