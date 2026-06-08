@@ -178,10 +178,6 @@ interface CandidateProvider {
 /**
  * ProviderManager handles provider selection and failover
  */
-function isInsecureHttpUrl(url: string): boolean {
-  return url.startsWith("http://");
-}
-
 export class ProviderManager {
   private failedProviders = new Set<string>();
   /** Track when each provider last failed (provider URL -> timestamp) */
@@ -460,8 +456,8 @@ export class ProviderManager {
           continue;
         }
 
-        // Skip onion URLs and insecure http URLs if not in Tor mode
-        if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl))) {
+        // Skip onion URLs if not in Tor mode
+        if (!torMode && isOnionUrl(baseUrl)) {
           continue;
         }
 
@@ -535,7 +531,7 @@ export class ProviderManager {
     for (const [baseUrl, models] of Object.entries(allProviders)) {
       if (disabledProviders.has(baseUrl)) continue;
       if (this.isOnCooldown(baseUrl)) continue;
-      if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl)))
+      if (!torMode && isOnionUrl(baseUrl))
         continue;
 
       const model = models.find((m: Model) => m.id === modelId);
@@ -569,7 +565,7 @@ export class ProviderManager {
       if (torMode && !baseUrl.includes(".onion")) continue;
       if (
         !torMode &&
-        (baseUrl.includes(".onion") || isInsecureHttpUrl(baseUrl))
+        baseUrl.includes(".onion")
       )
         continue;
 
