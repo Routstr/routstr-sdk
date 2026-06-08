@@ -1,6 +1,6 @@
 {
   "name": "@routstr/sdk",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "Framework-agnostic SDK for Routstr API interactions",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -67,7 +67,6 @@
   },
   "dependencies": {
     "@cashu/cashu-ts": "^3.1.1",
-    "@routstr/sdk": "link:",
     "applesauce-core": "^5.1.0",
     "applesauce-relay": "^5.1.0",
     "applesauce-sqlite": "^6.0.0",
