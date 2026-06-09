@@ -10,10 +10,6 @@ export interface ListUsageTrackingOptions {
   client?: string;
   /** Match any of these client ids (SQL `client IN (...)`). Complements `client`. */
   clients?: string[];
-  /** Inclusive lower bound on totalTokens (`total_tokens >= n`). */
-  minTotalTokens?: number;
-  /** Exclusive upper bound on totalTokens (`total_tokens < n`). */
-  maxTotalTokens?: number;
 }
 
 /** Dimension to group usage aggregates by. `day`/`hour` are timezone-aware. */

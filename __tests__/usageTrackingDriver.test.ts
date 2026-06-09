@@ -143,14 +143,6 @@ describe("usage tracking aggregate", () => {
     expect(rows.reduce((sum, r) => sum + r.requests, 0)).toBe(2);
   });
 
-  it("filters by total-token range for size buckets", async () => {
-    const driver = await seeded();
-    const [huge] = await driver.aggregate({ minTotalTokens: 100000 });
-    expect(huge).toMatchObject({ requests: 1, satsCost: 7 });
-    const [mid] = await driver.aggregate({ minTotalTokens: 1000, maxTotalTokens: 50000 });
-    expect(mid).toMatchObject({ requests: 1, totalTokens: 2000 });
-  });
-
   it("produces identical results across memory and sqlite drivers", async () => {
     const mem = await seeded();
     const sql = createSqliteUsageTrackingDriver({ dbPath: ":memory:", tableName: "usage_aggregate_test" });
@@ -163,7 +155,6 @@ describe("usage tracking aggregate", () => {
       { groupBy: "day" as const, tzOffsetMinutes: 300 },
       { groupBy: "hour" as const, tzOffsetMinutes: 300 },
       { groupBy: "modelId" as const, clients: ["c1"] },
-      { minTotalTokens: 100000 },
     ]) {
       expect(await sql.aggregate(opts)).toEqual(await mem.aggregate(opts));
     }

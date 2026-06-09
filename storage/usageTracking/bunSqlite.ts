@@ -49,15 +49,6 @@ const buildWhereClause = (
     clauses.push(`client IN (${placeholders})`);
     params.push(...options.clients);
   }
-  if (typeof options.minTotalTokens === "number") {
-    clauses.push("total_tokens >= ?");
-    params.push(options.minTotalTokens);
-  }
-  if (typeof options.maxTotalTokens === "number") {
-    clauses.push("total_tokens < ?");
-    params.push(options.maxTotalTokens);
-  }
-
   return {
     sql: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "",
     params,

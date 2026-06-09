@@ -39,12 +39,6 @@ const matchesFilters = (
   ) {
     return false;
   }
-  if (typeof options.minTotalTokens === "number" && entry.totalTokens < options.minTotalTokens) {
-    return false;
-  }
-  if (typeof options.maxTotalTokens === "number" && entry.totalTokens >= options.maxTotalTokens) {
-    return false;
-  }
   return true;
 };
 
