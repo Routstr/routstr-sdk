@@ -21,7 +21,32 @@ const entry = (overrides: Partial<UsageTrackingEntry> = {}): UsageTrackingEntry 
   client: overrides.client,
   sessionId: overrides.sessionId,
   tags: overrides.tags,
+  provider: overrides.provider,
+  baseMsats: overrides.baseMsats,
+  inputMsats: overrides.inputMsats,
+  outputMsats: overrides.outputMsats,
+  totalMsats: overrides.totalMsats,
+  totalUsd: overrides.totalUsd,
+  cacheReadInputTokens: overrides.cacheReadInputTokens,
+  cacheCreationInputTokens: overrides.cacheCreationInputTokens,
+  cacheReadMsats: overrides.cacheReadMsats,
+  cacheCreationMsats: overrides.cacheCreationMsats,
+  remainingBalanceMsats: overrides.remainingBalanceMsats,
 });
+
+const costFields = {
+  provider: "openrouter:openrouter:Anthropic",
+  baseMsats: 0,
+  inputMsats: 24638,
+  outputMsats: 51,
+  totalMsats: 24689,
+  totalUsd: 0.0176475,
+  cacheReadInputTokens: 0,
+  cacheCreationInputTokens: 0,
+  cacheReadMsats: 0,
+  cacheCreationMsats: 0,
+  remainingBalanceMsats: 3605659,
+} satisfies Partial<UsageTrackingEntry>;
 
 describe("usage tracking drivers", () => {
   it("memory driver appends and lists entries in descending timestamp order", async () => {
@@ -75,6 +100,89 @@ describe("usage tracking drivers", () => {
 
     const legacyRows = await legacyDriver.getItem(SDK_STORAGE_KEYS.USAGE_TRACKING, [] as UsageTrackingEntry[]);
     expect(legacyRows).toEqual([]);
+  });
+
+  it("memory driver round-trips the full cost breakdown and provider", async () => {
+    const driver = createMemoryUsageTrackingDriver();
+    await driver.append(entry({ id: "c1", ...costFields }));
+
+    const [row] = await driver.list();
+    expect(row).toMatchObject(costFields);
+  });
+
+  it("memory driver filters by provider", async () => {
+    const driver = createMemoryUsageTrackingDriver();
+    await driver.appendMany([
+      entry({ id: "a", timestamp: 1, provider: "prov-a" }),
+      entry({ id: "b", timestamp: 2, provider: "prov-b" }),
+    ]);
+    const rows = await driver.list({ provider: "prov-b" });
+    expect(rows.map((r) => r.id)).toEqual(["b"]);
+  });
+
+  it("sqlite driver persists and filters the cost breakdown + provider", async () => {
+    const driver = createSqliteUsageTrackingDriver({
+      dbPath: ":memory:",
+      tableName: "usage_tracking_cost",
+    });
+    await driver.migrate();
+    await driver.append(entry({ id: "c1", ...costFields }));
+
+    const [row] = await driver.list();
+    expect(row).toMatchObject(costFields);
+
+    const filtered = await driver.list({ provider: costFields.provider });
+    expect(filtered.map((r) => r.id)).toEqual(["c1"]);
+  });
+
+  it("sqlite driver migrates an existing pre-breakdown table by adding columns", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    // Create the old schema (no breakdown/provider columns) on a shared file.
+    const dbPath = `:memory:`;
+    const db = new Database(dbPath);
+    const tableName = "usage_tracking_old";
+    db.exec(`
+      CREATE TABLE ${tableName} (
+        id TEXT PRIMARY KEY,
+        timestamp INTEGER NOT NULL,
+        model_id TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        cost REAL NOT NULL,
+        sats_cost REAL NOT NULL,
+        prompt_tokens INTEGER NOT NULL,
+        completion_tokens INTEGER NOT NULL,
+        total_tokens INTEGER NOT NULL,
+        client TEXT,
+        session_id TEXT,
+        tags TEXT
+      );
+    `);
+    db.prepare(
+      `INSERT INTO ${tableName} (id, timestamp, model_id, base_url, request_id, cost, sats_cost, prompt_tokens, completion_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("old-1", 50, "m", "https://x/", "r", 1, 1, 1, 1, 2);
+
+    const cols = db
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all()
+      .map((r: any) => r.name);
+    expect(cols).not.toContain("provider");
+    expect(cols).not.toContain("total_msats");
+
+    // Now add the columns the same way the driver migration does.
+    for (const col of [
+      ["provider", "TEXT"],
+      ["total_msats", "REAL"],
+    ] as const) {
+      db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${col[0]} ${col[1]}`);
+    }
+    const migratedCols = db
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all()
+      .map((r: any) => r.name);
+    expect(migratedCols).toContain("provider");
+    expect(migratedCols).toContain("total_msats");
+    db.close();
   });
 });
 

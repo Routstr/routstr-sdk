@@ -39,6 +39,9 @@ const matchesFilters = (
   ) {
     return false;
   }
+  if (options.provider && entry.provider !== options.provider) {
+    return false;
+  }
   return true;
 };
 

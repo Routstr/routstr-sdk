@@ -11,6 +11,10 @@ function mergeUsage(
   next: UsageTrackingData
 ): UsageTrackingData {
   if (!previous) return next;
+  const pickNum = (
+    n: number | undefined,
+    p: number | undefined
+  ): number | undefined => (typeof n === "number" && n > 0 ? n : p ?? n);
   return {
     promptTokens:
       next.promptTokens > 0 ? next.promptTokens : previous.promptTokens,
@@ -22,6 +26,29 @@ function mergeUsage(
       next.totalTokens > 0 ? next.totalTokens : previous.totalTokens,
     cost: next.cost > 0 ? next.cost : previous.cost,
     satsCost: next.satsCost > 0 ? next.satsCost : previous.satsCost,
+    provider: next.provider ?? previous.provider,
+    baseMsats: pickNum(next.baseMsats, previous.baseMsats),
+    inputMsats: pickNum(next.inputMsats, previous.inputMsats),
+    outputMsats: pickNum(next.outputMsats, previous.outputMsats),
+    totalMsats: pickNum(next.totalMsats, previous.totalMsats),
+    totalUsd: pickNum(next.totalUsd, previous.totalUsd),
+    cacheReadInputTokens: pickNum(
+      next.cacheReadInputTokens,
+      previous.cacheReadInputTokens
+    ),
+    cacheCreationInputTokens: pickNum(
+      next.cacheCreationInputTokens,
+      previous.cacheCreationInputTokens
+    ),
+    cacheReadMsats: pickNum(next.cacheReadMsats, previous.cacheReadMsats),
+    cacheCreationMsats: pickNum(
+      next.cacheCreationMsats,
+      previous.cacheCreationMsats
+    ),
+    remainingBalanceMsats: pickNum(
+      next.remainingBalanceMsats,
+      previous.remainingBalanceMsats
+    ),
   };
 }
 
@@ -35,7 +62,27 @@ function hasUsageChanged(
     previous.completionTokens !== next.completionTokens ||
     previous.totalTokens !== next.totalTokens ||
     previous.cost !== next.cost ||
-    previous.satsCost !== next.satsCost
+    previous.satsCost !== next.satsCost ||
+    previous.provider !== next.provider ||
+    previous.totalMsats !== next.totalMsats ||
+    previous.remainingBalanceMsats !== next.remainingBalanceMsats
+  );
+}
+
+/**
+ * The inspector can stop early once we've seen the response id, a provider,
+ * usage with token counts, and the detailed cost breakdown (total_msats).
+ */
+function isInspectionComplete(
+  responseIdCaptured: boolean,
+  usage: UsageTrackingData | null
+): boolean {
+  return (
+    responseIdCaptured &&
+    !!usage &&
+    usage.totalTokens > 0 &&
+    typeof usage.totalMsats === "number" &&
+    !!usage.provider
   );
 }
 
@@ -68,19 +115,24 @@ export async function inspectSSEWebStream(
   let responseIdCaptured = false;
 
   const inspectDataPayload = (jsonText: string): void => {
-    if (
-      responseIdCaptured &&
-      capturedUsage &&
-      capturedUsage.totalTokens > 0
-    ) {
+    const trimmed = jsonText.trim();
+    if (!trimmed || trimmed === "[DONE]") {
+      if (trimmed === "[DONE]") console.log("[routstr:sse] [DONE]");
       return;
     }
-    const trimmed = jsonText.trim();
-    if (!trimmed || trimmed === "[DONE]") return;
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return;
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      console.log("[routstr:sse] non-JSON payload:", trimmed.slice(0, 200));
+      return;
+    }
 
     try {
       const data = JSON.parse(trimmed) as any;
+      console.log("[routstr:sse] chunk:", JSON.stringify(data));
+
+      if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
+        console.log("[routstr:sse] (inspection already complete, skipping)");
+        return;
+      }
 
       if (!responseIdCaptured) {
         const responseId = data?.id;
@@ -93,26 +145,22 @@ export async function inspectSSEWebStream(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
+        console.log("[routstr:sse] → usage detected:", usage);
         const merged = mergeUsage(capturedUsage, usage);
         if (hasUsageChanged(capturedUsage, merged)) {
           capturedUsage = merged;
+          console.log("[routstr:sse] → merged (changed):", merged);
           onUsage(merged);
+        } else {
+          console.log("[routstr:sse] → merged (no change)");
         }
       }
     } catch {
-      // Ignore non-JSON payloads.
+      console.log("[routstr:sse] failed to parse payload:", trimmed.slice(0, 200));
     }
   };
 
   const inspectEventBlock = (eventBlock: string): void => {
-    if (
-      responseIdCaptured &&
-      capturedUsage &&
-      capturedUsage.totalTokens > 0
-    ) {
-      return;
-    }
-
     const lines = eventBlock.split(/\r?\n/);
     const dataParts: string[] = [];
     for (const line of lines) {
@@ -198,15 +246,24 @@ export function createSSEParserTransform(
   let responseIdCaptured = false;
 
   const inspectDataPayload = (jsonText: string): void => {
-    if (responseIdCaptured && capturedUsage && capturedUsage.totalTokens > 0) {
+    const trimmed = jsonText.trim();
+    if (!trimmed || trimmed === "[DONE]") {
+      if (trimmed === "[DONE]") console.log("[routstr:sse] [DONE]");
       return;
     }
-    const trimmed = jsonText.trim();
-    if (!trimmed || trimmed === "[DONE]") return;
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return;
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      console.log("[routstr:sse] non-JSON payload:", trimmed.slice(0, 200));
+      return;
+    }
 
     try {
       const data = JSON.parse(trimmed) as any;
+      console.log("[routstr:sse] chunk:", JSON.stringify(data));
+
+      if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
+        console.log("[routstr:sse] (inspection already complete, skipping)");
+        return;
+      }
 
       if (!responseIdCaptured) {
         const responseId = data?.id;
@@ -218,14 +275,18 @@ export function createSSEParserTransform(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
+        console.log("[routstr:sse] → usage detected:", usage);
         const mergedUsage = mergeUsage(capturedUsage, usage);
         if (hasUsageChanged(capturedUsage, mergedUsage)) {
           capturedUsage = mergedUsage;
+          console.log("[routstr:sse] → merged (changed):", mergedUsage);
           onUsage(mergedUsage);
+        } else {
+          console.log("[routstr:sse] → merged (no change)");
         }
       }
     } catch {
-      // Ignore non-JSON data payloads.
+      console.log("[routstr:sse] failed to parse payload:", trimmed.slice(0, 200));
     }
   };
 
@@ -235,10 +296,6 @@ export function createSSEParserTransform(
    * event are concatenated with `\n` to form the payload.
    */
   const inspectEventBlock = (eventBlock: string): void => {
-    if (responseIdCaptured && capturedUsage && capturedUsage.totalTokens > 0) {
-      return;
-    }
-
     const lines = eventBlock.split(/\r?\n/);
     const dataParts: string[] = [];
 

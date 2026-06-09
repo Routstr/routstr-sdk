@@ -10,6 +10,7 @@ export interface ListUsageTrackingOptions {
   client?: string;
   /** Match any of these client ids (SQL `client IN (...)`). Complements `client`. */
   clients?: string[];
+  provider?: string;
 }
 
 /** Dimension to group usage aggregates by. `day`/`hour` are timezone-aware. */
