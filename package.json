@@ -63,8 +63,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit",
-    "bench": "bun scripts/bench-aggregate.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@cashu/cashu-ts": "^3.1.1",
