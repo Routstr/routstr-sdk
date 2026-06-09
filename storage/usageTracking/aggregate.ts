@@ -19,7 +19,16 @@ const aggregateColumns =
   "COALESCE(SUM(completion_tokens), 0) AS completionTokens, " +
   "COALESCE(SUM(total_tokens), 0) AS totalTokens, " +
   "COALESCE(SUM(cost), 0) AS cost, " +
-  "COALESCE(SUM(sats_cost), 0) AS satsCost";
+  "COALESCE(SUM(sats_cost), 0) AS satsCost, " +
+  "COALESCE(SUM(base_msats), 0) AS baseMsats, " +
+  "COALESCE(SUM(input_msats), 0) AS inputMsats, " +
+  "COALESCE(SUM(output_msats), 0) AS outputMsats, " +
+  "COALESCE(SUM(total_msats), 0) AS totalMsats, " +
+  "COALESCE(SUM(total_usd), 0) AS totalUsd, " +
+  "COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens, " +
+  "COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens, " +
+  "COALESCE(SUM(cache_read_msats), 0) AS cacheReadMsats, " +
+  "COALESCE(SUM(cache_creation_msats), 0) AS cacheCreationMsats";
 
 /**
  * SQL expression producing the group key. `day`/`hour` shift the (millisecond)
@@ -38,6 +47,8 @@ const sqlGroupExpr = (
       return { expr: "client", usesTz: false };
     case "sessionId":
       return { expr: "session_id", usesTz: false };
+    case "provider":
+      return { expr: "provider", usesTz: false };
     case "day":
       return {
         expr: "strftime('%Y-%m-%d', (timestamp - ? * 60000) / 1000, 'unixepoch')",
@@ -91,6 +102,15 @@ export const mapAggregateRow = (row: Record<string, unknown>): UsageAggregateRow
   totalTokens: Number(row.totalTokens ?? 0),
   cost: Number(row.cost ?? 0),
   satsCost: Number(row.satsCost ?? 0),
+  baseMsats: Number(row.baseMsats ?? 0),
+  inputMsats: Number(row.inputMsats ?? 0),
+  outputMsats: Number(row.outputMsats ?? 0),
+  totalMsats: Number(row.totalMsats ?? 0),
+  totalUsd: Number(row.totalUsd ?? 0),
+  cacheReadInputTokens: Number(row.cacheReadInputTokens ?? 0),
+  cacheCreationInputTokens: Number(row.cacheCreationInputTokens ?? 0),
+  cacheReadMsats: Number(row.cacheReadMsats ?? 0),
+  cacheCreationMsats: Number(row.cacheCreationMsats ?? 0),
 });
 
 const jsGroupKey = (
@@ -107,6 +127,8 @@ const jsGroupKey = (
       return entry.client ?? null;
     case "sessionId":
       return entry.sessionId ?? null;
+    case "provider":
+      return entry.provider ?? null;
     case "day": {
       const d = new Date(entry.timestamp - tzOffsetMinutes * 60000);
       return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
@@ -135,6 +157,15 @@ export const reduceAggregate = (
     totalTokens: 0,
     cost: 0,
     satsCost: 0,
+    baseMsats: 0,
+    inputMsats: 0,
+    outputMsats: 0,
+    totalMsats: 0,
+    totalUsd: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadMsats: 0,
+    cacheCreationMsats: 0,
   });
 
   const accumulate = (row: UsageAggregateRow, entry: UsageTrackingEntry): void => {
@@ -144,6 +175,15 @@ export const reduceAggregate = (
     row.totalTokens += entry.totalTokens;
     row.cost += entry.cost;
     row.satsCost += entry.satsCost;
+    row.baseMsats += entry.baseMsats ?? 0;
+    row.inputMsats += entry.inputMsats ?? 0;
+    row.outputMsats += entry.outputMsats ?? 0;
+    row.totalMsats += entry.totalMsats ?? 0;
+    row.totalUsd += entry.totalUsd ?? 0;
+    row.cacheReadInputTokens += entry.cacheReadInputTokens ?? 0;
+    row.cacheCreationInputTokens += entry.cacheCreationInputTokens ?? 0;
+    row.cacheReadMsats += entry.cacheReadMsats ?? 0;
+    row.cacheCreationMsats += entry.cacheCreationMsats ?? 0;
   };
 
   if (!options.groupBy) {

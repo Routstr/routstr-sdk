@@ -19,6 +19,7 @@ export type UsageGroupBy =
   | "baseUrl"
   | "client"
   | "sessionId"
+  | "provider"
   | "day"
   | "hour";
 
@@ -46,6 +47,15 @@ export interface UsageAggregateRow {
   totalTokens: number;
   cost: number;
   satsCost: number;
+  baseMsats: number;
+  inputMsats: number;
+  outputMsats: number;
+  totalMsats: number;
+  totalUsd: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadMsats: number;
+  cacheCreationMsats: number;
 }
 
 export interface UsageTrackingDriver {

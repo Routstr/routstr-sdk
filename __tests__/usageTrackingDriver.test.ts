@@ -192,10 +192,73 @@ describe("usage tracking aggregate", () => {
   const D1 = Date.UTC(2026, 0, 15, 2, 30);
   const D2 = Date.UTC(2026, 0, 15, 14, 0);
   const seed: UsageTrackingEntry[] = [
-    entry({ id: "1", timestamp: D1, modelId: "m-a", client: "c1", baseUrl: "https://p1/", satsCost: 10, cost: 1, promptTokens: 5, completionTokens: 5, totalTokens: 10 }),
-    entry({ id: "2", timestamp: D1 + 1000, modelId: "m-b", client: "c1", baseUrl: "https://p2/", satsCost: 50, cost: 5, promptTokens: 100, completionTokens: 100, totalTokens: 200 }),
-    entry({ id: "3", timestamp: D2, modelId: "m-a", client: "c2", baseUrl: "https://p1/", satsCost: 30, cost: 3, promptTokens: 1000, completionTokens: 1000, totalTokens: 2000 }),
-    entry({ id: "4", timestamp: D2 + 5000, modelId: "m-a", client: undefined, baseUrl: "https://p1/", satsCost: 7, cost: 0.5, promptTokens: 50000, completionTokens: 60000, totalTokens: 110000 }),
+    entry({
+      id: "1",
+      timestamp: D1,
+      modelId: "m-a",
+      client: "c1",
+      provider: "prov-a",
+      baseUrl: "https://p1/",
+      satsCost: 10,
+      cost: 1,
+      promptTokens: 5,
+      completionTokens: 5,
+      totalTokens: 10,
+      baseMsats: 1,
+      inputMsats: 2,
+      outputMsats: 3,
+      totalMsats: 6,
+      totalUsd: 0.01,
+      cacheReadInputTokens: 4,
+      cacheCreationInputTokens: 5,
+      cacheReadMsats: 6,
+      cacheCreationMsats: 7,
+    }),
+    entry({
+      id: "2",
+      timestamp: D1 + 1000,
+      modelId: "m-b",
+      client: "c1",
+      provider: "prov-b",
+      baseUrl: "https://p2/",
+      satsCost: 50,
+      cost: 5,
+      promptTokens: 100,
+      completionTokens: 100,
+      totalTokens: 200,
+      baseMsats: 10,
+      inputMsats: 20,
+      outputMsats: 30,
+      totalMsats: 60,
+      totalUsd: 0.02,
+      cacheReadInputTokens: 40,
+      cacheCreationInputTokens: 50,
+      cacheReadMsats: 60,
+      cacheCreationMsats: 70,
+    }),
+    entry({
+      id: "3",
+      timestamp: D2,
+      modelId: "m-a",
+      client: "c2",
+      provider: "prov-a",
+      baseUrl: "https://p1/",
+      satsCost: 30,
+      cost: 3,
+      promptTokens: 1000,
+      completionTokens: 1000,
+      totalTokens: 2000,
+      baseMsats: 100,
+      inputMsats: 200,
+      outputMsats: 300,
+      totalMsats: 600,
+      totalUsd: 0.03,
+      cacheReadInputTokens: 400,
+      cacheCreationInputTokens: 500,
+      cacheReadMsats: 600,
+      cacheCreationMsats: 700,
+    }),
+    entry({ id: "4", timestamp: D2 + 5000, modelId: "m-a", client: undefined, provider: undefined, baseUrl: "https://p1/", satsCost: 7, cost: 0.5, promptTokens: 50000, completionTokens: 60000, totalTokens: 110000 }),
   ];
 
   const seeded = async () => {
@@ -207,13 +270,44 @@ describe("usage tracking aggregate", () => {
   it("returns a single grand-total row when groupBy is omitted", async () => {
     const driver = await seeded();
     const [total] = await driver.aggregate();
-    expect(total).toMatchObject({ group: null, requests: 4, satsCost: 97, totalTokens: 112210 });
+    expect(total).toMatchObject({
+      group: null,
+      requests: 4,
+      satsCost: 97,
+      totalTokens: 112210,
+      baseMsats: 111,
+      inputMsats: 222,
+      outputMsats: 333,
+      totalMsats: 666,
+      cacheReadInputTokens: 444,
+      cacheCreationInputTokens: 555,
+      cacheReadMsats: 666,
+      cacheCreationMsats: 777,
+    });
+    expect(total?.totalUsd).toBeCloseTo(0.06);
   });
 
   it("returns a zero total row for an empty store", async () => {
     const driver = createMemoryUsageTrackingDriver();
     expect(await driver.aggregate()).toEqual([
-      { group: null, requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, cost: 0, satsCost: 0 },
+      {
+        group: null,
+        requests: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cost: 0,
+        satsCost: 0,
+        baseMsats: 0,
+        inputMsats: 0,
+        outputMsats: 0,
+        totalMsats: 0,
+        totalUsd: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        cacheReadMsats: 0,
+        cacheCreationMsats: 0,
+      },
     ]);
   });
 
@@ -228,6 +322,18 @@ describe("usage tracking aggregate", () => {
     const driver = await seeded();
     const rows = await driver.aggregate({ groupBy: "client" });
     expect(rows.find((r) => r.group === null)).toMatchObject({ requests: 1, satsCost: 7 });
+  });
+
+  it("groups by provider sorted by satsCost descending", async () => {
+    const driver = await seeded();
+    const rows = await driver.aggregate({ groupBy: "provider" });
+    expect(rows.map((r) => r.group)).toEqual(["prov-b", "prov-a", null]);
+    expect(rows.find((r) => r.group === "prov-a")).toMatchObject({
+      requests: 2,
+      satsCost: 40,
+      totalMsats: 606,
+      cacheReadInputTokens: 404,
+    });
   });
 
   it("buckets days by the caller's timezone offset", async () => {
@@ -260,6 +366,7 @@ describe("usage tracking aggregate", () => {
       {},
       { groupBy: "modelId" as const },
       { groupBy: "client" as const },
+      { groupBy: "provider" as const },
       { groupBy: "day" as const, tzOffsetMinutes: 300 },
       { groupBy: "hour" as const, tzOffsetMinutes: 300 },
       { groupBy: "modelId" as const, clients: ["c1"] },
