@@ -553,9 +553,11 @@ export class ProviderManager {
   ): ModelProviderPrice[] {
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
-    const disabledProviders = new Set(
-      this.providerRegistry.getDisabledProviders()
-    );
+    const disabledProviderList = this.providerRegistry.getDisabledProviders();
+    const disabledProviders = new Set(disabledProviderList);
+    if (disabledProviderList.length > 0) {
+      this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
+    }
     const allModels = this.providerRegistry.getAllProvidersModels();
     const results: ModelProviderPrice[] = [];
 
@@ -591,12 +593,23 @@ export class ProviderManager {
       });
     }
 
-    return results.sort((a, b) => {
+    results.sort((a, b) => {
       if (a.totalPerMillion !== b.totalPerMillion) {
         return a.totalPerMillion - b.totalPerMillion;
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
+
+    if (results.length > 0) {
+      const ranking = results
+        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
+        .join("\n");
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
+    } else {
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
+    }
+
+    return results;
   }
 
   /**
