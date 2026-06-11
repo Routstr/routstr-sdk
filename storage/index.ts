@@ -19,9 +19,12 @@ export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
 export type { StorageAdapter, ProviderRegistry, XCashuTokenEntry } from "../wallet/interfaces";
 export type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageGroupBy,
   UsageTrackingDriver,
   UsageTrackingEntry,
-  ListUsageTrackingOptions,
 } from "./usageTracking";
 export { SDK_STORAGE_KEYS } from "./keys";
 export {

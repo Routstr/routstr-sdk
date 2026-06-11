@@ -1,5 +1,11 @@
-import type { ListUsageTrackingOptions, UsageTrackingDriver } from "./interfaces";
+import type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageTrackingDriver,
+} from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+import { reduceAggregate } from "./aggregate";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
@@ -24,6 +30,13 @@ const matchesFilters = (
     return false;
   }
   if (options.client && entry.client !== options.client) {
+    return false;
+  }
+  if (
+    options.clients &&
+    options.clients.length > 0 &&
+    (entry.client == null || !options.clients.includes(entry.client))
+  ) {
     return false;
   }
   if (options.provider && entry.provider !== options.provider) {
@@ -68,6 +81,11 @@ export const createMemoryUsageTrackingDriver = (
 
     async count(options: Omit<ListUsageTrackingOptions, "limit"> = {}): Promise<number> {
       return (await this.list(options)).length;
+    },
+
+    async aggregate(options: AggregateUsageOptions = {}): Promise<UsageAggregateRow[]> {
+      const entries = [...store.values()].filter((entry) => matchesFilters(entry, options));
+      return reduceAggregate(entries, options);
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {

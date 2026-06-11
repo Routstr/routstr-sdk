@@ -1,10 +1,13 @@
 import { SDK_STORAGE_KEYS } from "../keys";
 import type { StorageDriver } from "../types";
 import type {
+  AggregateUsageOptions,
   ListUsageTrackingOptions,
+  UsageAggregateRow,
   UsageTrackingDriver,
 } from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+import { buildAggregateSql, mapAggregateRow } from "./aggregate";
 
 const MIGRATION_MARKER_KEY = "usage_tracking_migration_v1";
 
@@ -56,6 +59,11 @@ const buildWhereClause = (
   if (options.client) {
     clauses.push("client = ?");
     params.push(options.client);
+  }
+  if (options.clients && options.clients.length > 0) {
+    const placeholders = options.clients.map(() => "?").join(", ");
+    clauses.push(`client IN (${placeholders})`);
+    params.push(...options.clients);
   }
   if (options.provider) {
     clauses.push("provider = ?");
@@ -266,6 +274,14 @@ export const createBunSqliteUsageTrackingDriver = (
       const query = `SELECT COUNT(*) as count FROM ${tableName} ${sql}`;
       const row = db.query(query).get(...params);
       return Number(row?.count ?? 0);
+    },
+
+    async aggregate(options: AggregateUsageOptions = {}): Promise<UsageAggregateRow[]> {
+      await ensureMigrated();
+      const where = buildWhereClause(options);
+      const { sql, params } = buildAggregateSql(tableName, where, options);
+      const rows = db.query(sql).all(...params) as Record<string, unknown>[];
+      return rows.map(mapAggregateRow);
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {
