@@ -321,3 +321,357 @@ describe("BalanceManager provider wallet collision guard", () => {
     expect(result2.message).not.toContain("locked");
   });
 });
+
+describe("BalanceManager force-refund escalation", () => {
+  const Mint = "https://mint.example.com";
+  const ProviderA = "https://provider-a.example.com";
+  const ProviderB = "https://provider-b.example.com";
+
+  it("force-refunds a recently-used provider when it is the only way to pay a different provider", async () => {
+    let walletBalance = 500;
+    let providerARemoved = false;
+    let refundCalls = 0;
+    let forceRefundUsed = false;
+
+    const wallet = createWallet({
+      getBalances: async () => ({ [Mint]: walletBalance }),
+      getMintUnits: () => ({ [Mint]: "sat" }),
+      sendToken: async (_mintUrl: string, amount: number) => {
+        if (walletBalance >= amount) {
+          walletBalance -= amount;
+          return "new-token-for-provider-b";
+        }
+        throw new Error("Insufficient balance");
+      },
+      receiveToken: async () => {
+        walletBalance += 1500;
+        return { success: true, amount: 1500, unit: "sat" as const };
+      },
+    });
+
+    const storage = createStorage({
+      getApiKeyDistribution: () => {
+        if (providerARemoved) return [];
+        return [{ baseUrl: ProviderA, amount: 1500 }];
+      },
+      getAllApiKeys: () => {
+        if (providerARemoved) return [];
+        return [{
+          key: "key-provider-a",
+          baseUrl: ProviderA,
+          balance: 1500,
+          lastUsed: Date.now() - 60_000,
+        }];
+      },
+      getApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA && !providerARemoved) {
+          return {
+            key: "key-provider-a",
+            baseUrl: ProviderA,
+            balance: 1500,
+            lastUsed: Date.now() - 60_000,
+          };
+        }
+        return null;
+      },
+      removeApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA) providerARemoved = true;
+      },
+    });
+
+    const manager = new BalanceManager(wallet, storage);
+    const originalRefund = manager.refundApiKey.bind(manager);
+    manager.refundApiKey = async (opts) => {
+      refundCalls++;
+      if (opts.forceRefund) forceRefundUsed = true;
+      return originalRefund(opts);
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("provider-a.example.com/v1/wallet/refund")) {
+        return new Response(JSON.stringify({ token: "refunded-cashu-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    try {
+      const result = await manager.createProviderToken({
+        mintUrl: Mint,
+        baseUrl: ProviderB,
+        amount: 1400,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.token).toBe("new-token-for-provider-b");
+      expect(providerARemoved).toBe(true);
+      expect(forceRefundUsed).toBe(true);
+      expect(refundCalls).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fails with InsufficientBalanceError when even force-refund cannot free enough balance", async () => {
+    let walletBalance = 500;
+    let providerARemoved = false;
+
+    const wallet = createWallet({
+      getBalances: async () => ({ [Mint]: walletBalance }),
+      getMintUnits: () => ({ [Mint]: "sat" }),
+      receiveToken: async () => {
+        walletBalance += 1500;
+        return { success: true, amount: 1500, unit: "sat" as const };
+      },
+    });
+
+    const storage = createStorage({
+      getApiKeyDistribution: () => {
+        if (providerARemoved) return [];
+        return [{ baseUrl: ProviderA, amount: 1500 }];
+      },
+      getAllApiKeys: () => {
+        if (providerARemoved) return [];
+        return [{
+          key: "key-provider-a",
+          baseUrl: ProviderA,
+          balance: 1500,
+          lastUsed: Date.now() - 60_000,
+        }];
+      },
+      getApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA && !providerARemoved) {
+          return {
+            key: "key-provider-a",
+            baseUrl: ProviderA,
+            balance: 1500,
+            lastUsed: Date.now() - 60_000,
+          };
+        }
+        return null;
+      },
+      removeApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA) providerARemoved = true;
+      },
+    });
+
+    const manager = new BalanceManager(wallet, storage);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("provider-a.example.com/v1/wallet/refund")) {
+        return new Response(JSON.stringify({ token: "refunded-cashu-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    try {
+      const result = await manager.createProviderToken({
+        mintUrl: Mint,
+        baseUrl: ProviderB,
+        amount: 3000,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Insufficient balance");
+      // Even total (500+1500=2000) < 3000, so the refund is never attempted.
+      expect(providerARemoved).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("stops early after force-refunding only as many providers as needed", async () => {
+    let walletBalance = 100;
+    const removedProviders = new Set<string>();
+    const refundedProviders: string[] = [];
+    const ProviderC = "https://provider-c.example.com";
+
+    // Track which provider is being refunded so receiveToken can add the right amount
+    let currentRefundProvider = "";
+
+    const wallet = createWallet({
+      getBalances: async () => ({ [Mint]: walletBalance }),
+      getMintUnits: () => ({ [Mint]: "sat" }),
+      sendToken: async (_mintUrl: string, amount: number) => {
+        if (walletBalance >= amount) {
+          walletBalance -= amount;
+          return "token-for-provider-b";
+        }
+        throw new Error("Insufficient balance");
+      },
+      receiveToken: async () => {
+        const amounts: Record<string, number> = { [ProviderA]: 800, [ProviderC]: 2000 };
+        const amt = amounts[currentRefundProvider] ?? 0;
+        walletBalance += amt;
+        return { success: true, amount: amt, unit: "sat" as const };
+      },
+    });
+
+    const storage = createStorage({
+      getApiKeyDistribution: () => {
+        const dist: Array<{ baseUrl: string; amount: number }> = [];
+        if (!removedProviders.has(ProviderA)) dist.push({ baseUrl: ProviderA, amount: 800 });
+        if (!removedProviders.has(ProviderC)) dist.push({ baseUrl: ProviderC, amount: 2000 });
+        return dist;
+      },
+      getAllApiKeys: () => {
+        const keys: Array<{ key: string; baseUrl: string; balance: number; lastUsed: number | null }> = [];
+        if (!removedProviders.has(ProviderA)) {
+          keys.push({ key: "key-a", baseUrl: ProviderA, balance: 800, lastUsed: Date.now() - 120_000 });
+        }
+        if (!removedProviders.has(ProviderC)) {
+          keys.push({ key: "key-c", baseUrl: ProviderC, balance: 2000, lastUsed: Date.now() - 60_000 });
+        }
+        return keys;
+      },
+      getApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA && !removedProviders.has(ProviderA)) {
+          return { key: "key-a", baseUrl: ProviderA, balance: 800, lastUsed: Date.now() - 120_000 };
+        }
+        if (baseUrl === ProviderC && !removedProviders.has(ProviderC)) {
+          return { key: "key-c", baseUrl: ProviderC, balance: 2000, lastUsed: Date.now() - 60_000 };
+        }
+        return null;
+      },
+      removeApiKey: (baseUrl: string) => {
+        removedProviders.add(baseUrl);
+      },
+    });
+
+    const manager = new BalanceManager(wallet, storage);
+    const originalRefund = manager.refundApiKey.bind(manager);
+    manager.refundApiKey = async (opts) => {
+      refundedProviders.push(opts.baseUrl);
+      currentRefundProvider = opts.baseUrl;
+      return originalRefund(opts);
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("v1/wallet/refund")) {
+        return new Response(JSON.stringify({ token: "refunded-cashu-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    try {
+      const result = await manager.createProviderToken({
+        mintUrl: Mint,
+        baseUrl: ProviderB,
+        amount: 1200,
+      });
+
+      expect(result.success).toBe(true);
+      // wallet=100, ProviderA=800 → after refund: 900 < 1200, need ProviderC too
+      expect(removedProviders.has(ProviderA)).toBe(true);
+      expect(removedProviders.has(ProviderC)).toBe(true);
+      // Both were force-refunded on retryCount=2 (the last 2 calls in the list)
+      const forceRefundCalls = refundedProviders.slice(-2);
+      expect(forceRefundCalls).toEqual([ProviderA, ProviderC]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not force-refund if soft refund from a naturally-expired provider frees enough balance", async () => {
+    let walletBalance = 500;
+    let providerARemoved = false;
+    let refundCalls = 0;
+    let forceRefundUsed = false;
+
+    const wallet = createWallet({
+      getBalances: async () => ({ [Mint]: walletBalance }),
+      getMintUnits: () => ({ [Mint]: "sat" }),
+      sendToken: async (_mintUrl: string, amount: number) => {
+        if (walletBalance >= amount) {
+          walletBalance -= amount;
+          return "token-for-provider-b";
+        }
+        throw new Error("Insufficient balance");
+      },
+      receiveToken: async () => {
+        walletBalance += 800;
+        return { success: true, amount: 800, unit: "sat" as const };
+      },
+    });
+
+    const storage = createStorage({
+      getApiKeyDistribution: () => {
+        if (providerARemoved) return [];
+        return [{ baseUrl: ProviderA, amount: 800 }];
+      },
+      getAllApiKeys: () => {
+        if (providerARemoved) return [];
+        return [{
+          key: "key-a",
+          baseUrl: ProviderA,
+          balance: 800,
+          lastUsed: Date.now() - 10 * 60_000,
+        }];
+      },
+      getApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA && !providerARemoved) {
+          return {
+            key: "key-a",
+            baseUrl: ProviderA,
+            balance: 800,
+            lastUsed: Date.now() - 10 * 60_000,
+          };
+        }
+        return null;
+      },
+      removeApiKey: (baseUrl: string) => {
+        if (baseUrl === ProviderA) providerARemoved = true;
+      },
+    });
+
+    const manager = new BalanceManager(wallet, storage);
+    const originalRefund = manager.refundApiKey.bind(manager);
+    manager.refundApiKey = async (opts) => {
+      refundCalls++;
+      if (opts.forceRefund) forceRefundUsed = true;
+      return originalRefund(opts);
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("v1/wallet/refund")) {
+        return new Response(JSON.stringify({ token: "refunded-cashu-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    try {
+      const result = await manager.createProviderToken({
+        mintUrl: Mint,
+        baseUrl: ProviderB,
+        amount: 1000,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.token).toBe("token-for-provider-b");
+      expect(providerARemoved).toBe(true);
+      expect(refundCalls).toBe(1);
+      expect(forceRefundUsed).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
