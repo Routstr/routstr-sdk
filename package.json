@@ -1,6 +1,6 @@
 {
   "name": "@routstr/sdk",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "Framework-agnostic SDK for Routstr API interactions",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -11,10 +11,35 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
+    "./browser": {
+      "types": "./dist/browser.d.mts",
+      "import": "./dist/browser.mjs",
+      "require": "./dist/browser.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.mts",
+      "import": "./dist/node.mjs",
+      "require": "./dist/node.js"
+    },
+    "./bun": {
+      "types": "./dist/bun.d.mts",
+      "import": "./dist/bun.mjs",
+      "require": "./dist/bun.js"
+    },
     "./storage": {
       "types": "./dist/storage/index.d.mts",
       "import": "./dist/storage/index.mjs",
       "require": "./dist/storage/index.js"
+    },
+    "./storage/node": {
+      "types": "./dist/storage/node.d.mts",
+      "import": "./dist/storage/node.mjs",
+      "require": "./dist/storage/node.js"
+    },
+    "./storage/bun": {
+      "types": "./dist/storage/bun.d.mts",
+      "import": "./dist/storage/bun.mjs",
+      "require": "./dist/storage/bun.js"
     },
     "./wallet": {
       "types": "./dist/wallet/index.d.mts",

@@ -527,9 +527,9 @@ export class BalanceManager {
       totalMintBalance + targetProviderBalance < adjustedAmount &&
       totalMintBalance + targetProviderBalance + refundableProviderBalance >=
         adjustedAmount &&
-      retryCount < 2
+      retryCount < 3
     ) {
-      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount);
+      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
       return this.createProviderToken({
         ...options,
         retryCount: retryCount + 1,
@@ -717,41 +717,77 @@ export class BalanceManager {
   private async _refundOtherProvidersForTopUp(
     baseUrl: string,
     mintUrl: string,
-    retryCount: number
+    retryCount: number,
+    requiredAmount: number
   ): Promise<void> {
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
 
     // If retryCount >= 2, force refund even if API keys were used recently
     const forceRefund = retryCount >= 2;
 
-    const apiKeysToRefund = apiKeyDistribution.filter(
-      (apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0
-    );
+    // Build full candidate list sorted by lastUsed, oldest first.
+    // This way providers outside the 5-min window are tried first (natural
+    // refund succeeds), and if we must force-refund, we target the oldest
+    // (closest to expiring) locked providers first.
+    const candidates = apiKeyDistribution
+      .filter((apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0)
+      .map((apiKey) => {
+        const full = this.storageAdapter.getApiKey(apiKey.baseUrl);
+        return {
+          baseUrl: apiKey.baseUrl,
+          amount: apiKey.amount,
+          lastUsed: full?.lastUsed ?? 0,
+          key: full?.key,
+        } as const;
+      })
+      .filter((c) => c.key != null)
+      .sort((a, b) => a.lastUsed - b.lastUsed); // oldest first
 
-    const apiKeyRefundResults = await Promise.allSettled(
-      apiKeysToRefund.map(async (apiKeyEntry) => {
-        const fullApiKeyEntry = this.storageAdapter.getApiKey(
-          apiKeyEntry.baseUrl
-        );
-        if (!fullApiKeyEntry) {
-          return { baseUrl: apiKeyEntry.baseUrl, success: false };
-        }
+    if (candidates.length === 0) return;
 
-        const result = await this.refundApiKey({
+    if (forceRefund) {
+      // Sequential: refund one at a time until we have enough liquid balance
+      // for the target provider, so we only force-refund as few providers as
+      // necessary.
+      //
+      // NOTE: refundApiKey() already calls removeApiKey() on success, so we
+      // don't need to update the balance here — the key is gone.
+      for (const candidate of candidates) {
+        await this.refundApiKey({
           mintUrl,
-          baseUrl: apiKeyEntry.baseUrl,
-          apiKey: fullApiKeyEntry.key,
-          forceRefund,
+          baseUrl: candidate.baseUrl,
+          apiKey: candidate.key!,
+          forceRefund: true,
         });
 
-        return { baseUrl: apiKeyEntry.baseUrl, success: result.success };
-      })
-    );
+        // Check if we've freed enough balance for the target provider
+        const newState = await this.getBalanceState();
+        const newAvailable =
+          (newState.mintBalances[mintUrl] || 0) +
+          (newState.providerBalances[baseUrl] || 0);
 
-    for (const result of apiKeyRefundResults) {
-      if (result.status === "fulfilled" && result.value.success) {
-        this.storageAdapter.updateApiKeyBalance(result.value.baseUrl, 0);
+        if (newAvailable >= requiredAmount) {
+          this.logger.log(
+            `_refundOtherProvidersForTopUp: freed enough balance (${newAvailable} >= ${requiredAmount}), stopping early`
+          );
+          return;
+        }
       }
+    } else {
+      // Non-force: try all in parallel (existing behavior, now sorted by
+      // lastUsed for determinism). Providers outside the 5-min window will
+      // succeed and be cleaned up by refundApiKey; recently-used ones are
+      // skipped without side effects.
+      await Promise.allSettled(
+        candidates.map((candidate) =>
+          this.refundApiKey({
+            mintUrl,
+            baseUrl: candidate.baseUrl,
+            apiKey: candidate.key!,
+            forceRefund: false,
+          })
+        )
+      );
     }
   }
 

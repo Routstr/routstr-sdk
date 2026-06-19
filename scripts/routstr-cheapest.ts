@@ -8,7 +8,8 @@ import {
   consoleLogger,
 } from "@routstr/sdk";
 import { getDecodedToken } from "@cashu/cashu-ts";
-import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
+import { createSdkStore } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
   createDiscoveryAdapterFromStore,
   createProviderRegistryFromStore,
@@ -339,13 +340,18 @@ async function main(): Promise<void> {
                 typeof message.content === "string"
                   ? message.content
                   : JSON.stringify(message.content);
-              console.log("FULL", message);
+              console.log("=== FULL ASSISTANT MESSAGE ===");
+              console.dir(message, { depth: null, colors: true });
+              console.log("=== END ASSISTANT MESSAGE ===");
             }
             if (message.role === "system") {
               errorMessage =
                 typeof message.content === "string"
                   ? message.content
                   : JSON.stringify(message.content);
+              console.log("=== FULL SYSTEM MESSAGE ===");
+              console.dir(message, { depth: null, colors: true });
+              console.log("=== END SYSTEM MESSAGE ===");
             }
           },
           onBalanceUpdate: () => {},

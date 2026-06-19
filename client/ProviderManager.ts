@@ -178,10 +178,6 @@ interface CandidateProvider {
 /**
  * ProviderManager handles provider selection and failover
  */
-function isInsecureHttpUrl(url: string): boolean {
-  return url.startsWith("http://");
-}
-
 export class ProviderManager {
   private failedProviders = new Set<string>();
   /** Track when each provider last failed (provider URL -> timestamp) */
@@ -460,8 +456,8 @@ export class ProviderManager {
           continue;
         }
 
-        // Skip onion URLs and insecure http URLs if not in Tor mode
-        if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl))) {
+        // Skip onion URLs if not in Tor mode
+        if (!torMode && isOnionUrl(baseUrl)) {
           continue;
         }
 
@@ -535,7 +531,7 @@ export class ProviderManager {
     for (const [baseUrl, models] of Object.entries(allProviders)) {
       if (disabledProviders.has(baseUrl)) continue;
       if (this.isOnCooldown(baseUrl)) continue;
-      if (!torMode && (isOnionUrl(baseUrl) || isInsecureHttpUrl(baseUrl)))
+      if (!torMode && isOnionUrl(baseUrl))
         continue;
 
       const model = models.find((m: Model) => m.id === modelId);
@@ -557,9 +553,11 @@ export class ProviderManager {
   ): ModelProviderPrice[] {
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
-    const disabledProviders = new Set(
-      this.providerRegistry.getDisabledProviders()
-    );
+    const disabledProviderList = this.providerRegistry.getDisabledProviders();
+    const disabledProviders = new Set(disabledProviderList);
+    if (disabledProviderList.length > 0) {
+      this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
+    }
     const allModels = this.providerRegistry.getAllProvidersModels();
     const results: ModelProviderPrice[] = [];
 
@@ -569,7 +567,7 @@ export class ProviderManager {
       if (torMode && !baseUrl.includes(".onion")) continue;
       if (
         !torMode &&
-        (baseUrl.includes(".onion") || isInsecureHttpUrl(baseUrl))
+        baseUrl.includes(".onion")
       )
         continue;
 
@@ -595,12 +593,23 @@ export class ProviderManager {
       });
     }
 
-    return results.sort((a, b) => {
+    results.sort((a, b) => {
       if (a.totalPerMillion !== b.totalPerMillion) {
         return a.totalPerMillion - b.totalPerMillion;
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
+
+    if (results.length > 0) {
+      const ranking = results
+        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
+        .join("\n");
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
+    } else {
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
+    }
+
+    return results;
   }
 
   /**

@@ -1,7 +1,13 @@
 import { SDK_STORAGE_KEYS } from "../keys";
 import type { StorageDriver } from "../types";
-import type { ListUsageTrackingOptions, UsageTrackingDriver } from "./interfaces";
+import type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageTrackingDriver,
+} from "./interfaces";
 import type { UsageTrackingEntry } from "./types";
+import { buildAggregateSql, mapAggregateRow } from "./aggregate";
 
 type BetterSqlite3Database = {
   prepare: (sql: string) => {
@@ -19,6 +25,23 @@ export interface SqliteUsageTrackingDriverOptions {
 }
 
 const MIGRATION_MARKER_KEY = "usage_tracking_migration_v1";
+
+// Columns added after the initial release. Each entry is added via
+// `ALTER TABLE ... ADD COLUMN` only if it is not already present, so the
+// migration is safe to run repeatedly and against partially-migrated DBs.
+const ADDED_COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
+  { name: "provider", type: "TEXT" },
+  { name: "base_msats", type: "REAL" },
+  { name: "input_msats", type: "REAL" },
+  { name: "output_msats", type: "REAL" },
+  { name: "total_msats", type: "REAL" },
+  { name: "total_usd", type: "REAL" },
+  { name: "cache_read_input_tokens", type: "INTEGER" },
+  { name: "cache_creation_input_tokens", type: "INTEGER" },
+  { name: "cache_read_msats", type: "REAL" },
+  { name: "cache_creation_msats", type: "REAL" },
+  { name: "remaining_balance_msats", type: "REAL" },
+];
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
@@ -78,6 +101,15 @@ const buildWhereClause = (
     clauses.push("client = ?");
     params.push(options.client);
   }
+  if (options.clients && options.clients.length > 0) {
+    const placeholders = options.clients.map(() => "?").join(", ");
+    clauses.push(`client IN (${placeholders})`);
+    params.push(...options.clients);
+  }
+  if (options.provider) {
+    clauses.push("provider = ?");
+    params.push(options.provider);
+  }
 
   return {
     sql: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "",
@@ -123,12 +155,37 @@ export const createSqliteUsageTrackingDriver = (
         CREATE INDEX IF NOT EXISTS idx_${tableName}_client ON ${tableName}(client);
       `);
 
+      // Add columns introduced after the initial schema. `PRAGMA table_info`
+      // tells us which already exist so repeated/partial migrations are safe.
+      const existingColumns = new Set<string>(
+        db
+          .prepare(`PRAGMA table_info(${tableName})`)
+          .all()
+          .map((row: any) => String(row.name))
+      );
+      for (const column of ADDED_COLUMNS) {
+        if (!existingColumns.has(column.name)) {
+          db.exec(
+            `ALTER TABLE ${tableName} ADD COLUMN ${column.name} ${column.type}`
+          );
+        }
+      }
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_${tableName}_provider ON ${tableName}(provider)`
+      );
+
       insertStmt = db.prepare(`
         INSERT OR REPLACE INTO ${tableName} (
           id, timestamp, model_id, base_url, request_id,
           cost, sats_cost, prompt_tokens, completion_tokens, total_tokens,
-          client, session_id, tags
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          client, session_id, tags,
+          provider, base_msats, input_msats, output_msats, total_msats,
+          total_usd, cache_read_input_tokens, cache_creation_input_tokens,
+          cache_read_msats, cache_creation_msats, remaining_balance_msats
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
       `);
     }
   };
@@ -153,7 +210,18 @@ export const createSqliteUsageTrackingDriver = (
       entry.totalTokens,
       entry.client ?? null,
       entry.sessionId ?? null,
-      JSON.stringify(entry.tags ?? [])
+      JSON.stringify(entry.tags ?? []),
+      entry.provider ?? null,
+      entry.baseMsats ?? null,
+      entry.inputMsats ?? null,
+      entry.outputMsats ?? null,
+      entry.totalMsats ?? null,
+      entry.totalUsd ?? null,
+      entry.cacheReadInputTokens ?? null,
+      entry.cacheCreationInputTokens ?? null,
+      entry.cacheReadMsats ?? null,
+      entry.cacheCreationMsats ?? null,
+      entry.remainingBalanceMsats ?? null
     );
   };
 
@@ -199,6 +267,17 @@ export const createSqliteUsageTrackingDriver = (
     client: row.client ?? undefined,
     sessionId: row.session_id ?? undefined,
     tags: typeof row.tags === "string" ? JSON.parse(row.tags) : undefined,
+    provider: row.provider ?? undefined,
+    baseMsats: row.base_msats ?? undefined,
+    inputMsats: row.input_msats ?? undefined,
+    outputMsats: row.output_msats ?? undefined,
+    totalMsats: row.total_msats ?? undefined,
+    totalUsd: row.total_usd ?? undefined,
+    cacheReadInputTokens: row.cache_read_input_tokens ?? undefined,
+    cacheCreationInputTokens: row.cache_creation_input_tokens ?? undefined,
+    cacheReadMsats: row.cache_read_msats ?? undefined,
+    cacheCreationMsats: row.cache_creation_msats ?? undefined,
+    remainingBalanceMsats: row.remaining_balance_msats ?? undefined,
   });
 
   return {
@@ -242,6 +321,15 @@ export const createSqliteUsageTrackingDriver = (
       const stmt = db.prepare(`SELECT COUNT(*) as count FROM ${tableName} ${sql}`);
       const row = stmt.get(...params);
       return Number(row?.count ?? 0);
+    },
+
+    async aggregate(options: AggregateUsageOptions = {}): Promise<UsageAggregateRow[]> {
+      await ensureInit();
+      await ensureMigrated();
+      const where = buildWhereClause(options);
+      const { sql, params } = buildAggregateSql(tableName, where, options);
+      const rows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+      return rows.map(mapAggregateRow);
     },
 
     async deleteOlderThan(timestamp: number): Promise<number> {

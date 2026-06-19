@@ -1,15 +1,9 @@
 import { localStorageDriver } from "./drivers/localStorage";
 import { createMemoryDriver } from "./drivers/memory";
-import {
-  createSqliteDriver,
-  createBunSqliteDriver,
-} from "./drivers/sqlite";
 import { createIndexedDBDriver } from "./drivers/indexedDB";
 import {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
-  createSqliteUsageTrackingDriver,
-  createBunSqliteUsageTrackingDriver,
   type UsageTrackingDriver,
 } from "./usageTracking";
 import type { StorageDriver } from "./types";
@@ -25,9 +19,12 @@ export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
 export type { StorageAdapter, ProviderRegistry, XCashuTokenEntry } from "../wallet/interfaces";
 export type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageGroupBy,
   UsageTrackingDriver,
   UsageTrackingEntry,
-  ListUsageTrackingOptions,
 } from "./usageTracking";
 export { SDK_STORAGE_KEYS } from "./keys";
 export {
@@ -39,15 +36,11 @@ export {
 export {
   localStorageDriver,
   createMemoryDriver,
-  createSqliteDriver,
-  createBunSqliteDriver,
   createIndexedDBDriver,
 };
 export {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
-  createSqliteUsageTrackingDriver,
-  createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
 import {
   createProviderRegistryFromDiscoveryAdapter,
@@ -72,36 +65,12 @@ const isBrowser = (): boolean => {
   }
 };
 
-const isNode = (): boolean => {
-  try {
-    return (
-      typeof process !== "undefined" &&
-      process.versions != null &&
-      process.versions.node != null
-    );
-  } catch {
-    return false;
-  }
-};
-
 let defaultDriver: StorageDriver | null = null;
-
-const isBun = (): boolean => {
-  return typeof process.versions.bun !== "undefined";
-};
 
 export const getDefaultSdkDriver = (): StorageDriver => {
   if (defaultDriver) return defaultDriver;
   if (isBrowser()) {
     defaultDriver = localStorageDriver;
-    return defaultDriver;
-  }
-  if (isBun()) {
-    defaultDriver = createMemoryDriver();
-    return defaultDriver;
-  }
-  if (isNode()) {
-    defaultDriver = createSqliteDriver();
     return defaultDriver;
   }
   defaultDriver = createMemoryDriver();
@@ -125,18 +94,6 @@ export const getDefaultUsageTrackingDriver = (): UsageTrackingDriver => {
 
   if (isBrowser()) {
     defaultUsageTrackingDriver = createIndexedDBUsageTrackingDriver({
-      legacyStorageDriver: storageDriver,
-    });
-    return defaultUsageTrackingDriver;
-  }
-
-  if (isBun()) {
-    defaultUsageTrackingDriver = createBunSqliteUsageTrackingDriver();
-    return defaultUsageTrackingDriver;
-  }
-
-  if (isNode()) {
-    defaultUsageTrackingDriver = createSqliteUsageTrackingDriver({
       legacyStorageDriver: storageDriver,
     });
     return defaultUsageTrackingDriver;

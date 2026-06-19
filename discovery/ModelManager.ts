@@ -18,11 +18,11 @@ import type { NostrEvent } from "applesauce-core/helpers";
 import { tap } from "rxjs";
 
 type SqliteStatement = {
-  run?: (...params: unknown[]) => unknown;
-  get?: (...params: unknown[]) => any;
+  run?: (...params: any[]) => unknown;
+  get?: (...params: any[]) => any;
 };
 
-type PersistentEventDatabase = IEventDatabase & {
+export type PersistentEventDatabase = IEventDatabase & {
   db?: {
     exec: (sql: string) => void;
     prepare: (sql: string) => SqliteStatement;
@@ -30,11 +30,9 @@ type PersistentEventDatabase = IEventDatabase & {
   close?: () => void;
 };
 
-declare const Bun: unknown;
-
-function isBunRuntime(): boolean {
-  return typeof Bun !== "undefined";
-}
+export type PersistentEventDatabaseFactory = (
+  dbPath: string
+) => Promise<PersistentEventDatabase> | PersistentEventDatabase;
 
 /**
  * Configuration for ModelManager
@@ -50,13 +48,24 @@ export interface ModelManagerConfig {
   cacheTTL?: number;
   /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
   routstrPubkey?: string;
+  /** Nostr relay URLs for provider/model discovery.
+   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
+   * When unset, each method uses its own default relay set. */
+  nostrRelays?: string[];
   /** Optional injectable logger */
   logger?: SdkLogger;
-  /** Path to SQLite database for persistent Nostr event storage.
+  /** Path to database for persistent Nostr event storage.
    * If provided, events fetched by ModelManager from relays (kinds 38421,
    * 38423, 38425) are persisted and survive process restarts. The underlying
-   * EventStore can also be accessed for advanced/manual event management. */
+   * EventStore can also be accessed for advanced/manual event management.
+   *
+   * Runtime-specific SQLite implementations are intentionally not imported by
+   * the browser-safe default SDK entrypoint. Use @routstr/sdk/node or
+   * @routstr/sdk/bun to get a ModelManager preconfigured with a SQLite-backed
+   * persistentEventDatabaseFactory, or inject your own factory here. */
   eventStoreDbPath?: string;
+  /** Factory used with eventStoreDbPath to create the persistent event DB. */
+  persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 }
 
 /**
@@ -69,6 +78,7 @@ export class ModelManager {
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
   private readonly routstrPubkey: string;
+  private readonly nostrRelays: string[] | undefined;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
   /** Persistent event store for relay-fetched events (null if not configured/initialized) */
@@ -76,6 +86,7 @@ export class ModelManager {
   private eventStoreDb: PersistentEventDatabase | null = null;
   private eventStoreInitPromise: Promise<EventStore | null> | null = null;
   private readonly eventStoreDbPath?: string;
+  private readonly persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -89,9 +100,11 @@ export class ModelManager {
     this.routstrPubkey =
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
+    this.nostrRelays = config.nostrRelays;
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
 
     this.eventStoreDbPath = config.eventStoreDbPath;
+    this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
   }
 
   /**
@@ -124,7 +137,7 @@ export class ModelManager {
         } catch (error) {
           this.eventStoreInitPromise = null;
           throw new Error(
-            `applesauce-sqlite with a supported SQLite driver is required for persistent Nostr event storage. Bun uses bun:sqlite; Node.js uses better-sqlite3. Install optional dependencies or omit eventStoreDbPath. (${error})`
+            `Persistent Nostr event storage requires a runtime-specific database factory. Use @routstr/sdk/node, @routstr/sdk/bun, inject persistentEventDatabaseFactory, or omit eventStoreDbPath. (${error})`
           );
         }
       })();
@@ -142,19 +155,15 @@ export class ModelManager {
   }
 
   private async createPersistentEventDatabase(): Promise<PersistentEventDatabase> {
-    if (isBunRuntime()) {
-      const { BunSqliteEventDatabase } = await import("applesauce-sqlite/bun");
-      return new BunSqliteEventDatabase(
-        this.eventStoreDbPath
-      ) as PersistentEventDatabase;
+    if (!this.eventStoreDbPath) {
+      throw new Error("eventStoreDbPath is required");
     }
-
-    const { BetterSqlite3EventDatabase } = await import(
-      "applesauce-sqlite/better-sqlite3"
-    );
-    return new BetterSqlite3EventDatabase(
-      this.eventStoreDbPath
-    ) as PersistentEventDatabase;
+    if (!this.persistentEventDatabaseFactory) {
+      throw new Error(
+        "persistentEventDatabaseFactory is required. Import ModelManager from @routstr/sdk/node or @routstr/sdk/bun for SQLite-backed persistent event storage."
+      );
+    }
+    return this.persistentEventDatabaseFactory(this.eventStoreDbPath);
   }
 
   /** Close the persistent event store database handle, if configured. */
@@ -300,6 +309,14 @@ export class ModelManager {
   }
 
   /**
+   * Resolve Nostr relay URLs for a given use case.
+   * Returns user-configured relays if set, otherwise the provided defaults.
+   */
+  private getNostrRelays(defaults: string[]): string[] {
+    return this.nostrRelays && this.nostrRelays.length > 0 ? this.nostrRelays : defaults;
+  }
+
+  /**
    * Bootstrap providers from Nostr network (kind 38421)
    * @param kind The Nostr kind to fetch
    * @param torMode Whether running in Tor context
@@ -310,11 +327,11 @@ export class ModelManager {
     torMode: boolean,
     forceRefresh: boolean = false
   ): Promise<string[]> {
-    const DEFAULT_RELAYS = [
+    const relays = this.getNostrRelays([
       "wss://relay.primal.net",
       "wss://nos.lol",
       "wss://relay.damus.io",
-    ];
+    ]);
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
@@ -331,7 +348,7 @@ export class ModelManager {
 
       await new Promise<void>((resolve) => {
         pool
-          .req(DEFAULT_RELAYS, {
+          .req(relays, {
             kinds: [kind],
             limit: 100,
           })
@@ -541,17 +558,17 @@ export class ModelManager {
       let sessionEvents: NostrEvent[] = cached;
 
       if (cached.length === 0) {
-        const LGTM_RELAYS = [
+        const lgtmRelays = this.getNostrRelays([
           "wss://relay.primal.net",
           "wss://nos.lol",
           "wss://relay.damus.io",
           "wss://relay.routstr.com",
-        ];
+        ]);
         const pool = new RelayPool();
         const timeoutMs = 5000;
         await new Promise<void>((resolve) => {
           pool
-            .req(LGTM_RELAYS, {
+            .req(lgtmRelays, {
               kinds: [38425],
               "#t": ["lgtm"],
               limit: 500,
@@ -856,11 +873,11 @@ export class ModelManager {
       }
     }
 
-    const DEFAULT_RELAYS = [
+    const relays = this.getNostrRelays([
       "wss://relay.damus.io",
       "wss://nos.lol",
       "wss://relay.routstr.com",
-    ];
+    ]);
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
@@ -877,7 +894,7 @@ export class ModelManager {
 
       await new Promise<void>((resolve) => {
         pool
-          .req(DEFAULT_RELAYS, {
+          .req(relays, {
             kinds: [38423],
             "#d": ["routstr-21-models"],
             limit: 1,
