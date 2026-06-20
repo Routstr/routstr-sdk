@@ -62,7 +62,9 @@ export interface RouteRequestOptions {
   routstrPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;
-  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, and providerManager. */
+  /** Optional: directory for raw request/response logging. Writes requests/*.json and responses/*.jsonl. */
+  requestResponseLogDir?: string;
+  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, providerManager, and requestResponseLogDir. */
   client?: RoutstrClient;
 }
 
@@ -118,6 +120,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     sdkStore,
     providerManager: providedProviderManager,
     logger,
+    requestResponseLogDir,
   } = options;
 
   let modelManager: ModelManager;
@@ -195,7 +198,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     providerRegistry,
     "min",
     mode,
-    { usageTrackingDriver, sdkStore, providerManager, logger }
+    { usageTrackingDriver, sdkStore, providerManager, logger, requestResponseLogDir }
   );
 
   const maxTokens = extractMaxTokens(requestBody);

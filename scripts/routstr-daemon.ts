@@ -47,6 +47,7 @@ if (process.env.NODE_ENV === "test" || process.env.MOCK_ERRORS) {
 }
 
 const REQUESTS_DIR = join(__dirname, "requests");
+const DEFAULT_REQUEST_RESPONSE_LOG_DIR = process.env.ROUTSTR_REQUEST_RESPONSE_LOG_DIR || join(__dirname, "request-response-logs");
 const EVENT_STORE_DB_PATH = join(__dirname, "events.db");
 
 async function ensureRequestsDir(): Promise<void> {
@@ -61,6 +62,7 @@ function parseArgs(argv: string[]): {
   port: number;
   provider: string | null;
   mode: "xcashu" | "apikeys";
+  requestResponseLogDir: string;
 } {
   const portFlagIndex = argv.findIndex((arg) => arg === "--port");
   const providerFlagIndex = argv.findIndex(
@@ -68,6 +70,9 @@ function parseArgs(argv: string[]): {
   );
   const modeFlagIndex = argv.findIndex(
     (arg) => arg === "--mode" || arg === "-m"
+  );
+  const requestResponseLogDirFlagIndex = argv.findIndex(
+    (arg) => arg === "--request-response-log-dir" || arg === "--rr-log-dir"
   );
 
   const port =
@@ -81,8 +86,12 @@ function parseArgs(argv: string[]): {
     modeArg === "xcashu"
       ? modeArg
       : "apikeys";
+  const requestResponseLogDir =
+    requestResponseLogDirFlagIndex !== -1
+      ? argv[requestResponseLogDirFlagIndex + 1]?.trim() || DEFAULT_REQUEST_RESPONSE_LOG_DIR
+      : DEFAULT_REQUEST_RESPONSE_LOG_DIR;
 
-  return { port, provider, mode };
+  return { port, provider, mode, requestResponseLogDir };
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -249,7 +258,7 @@ function toForwardHeaders(
 }
 
 async function main(): Promise<void> {
-  const { port, provider, mode } = parseArgs(process.argv);
+  const { port, provider, mode, requestResponseLogDir } = parseArgs(process.argv);
 
   const driver = createSqliteDriver();
   const { store, hydrate } = createSdkStore({ driver });
@@ -423,6 +432,7 @@ async function main(): Promise<void> {
           discoveryAdapter,
           modelManager,
           usageTrackingDriver,
+          requestResponseLogDir,
         });
 
         res.statusCode = response.status;
@@ -484,6 +494,7 @@ async function main(): Promise<void> {
   server.listen(port, async () => {
     await ensureRequestsDir();
     console.log(`Routstr daemon listening on http://localhost:${port} (mode: ${mode})`);
+    console.log(`Request/response logs: ${requestResponseLogDir}`);
   });
 }
 
