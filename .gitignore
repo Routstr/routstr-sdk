@@ -26,3 +26,11 @@ yarn-error.log*
 dist
 package-lock.json
 .worktrees
+
+# debug request dumps
+reqs/
+
+# local db and logs
+*.sqlite
+audit.log
+scripts/events.db

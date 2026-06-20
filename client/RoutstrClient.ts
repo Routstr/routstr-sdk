@@ -369,14 +369,8 @@ export class RoutstrClient {
         `[RoutstrClient] Attesting E2EE model ${modelId} before spend`
       );
 
-      const attestAuth = await this._getAttestationAuth({
-        baseUrl,
-        mintUrl,
-      });
-
       const e2eePrep = await prepareE2EERequest({
         baseUrl,
-        authHeaders: attestAuth.authHeaders,
         modelId,
         body: requestBody as Record<string, unknown>,
       });
@@ -1518,80 +1512,5 @@ export class RoutstrClient {
     return nextHeaders;
   }
 
-  /**
-   * Get auth headers for Venice E2EE attestation WITHOUT the main request spend.
-   *
-   * - apikeys mode: uses the stored API key (no spend at all).
-   * - xcashu mode:  does a minimal spend; the returned spendResult can be
-   *   reused for the actual request so we don't spend twice.
-   */
-  private async _getAttestationAuth(params: {
-    baseUrl: string;
-    mintUrl: string;
-    additionalHeaders?: Record<string, string>;
-  }): Promise<{
-    authHeaders: Record<string, string>;
-    spendResult?: {
-      token: string;
-      tokenBalance: number;
-      tokenBalanceUnit: "sat" | "msat";
-    };
-  }> {
-    const { baseUrl, mintUrl, additionalHeaders = {} } = params;
-    const baseHeaders = this._buildBaseHeaders(additionalHeaders);
-
-    if (this.mode === "apikeys") {
-      const apiKey = this.storageAdapter.getApiKey(baseUrl);
-      if (apiKey?.key) {
-        return {
-          authHeaders: this._withAuthHeader(baseHeaders, apiKey.key),
-          // no spendResult — _spendToken will be called as usual for lookup
-        };
-      }
-      // No stored key yet — do a minimal spend to create one
-      const spendResult = await this.cashuSpender.spend({
-        mintUrl,
-        amount: 1,
-        baseUrl: "",
-        reuseToken: false,
-      });
-      if (!spendResult.token) {
-        throw new Error(
-          `Failed to get API key for attestation: ${spendResult.error}`
-        );
-      }
-      return {
-        authHeaders: this._withAuthHeader(baseHeaders, spendResult.token),
-        spendResult: {
-          token: spendResult.token,
-          tokenBalance: spendResult.balance,
-          tokenBalanceUnit: spendResult.unit ?? "sat",
-        },
-      };
-    }
-
-    // xcashu mode: minimal spend so attestation happens before the main spend.
-    // The token is returned so we can reuse it for the actual request.
-    const spendResult = await this.cashuSpender.spend({
-      mintUrl,
-      amount: 1,
-      baseUrl: "",
-      reuseToken: false,
-    });
-
-    if (!spendResult.token) {
-      throw new Error(
-        `Failed to get xcashu token for attestation: ${spendResult.error}`
-      );
-    }
-
-    return {
-      authHeaders: this._withAuthHeader(baseHeaders, spendResult.token),
-      spendResult: {
-        token: spendResult.token,
-        tokenBalance: spendResult.balance,
-        tokenBalanceUnit: spendResult.unit ?? "sat",
-      },
-    };
-  }
 }
+

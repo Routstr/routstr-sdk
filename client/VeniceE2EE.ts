@@ -120,21 +120,19 @@ function randomNonceHex(): string {
 
 export async function fetchVeniceAttestation(params: {
   baseUrl: string;
-  /** Auth headers to forward (e.g., X-Cashu or Authorization: Bearer ...) */
-  authHeaders: Record<string, string>;
   model: string;
 }): Promise<{ modelPublicKey: string; attestation: unknown }> {
-  const { baseUrl, authHeaders, model } = params;
+  const { baseUrl, model } = params;
   const nonce = randomNonceHex();
 
   const url = `${baseUrl.replace(/\/+$/, "")}/tee/attestation?model=${encodeURIComponent(model)}&nonce=${encodeURIComponent(nonce)}`;
 
+  // The /tee/attestation endpoint on the Routstr proxy requires no auth —
+  // it is a free unauthenticated GET that is forwarded directly upstream.
   // Request uncompressed response to avoid Brotli decompression errors
   // that can crash undici's built-in fetch (ERR__ERROR_FORMAT_PADDING_2).
-  // The attestation payload is tiny — compression provides no meaningful benefit.
   const res = await fetch(url, {
     headers: {
-      ...authHeaders,
       "Accept-Encoding": "identity",
     },
   });
@@ -324,8 +322,6 @@ export function createE2EEDecryptTransform(
  */
 export async function prepareE2EERequest(params: {
   baseUrl: string;
-  /** Auth headers for attestation + chat request (X-Cashu or Authorization) */
-  authHeaders: Record<string, string>;
   modelId: string;
   body: Record<string, unknown>;
 }): Promise<{
@@ -333,15 +329,14 @@ export async function prepareE2EERequest(params: {
   e2eeHeaders: Record<string, string>;
   sessionEcdh: crypto.ECDH;
 }> {
-  const { baseUrl, authHeaders, modelId, body } = params;
+  const { baseUrl, modelId, body } = params;
 
   // 1. Create session key pair
   const session = createSessionKeyPair();
 
-  // 2. Fetch attestation to get model's public key
+  // 2. Fetch attestation to get model's public key (no auth required)
   const { modelPublicKey } = await fetchVeniceAttestation({
     baseUrl,
-    authHeaders,
     model: modelId,
   });
 
