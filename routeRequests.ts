@@ -207,6 +207,13 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     { usageTrackingDriver, sdkStore, providerManager, logger }
   );
 
+  // Apply the requested debug level to the client. Previously `debugLevel` was
+  // destructured from options but never wired up (dead/broken API). Note: even
+  // at "DEBUG" the client never logs header VALUES (see RoutstrClient._makeRequest).
+  if (debugLevel) {
+    client.setDebugLevel(debugLevel);
+  }
+
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
 

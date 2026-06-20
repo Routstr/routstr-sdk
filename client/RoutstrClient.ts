@@ -173,6 +173,18 @@ export class RoutstrClient {
   }
 
   /**
+   * Redact a secret (live Cashu token / API key) for logging.
+   *
+   * These values are spendable credentials. We must NEVER log them in full —
+   * not even at DEBUG. This returns a short, non-spendable prefix so logs stay
+   * useful for correlation without leaking the secret.
+   */
+  private _tokenPreview(secret: string | undefined | null): string {
+    if (!secret) return "<none>";
+    return `${secret.slice(0, 8)}…(${secret.length} chars)`;
+  }
+
+  /**
    * Get the CashuSpender instance
    */
   getCashuSpender(): CashuSpender {
@@ -738,7 +750,8 @@ export class RoutstrClient {
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
-      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+      if (this.mode === "xcashu")
+        this._log("DEBUG", "HEADERS keys:", Object.keys(headers));
 
       const response = await fetch(url, {
         method,
@@ -748,7 +761,8 @@ export class RoutstrClient {
             ? undefined
             : JSON.stringify(body),
       });
-      if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
+      if (this.mode === "xcashu")
+        this._log("DEBUG", "response status:", response.status);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
@@ -826,7 +840,7 @@ export class RoutstrClient {
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorMessage=${errorMessage}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${this._tokenPreview(token)}, requestId=${requestId}, errorMessage=${errorMessage}`
     );
 
     this._log(
@@ -1067,7 +1081,7 @@ export class RoutstrClient {
     if (status === 401 && this.mode === "apikeys") {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${token}`
+        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${this._tokenPreview(token)}`
       );
       const latestBalanceInfo = await this.balanceManager.getTokenBalance(
         token,
@@ -1100,7 +1114,7 @@ export class RoutstrClient {
       if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
+          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${this._tokenPreview(token)}`
         );
         const latestBalanceInfo = await this.balanceManager.getTokenBalance(
           token,
@@ -1594,13 +1608,13 @@ export class RoutstrClient {
         } else {
           this._log(
             "DEBUG",
-            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
+            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${this._tokenPreview(spendResult.token)}`
           );
         }
 
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${this._tokenPreview(spendResult.token)}, balance: ${spendResult.balance}`
         );
 
         try {
@@ -1636,7 +1650,7 @@ export class RoutstrClient {
       } else {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}`
+          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${this._tokenPreview(parentApiKey.key)}`
         );
       }
 
@@ -1696,7 +1710,7 @@ export class RoutstrClient {
     } else {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
+        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${this._tokenPreview(spendResult.token)}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
       // Store xcashu token using the storage adapter
       this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);

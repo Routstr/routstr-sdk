@@ -14,8 +14,6 @@ import {
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
 import { getDecodedToken } from "@cashu/cashu-ts";
-import { writeFile, mkdir } from "fs/promises";
-import { join } from "path";
 
 const MOCK_ERROR_CODES: Record<string, number> = {
   // 'https://api.provider.com': 429,
@@ -41,16 +39,6 @@ if (process.env.NODE_ENV === "test" || process.env.MOCK_ERRORS) {
     }
     return originalFetch(input, init);
   };
-}
-
-const REQUESTS_DIR = join(__dirname, "requests");
-
-async function ensureRequestsDir(): Promise<void> {
-  try {
-    await mkdir(REQUESTS_DIR, { recursive: true });
-  } catch (error) {
-    // Directory may already exist
-  }
 }
 
 function parseArgs(argv: string[]): {
@@ -184,31 +172,6 @@ function pickTokenLine(output: string): string {
     .map((line) => line.trim())
     .filter(Boolean);
   return lines[lines.length - 1] || "";
-}
-
-async function saveRequestBody(
-  body: unknown,
-  headers: IncomingMessage["headers"],
-  path: string,
-  method: string
-): Promise<string> {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const filename = `req-${timestamp}.json`;
-  const filepath = join(REQUESTS_DIR, filename);
-  await writeFile(
-    filepath,
-    JSON.stringify(
-      {
-        method,
-        path,
-        headers,
-        body,
-      },
-      null,
-      2
-    )
-  );
-  return filename;
 }
 
 function toForwardHeaders(
@@ -375,14 +338,6 @@ async function main(): Promise<void> {
         return;
       }
 
-      // const savedFilename = await saveRequestBody(
-      //  requestBody,
-      //  req.headers,
-      //  `${url.pathname}${url.search}`,
-      //  req.method || "POST"
-      // );
-      // console.log(`[daemon] Request body saved to: ${savedFilename}`);
-
       const bodyObj = requestBody as Record<string, unknown>;
       const modelId = typeof bodyObj.model === "string" ? bodyObj.model : "";
 
@@ -471,8 +426,7 @@ async function main(): Promise<void> {
     }
   );
 
-  server.listen(port, async () => {
-    await ensureRequestsDir();
+  server.listen(port, () => {
     console.log(`Routstr daemon listening on http://localhost:${port} (mode: ${mode})`);
   });
 }
