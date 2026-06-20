@@ -42,6 +42,10 @@ import {
   prepareE2EERequest,
   createE2EEDecryptTransform,
 } from "./VeniceE2EE";
+import {
+  isTinfoilModel,
+  prepareTinfoilClient,
+} from "./TinfoilSecure";
 import { promises as fs } from "fs";
 import path from "path";
 
@@ -325,6 +329,32 @@ export class RoutstrClient {
     // Build clean outgoing headers — do NOT pass the incoming client headers here
     const baseHeaders = this._buildBaseHeaders();
 
+    // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
+    const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
+
+    if (tinfoilEnabled) {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] Attesting Tinfoil model ${modelId} before spend`
+      );
+
+      const { verification } = await prepareTinfoilClient({ baseUrl });
+
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] Tinfoil attestation passed, enclave=${verification.enclaveHost}, codeFingerprint=${verification.codeFingerprint.slice(0, 16)}...`
+      );
+
+      // Do NOT strip or remap the tinfoil- prefix. If an earlier compatibility
+      // path/provider mapping changed body.model, restore the caller-facing id.
+      if (requestBody && typeof requestBody === "object") {
+        requestBody = {
+          ...(requestBody as Record<string, unknown>),
+          model: modelId,
+        };
+      }
+    }
+
     // ─── Venice E2EE: attest BEFORE spending tokens ──────
     let e2eeSessionEcdh: any = undefined;
     let e2eeHeaders: Record<string, string> = {};
@@ -368,7 +398,7 @@ export class RoutstrClient {
       baseUrl,
     });
 
-    const { token, tokenBalance, tokenBalanceUnit } = spendResult;
+    const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
 
     // Build final request headers (auth + E2EE)
     const requestHeaders = this._withAuthHeader(baseHeaders, token);
@@ -387,6 +417,7 @@ export class RoutstrClient {
       headers: finalHeaders,
       baseHeaders,
       selectedModel,
+      tinfoilEnabled,
     });
 
     let tokenBalanceInSats =
@@ -498,19 +529,30 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
+    /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
+    tinfoilEnabled?: boolean;
   }): Promise<Response> {
-    const { path, method, body, baseUrl, token, headers } = params;
+    const { path, method, body, baseUrl, token, headers, tinfoilEnabled } = params;
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
 
-      // Store request to reqs/ folder before fetch
-      this._storeRequest({ url, method, headers, body, baseUrl }).catch(
-        (err) => this._log("WARN", "Failed to store request:", err)
-      );
+      this._storeRequest({
+        url,
+        method,
+        headers,
+        body: tinfoilEnabled
+          ? "[redacted: Tinfoil EHBP encrypted inside SecureClient.fetch]"
+          : body,
+        baseUrl,
+      }).catch((err) => this._log("WARN", "Failed to store request:", err));
 
-      const response = await fetch(url, {
+      const fetchImpl = tinfoilEnabled
+        ? (await prepareTinfoilClient({ baseUrl })).client.fetch
+        : fetch;
+
+      const response = await fetchImpl(url, {
         method,
         headers,
         body:
@@ -612,6 +654,7 @@ export class RoutstrClient {
       maxTokens?: number;
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
+      tinfoilEnabled?: boolean;
     },
     token: string,
     status: number,
@@ -992,6 +1035,14 @@ export class RoutstrClient {
         messagesForPricing,
         params.maxTokens
       );
+
+      if (params.tinfoilEnabled) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: Attesting Tinfoil failover provider ${nextProvider} before spend`
+        );
+        await prepareTinfoilClient({ baseUrl: nextProvider });
+      }
 
       this._log(
         "DEBUG",

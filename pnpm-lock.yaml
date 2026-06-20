@@ -26,6 +26,9 @@ importers:
       rxjs:
         specifier: ^7.8.1
         version: 7.8.2
+      tinfoil:
+        specifier: ^1.1.6
+        version: 1.1.6(@noble/curves@2.2.0)(zod@4.4.3)
       zustand:
         specifier: ^5.0.5
         version: 5.0.13
@@ -51,6 +54,22 @@ importers:
         version: 12.10.0
 
 packages:
+
+  '@ai-sdk/openai-compatible@2.0.51':
+    resolution: {integrity: sha512-A6qfyaVs4lxmRxRux6U3ViOa8mMbsSd0OaHghpei2MpiBT6791J4zFH5MN7kaW1tLfQ246rSC2DVTMOavsycjQ==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/provider-utils@4.0.30':
+    resolution: {integrity: sha512-VO7I+vPffqI5sMnPoUq5DCSqKIgQIk/naJWRdQVpz2ma2zoprC/lqiJiUEl2s6DfvTD76TbhD3q39ROjlA6rGw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/provider@3.0.10':
+    resolution: {integrity: sha512-Q3BZ27qfpYqnCYGvE3vt+Qi6LGOF9R5Nmzn+9JoM1lCRsD9mYaIhfJLkSunN48nfGXJ6n+XNV0J/XVpqGQl7Dw==}
+    engines: {node: '>=18'}
 
   '@cashu/cashu-ts@3.7.0':
     resolution: {integrity: sha512-Jy4Hek+Wouh94xS4InmTJRLpBPXA6fddVOAHR5lfNyTsCk9r3desY0vnwUGvOZBZWsSKZXedqdD/YpjWb3zngQ==}
@@ -221,6 +240,17 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@freedomofpress/crypto-browser@0.1.7':
+    resolution: {integrity: sha512-zjWmZDKdAu8g0Zq1IjBQ+sKQ/NpfzStBDFjy/qHUSMVEL4wNlNGtA7lhtw8v8asXa0yqF2QTYQ3rq6xCTQeADw==}
+    peerDependencies:
+      '@noble/curves': ^1.6.0
+
+  '@freedomofpress/sigstore-browser@0.1.13':
+    resolution: {integrity: sha512-3YfmP9JQ5h8CAO/vKJEGYrFdzss6xWxYi5ZkbR4KoHlxIaLGrnu+5TQDoZVWhuhyfDBdLQqj6ypdN0W6PsH3Jw==}
+
+  '@freedomofpress/tuf-browser@0.1.11':
+    resolution: {integrity: sha512-d76ohB/AS5+zI+lnbiFMX/BIK3nT18hZ8q3Na6X4vyYaSYjXkeknzhAnbx1da+8ObWLwsaZLue46haEch28qtQ==}
+
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
 
@@ -307,6 +337,10 @@ packages:
   '@noble/ciphers@0.5.3':
     resolution: {integrity: sha512-B0+6IIHiqEs3BPMT0hcRmHvEj2QHOLu+uwt+tqDDeVd0oyVzh7BPrDcPjRnV1PV/5LaknXJJQvOuRGR0zQJz+w==}
 
+  '@noble/ciphers@2.2.0':
+    resolution: {integrity: sha512-Z6pjIZ/8IJcCGzb2S/0Px5J81yij85xASuk1teLNeg75bfT07MV3a/O2Mtn1I2se43k3lkVEcFaR10N4cgQcZA==}
+    engines: {node: '>= 20.19.0'}
+
   '@noble/curves@1.1.0':
     resolution: {integrity: sha512-091oBExgENk/kGj3AZmtBDMpxQPDtxQABR2B9lb1JbVTs6ytdzZNwvhxQ4MWasRNEzlbEH8jCWFCwhF/Obj5AA==}
 
@@ -332,6 +366,15 @@ packages:
   '@noble/hashes@2.2.0':
     resolution: {integrity: sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==}
     engines: {node: '>= 20.19.0'}
+
+  '@noble/post-quantum@0.6.1':
+    resolution: {integrity: sha512-+pormrDZwjRw05U8ADK4JpHejo87+gBd+muRBB/ozztH5yhDLMDF4jHQWN3NQQAsu1zBNPWTG0ZwVI0CR29H0A==}
+    engines: {node: '>= 20.19.0'}
+
+  '@panva/hpke-noble@1.1.2':
+    resolution: {integrity: sha512-Gr/jKr/ErpRow8aHK+SAp0sAaWy7iJGHlFsXsdTjD8ULcN4vvsVVWR3fiD6Ogf+VoSB28XY/xWRDUEIGXw+9aA==}
+    peerDependencies:
+      hpke: ^1.0.0
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
     resolution: {integrity: sha512-F5QXMSiFebS9hKZj02XhWLLnRpJ3B3AROP0tWbFBSj+6kCbg5m9j5JoHKd4mmSVy5mS/IMQloYgYxCuJC0fxEQ==}
@@ -486,6 +529,13 @@ packages:
   '@scure/bip39@1.2.1':
     resolution: {integrity: sha512-Z3/Fsz1yr904dduJD0NpiyRHhRYHdcnyh73FZWiV+/qhWi83wNJ3NWolYqCEN+ZWsUz2TWwajJggcRE9r1zUYg==}
 
+  '@standard-schema/spec@1.1.0':
+    resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
+
+  '@tinfoilsh/verifier@1.1.6':
+    resolution: {integrity: sha512-egZlLFU98kh48GKV5B8Gh1abGHCUGEcSijWmTv3hn5lqAMXdLsqyehKDaUen8/98CrNxiOP+mzeqVbKSyAs5ZQ==}
+    engines: {node: '>=20'}
+
   '@tursodatabase/database-common@0.2.2':
     resolution: {integrity: sha512-cSNpms6MIaRj29B37XzIu9yGbea0HSGDupZs8QrMxR3rKqgHJIfY04ysqDD/4lS8TNIImPlPZrZgqQz+b/FoKQ==}
 
@@ -633,6 +683,10 @@ packages:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
 
+  ehbp@0.2.3:
+    resolution: {integrity: sha512-f7iLlhGpeE5xNOYASR3d529PzmBD7Pq5Yb/z0R7vQcxalwNuVTHhX6i4wDJRIVai18MznwoOQ3OWyT/EWaDJ3w==}
+    engines: {node: '>=20.0.0'}
+
   end-of-stream@1.4.5:
     resolution: {integrity: sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==}
 
@@ -640,6 +694,10 @@ packages:
     resolution: {integrity: sha512-IxpibTjyVnmrIQo5aqNpCgoACA/dTKLTlhMHihVHhdkxKyPO1uBBthumT0rdHmcsk9uMonIWS0m4FljWzILh3w==}
     engines: {node: '>=18'}
     hasBin: true
+
+  eventsource-parser@3.1.0:
+    resolution: {integrity: sha512-kJezFj9YFAMLeORyi7aCLxLbD5/qWMQnoMVlVPyHIll7lgRJCc3JVln9Vgl9nwQi0YkMnhdGTMNn7CkRRAptMg==}
+    engines: {node: '>=18.0.0'}
 
   expand-template@2.0.3:
     resolution: {integrity: sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==}
@@ -685,6 +743,9 @@ packages:
   hash-sum@2.0.0:
     resolution: {integrity: sha512-WdZTbAByD+pHfl/g9QSsBIIwy8IT+EsPiKDs0KNX+zSHhdDLFKdZu0BQHljvO+0QI/BasbMSUa8wYNCZTvhslg==}
 
+  hpke@1.1.2:
+    resolution: {integrity: sha512-6Z8JoG/zYXly+MfsgQ5aNibBx/HDq2F74254Tv8VK4DR3/Mmf6zVrGakqsodfy9pF0XGKSYh5MA9x6D30gbhbg==}
+
   ieee754@1.2.1:
     resolution: {integrity: sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==}
 
@@ -700,6 +761,9 @@ packages:
 
   js-base64@3.7.8:
     resolution: {integrity: sha512-hNngCeKxIUQiEUN3GPJOkz4wF/YvdUdbNL9hsBcMQTkKzboD7T/q3OYOuuPZLUE6dBxSGpwhk5mwuDud7JVAow==}
+
+  json-schema@0.4.0:
+    resolution: {integrity: sha512-es94M3nTIfsEPisRafak+HDLfHXnKBhV3vU5eqPcS3flIWqcxJWgXHXiey3YrpaNsanY5ei1VoYEbOzijuq9BA==}
 
   libsql@0.5.29:
     resolution: {integrity: sha512-8lMP8iMgiBzzoNbAPQ59qdVcj6UaE/Vnm+fiwX4doX4Narook0a4GPKWBEv+CR8a1OwbfkgL18uBfBjWdF0Fzg==}
@@ -777,6 +841,17 @@ packages:
 
   once@1.4.0:
     resolution: {integrity: sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==}
+
+  openai@6.44.0:
+    resolution: {integrity: sha512-09/gH+8jH0RgUwsgWHAaxsKGRT5zVZ95IaJUnqAWj6XejIBmnFRwq2WUIF37VtDEsmGrtPmvCs5+yBSeZGWvkA==}
+    peerDependencies:
+      ws: ^8.18.0
+      zod: ^3.25 || ^4.0
+    peerDependenciesMeta:
+      ws:
+        optional: true
+      zod:
+        optional: true
 
   pathe@2.0.3:
     resolution: {integrity: sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==}
@@ -893,6 +968,15 @@ packages:
   thenify@3.3.1:
     resolution: {integrity: sha512-RVZSIV5IG10Hk3enotrhvz0T9em6cyHBLkH/YAZuKqd8hRkKhSfCGIcP2KUY0EPxndzANBmNllzWPwak+bheSw==}
 
+  tinfoil@1.1.6:
+    resolution: {integrity: sha512-kAgVPuvdydLSF72GH8I5Awnc0835MQCNHb9cS/J2TxGgMF2LFgqaJhe9l1iPf7Si64h3s+Gebz0XfTJ80QZ8wQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      ai: ^6.0.168
+    peerDependenciesMeta:
+      ai:
+        optional: true
+
   tinyexec@0.3.2:
     resolution: {integrity: sha512-KQQR9yN7R5+OSwaK0XQoj22pwHoTlgYqmUscPYoknOoWCWfj/5/ABTMRi69FrKU5ffPVh5QcFikpWJI/P1ocHA==}
 
@@ -965,6 +1049,9 @@ packages:
       utf-8-validate:
         optional: true
 
+  zod@4.4.3:
+    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
+
   zustand@5.0.13:
     resolution: {integrity: sha512-efI2tVaVQPqtOh114loML/Z80Y4NP3yc+Ff0fYiZJPauNeWZeIp/bRFD7I9bfmCOYBh/PHxlglQ9+wvlwnPikQ==}
     engines: {node: '>=12.20.0'}
@@ -984,6 +1071,23 @@ packages:
         optional: true
 
 snapshots:
+
+  '@ai-sdk/openai-compatible@2.0.51(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.30(zod@4.4.3)
+      zod: 4.4.3
+
+  '@ai-sdk/provider-utils@4.0.30(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.10
+      '@standard-schema/spec': 1.1.0
+      eventsource-parser: 3.1.0
+      zod: 4.4.3
+
+  '@ai-sdk/provider@3.0.10':
+    dependencies:
+      json-schema: 0.4.0
 
   '@cashu/cashu-ts@3.7.0':
     dependencies:
@@ -1083,6 +1187,22 @@ snapshots:
   '@esbuild/win32-x64@0.27.7':
     optional: true
 
+  '@freedomofpress/crypto-browser@0.1.7(@noble/curves@2.2.0)':
+    dependencies:
+      '@noble/curves': 2.2.0
+
+  '@freedomofpress/sigstore-browser@0.1.13':
+    dependencies:
+      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@2.2.0)
+      '@freedomofpress/tuf-browser': 0.1.11(@noble/curves@2.2.0)
+      '@noble/curves': 2.2.0
+
+  '@freedomofpress/tuf-browser@0.1.11(@noble/curves@2.2.0)':
+    dependencies:
+      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@2.2.0)
+    transitivePeerDependencies:
+      - '@noble/curves'
+
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
       '@jridgewell/sourcemap-codec': 1.5.5
@@ -1169,6 +1289,8 @@ snapshots:
 
   '@noble/ciphers@0.5.3': {}
 
+  '@noble/ciphers@2.2.0': {}
+
   '@noble/curves@1.1.0':
     dependencies:
       '@noble/hashes': 1.3.1
@@ -1188,6 +1310,20 @@ snapshots:
   '@noble/hashes@1.8.0': {}
 
   '@noble/hashes@2.2.0': {}
+
+  '@noble/post-quantum@0.6.1':
+    dependencies:
+      '@noble/ciphers': 2.2.0
+      '@noble/curves': 2.2.0
+      '@noble/hashes': 2.2.0
+
+  '@panva/hpke-noble@1.1.2(hpke@1.1.2)':
+    dependencies:
+      '@noble/ciphers': 2.2.0
+      '@noble/curves': 2.2.0
+      '@noble/hashes': 2.2.0
+      '@noble/post-quantum': 0.6.1
+      hpke: 1.1.2
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
     optional: true
@@ -1284,6 +1420,16 @@ snapshots:
     dependencies:
       '@noble/hashes': 1.3.1
       '@scure/base': 1.1.1
+
+  '@standard-schema/spec@1.1.0': {}
+
+  '@tinfoilsh/verifier@1.1.6(@noble/curves@2.2.0)':
+    dependencies:
+      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@2.2.0)
+      '@freedomofpress/sigstore-browser': 0.1.13
+      '@freedomofpress/tuf-browser': 0.1.11(@noble/curves@2.2.0)
+    transitivePeerDependencies:
+      - '@noble/curves'
 
   '@tursodatabase/database-common@0.2.2': {}
 
@@ -1448,6 +1594,11 @@ snapshots:
 
   detect-libc@2.1.2: {}
 
+  ehbp@0.2.3:
+    dependencies:
+      '@panva/hpke-noble': 1.1.2(hpke@1.1.2)
+      hpke: 1.1.2
+
   end-of-stream@1.4.5:
     dependencies:
       once: 1.4.0
@@ -1480,6 +1631,8 @@ snapshots:
       '@esbuild/win32-arm64': 0.27.7
       '@esbuild/win32-ia32': 0.27.7
       '@esbuild/win32-x64': 0.27.7
+
+  eventsource-parser@3.1.0: {}
 
   expand-template@2.0.3: {}
 
@@ -1515,6 +1668,8 @@ snapshots:
 
   hash-sum@2.0.0: {}
 
+  hpke@1.1.2: {}
+
   ieee754@1.2.1: {}
 
   inherits@2.0.4: {}
@@ -1524,6 +1679,8 @@ snapshots:
   joycon@3.1.1: {}
 
   js-base64@3.7.8: {}
+
+  json-schema@0.4.0: {}
 
   libsql@0.5.29:
     dependencies:
@@ -1606,6 +1763,11 @@ snapshots:
   once@1.4.0:
     dependencies:
       wrappy: 1.0.2
+
+  openai@6.44.0(ws@8.21.0)(zod@4.4.3):
+    optionalDependencies:
+      ws: 8.21.0
+      zod: 4.4.3
 
   pathe@2.0.3: {}
 
@@ -1752,6 +1914,21 @@ snapshots:
     dependencies:
       any-promise: 1.3.0
 
+  tinfoil@1.1.6(@noble/curves@2.2.0)(zod@4.4.3):
+    dependencies:
+      '@ai-sdk/openai-compatible': 2.0.51(zod@4.4.3)
+      '@freedomofpress/sigstore-browser': 0.1.13
+      '@tinfoilsh/verifier': 1.1.6(@noble/curves@2.2.0)
+      '@types/ws': 8.18.1
+      ehbp: 0.2.3
+      openai: 6.44.0(ws@8.21.0)(zod@4.4.3)
+      ws: 8.21.0
+    transitivePeerDependencies:
+      - '@noble/curves'
+      - bufferutil
+      - utf-8-validate
+      - zod
+
   tinyexec@0.3.2: {}
 
   tinyglobby@0.2.16:
@@ -1809,5 +1986,7 @@ snapshots:
   wrappy@1.0.2: {}
 
   ws@8.21.0: {}
+
+  zod@4.4.3: {}
 
   zustand@5.0.13: {}
