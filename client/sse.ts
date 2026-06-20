@@ -105,7 +105,7 @@ export async function inspectSSEWebStream(
   onResponseId?: (responseId: string) => void,
   options?: {
     /** Called with each raw chunk read from the tee'd inspection branch. */
-    onRawChunk?: (chunk: Uint8Array, sequence: number) => void;
+    onRawChunk?: (chunk: Uint8Array, sequence: number, text: string) => void | Promise<void>;
   }
 ): Promise<{
   capturedUsage?: UsageTrackingData;
@@ -197,8 +197,9 @@ export async function inspectSSEWebStream(
       const { value, done } = await reader.read();
       if (done) break;
       if (value && value.byteLength > 0) {
-        options?.onRawChunk?.(value, rawChunkSequence++);
-        buffer += decoder.decode(value, { stream: true });
+        const text = decoder.decode(value, { stream: true });
+        void options?.onRawChunk?.(value, rawChunkSequence++, text);
+        buffer += text;
         drainBufferedEvents();
       }
     }

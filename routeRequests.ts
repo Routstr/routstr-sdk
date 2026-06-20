@@ -14,7 +14,11 @@ import type {
 } from "./wallet/interfaces";
 import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
-import { RoutstrClient, type DebugLevel } from "./client/RoutstrClient";
+import {
+  RoutstrClient,
+  type DebugLevel,
+  type RequestResponseLogSink,
+} from "./client/RoutstrClient";
 import type { UsageTrackingDriver } from "./storage/usageTracking";
 import type { SdkStore } from "./storage/store";
 
@@ -62,9 +66,9 @@ export interface RouteRequestOptions {
   routstrPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;
-  /** Optional: directory for raw request/response logging. Writes requests/*.json and responses/*.jsonl. */
-  requestResponseLogDir?: string;
-  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, providerManager, and requestResponseLogDir. */
+  /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
+  requestResponseLogSink?: RequestResponseLogSink;
+  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, providerManager, and requestResponseLogSink. */
   client?: RoutstrClient;
 }
 
@@ -120,7 +124,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     sdkStore,
     providerManager: providedProviderManager,
     logger,
-    requestResponseLogDir,
+    requestResponseLogSink,
   } = options;
 
   let modelManager: ModelManager;
@@ -207,7 +211,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     providerRegistry,
     "min",
     mode,
-    { usageTrackingDriver, sdkStore, providerManager, logger, requestResponseLogDir }
+    { usageTrackingDriver, sdkStore, providerManager, logger, requestResponseLogSink }
   );
 
   const maxTokens = extractMaxTokens(requestBody);
