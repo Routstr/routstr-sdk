@@ -8,9 +8,11 @@ Example:
 tinfoil-llama3-3-70b
 ```
 
-The SDK **does not strip** the `tinfoil-` prefix. The exact model id provided by
-the caller is sent upstream in the JSON body. Provider-side routing can decide
-how to map that public model id to an enclave/internal model id.
+The SDK **strips** the `tinfoil-` prefix from the model id inside the encrypted
+request body. The attested enclave receives the bare model id it expects (e.g.
+`llama3-3-70b`). The full caller-facing id (e.g. `tinfoil-llama3-3-70b`) is sent in
+the `X-Routstr-Model` header for proxy-side model lookup, cost calculation, and
+routing without parsing the encrypted body.
 
 ## Files
 
@@ -32,7 +34,8 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
    │── spend token as usual ───────────────▶│                                  │
    │                                         │                                  │
    │── POST /v1/chat/completions ──────────▶│── EHBP ciphertext body ─────────▶│
-   │   body.model remains tinfoil-...       │   X-Tinfoil-Enclave-Url          │
+   │   X-Routstr-Model: tinfoil-...         │   X-Tinfoil-Enclave-Url          │
+   │   body.model = bare id (stripped)      │   X-Private-Model: private/...   │
    │   body encrypted by SecureClient.fetch │                                  │
    │←─ decrypted Response stream ──────────│←─ EHBP encrypted response ───────│
 ```
@@ -40,8 +43,13 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
 ## Behavior
 
 - `isTinfoilModel(modelId)` returns true for `modelId.startsWith("tinfoil-")`.
+- `getTinfoilUpstreamModelId(modelId)` strips the `tinfoil-` prefix for the
+  model id inside the encrypted body (e.g. `tinfoil-kimi-k2-6` → `kimi-k2-6`).
 - `RoutstrClient` runs Tinfoil attestation **before** spending the main token.
 - The actual API request uses `SecureClient.fetch`, not global `fetch`.
+- The full caller-facing model id is sent in the `X-Routstr-Model` header so the
+  proxy can do model lookup, cost calculation, and routing without parsing the
+  encrypted body.
 - No custom stream transform is needed; Tinfoil decrypts the response before the
   SDK's normal SSE processing sees it.
 - Request debug storage redacts the body for Tinfoil requests because encryption
@@ -62,7 +70,8 @@ Optional environment overrides:
 
 ## Important notes
 
-- The model prefix is **not stripped**.
+- The `tinfoil-` prefix is stripped from the model id inside the encrypted body.
+  The full id is sent in the `X-Routstr-Model` header for proxy-side lookup.
 - Tinfoil support requires the `tinfoil` package dependency.
 - Provider/proxy infrastructure must understand EHBP-wrapped requests and forward
   them to the attested Tinfoil enclave. If a provider does not support Tinfoil

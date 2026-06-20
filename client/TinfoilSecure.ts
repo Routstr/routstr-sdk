@@ -41,13 +41,13 @@ export function isTinfoilModel(modelId: string): boolean {
 }
 
 /**
- * Return the model id sent upstream for a Tinfoil request.
+ * Return the model id sent inside the EHBP-encrypted request body.
  *
- * Intentionally does NOT strip `tinfoil-`. Routstr/provider model registries can
- * use the prefix as the public model id and decide server-side how to map it.
+ * Strips the `tinfoil-` prefix so the attested enclave receives the bare
+ * model id it expects (e.g. "kimi-k2-6"), not the caller-facing routstr id.
  */
 export function getTinfoilUpstreamModelId(modelId: string): string {
-  return modelId;
+  return modelId.slice(TINFOIL_MODEL_PREFIX.length);
 }
 
 function normalizeBaseUrl(baseUrl: string): string {

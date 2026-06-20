@@ -44,6 +44,7 @@ import {
 } from "./VeniceE2EE";
 import {
   isTinfoilModel,
+  getTinfoilUpstreamModelId,
   prepareTinfoilClient,
 } from "./TinfoilSecure";
 import { promises as fs } from "fs";
@@ -345,12 +346,14 @@ export class RoutstrClient {
         `[RoutstrClient] Tinfoil attestation passed, enclave=${verification.enclaveHost}, codeFingerprint=${verification.codeFingerprint.slice(0, 16)}...`
       );
 
-      // Do NOT strip or remap the tinfoil- prefix. If an earlier compatibility
-      // path/provider mapping changed body.model, restore the caller-facing id.
-      if (requestBody && typeof requestBody === "object") {
+      // Strip the tinfoil- prefix for the model id inside the encrypted body.
+      // The attested enclave expects the bare model id (e.g. "kimi-k2-6"),
+      // not the caller-facing routstr id (e.g. "tinfoil-kimi-k2-6").
+      // The full id is sent in the X-Routstr-Model header for proxy-side lookup.
+      if (requestBody && typeof requestBody === "object" && modelId) {
         requestBody = {
           ...(requestBody as Record<string, unknown>),
-          model: modelId,
+          model: getTinfoilUpstreamModelId(modelId),
         };
       }
     }
@@ -394,11 +397,18 @@ export class RoutstrClient {
 
     const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
 
-    // Build final request headers (auth + E2EE)
+    // Build final request headers (auth + E2EE + Tinfoil model hint)
     const requestHeaders = this._withAuthHeader(baseHeaders, token);
     const finalHeaders = e2eeSessionEcdh
       ? { ...requestHeaders, ...e2eeHeaders }
       : requestHeaders;
+
+    // For Tinfoil EHBP requests the body is HPKE-encrypted by SecureClient.fetch
+    // and is opaque to the proxy. Send the model id in a header so the proxy can
+    // do model lookup, cost calculation, and routing without parsing the body.
+    if (tinfoilEnabled && modelId) {
+      finalHeaders["X-Routstr-Model"] = modelId;
+    }
 
     const response = await this._makeRequest({
       path: requestPath,
