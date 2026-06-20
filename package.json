@@ -38,7 +38,9 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@cashu/cashu-ts": "^3.1.1",
@@ -55,7 +57,8 @@
     "@types/node": "^22.0.0",
     "joycon": "^3.1.1",
     "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.1.9"
   },
   "peerDependencies": {
     "typescript": ">=5.0.0"
@@ -74,5 +77,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/routstr/routstr-sdk"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "better-sqlite3"
+    ]
   }
 }

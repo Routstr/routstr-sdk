@@ -10,6 +10,9 @@ coverage
 .DS_Store
 *.pem
 
+# debug request dumps (never commit: may contain live cashu tokens / api keys)
+reqs/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
