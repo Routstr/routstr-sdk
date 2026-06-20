@@ -37,6 +37,7 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
+import { RequestResponseLogger } from "./requestResponseLogger";
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -65,6 +66,8 @@ export interface RoutstrClientConfig {
   providerManager?: ProviderManager;
   /** Optional: injectable logger (defaults to consoleLogger) */
   logger?: SdkLogger;
+  /** Optional: directory for raw request/response logging. Writes requests/*.json and responses/*.jsonl. */
+  requestResponseLogDir?: string;
 }
 
 export class RoutstrClient {
@@ -77,6 +80,7 @@ export class RoutstrClient {
   private usageTrackingDriver?: UsageTrackingDriver;
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
+  private requestResponseLogger?: RequestResponseLogger;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -105,6 +109,12 @@ export class RoutstrClient {
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
+    this.requestResponseLogger = options.requestResponseLogDir
+      ? new RequestResponseLogger({
+          dir: options.requestResponseLogDir,
+          logger: this.logger,
+        })
+      : undefined;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
@@ -371,6 +381,9 @@ export class RoutstrClient {
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
       const [clientStream, inspectStream] = response.body.tee();
+      const requestResponseLogId = (response as any).requestResponseLogId as
+        | string
+        | undefined;
 
       processedResponse = new Response(clientStream, {
         status: response.status,
@@ -380,6 +393,7 @@ export class RoutstrClient {
 
       (processedResponse as any).baseUrl = (response as any).baseUrl;
       (processedResponse as any).token = (response as any).token;
+      (processedResponse as any).requestResponseLogId = requestResponseLogId;
 
       usagePromise = inspectSSEWebStream(
         inspectStream,
@@ -390,8 +404,20 @@ export class RoutstrClient {
         (responseId) => {
           capturedResponseId = responseId;
           (processedResponse as any).requestId = responseId;
+        },
+        {
+          onRawChunk: (chunk, sequence) => {
+            void this.requestResponseLogger?.logChunk(
+              requestResponseLogId,
+              sequence,
+              chunk
+            );
+          },
         }
-      );
+      ).then(async (result) => {
+        await this.requestResponseLogger?.logResponseEnd(requestResponseLogId);
+        return result;
+      });
 
       (processedResponse as any).usagePromise = usagePromise;
     }
@@ -445,21 +471,35 @@ export class RoutstrClient {
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      const requestBodyText =
+        body === undefined || method === "GET" ? undefined : JSON.stringify(body);
+      const requestLogId = await this.requestResponseLogger?.logRequest({
+        method,
+        url,
+        path,
+        baseUrl,
+        headers,
+        body,
+        rawBody: requestBodyText,
+      });
+
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
       const response = await fetch(url, {
         method,
         headers,
-        body:
-          body === undefined || method === "GET"
-            ? undefined
-            : JSON.stringify(body),
+        body: requestBodyText,
       });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
+      (response as any).requestResponseLogId = requestLogId;
+      await this.requestResponseLogger?.logResponseStart(requestLogId, response);
+
+      const contentType = response.headers.get("content-type") || "";
 
       if (!response.ok) {
+        void this.requestResponseLogger?.logResponseBody(response.clone(), requestLogId);
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
         let bodyText: string | undefined;
@@ -479,6 +519,10 @@ export class RoutstrClient {
           bodyText,
           params.retryCount ?? 0
         );
+      }
+
+      if (!contentType.includes("text/event-stream")) {
+        void this.requestResponseLogger?.logResponseBody(response.clone(), requestLogId);
       }
 
       return response;
