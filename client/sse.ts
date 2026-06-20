@@ -102,7 +102,11 @@ function isInspectionComplete(
 export async function inspectSSEWebStream(
   stream: ReadableStream<Uint8Array>,
   onUsage: (usage: UsageTrackingData) => void,
-  onResponseId?: (responseId: string) => void
+  onResponseId?: (responseId: string) => void,
+  options?: {
+    /** Called with each raw chunk read from the tee'd inspection branch. */
+    onRawChunk?: (chunk: Uint8Array, sequence: number, text: string) => void | Promise<void>;
+  }
 ): Promise<{
   capturedUsage?: UsageTrackingData;
   capturedResponseId?: string;
@@ -113,6 +117,7 @@ export async function inspectSSEWebStream(
   let capturedUsage: UsageTrackingData | null = null;
   let capturedResponseId: string | undefined;
   let responseIdCaptured = false;
+  let rawChunkSequence = 0;
 
   const inspectDataPayload = (jsonText: string): void => {
     const trimmed = jsonText.trim();
@@ -192,7 +197,9 @@ export async function inspectSSEWebStream(
       const { value, done } = await reader.read();
       if (done) break;
       if (value && value.byteLength > 0) {
-        buffer += decoder.decode(value, { stream: true });
+        const text = decoder.decode(value, { stream: true });
+        void options?.onRawChunk?.(value, rawChunkSequence++, text);
+        buffer += text;
         drainBufferedEvents();
       }
     }
