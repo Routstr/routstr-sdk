@@ -150,14 +150,14 @@ export async function inspectSSEWebStream(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
-        console.log("[routstr:sse] → usage detected:", usage);
+        // console.log("[routstr:sse] → usage detected:", usage);
         const merged = mergeUsage(capturedUsage, usage);
         if (hasUsageChanged(capturedUsage, merged)) {
           capturedUsage = merged;
-          console.log("[routstr:sse] → merged (changed):", merged);
+          // console.log("[routstr:sse] → merged (changed):", merged);
           onUsage(merged);
         } else {
-          console.log("[routstr:sse] → merged (no change)");
+          // console.log("[routstr:sse] → merged (no change)");
         }
       }
     } catch {

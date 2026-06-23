@@ -46,6 +46,7 @@ import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
   prepareTinfoilClient,
+  fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
 import { promises as fs } from "fs";
 import path from "path";
@@ -421,17 +422,15 @@ export class RoutstrClient {
     const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
 
     // Build final request headers (auth + E2EE + Tinfoil model hint)
-    const requestHeaders = this._withAuthHeader(baseHeaders, token);
+    const requestHeaders = this._withAuthAndTinfoilHeaders(
+      baseHeaders,
+      token,
+      tinfoilEnabled,
+      modelId
+    );
     const finalHeaders = e2eeSessionEcdh
       ? { ...requestHeaders, ...e2eeHeaders }
       : requestHeaders;
-
-    // For Tinfoil EHBP requests the body is HPKE-encrypted by SecureClient.fetch
-    // and is opaque to the proxy. Send the model id in a header so the proxy can
-    // do model lookup, cost calculation, and routing without parsing the body.
-    if (tinfoilEnabled && modelId) {
-      finalHeaders["X-Routstr-Model"] = modelId;
-    }
 
     const response = await this._makeRequest({
       path: requestPath,
@@ -601,20 +600,26 @@ export class RoutstrClient {
         method,
         headers,
         body: tinfoilEnabled
-          ? "[redacted: Tinfoil EHBP encrypted inside SecureClient.fetch]"
+          ? "[redacted: Tinfoil EHBP encrypted before upstream fetch]"
           : body,
         baseUrl,
       }).catch((err) => this._log("WARN", "Failed to store request:", err));
 
-      const fetchImpl = tinfoilEnabled
-        ? (await prepareTinfoilClient({ baseUrl })).client.fetch
-        : fetch;
-
-      const response = await fetchImpl(url, {
-        method,
-        headers,
-        body: requestBodyText,
-      });
+      const response = tinfoilEnabled
+        ? await fetchTinfoilPreservingPlaintextErrors(
+            { baseUrl },
+            url,
+            {
+              method,
+              headers,
+              body: requestBodyText,
+            }
+          )
+        : await fetch(url, {
+            method,
+            headers,
+            body: requestBodyText,
+          });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
@@ -634,6 +639,17 @@ export class RoutstrClient {
         } catch (e) {
           bodyText = undefined;
         }
+
+        this._log("ERROR", "[RoutstrClient] Upstream error response", {
+          baseUrl,
+          url,
+          path,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: bodyText ?? "<unable to read response body>",
+        });
+
         return await this._handleErrorResponse(
           params,
           token,
@@ -897,7 +913,12 @@ export class RoutstrClient {
           return this._makeRequest({
             ...params,
             token: params.token,
-            headers: this._withAuthHeader(params.baseHeaders, params.token),
+            headers: this._withAuthAndTinfoilHeaders(
+              params.baseHeaders,
+              params.token,
+              params.tinfoilEnabled,
+              params.selectedModel?.id
+            ),
             retryCount: retryCount + 1,
           });
         } else {
@@ -975,7 +996,12 @@ export class RoutstrClient {
         return this._makeRequest({
           ...params,
           token: retryToken,
-          headers: this._withAuthHeader(params.baseHeaders, retryToken),
+          headers: this._withAuthAndTinfoilHeaders(
+            params.baseHeaders,
+            retryToken,
+            params.tinfoilEnabled,
+            params.selectedModel?.id
+          ),
           retryCount: retryCount + 1,
         });
       } else {
@@ -1130,7 +1156,12 @@ export class RoutstrClient {
         selectedModel: newModel,
         token: spendResult.token!,
         requiredSats: newRequiredSats,
-        headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
+        headers: this._withAuthAndTinfoilHeaders(
+          params.baseHeaders,
+          spendResult.token!,
+          params.tinfoilEnabled,
+          newModel.id
+        ),
         retryCount: 0,
       });
       (retryResponse as any).initialTokenBalanceInSats =
@@ -1577,6 +1608,27 @@ export class RoutstrClient {
       nextHeaders["X-Cashu"] = token;
     } else {
       nextHeaders["Authorization"] = `Bearer ${token}`;
+    }
+
+    return nextHeaders;
+  }
+
+  /**
+   * Attach auth headers and preserve the plaintext model hint required by the
+   * Routstr proxy for Tinfoil/EHBP requests. EHBP encrypts the JSON body, so
+   * retries/failover must not rebuild headers from baseHeaders alone or the
+   * proxy cannot route/price the encrypted request.
+   */
+  private _withAuthAndTinfoilHeaders(
+    headers: Record<string, string>,
+    token: string,
+    tinfoilEnabled?: boolean,
+    modelId?: string
+  ): Record<string, string> {
+    const nextHeaders = this._withAuthHeader(headers, token);
+
+    if (tinfoilEnabled && modelId) {
+      nextHeaders["X-Routstr-Model"] = modelId;
     }
 
     return nextHeaders;
