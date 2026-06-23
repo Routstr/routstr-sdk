@@ -53,6 +53,8 @@ export const createSqliteDriver = (
   const initDb = async () => {
     if (!db) {
       db = await loadDatabase(dbPath);
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA busy_timeout = 5000");
       db.exec(
         `CREATE TABLE IF NOT EXISTS ${tableName} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`
       );

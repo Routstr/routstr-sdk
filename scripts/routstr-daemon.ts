@@ -275,7 +275,7 @@ async function main(): Promise<void> {
   const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
   const storageAdapter = createStorageAdapterFromStore(store);
 
-  const usageTrackingDriver = createSqliteUsageTrackingDriver(store);
+  const usageTrackingDriver = createSqliteUsageTrackingDriver({ legacyStorageDriver: driver });
 
   console.log("Bootstrapping providers...");
   const modelManager = new ModelManager(discoveryAdapter, {

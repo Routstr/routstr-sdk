@@ -34,6 +34,12 @@ export type PersistentEventDatabaseFactory = (
   dbPath: string
 ) => Promise<PersistentEventDatabase> | PersistentEventDatabase;
 
+export const DEFAULT_NOSTR_RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.routstr.com",
+];
+
 /**
  * Configuration for ModelManager
  */
@@ -50,7 +56,7 @@ export interface ModelManagerConfig {
   routstrPubkey?: string;
   /** Nostr relay URLs for provider/model discovery.
    * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
-   * When unset, each method uses its own default relay set. */
+   * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
   nostrRelays?: string[];
   /** Optional injectable logger */
   logger?: SdkLogger;
@@ -309,11 +315,13 @@ export class ModelManager {
   }
 
   /**
-   * Resolve Nostr relay URLs for a given use case.
-   * Returns user-configured relays if set, otherwise the provided defaults.
+   * Resolve Nostr relay URLs.
+   * Returns user-configured relays if set, otherwise the shared defaults.
    */
-  private getNostrRelays(defaults: string[]): string[] {
-    return this.nostrRelays && this.nostrRelays.length > 0 ? this.nostrRelays : defaults;
+  private getNostrRelays(): string[] {
+    return this.nostrRelays && this.nostrRelays.length > 0
+      ? this.nostrRelays
+      : DEFAULT_NOSTR_RELAYS;
   }
 
   /**
@@ -327,11 +335,7 @@ export class ModelManager {
     torMode: boolean,
     forceRefresh: boolean = false
   ): Promise<string[]> {
-    const relays = this.getNostrRelays([
-      "wss://relay.primal.net",
-      "wss://nos.lol",
-      "wss://relay.damus.io",
-    ]);
+    const relays = this.getNostrRelays();
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
@@ -558,12 +562,7 @@ export class ModelManager {
       let sessionEvents: NostrEvent[] = cached;
 
       if (cached.length === 0) {
-        const lgtmRelays = this.getNostrRelays([
-          "wss://relay.primal.net",
-          "wss://nos.lol",
-          "wss://relay.damus.io",
-          "wss://relay.routstr.com",
-        ]);
+        const lgtmRelays = this.getNostrRelays();
         const pool = new RelayPool();
         const timeoutMs = 5000;
         await new Promise<void>((resolve) => {
@@ -873,11 +872,7 @@ export class ModelManager {
       }
     }
 
-    const relays = this.getNostrRelays([
-      "wss://relay.damus.io",
-      "wss://nos.lol",
-      "wss://relay.routstr.com",
-    ]);
+    const relays = this.getNostrRelays();
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(

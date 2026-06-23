@@ -1,6 +1,6 @@
 {
   "name": "@routstr/sdk",
-  "version": "0.3.10",
+  "version": "0.3.12",
   "description": "Framework-agnostic SDK for Routstr API interactions",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -63,7 +63,10 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:sdk": "vitest run tests/unit",
+    "test:sdk:unit": "vitest run tests/unit",
+    "test:sdk:integration": "vitest run tests/integration"
   },
   "dependencies": {
     "@cashu/cashu-ts": "^3.1.1",
@@ -83,7 +86,8 @@
     "@types/node": "^22.0.0",
     "joycon": "^3.1.1",
     "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.9"
   },
   "peerDependencies": {
     "typescript": ">=5.0.0"

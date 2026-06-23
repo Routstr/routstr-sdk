@@ -373,7 +373,6 @@ async function main(): Promise<void> {
         },
         {
           client,
-          providerRegistry,
           alertLevel,
           logger,
         }

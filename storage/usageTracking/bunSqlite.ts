@@ -104,6 +104,11 @@ export const createBunSqliteUsageTrackingDriver = (
 
   const db = new SQLiteDatabase(dbPath);
 
+  // Enable WAL mode and set a busy timeout so concurrent reads don't fail
+  // instantly with "database is locked" when another connection is writing.
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA busy_timeout = 5000");
+
   db.run(`
     CREATE TABLE IF NOT EXISTS ${tableName} (
       id TEXT PRIMARY KEY,
