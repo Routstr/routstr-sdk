@@ -29,6 +29,7 @@ package-lock.json
 
 # debug request dumps
 reqs/
+scripts/reqRes/
 
 # local db and logs
 *.sqlite
