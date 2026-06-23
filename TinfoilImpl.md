@@ -18,8 +18,8 @@ routing without parsing the encrypted body.
 
 | File | Role |
 |---|---|
-| `client/TinfoilSecure.ts` | Tinfoil model detection, `SecureClient` creation/cache, attestation helpers |
-| `client/RoutstrClient.ts` | Detects `tinfoil-*`, attests before token spend, uses `SecureClient.fetch` for the request |
+| `client/TinfoilSecure.ts` | Tinfoil model detection, `SecureClient` creation/cache, attestation helpers, EHBP fetch wrapper that preserves plaintext proxy errors |
+| `client/RoutstrClient.ts` | Detects `tinfoil-*`, attests before token spend, uses the Tinfoil EHBP fetch wrapper for the request |
 | `client/index.ts` | Re-exports Tinfoil helpers |
 
 ## Request flow
@@ -36,7 +36,7 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
    │── POST /v1/chat/completions ──────────▶│── EHBP ciphertext body ─────────▶│
    │   X-Routstr-Model: tinfoil-...         │   X-Tinfoil-Enclave-Url          │
    │   body.model = bare id (stripped)      │   X-Private-Model: private/...   │
-   │   body encrypted by SecureClient.fetch │                                  │
+   │   body encrypted by EHBP fetch wrapper │                                  │
    │←─ decrypted Response stream ──────────│←─ EHBP encrypted response ───────│
 ```
 
@@ -46,14 +46,20 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
 - `getTinfoilUpstreamModelId(modelId)` strips the `tinfoil-` prefix for the
   model id inside the encrypted body (e.g. `tinfoil-kimi-k2-6` → `kimi-k2-6`).
 - `RoutstrClient` runs Tinfoil attestation **before** spending the main token.
-- The actual API request uses `SecureClient.fetch`, not global `fetch`.
+- The actual API request uses Tinfoil/EHBP request encryption. The SDK wraps
+  Tinfoil's lower-level EHBP primitives so plaintext proxy-side error responses
+  (for example 402 balance errors before the enclave is reached) are returned
+  with their real status/body instead of being hidden behind a missing-nonce
+  `ProtocolError`.
 - The full caller-facing model id is sent in the `X-Routstr-Model` header so the
   proxy can do model lookup, cost calculation, and routing without parsing the
   encrypted body.
 - No custom stream transform is needed; Tinfoil decrypts the response before the
   SDK's normal SSE processing sees it.
 - Request debug storage redacts the body for Tinfoil requests because encryption
-  happens inside `SecureClient.fetch` at call time.
+  happens inside the Tinfoil EHBP fetch path.
+- EHBP key-config mismatch responses still trigger one fresh attestation and one
+  retry, matching stock `SecureClient.fetch` key-rotation behavior.
 
 ## Configuration
 
@@ -72,7 +78,8 @@ Optional environment overrides:
 
 - The `tinfoil-` prefix is stripped from the model id inside the encrypted body.
   The full id is sent in the `X-Routstr-Model` header for proxy-side lookup.
-- Tinfoil support requires the `tinfoil` package dependency.
+- Tinfoil support requires the `tinfoil` package dependency and imports `ehbp`
+  directly for the custom plaintext-error-preserving fetch wrapper.
 - Provider/proxy infrastructure must understand EHBP-wrapped requests and forward
   them to the attested Tinfoil enclave. If a provider does not support Tinfoil
   proxying, `tinfoil-*` requests will fail.

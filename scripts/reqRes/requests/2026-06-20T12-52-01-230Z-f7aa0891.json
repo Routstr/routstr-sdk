@@ -1,0 +1,425 @@
+{
+  "id": "2026-06-20T12-52-01-230Z-f7aa0891",
+  "timestamp": "2026-06-20T12:52:01.235Z",
+  "method": "POST",
+  "url": "https://ai.redsh1ft.com/v1/chat/completions",
+  "path": "/v1/chat/completions",
+  "baseUrl": "https://ai.redsh1ft.com/",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "[REDACTED]",
+    "X-Routstr-Model": "tinfoil-gemma4-31b"
+  },
+  "body": {
+    "model": "gemma4-31b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "If i ask you to create a worktree, make sure to always create in .worktrees fodler inside that project. Also add it to .gitignore if not it's not already present. \n\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>call-trace</name>\n    <description>Produce indented ASCII call-tree diagrams from source code by tracing function calls across files</description>\n    <location>/Users/r/.agents/skills/call-trace/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>nostr-projects</name>\n    <description>Create and manage Nostr projects (kind 3635) with tasks (kind 3636), delta-updates (kind 3637), and codebase context (kind 3638). Use when the user wants to create a project, task, update task status, list tasks, add codebase findings/research context to an existing task, or view context events. This is the single unified skill for the full Nostr project lifecycle — projects, tasks, context, and updates. Relay: use the default relay unless the user specifies otherwise.</description>\n    <location>/Users/r/.agents/skills/nostr-projects/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>skills-management</name>\n    <description>Guide for creating, structuring, and managing agent skills in the knightclaw project</description>\n    <location>/Users/r/.agents/skills/skills-management/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>librarian</name>\n    <description>Research open-source libraries with evidence-backed answers and GitHub permalinks. Use when the user asks about library internals, needs implementation details with source code references, wants to understand why something was changed, or needs authoritative answers backed by actual code. Excels at navigating large open-source repos and providing citations to exact lines of code.</description>\n    <location>/Users/r/.pi/agent/npm/node_modules/pi-web-access/skills/librarian/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>glimpse</name>\n    <description>Show native UI from scripts and agents — dialogs, forms, visualizations, floating widgets, cursor companions. Supports macOS, Linux, and Windows. Use when you need to display HTML to the user, collect input, show a chart, render markdown, or create any visual interaction without a browser.</description>\n    <location>/Users/r/.pi/agent/npm/node_modules/glimpseui/skills/glimpse/SKILL.md</location>\n  </skill>\n</available_skills>\nCurrent date: 2026-06-20\nCurrent working directory: /Users/r/projects/routstr_main/routstr-sdk/.worktrees/feat/venice-integration"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "store": false,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to the file to read (relative or absolute)"
+              },
+              "offset": {
+                "type": "number",
+                "description": "Line number to start reading from (1-indexed)"
+              },
+              "limit": {
+                "type": "number",
+                "description": "Maximum number of lines to read"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Bash command to execute"
+              },
+              "timeout": {
+                "type": "number",
+                "description": "Timeout in seconds (optional, no default timeout)"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit",
+          "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "path",
+              "edits"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to the file to edit (relative or absolute)"
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "oldText",
+                    "newText"
+                  ],
+                  "properties": {
+                    "oldText": {
+                      "type": "string",
+                      "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+                    },
+                    "newText": {
+                      "type": "string",
+                      "description": "Replacement text for this targeted edit."
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
+              }
+            },
+            "additionalProperties": false
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "write",
+          "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "path",
+              "content"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to the file to write (relative or absolute)"
+              },
+              "content": {
+                "type": "string",
+                "description": "Content to write to the file"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "subagent",
+          "description": "Delegate tasks to specialized subagents with isolated context. Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder). Default agent scope is \"user\" (from ~/.pi/agent/agents). To enable project-local agents in .pi/agents, set agentScope: \"both\" (or \"project\").",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "agent": {
+                "type": "string",
+                "description": "Name of the agent to invoke (for single mode)"
+              },
+              "task": {
+                "type": "string",
+                "description": "Task to delegate (for single mode)"
+              },
+              "tasks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "agent",
+                    "task"
+                  ],
+                  "properties": {
+                    "agent": {
+                      "type": "string",
+                      "description": "Name of the agent to invoke"
+                    },
+                    "task": {
+                      "type": "string",
+                      "description": "Task to delegate to the agent"
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Working directory for the agent process"
+                    }
+                  }
+                },
+                "description": "Array of {agent, task} for parallel execution"
+              },
+              "chain": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "agent",
+                    "task"
+                  ],
+                  "properties": {
+                    "agent": {
+                      "type": "string",
+                      "description": "Name of the agent to invoke"
+                    },
+                    "task": {
+                      "type": "string",
+                      "description": "Task with optional {previous} placeholder for prior output"
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Working directory for the agent process"
+                    }
+                  }
+                },
+                "description": "Array of {agent, task} for sequential execution"
+              },
+              "agentScope": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "project",
+                  "both"
+                ],
+                "description": "Which agent directories to use. Default: \"user\". Use \"both\" to include project-local agents.",
+                "default": "user"
+              },
+              "confirmProjectAgents": {
+                "type": "boolean",
+                "description": "Prompt before running project-local agents. Default: true.",
+                "default": true
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the agent process (single mode)"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the web using Perplexity AI, Exa, or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to \"none\" to skip curation. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead."
+              },
+              "queries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results)."
+              },
+              "numResults": {
+                "type": "number",
+                "description": "Results per query (default: 5, max: 20)"
+              },
+              "includeContent": {
+                "type": "boolean",
+                "description": "Fetch full page content (async)"
+              },
+              "recencyFilter": {
+                "type": "string",
+                "enum": [
+                  "day",
+                  "week",
+                  "month",
+                  "year"
+                ],
+                "description": "Filter by recency"
+              },
+              "domainFilter": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Limit to domains (prefix with - to exclude)"
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "perplexity",
+                  "gemini",
+                  "exa"
+                ],
+                "description": "Search provider (default: auto)"
+              },
+              "workflow": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "summary-review"
+                ],
+                "description": "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default)"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "code_search",
+          "description": "Search for code examples, documentation, and API references. Returns relevant code snippets and docs from GitHub, Stack Overflow, and official documentation. Use for any programming question — API usage, library examples, debugging help.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "query"
+            ],
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Programming question, API, library, or debugging topic to search for"
+              },
+              "maxTokens": {
+                "type": "integer",
+                "minimum": 1000,
+                "maximum": 50000,
+                "description": "Maximum tokens of code/documentation context to return (default: 5000)"
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "fetch_content",
+          "description": "Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with get_search_content.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Single URL to fetch"
+              },
+              "urls": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Multiple URLs (parallel)"
+              },
+              "forceClone": {
+                "type": "boolean",
+                "description": "Force cloning large GitHub repositories that exceed the size threshold"
+              },
+              "prompt": {
+                "type": "string",
+                "description": "Question or instruction for video analysis (YouTube and video files). Pass the user's specific question here — e.g. 'describe the book shown at the advice for beginners section'. Without this, a generic transcript extraction is used which may miss what the user is asking about."
+              },
+              "timestamp": {
+                "type": "string",
+                "description": "Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame."
+              },
+              "frames": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12,
+                "description": "Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video."
+              },
+              "model": {
+                "type": "string",
+                "description": "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-2.5-flash', 'gemini-3-flash-preview'). Defaults to config or gemini-3-flash-preview."
+              }
+            }
+          },
+          "strict": false
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_search_content",
+          "description": "Retrieve full content from a previous web_search or fetch_content call.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "responseId"
+            ],
+            "properties": {
+              "responseId": {
+                "type": "string",
+                "description": "The responseId from web_search or fetch_content"
+              },
+              "query": {
+                "type": "string",
+                "description": "Get content for this query (web_search)"
+              },
+              "queryIndex": {
+                "type": "number",
+                "description": "Get content for query at index"
+              },
+              "url": {
+                "type": "string",
+                "description": "Get content for this URL"
+              },
+              "urlIndex": {
+                "type": "number",
+                "description": "Get content for URL at index"
+              }
+            }
+          },
+          "strict": false
+        }
+      }
+    ]
+  },
+  "rawBody": "{\"model\":\"gemma4-31b\",\"messages\":[{\"role\":\"system\",\"content\":\"If i ask you to create a worktree, make sure to always create in .worktrees fodler inside that project. Also add it to .gitignore if not it's not already present. \\n\\n\\nThe following skills provide specialized instructions for specific tasks.\\nUse the read tool to load a skill's file when the task matches its description.\\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\\n\\n<available_skills>\\n  <skill>\\n    <name>call-trace</name>\\n    <description>Produce indented ASCII call-tree diagrams from source code by tracing function calls across files</description>\\n    <location>/Users/r/.agents/skills/call-trace/SKILL.md</location>\\n  </skill>\\n  <skill>\\n    <name>nostr-projects</name>\\n    <description>Create and manage Nostr projects (kind 3635) with tasks (kind 3636), delta-updates (kind 3637), and codebase context (kind 3638). Use when the user wants to create a project, task, update task status, list tasks, add codebase findings/research context to an existing task, or view context events. This is the single unified skill for the full Nostr project lifecycle — projects, tasks, context, and updates. Relay: use the default relay unless the user specifies otherwise.</description>\\n    <location>/Users/r/.agents/skills/nostr-projects/SKILL.md</location>\\n  </skill>\\n  <skill>\\n    <name>skills-management</name>\\n    <description>Guide for creating, structuring, and managing agent skills in the knightclaw project</description>\\n    <location>/Users/r/.agents/skills/skills-management/SKILL.md</location>\\n  </skill>\\n  <skill>\\n    <name>librarian</name>\\n    <description>Research open-source libraries with evidence-backed answers and GitHub permalinks. Use when the user asks about library internals, needs implementation details with source code references, wants to understand why something was changed, or needs authoritative answers backed by actual code. Excels at navigating large open-source repos and providing citations to exact lines of code.</description>\\n    <location>/Users/r/.pi/agent/npm/node_modules/pi-web-access/skills/librarian/SKILL.md</location>\\n  </skill>\\n  <skill>\\n    <name>glimpse</name>\\n    <description>Show native UI from scripts and agents — dialogs, forms, visualizations, floating widgets, cursor companions. Supports macOS, Linux, and Windows. Use when you need to display HTML to the user, collect input, show a chart, render markdown, or create any visual interaction without a browser.</description>\\n    <location>/Users/r/.pi/agent/npm/node_modules/glimpseui/skills/glimpse/SKILL.md</location>\\n  </skill>\\n</available_skills>\\nCurrent date: 2026-06-20\\nCurrent working directory: /Users/r/projects/routstr_main/routstr-sdk/.worktrees/feat/venice-integration\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"store\":false,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.\",\"parameters\":{\"type\":\"object\",\"required\":[\"path\"],\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"number\",\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"number\",\"description\":\"Maximum number of lines to read\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.\",\"parameters\":{\"type\":\"object\",\"required\":[\"command\"],\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Bash command to execute\"},\"timeout\":{\"type\":\"number\",\"description\":\"Timeout in seconds (optional, no default timeout)\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.\",\"parameters\":{\"type\":\"object\",\"required\":[\"path\",\"edits\"],\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to edit (relative or absolute)\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"oldText\",\"newText\"],\"properties\":{\"oldText\":{\"type\":\"string\",\"description\":\"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.\"},\"newText\":{\"type\":\"string\",\"description\":\"Replacement text for this targeted edit.\"}},\"additionalProperties\":false},\"description\":\"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.\"}},\"additionalProperties\":false},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.\",\"parameters\":{\"type\":\"object\",\"required\":[\"path\",\"content\"],\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to write (relative or absolute)\"},\"content\":{\"type\":\"string\",\"description\":\"Content to write to the file\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"subagent\",\"description\":\"Delegate tasks to specialized subagents with isolated context. Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder). Default agent scope is \\\"user\\\" (from ~/.pi/agent/agents). To enable project-local agents in .pi/agents, set agentScope: \\\"both\\\" (or \\\"project\\\").\",\"parameters\":{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\",\"description\":\"Name of the agent to invoke (for single mode)\"},\"task\":{\"type\":\"string\",\"description\":\"Task to delegate (for single mode)\"},\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"agent\",\"task\"],\"properties\":{\"agent\":{\"type\":\"string\",\"description\":\"Name of the agent to invoke\"},\"task\":{\"type\":\"string\",\"description\":\"Task to delegate to the agent\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory for the agent process\"}}},\"description\":\"Array of {agent, task} for parallel execution\"},\"chain\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"agent\",\"task\"],\"properties\":{\"agent\":{\"type\":\"string\",\"description\":\"Name of the agent to invoke\"},\"task\":{\"type\":\"string\",\"description\":\"Task with optional {previous} placeholder for prior output\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory for the agent process\"}}},\"description\":\"Array of {agent, task} for sequential execution\"},\"agentScope\":{\"type\":\"string\",\"enum\":[\"user\",\"project\",\"both\"],\"description\":\"Which agent directories to use. Default: \\\"user\\\". Use \\\"both\\\" to include project-local agents.\",\"default\":\"user\"},\"confirmProjectAgents\":{\"type\":\"boolean\",\"description\":\"Prompt before running project-local agents. Default: true.\",\"default\":true},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory for the agent process (single mode)\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web using Perplexity AI, Exa, or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to \\\"none\\\" to skip curation. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Single search query. For research tasks, prefer 'queries' with multiple varied angles instead.\"},\"queries\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results).\"},\"numResults\":{\"type\":\"number\",\"description\":\"Results per query (default: 5, max: 20)\"},\"includeContent\":{\"type\":\"boolean\",\"description\":\"Fetch full page content (async)\"},\"recencyFilter\":{\"type\":\"string\",\"enum\":[\"day\",\"week\",\"month\",\"year\"],\"description\":\"Filter by recency\"},\"domainFilter\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Limit to domains (prefix with - to exclude)\"},\"provider\":{\"type\":\"string\",\"enum\":[\"auto\",\"perplexity\",\"gemini\",\"exa\"],\"description\":\"Search provider (default: auto)\"},\"workflow\":{\"type\":\"string\",\"enum\":[\"none\",\"summary-review\"],\"description\":\"Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default)\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Search for code examples, documentation, and API references. Returns relevant code snippets and docs from GitHub, Stack Overflow, and official documentation. Use for any programming question — API usage, library examples, debugging help.\",\"parameters\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Programming question, API, library, or debugging topic to search for\"},\"maxTokens\":{\"type\":\"integer\",\"minimum\":1000,\"maximum\":50000,\"description\":\"Maximum tokens of code/documentation context to return (default: 5000)\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"fetch_content\",\"description\":\"Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with get_search_content.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Single URL to fetch\"},\"urls\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Multiple URLs (parallel)\"},\"forceClone\":{\"type\":\"boolean\",\"description\":\"Force cloning large GitHub repositories that exceed the size threshold\"},\"prompt\":{\"type\":\"string\",\"description\":\"Question or instruction for video analysis (YouTube and video files). Pass the user's specific question here — e.g. 'describe the book shown at the advice for beginners section'. Without this, a generic transcript extraction is used which may miss what the user is asking about.\"},\"timestamp\":{\"type\":\"string\",\"description\":\"Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame.\"},\"frames\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":12,\"description\":\"Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video.\"},\"model\":{\"type\":\"string\",\"description\":\"Override the Gemini model for video/YouTube analysis (e.g. 'gemini-2.5-flash', 'gemini-3-flash-preview'). Defaults to config or gemini-3-flash-preview.\"}}},\"strict\":false}},{\"type\":\"function\",\"function\":{\"name\":\"get_search_content\",\"description\":\"Retrieve full content from a previous web_search or fetch_content call.\",\"parameters\":{\"type\":\"object\",\"required\":[\"responseId\"],\"properties\":{\"responseId\":{\"type\":\"string\",\"description\":\"The responseId from web_search or fetch_content\"},\"query\":{\"type\":\"string\",\"description\":\"Get content for this query (web_search)\"},\"queryIndex\":{\"type\":\"number\",\"description\":\"Get content for query at index\"},\"url\":{\"type\":\"string\",\"description\":\"Get content for this URL\"},\"urlIndex\":{\"type\":\"number\",\"description\":\"Get content for URL at index\"}}},\"strict\":false}}]}"
+}

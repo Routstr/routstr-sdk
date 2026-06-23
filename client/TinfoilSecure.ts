@@ -1,14 +1,16 @@
 /**
  * TinfoilSecure - EHBP transport encryption + enclave attestation for Tinfoil models.
  *
- * Any model whose id starts with `tinfoil-` is routed through Tinfoil's
- * `SecureClient.fetch`. SecureClient performs attestation (`ready()`), verifies
- * the enclave code fingerprint, and then encrypts request bodies using EHBP so
- * only the attested enclave can decrypt them.
+ * Any model whose id starts with `tinfoil-` is routed through Tinfoil EHBP.
+ * SecureClient performs attestation (`ready()`) and verifies the enclave code
+ * fingerprint. The SDK then uses EHBP request encryption so only the attested
+ * enclave can decrypt request bodies.
  *
  * Unlike Venice E2EE, there is no per-field message encryption and no custom SSE
- * decrypt transform. The request body is passed to `SecureClient.fetch` as
- * normal JSON and the returned `Response` body is already decrypted.
+ * decrypt transform. Successful enclave responses are decrypted before normal
+ * SDK response handling sees them. Plaintext proxy-side errors (for example
+ * auth/balance failures before the request reaches the enclave) are preserved
+ * with their real status/body.
  */
 
 import type { SecureClient as SecureClientType, VerificationDocument } from "tinfoil";
@@ -141,6 +143,168 @@ export async function prepareTinfoilClient(
   } catch (error) {
     // Do not cache failed attestation attempts forever.
     clientCache.delete(key);
+    throw error;
+  }
+}
+
+function normalizeFetchArgs(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): { url: string; init?: RequestInit } {
+  if (typeof input === "string") {
+    return { url: input, init };
+  }
+  if (input instanceof URL) {
+    return { url: input.toString(), init };
+  }
+
+  const cloned = input.clone();
+  return {
+    url: cloned.url,
+    init: {
+      method: cloned.method,
+      headers: new Headers(cloned.headers),
+      body: cloned.body ?? undefined,
+      signal: cloned.signal,
+      ...init,
+    },
+  };
+}
+
+type EhbpModule = typeof import("ehbp");
+type NormalizedFetchArgs = ReturnType<typeof normalizeFetchArgs>;
+
+function isProblemJsonContentType(contentType: string | null): boolean {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/problem+json";
+}
+
+async function isEhbpKeyConfigMismatchResponse(
+  response: Response,
+  protocol: EhbpModule["PROTOCOL"]
+): Promise<boolean> {
+  if (response.status !== 422) {
+    return false;
+  }
+
+  if (!isProblemJsonContentType(response.headers.get("content-type"))) {
+    return false;
+  }
+
+  try {
+    const problem = await response.clone().json();
+    return problem?.type === protocol.KEY_CONFIG_PROBLEM_TYPE;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchTinfoilEhbpOnce(
+  context: TinfoilClientContext,
+  options: TinfoilClientOptions,
+  normalized: NormalizedFetchArgs,
+  ehbp: EhbpModule
+): Promise<Response> {
+  const { Identity, PROTOCOL, decryptResponseWithToken, extractSessionRecoveryToken } =
+    ehbp;
+
+  const resolved = resolveOptions(options);
+  const baseURL = context.client.getBaseURL() ?? resolved.baseUrl;
+  const enclaveURL = context.client.getEnclaveURL();
+  const baseOrigin = new URL(baseURL).origin;
+  const allowedOrigins = new Set([baseOrigin]);
+
+  if (enclaveURL) {
+    allowedOrigins.add(new URL(enclaveURL).origin);
+  }
+
+  const targetUrl = new URL(normalized.url, baseURL);
+
+  if (!allowedOrigins.has(targetUrl.origin)) {
+    throw new Error(
+      `refusing to send Tinfoil request to ${targetUrl.origin}: client is bound to the verified enclave/proxy`
+    );
+  }
+
+  const headers = new Headers(normalized.init?.headers);
+  if (enclaveURL && new URL(enclaveURL).origin !== baseOrigin) {
+    headers.set("X-Tinfoil-Enclave-Url", enclaveURL);
+  }
+
+  const method = normalized.init?.method ?? "GET";
+  const body = normalized.init?.body ?? null;
+  const serverIdentity = await Identity.fromPublicKeyHex(
+    context.verification.hpkePublicKey
+  );
+
+  const request = new Request(targetUrl.toString(), {
+    method,
+    headers,
+    body,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+
+  const { request: encryptedRequest, context: requestContext } =
+    await serverIdentity.encryptRequestWithContext(request);
+
+  const response = await fetch(encryptedRequest);
+  if (!requestContext) {
+    return response;
+  }
+
+  if (await isEhbpKeyConfigMismatchResponse(response, PROTOCOL)) {
+    throw new ehbp.KeyConfigMismatchError("EHBP key configuration mismatch");
+  }
+
+  if (!response.headers.get(PROTOCOL.RESPONSE_NONCE_HEADER)) {
+    return response;
+  }
+
+  const token = await extractSessionRecoveryToken(requestContext);
+  return await decryptResponseWithToken(response, token);
+}
+
+/**
+ * Fetch through Tinfoil EHBP while preserving plaintext proxy error responses.
+ *
+ * Tinfoil's stock SecureClient.fetch throws ProtocolError when a response to an
+ * encrypted request lacks Ehbp-Response-Nonce. That is correct for successful
+ * enclave responses, but Routstr proxy-side auth/balance errors are plaintext
+ * and need to flow through the SDK's normal error handling with their real
+ * status/body. This wrapper performs the same request-body encryption and
+ * response decryption, but returns non-EHBP responses unchanged.
+ *
+ * It also keeps SecureClient's key-rotation behavior: an EHBP key-config
+ * mismatch response triggers one fresh attestation and one retry.
+ */
+export async function fetchTinfoilPreservingPlaintextErrors(
+  options: TinfoilClientOptions,
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  const context = await prepareTinfoilClient(options);
+  const ehbp = await import("ehbp");
+  const normalized = normalizeFetchArgs(input, init);
+
+  try {
+    return await fetchTinfoilEhbpOnce(context, options, normalized, ehbp);
+  } catch (error) {
+    // Channel recovery: server rotated EHBP keys, request was never processed.
+    // Mirror tinfoil SecureClient.fetch by re-attesting and retrying once.
+    if (error instanceof ehbp.KeyConfigMismatchError) {
+      context.client.reset();
+      try {
+        await context.client.ready();
+        context.verification = context.client.getVerificationDocument();
+      } catch (reattestError) {
+        // Do not keep a failed post-rotation attestation in the shared cache.
+        clientCache.delete(cacheKey(resolveOptions(options)));
+        throw reattestError;
+      }
+
+      return await fetchTinfoilEhbpOnce(context, options, normalized, ehbp);
+    }
+
     throw error;
   }
 }
