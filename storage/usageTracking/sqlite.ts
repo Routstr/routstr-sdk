@@ -132,6 +132,8 @@ export const createSqliteUsageTrackingDriver = (
   const initDb = async () => {
     if (!db) {
       db = await loadDatabase(dbPath);
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA busy_timeout = 5000");
       db.exec(`
         CREATE TABLE IF NOT EXISTS ${tableName} (
           id TEXT PRIMARY KEY,

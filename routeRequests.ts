@@ -186,20 +186,11 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     selectedModel = cheapest.model;
   }
 
-  const balances = await walletAdapter.getBalances();
-  const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
-
-  if (totalBalance <= 0) {
-    throw new Error(
-      "Wallet balance is empty. Add a mint and fund it before making requests."
-    );
-  }
-
   const providerMints = providerRegistry.getProviderMints(baseUrl);
   const mintUrl =
     walletAdapter.getActiveMintUrl() ||
     providerMints[0] ||
-    Object.keys(balances)[0];
+    Object.keys(await walletAdapter.getBalances())[0];
 
   if (!mintUrl) {
     throw new Error("No mint configured in wallet");

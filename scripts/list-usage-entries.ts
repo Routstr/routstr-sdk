@@ -1,4 +1,5 @@
-import { createSqliteUsageTrackingDriver } from "@routstr/sdk/storage";
+import { createSqliteUsageTrackingDriver } from "@routstr/sdk/node";
+import type { UsageTrackingEntry } from "@routstr/sdk/storage";
 
 async function main(): Promise<void> {
   const driver = createSqliteUsageTrackingDriver();
@@ -11,7 +12,7 @@ async function main(): Promise<void> {
 
   console.log(`Last ${entries.length} usage entries:\n`);
   console.table(
-    entries.map((e) => ({
+    entries.map((e: UsageTrackingEntry) => ({
       timestamp: new Date(e.timestamp).toISOString(),
       modelId: e.modelId,
       baseUrl: e.baseUrl,

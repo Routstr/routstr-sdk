@@ -13,6 +13,11 @@ export async function createBunSqliteDriver(
   const SQLite = (await import("bun:sqlite")).default;
   const db = new SQLite(dbPath);
 
+  // Enable WAL mode and set a busy timeout so concurrent reads don't fail
+  // instantly with "database is locked" when another connection is writing.
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA busy_timeout = 5000");
+
   db.run(`
     CREATE TABLE IF NOT EXISTS sdk_storage (
       key TEXT PRIMARY KEY,

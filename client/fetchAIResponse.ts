@@ -1,5 +1,5 @@
 import type { Message, Model, TransactionHistory, StreamingResult, SdkLogger } from "../core/types";
-import type { ProviderRegistry, StreamingCallbacks } from "../wallet/interfaces";
+import type { StreamingCallbacks } from "../wallet/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
 import type { AlertLevel, RoutstrClientMode } from "./RoutstrClient";
 
@@ -27,15 +27,11 @@ interface FetchAIResponseClient {
     mintUrl: string;
     modelId?: string;
   }): Promise<Response>;
-  getProviderManager(): {
-    getModelForProvider(baseUrl: string, modelId: string): Promise<{ id: string } | null>;
-  };
   getMode(): RoutstrClientMode;
 }
 
 export interface FetchAIResponseDeps {
   client: FetchAIResponseClient;
-  providerRegistry: ProviderRegistry;
   alertLevel: AlertLevel;
   logger: SdkLogger;
   getPendingCashuTokenAmount?: () => number;
@@ -67,19 +63,8 @@ export async function fetchAIResponse(
 
     callbacks.onTokenCreated?.(deps.getPendingCashuTokenAmount?.() ?? 0);
 
-    const providerInfo = await deps.providerRegistry.getProviderInfo(baseUrl);
-    const providerVersion = providerInfo?.version ?? "";
-
-    let modelIdForRequest = selectedModel.id;
-    if (/^0\.1\./.test(providerVersion)) {
-      const newModel = await deps.client
-        .getProviderManager()
-        .getModelForProvider(baseUrl, selectedModel.id);
-      modelIdForRequest = newModel?.id ?? selectedModel.id;
-    }
-
     const body: any = {
-      model: modelIdForRequest,
+      model: selectedModel.id,
       messages: apiMessages,
       stream: true,
     };
