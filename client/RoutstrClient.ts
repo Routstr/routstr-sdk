@@ -43,12 +43,6 @@ import {
   prepareE2EERequest,
   createE2EEDecryptTransform,
 } from "./VeniceE2EE";
-import {
-  isTinfoilModel,
-  getTinfoilUpstreamModelId,
-  prepareTinfoilClient,
-  fetchTinfoilPreservingPlaintextErrors,
-} from "./TinfoilSecure";
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -353,34 +347,6 @@ export class RoutstrClient {
     // Build clean outgoing headers — do NOT pass the incoming client headers here
     const baseHeaders = this._buildBaseHeaders();
 
-    // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
-    const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
-
-    if (tinfoilEnabled) {
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] Attesting Tinfoil model ${modelId} before spend`
-      );
-
-      const { verification } = await prepareTinfoilClient({ baseUrl });
-
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] Tinfoil attestation passed, enclave=${verification.enclaveHost}, codeFingerprint=${verification.codeFingerprint.slice(0, 16)}...`
-      );
-
-      // Strip the tinfoil- prefix for the model id inside the encrypted body.
-      // The attested enclave expects the bare model id (e.g. "kimi-k2-6"),
-      // not the caller-facing routstr id (e.g. "tinfoil-kimi-k2-6").
-      // The full id is sent in the X-Routstr-Model header for proxy-side lookup.
-      if (requestBody && typeof requestBody === "object" && modelId) {
-        requestBody = {
-          ...(requestBody as Record<string, unknown>),
-          model: getTinfoilUpstreamModelId(modelId),
-        };
-      }
-    }
-
     // ─── Venice E2EE: attest BEFORE spending tokens ──────
     let e2eeSessionEcdh: any = undefined;
     let e2eeHeaders: Record<string, string> = {};
@@ -420,13 +386,8 @@ export class RoutstrClient {
 
     const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
 
-    // Build final request headers (auth + E2EE + Tinfoil model hint)
-    const requestHeaders = this._withAuthAndTinfoilHeaders(
-      baseHeaders,
-      token,
-      tinfoilEnabled,
-      modelId
-    );
+    // Build final request headers (auth + E2EE)
+    const requestHeaders = this._withAuthHeader(baseHeaders, token);
     const finalHeaders = e2eeSessionEcdh
       ? { ...requestHeaders, ...e2eeHeaders }
       : requestHeaders;
@@ -442,7 +403,6 @@ export class RoutstrClient {
       headers: finalHeaders,
       baseHeaders,
       selectedModel,
-      tinfoilEnabled,
     });
 
     let tokenBalanceInSats =
@@ -573,10 +533,8 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
-    /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
-    tinfoilEnabled?: boolean;
   }): Promise<Response> {
-    const { path, method, body, baseUrl, token, headers, tinfoilEnabled } = params;
+    const { path, method, body, baseUrl, token, headers } = params;
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
@@ -594,21 +552,11 @@ export class RoutstrClient {
 
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
 
-      const response = tinfoilEnabled
-        ? await fetchTinfoilPreservingPlaintextErrors(
-            { baseUrl },
-            url,
-            {
-              method,
-              headers,
-              body: requestBodyText,
-            }
-          )
-        : await fetch(url, {
-            method,
-            headers,
-            body: requestBodyText,
-          });
+      const response = await fetch(url, {
+        method,
+        headers,
+        body: requestBodyText,
+      });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
@@ -694,7 +642,6 @@ export class RoutstrClient {
       maxTokens?: number;
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
-      tinfoilEnabled?: boolean;
     },
     token: string,
     status: number,
@@ -873,12 +820,7 @@ export class RoutstrClient {
           return this._makeRequest({
             ...params,
             token: params.token,
-            headers: this._withAuthAndTinfoilHeaders(
-              params.baseHeaders,
-              params.token,
-              params.tinfoilEnabled,
-              params.selectedModel?.id
-            ),
+            headers: this._withAuthHeader(params.baseHeaders, params.token),
             retryCount: retryCount + 1,
           });
         } else {
@@ -956,12 +898,7 @@ export class RoutstrClient {
         return this._makeRequest({
           ...params,
           token: retryToken,
-          headers: this._withAuthAndTinfoilHeaders(
-            params.baseHeaders,
-            retryToken,
-            params.tinfoilEnabled,
-            params.selectedModel?.id
-          ),
+          headers: this._withAuthHeader(params.baseHeaders, retryToken),
           retryCount: retryCount + 1,
         });
       } else {
@@ -1086,14 +1023,6 @@ export class RoutstrClient {
         params.maxTokens
       );
 
-      if (params.tinfoilEnabled) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attesting Tinfoil failover provider ${nextProvider} before spend`
-        );
-        await prepareTinfoilClient({ baseUrl: nextProvider });
-      }
-
       this._log(
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
@@ -1116,12 +1045,7 @@ export class RoutstrClient {
         selectedModel: newModel,
         token: spendResult.token!,
         requiredSats: newRequiredSats,
-        headers: this._withAuthAndTinfoilHeaders(
-          params.baseHeaders,
-          spendResult.token!,
-          params.tinfoilEnabled,
-          newModel.id
-        ),
+        headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
         retryCount: 0,
       });
       (retryResponse as any).initialTokenBalanceInSats =
@@ -1602,27 +1526,6 @@ export class RoutstrClient {
       nextHeaders["X-Cashu"] = token;
     } else {
       nextHeaders["Authorization"] = `Bearer ${token}`;
-    }
-
-    return nextHeaders;
-  }
-
-  /**
-   * Attach auth headers and preserve the plaintext model hint required by the
-   * Routstr proxy for Tinfoil/EHBP requests. EHBP encrypts the JSON body, so
-   * retries/failover must not rebuild headers from baseHeaders alone or the
-   * proxy cannot route/price the encrypted request.
-   */
-  private _withAuthAndTinfoilHeaders(
-    headers: Record<string, string>,
-    token: string,
-    tinfoilEnabled?: boolean,
-    modelId?: string
-  ): Record<string, string> {
-    const nextHeaders = this._withAuthHeader(headers, token);
-
-    if (tinfoilEnabled && modelId) {
-      nextHeaders["X-Routstr-Model"] = modelId;
     }
 
     return nextHeaders;
