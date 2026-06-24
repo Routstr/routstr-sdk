@@ -61,6 +61,91 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
 - EHBP key-config mismatch responses still trigger one fresh attestation and one
   retry, matching stock `SecureClient.fetch` key-rotation behavior.
 
+## Proxy-side error handling
+
+Stock `SecureClient.fetch` from `tinfoil` uses EHBP's `Transport.request()`
+internally. That code requires `Ehbp-Response-Nonce` on the response before
+returning anything:
+
+```ts
+const responseNonceHeader = response.headers.get(PROTOCOL.RESPONSE_NONCE_HEADER);
+if (!responseNonceHeader) {
+  throw new ProtocolError(`Missing ${PROTOCOL.RESPONSE_NONCE_HEADER} header`);
+}
+```
+
+This breaks when the Routstr proxy returns a plaintext error **before** the
+request reaches the enclave (e.g. 402 insufficient balance, 401 unauthorized,
+403 forbidden, 429 rate limit, 500 server error). These responses are real and
+useful, but stock `SecureClient.fetch` throws a `ProtocolError` before the SDK
+can inspect them.
+
+The proxy cannot EHBP-encrypt its own error responses because it doesn't have
+the HPKE response context / session secret — only the enclave can produce valid
+encrypted responses with `Ehbp-Response-Nonce`.
+
+### Design decision
+
+We explicitly do **not** blindly map missing-nonce `ProtocolError` to a
+synthetic 402. That would lose the actual status/body and be incorrect for
+401, 403, 429, 500, and other proxy-side errors.
+
+Instead, the SDK uses a custom EHBP fetch wrapper
+(`fetchTinfoilPreservingPlaintextErrors`) that uses lower-level `ehbp`
+primitives directly:
+
+- `Identity.fromPublicKeyHex(...)`
+- `encryptRequestWithContext(...)`
+- `extractSessionRecoveryToken(...)`
+- `decryptResponseWithToken(...)`
+
+If the response has `Ehbp-Response-Nonce`, it decrypts and returns the
+decrypted response. If the response does **not** have the nonce header, it
+returns the plaintext response unchanged — letting `_makeRequest()` and
+`_handleErrorResponse()` process the real status and body.
+
+EHBP key-config mismatch (`422 application/problem+json`) still triggers one
+fresh attestation and one retry, matching stock `SecureClient.fetch`
+key-rotation behavior.
+
+### End-to-end flows
+
+**Success path:**
+
+```txt
+SDK
+  X-Routstr-Model: tinfoil-kimi-k2-6
+  encrypted body: { model: "kimi-k2-6", ... }
+    ↓
+Routstr proxy
+  reads X-Routstr-Model for billing/routing
+  adds X-Private-Model: private/kimi-k2-6
+  forwards raw EHBP body to upstream /private/
+    ↓
+Upstream / Tinfoil enclave
+  billing layer reads X-Private-Model
+  enclave decrypts body and sees model "kimi-k2-6"
+  returns EHBP encrypted response + Ehbp-Response-Nonce
+    ↓
+SDK custom EHBP fetch
+  decrypts response
+  returns plaintext Response to normal SDK handling
+```
+
+**Proxy-side error path:**
+
+```txt
+SDK sends encrypted request
+    ↓
+Routstr proxy rejects before enclave, e.g. 402 insufficient balance
+    ↓
+Plaintext 402 response has no Ehbp-Response-Nonce
+    ↓
+Custom SDK EHBP fetch returns plaintext 402 Response unchanged
+    ↓
+_makeRequest sees !response.ok and calls _handleErrorResponse with real status/body
+```
+
 ## Configuration
 
 By default, the SDK uses Tinfoil's public ATC and binds EHBP requests to the
