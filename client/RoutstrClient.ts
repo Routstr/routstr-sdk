@@ -39,11 +39,6 @@ import {
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
 import {
-  isE2EEModel,
-  prepareE2EERequest,
-  createE2EEDecryptTransform,
-} from "./VeniceE2EE";
-import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
   prepareTinfoilClient,
@@ -381,36 +376,6 @@ export class RoutstrClient {
       }
     }
 
-    // ─── Venice E2EE: attest BEFORE spending tokens ──────
-    let e2eeSessionEcdh: any = undefined;
-    let e2eeHeaders: Record<string, string> = {};
-
-    if (modelId && isE2EEModel(modelId)) {
-      if (!requestBody || typeof requestBody !== "object") {
-        throw new Error("E2EE requires a request body with messages");
-      }
-
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] Attesting E2EE model ${modelId} before spend`
-      );
-
-      const e2eePrep = await prepareE2EERequest({
-        baseUrl,
-        modelId,
-        body: requestBody as Record<string, unknown>,
-      });
-
-      requestBody = e2eePrep.modifiedBody;
-      e2eeHeaders = e2eePrep.e2eeHeaders;
-      e2eeSessionEcdh = e2eePrep.sessionEcdh;
-
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] E2EE attestation passed, messages encrypted`
-      );
-    }
-
     // Spend tokens for the actual request
     const spendResult = await this._spendToken({
       mintUrl,
@@ -420,16 +385,13 @@ export class RoutstrClient {
 
     const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
 
-    // Build final request headers (auth + E2EE + Tinfoil model hint)
-    const requestHeaders = this._withAuthAndTinfoilHeaders(
+    // Build final request headers (auth + Tinfoil model hint)
+    const finalHeaders = this._withAuthAndTinfoilHeaders(
       baseHeaders,
       token,
       tinfoilEnabled,
       modelId
     );
-    const finalHeaders = e2eeSessionEcdh
-      ? { ...requestHeaders, ...e2eeHeaders }
-      : requestHeaders;
 
     const response = await this._makeRequest({
       path: requestPath,
@@ -475,16 +437,9 @@ export class RoutstrClient {
     }> = Promise.resolve({});
 
     if (contentType.includes("text/event-stream") && response.body) {
-      // ─── Venice E2EE: wrap client stream with decrypt transform ──
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
-      const [rawClientStream, inspectStream] = response.body.tee();
-
-      const clientStream = e2eeSessionEcdh
-        ? rawClientStream.pipeThrough(
-            createE2EEDecryptTransform(e2eeSessionEcdh)
-          )
-        : rawClientStream;
+      const [clientStream, inspectStream] = response.body.tee();
       const requestResponseLogId = (response as any).requestResponseLogId as
         | string
         | undefined;
