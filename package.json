@@ -73,7 +73,9 @@
     "applesauce-core": "^5.1.0",
     "applesauce-relay": "^5.1.0",
     "applesauce-sqlite": "^6.0.0",
+    "ehbp": "^0.2.3",
     "rxjs": "^7.8.1",
+    "tinfoil": "^1.1.6",
     "zustand": "^5.0.5"
   },
   "optionalDependencies": {

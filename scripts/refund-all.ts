@@ -74,8 +74,27 @@ function parseBalances(output: string): Record<string, number> {
   return balances;
 }
 
+function parseArgs(): {
+  mintUrl: string;
+  xcashu: boolean;
+} {
+  const args = process.argv.slice(2);
+  let mintUrl = "https://mint.minibits.cash/Bitcoin";
+  let xcashu = false;
+
+  for (const arg of args) {
+    if (arg === "--xcashu") {
+      xcashu = true;
+    } else if (!arg.startsWith("--")) {
+      mintUrl = arg;
+    }
+  }
+
+  return { mintUrl, xcashu };
+}
+
 async function main(): Promise<void> {
-  const mintUrl = process.argv[2] || "https://mint.minibits.cash/Bitcoin";
+  const { mintUrl, xcashu } = parseArgs();
 
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
@@ -84,21 +103,45 @@ async function main(): Promise<void> {
 
   const cachedReceiveTokens = storageAdapter.getCachedReceiveTokens();
   const apiKeysStored = storageAdapter.getApiKeyDistribution();
+  const xcashuTokensStored = storageAdapter.getXcashuTokens();
+  const xcashuTokenCount = Object.values(xcashuTokensStored).reduce(
+    (sum, tokens) => sum + tokens.length,
+    0
+  );
 
-  if (cachedReceiveTokens.length === 0 && apiKeysStored.length === 0) {
-    console.log("No pending tokens to refund");
-    return;
-  }
+  if (xcashu) {
+    // --xcashu mode: only refund xcashu tokens
+    if (xcashuTokenCount === 0) {
+      console.log("No xcashu tokens to refund");
+      return;
+    }
 
-  console.log(`Found ${cachedReceiveTokens.length} cached receive tokens:`);
-  for (const pending of cachedReceiveTokens) {
-    const tokenPreview = pending.token.substring(0, 20) + "...";
-    console.log(`  - ${tokenPreview}: ${pending.amount} sats (${pending.unit})`);
-  }
+    console.log(`Found ${xcashuTokenCount} xcashu tokens:`);
+    for (const [baseUrl, tokens] of Object.entries(xcashuTokensStored)) {
+      for (const entry of tokens) {
+        const tokenPreview = entry.token.substring(0, 20) + "...";
+        console.log(
+          `  - ${baseUrl}: ${tokenPreview} (tries: ${entry.tryCount})`
+        );
+      }
+    }
+  } else {
+    // default mode: refund API keys
+    if (cachedReceiveTokens.length === 0 && apiKeysStored.length === 0) {
+      console.log("No pending tokens to refund");
+      return;
+    }
 
-  console.log(`Found ${apiKeysStored.length} apikeys:`);
-  for (const apikey of apiKeysStored) {
-    console.log(`  - ${apikey.baseUrl}: ${apikey.amount} sats`);
+    console.log(`Found ${cachedReceiveTokens.length} cached receive tokens:`);
+    for (const pending of cachedReceiveTokens) {
+      const tokenPreview = pending.token.substring(0, 20) + "...";
+      console.log(`  - ${tokenPreview}: ${pending.amount} sats (${pending.unit})`);
+    }
+
+    console.log(`Found ${apiKeysStored.length} apikeys:`);
+    for (const apikey of apiKeysStored) {
+      console.log(`  - ${apikey.baseUrl}: ${apikey.amount} sats`);
+    }
   }
 
   const refundBaseUrls = apiKeysStored.map((p) => p.baseUrl);
@@ -161,14 +204,27 @@ async function main(): Promise<void> {
 
   console.log(`\nRefunding to mint: ${mintUrl}`);
 
-  // Refund API keys (apikeys mode)
-  const results = await spender.refundProviders(mintUrl, true);
+  if (xcashu) {
+    // Refund xcashu tokens
+    const results = await spender.refundXcashuTokens(mintUrl);
 
-  console.log("\nRefund results:");
-  for (const result of results) {
-    console.log(
-      `  - ${result.baseUrl}: ${result.success ? "success" : "failed"}`
-    );
+    console.log("\nXcashu refund results:");
+    for (const result of results) {
+      const tokenPreview = result.token.substring(0, 20) + "...";
+      console.log(
+        `  - ${result.baseUrl} / ${tokenPreview}: ${result.success ? "success" : "failed"}${result.error ? ` (${result.error})` : ""}`
+      );
+    }
+  } else {
+    // Refund API keys (apikeys mode)
+    const results = await spender.refundProviders(mintUrl, true);
+
+    console.log("\nRefund results:");
+    for (const result of results) {
+      console.log(
+        `  - ${result.baseUrl}: ${result.success ? "success" : "failed"}`
+      );
+    }
   }
 }
 

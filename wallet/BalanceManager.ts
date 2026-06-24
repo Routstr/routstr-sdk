@@ -360,16 +360,28 @@ export class BalanceManager {
         response.headers.get("x-routstr-request-id") || undefined;
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        this.logger.warn(
-          `fetchRefundToken: non-ok response for ${url} status=${response.status} statusText=${response.statusText}`,
-          errorData
-        );
+        const responseBody = await response.text().catch(() => undefined);
+        let errorData: any = {};
+        if (responseBody) {
+          try {
+            errorData = JSON.parse(responseBody);
+          } catch {
+            errorData = {};
+          }
+        }
+        this.logger.error("Upstream wallet refund error response", {
+          baseUrl,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: responseBody ?? "<unable to read response body>",
+        });
         return {
           success: false,
           requestId,
           error: `API key refund failed: ${
-            errorData?.detail || response.statusText
+            errorData?.detail || responseBody || response.statusText
           }`,
         };
       }
@@ -836,12 +848,28 @@ export class BalanceManager {
         response.headers.get("x-routstr-request-id") || undefined;
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const responseBody = await response.text().catch(() => undefined);
+        let errorData: any = {};
+        if (responseBody) {
+          try {
+            errorData = JSON.parse(responseBody);
+          } catch {
+            errorData = {};
+          }
+        }
+        this.logger.error("Upstream wallet topup error response", {
+          baseUrl,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: responseBody ?? "<unable to read response body>",
+        });
         return {
           success: false,
           requestId,
           error:
-            errorData?.detail || `Top up failed with status ${response.status}`,
+            errorData?.detail || responseBody || `Top up failed with status ${response.status}`,
         };
       }
 
