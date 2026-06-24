@@ -202,6 +202,43 @@ export function extractUsageFromSSEJson(
   return result;
 }
 
+/**
+ * Extract cost/usage from EHBP/Tinfoil response headers.
+ *
+ * For EHBP requests the proxy cannot inject cost into the JSON/SSE body
+ * (the body is opaque encrypted). Instead it returns cost as response
+ * headers. This parses those headers into the same UsageTrackingData
+ * shape used for SSE/body extraction, so callers can merge or fall back.
+ */
+export function extractUsageFromResponseHeaders(
+  headers: Headers | Record<string, string>
+): UsageTrackingData | null {
+  const get = (name: string): string | null => {
+    if (headers instanceof Headers) return headers.get(name);
+    // Case-insensitive lookup for plain objects
+    const lower = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lower) return v;
+    }
+    return null;
+  };
+
+  const totalMsats = Number(get("X-Routstr-Cost-Msats"));
+  if (!totalMsats || !Number.isFinite(totalMsats)) return null;
+
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cost: Number(get("X-Routstr-Cost-Usd")) || 0,
+    satsCost: totalMsats / 1000,
+    totalMsats,
+    inputMsats: Number(get("X-Routstr-Input-Cost-Msats")) || 0,
+    outputMsats: Number(get("X-Routstr-Output-Cost-Msats")) || 0,
+    totalUsd: Number(get("X-Routstr-Cost-Usd")) || undefined,
+  };
+}
+
 export function toUsageStats(
   usage: UsageTrackingData | null | undefined
 ): UsageStats | undefined {

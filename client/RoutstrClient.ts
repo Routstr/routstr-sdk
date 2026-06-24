@@ -34,6 +34,7 @@ import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
   extractResponseId,
   extractUsageFromResponseBody,
+  extractUsageFromResponseHeaders,
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
@@ -1265,10 +1266,10 @@ export class RoutstrClient {
         satsSpent =
           latestTokenBalance !== undefined && !initialTokenBalanceUnknown
             ? Math.max(0, initialTokenBalance - latestTokenBalance)
-            : (fallbackSatsSpent ?? usage?.satsCost ?? 0);
+            : (fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
-        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? 0;
+        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0;
       }
     }
 
@@ -1299,6 +1300,16 @@ export class RoutstrClient {
     })();
 
     return satsSpent;
+  }
+
+  /**
+   * Extract sats cost from EHBP/Tinfoil response headers as a last-resort
+   * fallback when neither balance delta nor SSE/body usage provides a cost.
+   */
+  private _headerSatsCost(response?: Response): number | undefined {
+    if (!response) return undefined;
+    const headerUsage = extractUsageFromResponseHeaders(response.headers);
+    return headerUsage?.satsCost;
   }
 
   private async _trackResponseUsage(params: {
@@ -1360,7 +1371,31 @@ export class RoutstrClient {
       }
 
       if (!usage) {
-        return;
+        // No usage from SSE/body — try response headers (EHBP/Tinfoil path
+        // where cost is only in headers because the body is encrypted).
+        const headerUsage = extractUsageFromResponseHeaders(response.headers);
+        if (headerUsage) {
+          usage = headerUsage;
+        } else {
+          return;
+        }
+      } else {
+        // Merge header-based costs into SSE/body-extracted usage. For EHBP
+        // requests, the SSE body may have token counts but no cost breakdown;
+        // the headers carry the authoritative cost. Header values take
+        // priority when non-zero.
+        const headerUsage = extractUsageFromResponseHeaders(response.headers);
+        if (headerUsage) {
+          // Only override cost fields that headers actually have
+          if (headerUsage.totalMsats) {
+            usage.totalMsats = headerUsage.totalMsats;
+            usage.satsCost = headerUsage.satsCost;
+          }
+          if (headerUsage.cost) usage.cost = headerUsage.cost;
+          if (headerUsage.inputMsats) usage.inputMsats = headerUsage.inputMsats;
+          if (headerUsage.outputMsats) usage.outputMsats = headerUsage.outputMsats;
+          if (headerUsage.totalUsd) usage.totalUsd = headerUsage.totalUsd;
+        }
       }
 
       const finalRequestId = requestId || "unknown";
