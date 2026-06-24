@@ -49,8 +49,6 @@ import {
   prepareTinfoilClient,
   fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
-import { promises as fs } from "fs";
-import path from "path";
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -596,16 +594,6 @@ export class RoutstrClient {
 
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
 
-      this._storeRequest({
-        url,
-        method,
-        headers,
-        body: tinfoilEnabled
-          ? "[redacted: Tinfoil EHBP encrypted before upstream fetch]"
-          : body,
-        baseUrl,
-      }).catch((err) => this._log("WARN", "Failed to store request:", err));
-
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
             { baseUrl },
@@ -690,35 +678,6 @@ export class RoutstrClient {
   /**
    * Store request details to a file in the reqs/ folder before fetch.
    */
-  private async _storeRequest(params: {
-    url: string;
-    method: string;
-    headers: Record<string, string>;
-    body: unknown;
-    baseUrl: string;
-  }): Promise<void> {
-    const { url, method, headers, body, baseUrl } = params;
-
-    const reqsDir = path.join(process.cwd(), "reqs");
-    await fs.mkdir(reqsDir, { recursive: true });
-
-    const timestamp = Date.now();
-    const filename = `req-${timestamp}.json`;
-    const filepath = path.join(reqsDir, filename);
-
-    const entry = {
-      timestamp: new Date(timestamp).toISOString(),
-      url,
-      method,
-      baseUrl,
-      headers,
-      body,
-    };
-
-    await fs.writeFile(filepath, JSON.stringify(entry, null, 2), "utf-8");
-    this._log("DEBUG", `Request stored to ${filepath}`);
-  }
-
   /**
    * Handle error responses with failover
    */
