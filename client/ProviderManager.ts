@@ -623,12 +623,6 @@ export class ProviderManager {
     return ranking[0]?.baseUrl ?? null;
   }
 
-  private normalizeModelId(modelId: string): string {
-    return modelId.includes("/")
-      ? modelId.split("/").pop() || modelId
-      : modelId;
-  }
-
   /**
    * Check if a provider accepts a specific mint
    */
