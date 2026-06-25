@@ -15,10 +15,9 @@ const openDatabase = (
     return Promise.reject(new Error("IndexedDB is not available"));
   }
   return new Promise((resolve, reject) => {
-    // Version 2 — both sdk_storage and usage_tracking stores need to coexist.
-    // Each driver creates its own store AND the other driver's store during
-    // the upgrade to avoid a race where the second driver never gets onupgradeneeded.
-    const request = indexedDB.open(dbName, 2);
+    // Version 3 — unified with usageTracking driver so both open the same DB
+    // at the same version. Adds `provider` index to the usage_tracking store.
+    const request = indexedDB.open(dbName, 3);
 
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -34,6 +33,7 @@ const openDatabase = (
         utStore.createIndex("baseUrl", "baseUrl", { unique: false });
         utStore.createIndex("sessionId", "sessionId", { unique: false });
         utStore.createIndex("client", "client", { unique: false });
+        utStore.createIndex("provider", "provider", { unique: false });
       }
       // Also create sdk_storage if it doesn't exist (cross-driver init)
       if (storeName !== "sdk_storage" && !db.objectStoreNames.contains("sdk_storage")) {
