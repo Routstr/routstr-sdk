@@ -335,6 +335,53 @@ describe("BalanceManager provider wallet collision guard", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("blocks refund after topup completes (cooldown)", async () => {
+    const wallet = createWallet({
+      getBalances: async () => ({ "https://mint.example.com": 1000 }),
+      getMintUnits: () => ({ "https://mint.example.com": "sat" }),
+      sendToken: async () => "token",
+    });
+    const storage = createStatefulStorage({
+      apiKeys: { [BASE_URL]: SEED_KEY },
+    });
+    const manager = new BalanceManager(wallet, storage);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("v1/wallet/topup")) {
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ token: "cashu-token" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    // Run topup to completion
+    await manager.topUp({
+      mintUrl: "https://mint.example.com",
+      baseUrl: BASE_URL,
+      amount: 10,
+    });
+
+    // Immediately try refund — should be blocked by cooldown
+    const refundResult = await manager.refundApiKey({
+      mintUrl: "https://mint.example.com",
+      baseUrl: BASE_URL,
+      apiKey: "test-key",
+    });
+
+    expect(refundResult.success).toBe(false);
+    expect(refundResult.message).toContain("locked");
+    expect(refundResult.message).toContain("topup");
+
+    globalThis.fetch = originalFetch;
+  });
+
   it("does not permanently lock after operation failure", async () => {
     const wallet = createWallet();
     const storage = createStatefulStorage();
