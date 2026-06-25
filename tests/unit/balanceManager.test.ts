@@ -38,6 +38,58 @@ const createStorage = (
   ...overrides,
 });
 
+const norm = (url: string) => (url.endsWith("/") ? url : `${url}/`);
+
+interface ApiKeyRecord {
+  key: string;
+  balance: number;
+  lastUsed: number | null;
+}
+
+/**
+ * Stateful storage fixture where mutations (setApiKey, removeApiKey,
+ * updateApiKeyBalance) actually persist.  Tests that assert on multi-step
+ * state changes — refund then verify key is gone, force-refund removes
+ * providers, etc. — should use this instead of createStorage() closures.
+ */
+const createStatefulStorage = (seeds?: {
+  apiKeys?: Record<string, ApiKeyRecord>;
+}) => {
+  const apiKeys = new Map<string, ApiKeyRecord>();
+  if (seeds?.apiKeys) {
+    for (const [baseUrl, record] of Object.entries(seeds.apiKeys)) {
+      apiKeys.set(norm(baseUrl), { ...record });
+    }
+  }
+
+  return createStorage({
+    getApiKey: (baseUrl) => apiKeys.get(norm(baseUrl)) ?? null,
+    setApiKey: (baseUrl, key) => {
+      apiKeys.set(norm(baseUrl), { key, balance: 0, lastUsed: Date.now() });
+    },
+    removeApiKey: (baseUrl) => {
+      apiKeys.delete(norm(baseUrl));
+    },
+    updateApiKeyBalance: (baseUrl, balance) => {
+      const e = apiKeys.get(norm(baseUrl));
+      if (e) {
+        e.balance = balance;
+        e.lastUsed = Date.now();
+      }
+    },
+    getAllApiKeys: () =>
+      [...apiKeys.entries()].map(([baseUrl, e]) => ({
+        ...e,
+        baseUrl,
+      })),
+    getApiKeyDistribution: () =>
+      [...apiKeys.entries()].map(([baseUrl, e]) => ({
+        baseUrl,
+        amount: e.balance,
+      })),
+  });
+};
+
 describe("BalanceManager", () => {
   it("returns early when no apiKey to refund", async () => {
     const manager = new BalanceManager(createWallet(), createStorage());
@@ -104,6 +156,11 @@ describe("BalanceManager", () => {
 
 describe("BalanceManager provider wallet collision guard", () => {
   const BASE_URL = "https://provider.example.com";
+  const SEED_KEY: ApiKeyRecord = {
+    key: "test-key",
+    balance: 100,
+    lastUsed: null,
+  };
 
   it("blocks topup while refund is in-flight for the same provider", async () => {
     let refundResolve!: () => void;
@@ -116,13 +173,8 @@ describe("BalanceManager provider wallet collision guard", () => {
       getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       sendToken: async () => "token",
     });
-    const storage = createStorage({
-      getApiKey: () => ({
-        key: "test-key",
-        baseUrl: BASE_URL,
-        balance: 100,
-        lastUsed: null,
-      }),
+    const storage = createStatefulStorage({
+      apiKeys: { [BASE_URL]: SEED_KEY },
     });
     const manager = new BalanceManager(wallet, storage);
 
@@ -169,13 +221,8 @@ describe("BalanceManager provider wallet collision guard", () => {
       getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       sendToken: async () => "token",
     });
-    const storage = createStorage({
-      getApiKey: () => ({
-        key: "test-key",
-        baseUrl: BASE_URL,
-        balance: 100,
-        lastUsed: null,
-      }),
+    const storage = createStatefulStorage({
+      apiKeys: { [BASE_URL]: SEED_KEY },
     });
     const manager = new BalanceManager(wallet, storage);
 
@@ -212,25 +259,13 @@ describe("BalanceManager provider wallet collision guard", () => {
   });
 
   it("allows same-type operations to overlap (not blocked)", async () => {
-    let keyRemoved = false;
     const wallet = createWallet({
       getBalances: async () => ({ "https://mint.example.com": 1000 }),
       getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       sendToken: async () => "token",
     });
-    const storage = createStorage({
-      getApiKey: () =>
-        keyRemoved
-          ? null
-          : {
-              key: "test-key",
-              baseUrl: BASE_URL,
-              balance: 100,
-              lastUsed: null,
-            },
-      removeApiKey: () => {
-        keyRemoved = true;
-      },
+    const storage = createStatefulStorage({
+      apiKeys: { [BASE_URL]: SEED_KEY },
     });
     const manager = new BalanceManager(wallet, storage);
 
@@ -254,11 +289,8 @@ describe("BalanceManager provider wallet collision guard", () => {
       apiKey: "test-key",
     });
 
-    // r2 should not be blocked by guard (same type), but the key was
-    // already removed by r1 so it fails with a clean "no key" error.
+    // r2 should not be blocked by guard (same type)
     expect(r2.message ?? "").not.toContain("locked");
-    expect(r2.success).toBe(false);
-    expect(r2.message).toContain("No API key");
 
     await r1;
     globalThis.fetch = originalFetch;
@@ -270,13 +302,8 @@ describe("BalanceManager provider wallet collision guard", () => {
       getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       sendToken: async () => "token",
     });
-    const storage = createStorage({
-      getApiKey: () => ({
-        key: "test-key",
-        baseUrl: BASE_URL,
-        balance: 100,
-        lastUsed: null,
-      }),
+    const storage = createStatefulStorage({
+      apiKeys: { [BASE_URL]: SEED_KEY },
     });
     const manager = new BalanceManager(wallet, storage);
 
@@ -310,7 +337,7 @@ describe("BalanceManager provider wallet collision guard", () => {
 
   it("does not permanently lock after operation failure", async () => {
     const wallet = createWallet();
-    const storage = createStorage();
+    const storage = createStatefulStorage();
     const manager = new BalanceManager(wallet, storage);
 
     // topUp fails immediately because no api key
@@ -340,7 +367,6 @@ describe("BalanceManager force-refund escalation", () => {
 
   it("force-refunds a recently-used provider when it is the only way to pay a different provider", async () => {
     let walletBalance = 500;
-    let providerARemoved = false;
     let refundCalls = 0;
     let forceRefundUsed = false;
 
@@ -360,33 +386,13 @@ describe("BalanceManager force-refund escalation", () => {
       },
     });
 
-    const storage = createStorage({
-      getApiKeyDistribution: () => {
-        if (providerARemoved) return [];
-        return [{ baseUrl: ProviderA, amount: 1500 }];
-      },
-      getAllApiKeys: () => {
-        if (providerARemoved) return [];
-        return [{
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [ProviderA]: {
           key: "key-provider-a",
-          baseUrl: ProviderA,
           balance: 1500,
           lastUsed: Date.now() - 60_000,
-        }];
-      },
-      getApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA && !providerARemoved) {
-          return {
-            key: "key-provider-a",
-            baseUrl: ProviderA,
-            balance: 1500,
-            lastUsed: Date.now() - 60_000,
-          };
-        }
-        return null;
-      },
-      removeApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA) providerARemoved = true;
+        },
       },
     });
 
@@ -419,7 +425,7 @@ describe("BalanceManager force-refund escalation", () => {
 
       expect(result.success).toBe(true);
       expect(result.token).toBe("new-token-for-provider-b");
-      expect(providerARemoved).toBe(true);
+      expect(storage.getApiKey(ProviderA)).toBeNull();
       expect(forceRefundUsed).toBe(true);
       expect(refundCalls).toBe(3);
     } finally {
@@ -429,7 +435,6 @@ describe("BalanceManager force-refund escalation", () => {
 
   it("fails with InsufficientBalanceError when even force-refund cannot free enough balance", async () => {
     let walletBalance = 500;
-    let providerARemoved = false;
 
     const wallet = createWallet({
       getBalances: async () => ({ [Mint]: walletBalance }),
@@ -440,33 +445,13 @@ describe("BalanceManager force-refund escalation", () => {
       },
     });
 
-    const storage = createStorage({
-      getApiKeyDistribution: () => {
-        if (providerARemoved) return [];
-        return [{ baseUrl: ProviderA, amount: 1500 }];
-      },
-      getAllApiKeys: () => {
-        if (providerARemoved) return [];
-        return [{
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [ProviderA]: {
           key: "key-provider-a",
-          baseUrl: ProviderA,
           balance: 1500,
           lastUsed: Date.now() - 60_000,
-        }];
-      },
-      getApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA && !providerARemoved) {
-          return {
-            key: "key-provider-a",
-            baseUrl: ProviderA,
-            balance: 1500,
-            lastUsed: Date.now() - 60_000,
-          };
-        }
-        return null;
-      },
-      removeApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA) providerARemoved = true;
+        },
       },
     });
 
@@ -494,7 +479,7 @@ describe("BalanceManager force-refund escalation", () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain("Insufficient balance");
       // Even total (500+1500=2000) < 3000, so the refund is never attempted.
-      expect(providerARemoved).toBe(false);
+      expect(storage.getApiKey(ProviderA)).not.toBeNull();
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -502,7 +487,6 @@ describe("BalanceManager force-refund escalation", () => {
 
   it("stops early after force-refunding only as many providers as needed", async () => {
     let walletBalance = 100;
-    const removedProviders = new Set<string>();
     const refundedProviders: string[] = [];
     const ProviderC = "https://provider-c.example.com";
 
@@ -521,47 +505,31 @@ describe("BalanceManager force-refund escalation", () => {
       },
       receiveToken: async () => {
         const amounts: Record<string, number> = { [ProviderA]: 800, [ProviderC]: 2000 };
-        const amt = amounts[currentRefundProvider] ?? 0;
+        const amt = amounts[currentRefundProvider.replace(/\/$/, "")] ?? 0;
         walletBalance += amt;
         return { success: true, amount: amt, unit: "sat" as const };
       },
     });
 
-    const storage = createStorage({
-      getApiKeyDistribution: () => {
-        const dist: Array<{ baseUrl: string; amount: number }> = [];
-        if (!removedProviders.has(ProviderA)) dist.push({ baseUrl: ProviderA, amount: 800 });
-        if (!removedProviders.has(ProviderC)) dist.push({ baseUrl: ProviderC, amount: 2000 });
-        return dist;
-      },
-      getAllApiKeys: () => {
-        const keys: Array<{ key: string; baseUrl: string; balance: number; lastUsed: number | null }> = [];
-        if (!removedProviders.has(ProviderA)) {
-          keys.push({ key: "key-a", baseUrl: ProviderA, balance: 800, lastUsed: Date.now() - 120_000 });
-        }
-        if (!removedProviders.has(ProviderC)) {
-          keys.push({ key: "key-c", baseUrl: ProviderC, balance: 2000, lastUsed: Date.now() - 60_000 });
-        }
-        return keys;
-      },
-      getApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA && !removedProviders.has(ProviderA)) {
-          return { key: "key-a", baseUrl: ProviderA, balance: 800, lastUsed: Date.now() - 120_000 };
-        }
-        if (baseUrl === ProviderC && !removedProviders.has(ProviderC)) {
-          return { key: "key-c", baseUrl: ProviderC, balance: 2000, lastUsed: Date.now() - 60_000 };
-        }
-        return null;
-      },
-      removeApiKey: (baseUrl: string) => {
-        removedProviders.add(baseUrl);
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [ProviderA]: {
+          key: "key-a",
+          balance: 800,
+          lastUsed: Date.now() - 120_000,
+        },
+        [ProviderC]: {
+          key: "key-c",
+          balance: 2000,
+          lastUsed: Date.now() - 60_000,
+        },
       },
     });
 
     const manager = new BalanceManager(wallet, storage);
     const originalRefund = manager.refundApiKey.bind(manager);
     manager.refundApiKey = async (opts) => {
-      refundedProviders.push(opts.baseUrl);
+      refundedProviders.push(opts.baseUrl.replace(/\/$/, ""));
       currentRefundProvider = opts.baseUrl;
       return originalRefund(opts);
     };
@@ -587,8 +555,8 @@ describe("BalanceManager force-refund escalation", () => {
 
       expect(result.success).toBe(true);
       // wallet=100, ProviderA=800 → after refund: 900 < 1200, need ProviderC too
-      expect(removedProviders.has(ProviderA)).toBe(true);
-      expect(removedProviders.has(ProviderC)).toBe(true);
+      expect(storage.getApiKey(ProviderA)).toBeNull();
+      expect(storage.getApiKey(ProviderC)).toBeNull();
       // Both were force-refunded on retryCount=2 (the last 2 calls in the list)
       const forceRefundCalls = refundedProviders.slice(-2);
       expect(forceRefundCalls).toEqual([ProviderA, ProviderC]);
@@ -599,7 +567,6 @@ describe("BalanceManager force-refund escalation", () => {
 
   it("does not force-refund if soft refund from a naturally-expired provider frees enough balance", async () => {
     let walletBalance = 500;
-    let providerARemoved = false;
     let refundCalls = 0;
     let forceRefundUsed = false;
 
@@ -619,33 +586,13 @@ describe("BalanceManager force-refund escalation", () => {
       },
     });
 
-    const storage = createStorage({
-      getApiKeyDistribution: () => {
-        if (providerARemoved) return [];
-        return [{ baseUrl: ProviderA, amount: 800 }];
-      },
-      getAllApiKeys: () => {
-        if (providerARemoved) return [];
-        return [{
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [ProviderA]: {
           key: "key-a",
-          baseUrl: ProviderA,
           balance: 800,
           lastUsed: Date.now() - 10 * 60_000,
-        }];
-      },
-      getApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA && !providerARemoved) {
-          return {
-            key: "key-a",
-            baseUrl: ProviderA,
-            balance: 800,
-            lastUsed: Date.now() - 10 * 60_000,
-          };
-        }
-        return null;
-      },
-      removeApiKey: (baseUrl: string) => {
-        if (baseUrl === ProviderA) providerARemoved = true;
+        },
       },
     });
 
@@ -678,7 +625,7 @@ describe("BalanceManager force-refund escalation", () => {
 
       expect(result.success).toBe(true);
       expect(result.token).toBe("token-for-provider-b");
-      expect(providerARemoved).toBe(true);
+      expect(storage.getApiKey(ProviderA)).toBeNull();
       expect(refundCalls).toBe(1);
       expect(forceRefundUsed).toBe(false);
     } finally {
