@@ -319,11 +319,11 @@ export class ProviderManager {
    * Mark a provider as failed
    * If a provider fails twice within 5 minutes, it's added to cooldown
    */
-  markFailed(baseUrl: string): void {
+  markFailed(baseUrl: string, reason?: string): void {
     const now = Date.now();
     const lastFailure = this.lastFailed.get(baseUrl);
 
-    this.logger.log(`markFailed: ${baseUrl} lastFailure=${lastFailure} now=${now}`);
+    this.logger.log(`markFailed: ${baseUrl} lastFailure=${lastFailure} now=${now}${reason ? ` reason=[${reason}]` : ""}`);
 
     if (lastFailure !== undefined) {
       const timeSinceLastFailure = now - lastFailure;

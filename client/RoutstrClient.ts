@@ -615,13 +615,20 @@ export class RoutstrClient {
     } catch (error: any) {
       // Handle network errors with failover
       if (isNetworkErrorMessage(error?.message || "")) {
+        const fetchUrl = `${baseUrl.replace(/\/$/, "")}${path}`;
+        this._log("ERROR", "[RoutstrClient] Network error fetching from provider", {
+          baseUrl,
+          url: fetchUrl,
+          path,
+          error: error?.message || String(error),
+        });
         return await this._handleErrorResponse(
           params,
           token,
           -1, // just for Network Error to skip all statuses
           undefined,
           undefined,
-          undefined,
+          error?.message || String(error),
           params.retryCount ?? 0
         );
         // return await this._handleNetworkError(error, params);
@@ -998,10 +1005,17 @@ export class RoutstrClient {
       }
     }
 
-    this.providerManager.markFailed(baseUrl);
+    const failReason = [
+      `status=${status}`,
+      requestId ? `requestId=${requestId}` : null,
+      errorMessage ? `body=${errorMessage.slice(0, 200)}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    this.providerManager.markFailed(baseUrl, failReason);
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed`
+      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed (${failReason})`
     );
 
     if (!selectedModel) {
