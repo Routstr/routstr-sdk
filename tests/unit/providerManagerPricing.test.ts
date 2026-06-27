@@ -70,13 +70,25 @@ describe("ProviderManager", () => {
       ]);
     });
 
-    it("returns the best provider for a model", () => {
+    it("returns the cheapest provider for a model", () => {
       const registry = createRegistry({
         getAllProvidersModels: () => ({
-          "https://alpha.example.com/": [
+          "https://expensive.example.com/": [
             {
               id: "gpt-4o-mini",
-              sats_pricing: { prompt: 1, completion: 1 },
+              sats_pricing: { prompt: 10, completion: 10 },
+            } as any,
+          ],
+          "https://cheap.example.com/": [
+            {
+              id: "gpt-4o-mini",
+              sats_pricing: { prompt: 0.1, completion: 0.1 },
+            } as any,
+          ],
+          "https://mid.example.com/": [
+            {
+              id: "gpt-4o-mini",
+              sats_pricing: { prompt: 5, completion: 5 },
             } as any,
           ],
         }),
@@ -85,7 +97,7 @@ describe("ProviderManager", () => {
       const manager = new ProviderManager(registry);
       const best = manager.getBestProviderForModel("gpt-4o-mini");
 
-      expect(best).toBe("https://alpha.example.com/");
+      expect(best).toBe("https://cheap.example.com/");
     });
 
     it("returns null when no provider has the model", () => {
@@ -145,7 +157,7 @@ describe("ProviderManager", () => {
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
-              sats_pricing: { prompt: "1", completion: 1 } as any,
+              sats_pricing: { prompt: 1, completion: 1 } as any,
             },
           ],
           "https://beta.example.com/": [
@@ -160,7 +172,7 @@ describe("ProviderManager", () => {
       const manager = new ProviderManager(registry);
       expect(
         manager.getProviderPriceRankingForModel("gpt-4o-mini")
-      ).toHaveLength(0);
+      ).toHaveLength(1);
     });
 
     it("alphabetical tiebreak when total prices are equal", () => {

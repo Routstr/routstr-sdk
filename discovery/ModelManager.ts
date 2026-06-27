@@ -626,6 +626,20 @@ export class ModelManager {
       }
     }
 
+    // Carry forward previously-disabled providers that are no longer
+    // in the current bootstrap's baseUrls (e.g. their kind-38421 event
+    // was lost from relays).  Without this, a re-bootstrap silently
+    // re-enables providers whose Nostr event disappeared.
+    const previousDisabled = this.adapter.getDisabledProviders();
+    const currentBaseUrls = new Set(
+      baseUrls.map((url) => this.normalizeUrl(url))
+    );
+    for (const url of previousDisabled) {
+      if (!currentBaseUrls.has(url)) {
+        disabledByReview.push(url);
+      }
+    }
+
     this.adapter.setDisabledProviders(Array.from(new Set(disabledByReview)));
 
     return disabledByReview;
@@ -744,10 +758,20 @@ export class ModelManager {
 
     await Promise.allSettled(fetchPromises);
 
-    // Cache all provider results
+    // Cache all provider results, pruning stale entries for providers
+    // that are no longer in the current baseUrls (e.g. their Nostr event
+    // was lost).  Without this, stale models from vanished providers
+    // accumulate in the cache forever.
     const existingCache = this.adapter.getCachedModels();
+    const currentBaseUrls = new Set(baseUrls);
+    const prunedExisting: Record<string, Model[]> = {};
+    for (const url of Object.keys(existingCache)) {
+      if (currentBaseUrls.has(url)) {
+        prunedExisting[url] = existingCache[url];
+      }
+    }
     this.adapter.setCachedModels({
-      ...existingCache,
+      ...prunedExisting,
       ...modelsFromAllProviders,
     });
 
