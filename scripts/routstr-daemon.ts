@@ -286,6 +286,18 @@ async function main(): Promise<void> {
   await modelManager.fetchModels(providers);
   console.log("Provider bootstrap complete.");
 
+  // Catch up on any Nostr events published since last run
+  await modelManager.refreshNostrEvents();
+  console.log("Initial Nostr refresh complete.");
+
+  // Periodically fetch new Nostr events (new providers, reviews, models)
+  const NOSTR_REFRESH_INTERVAL_MS = 21 * 60 * 1000; // 21 minutes
+  const nostrRefreshInterval = setInterval(() => {
+    modelManager.refreshNostrEvents().catch((err) => {
+      console.error("Periodic Nostr refresh failed:", err);
+    });
+  }, NOSTR_REFRESH_INTERVAL_MS);
+
   let activeMintUrl: string | null = null;
   let mintUnits: Record<string, "sat" | "msat"> = {};
 
@@ -494,6 +506,10 @@ async function main(): Promise<void> {
       }
     }
   );
+
+  server.on("close", () => {
+    clearInterval(nostrRefreshInterval);
+  });
 
   server.listen(port, async () => {
     await ensureRequestsDir();

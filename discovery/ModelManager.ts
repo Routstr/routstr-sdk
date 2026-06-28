@@ -213,30 +213,84 @@ export class ModelManager {
   }
 
   /**
-   * Check the persistent event store for fresh cached events.
-   * Returns events from SQLite if they were fetched within `maxAge`, otherwise
-   * returns empty array (caller should hit relays). Events without local fetch
-   * metadata fall back to Nostr created_at for backwards compatibility.
+   * Return all matching events from the persistent event store.
+   * The store accumulates events over time — it is the source of truth,
+   * not a temporary cache. Old events remain valid.
    */
   private async getCachedNostrEvents(
     filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[] },
-    maxAge: number,
     forceRefresh: boolean = false
   ): Promise<NostrEvent[]> {
     const eventStore = await this.ensureEventStore();
     if (forceRefresh) return [];
     if (!eventStore) return [];
 
-    const timeline = eventStore.getTimeline(filter);
-    if (timeline.length === 0) return [];
+    return eventStore.getTimeline(filter);
+  }
 
-    const cutoff = Date.now() - maxAge;
-    const freshest = Math.max(
-      ...timeline.map((e) => this.getEventFetchedAt(e) ?? e.created_at * 1000)
+  /**
+   * Fetch current events from live Nostr relays for all tracked kinds
+   * (38421 providers, 38425 lgtm reviews, 38423 routstr21 models) and
+   * persist them into the event store. Existing events are not replaced —
+   * new events are merged in. Call this periodically (e.g. every 21 min)
+   * to discover new providers, reviews, and model lists published since
+   * the last fetch.
+   */
+  async refreshNostrEvents(): Promise<void> {
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) {
+      this.logger.warn("refreshNostrEvents: no event store configured, skipping");
+      return;
+    }
+
+    const relays = this.getNostrRelays();
+    const timeoutMs = 5000;
+
+    // Kind 38421 — provider discovery
+    await this.fetchLiveIntoStore({ kinds: [38421], limit: 100 }, relays, timeoutMs);
+
+    // Kind 38425 — lgtm reviews
+    await this.fetchLiveIntoStore(
+      { kinds: [38425], "#t": ["lgtm"], limit: 500, authors: [this.routstrPubkey] },
+      relays,
+      timeoutMs
     );
-    if (freshest < cutoff) return [];
 
-    return timeline;
+    // Kind 38423 — routstr21 curated model list
+    await this.fetchLiveIntoStore(
+      { kinds: [38423], "#d": ["routstr-21-models"], limit: 1, authors: [this.routstrPubkey] },
+      relays,
+      timeoutMs
+    );
+
+    this.logger.log("refreshNostrEvents: live fetch complete");
+  }
+
+  /**
+   * Fetch events from live relays and persist them into the event store.
+   */
+  private async fetchLiveIntoStore(
+    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[]; limit?: number },
+    relays: string[],
+    timeoutMs: number
+  ): Promise<void> {
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) return;
+
+    const pool = new RelayPool();
+    await new Promise<void>((resolve) => {
+      pool
+        .req(relays, filter)
+        .pipe(
+          onlyEvents(),
+          tap((event) => {
+            eventStore.add(event);
+            this.markEventFetched(event);
+          })
+        )
+        .subscribe({ complete: () => resolve() });
+      setTimeout(() => resolve(), timeoutMs);
+    });
   }
 
   static async init(
@@ -340,7 +394,6 @@ export class ModelManager {
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
       { kinds: [kind] },
-      this.cacheTTL,
       forceRefresh
     );
     let sessionEvents: NostrEvent[] = cached;
@@ -556,7 +609,6 @@ export class ModelManager {
       // Check persistent store first
       const cached = await this.getCachedNostrEvents(
         { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
-        this.cacheTTL,
         forceRefresh
       );
       let sessionEvents: NostrEvent[] = cached;
@@ -901,7 +953,6 @@ export class ModelManager {
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
-      this.cacheTTL,
       forceRefresh
     );
     let sessionEvents: NostrEvent[] = cached;
