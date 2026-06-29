@@ -327,8 +327,6 @@ async function main(): Promise<void> {
           selectedModel,
           baseUrl,
           mintUrl,
-          balance: totalBalance,
-          transactionHistory: [],
           // maxTokens: 1000,
         },
         {

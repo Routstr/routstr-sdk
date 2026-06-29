@@ -210,18 +210,6 @@ export interface StreamingResult {
 }
 
 /**
- * Parameters for fetching AI response
- */
-export interface FetchAIResponseParams {
-  messageHistory: Message[];
-  selectedModel: Model;
-  baseUrl: string;
-  mintUrl: string;
-  balance: number;
-  transactionHistory: TransactionHistory[];
-}
-
-/**
  * Candidate provider for failover
  */
 export interface CandidateProvider {
