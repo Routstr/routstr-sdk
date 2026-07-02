@@ -8,7 +8,6 @@
 import type { Model, Message, SdkLogger } from "./core/types";
 import type { DiscoveryAdapter } from "./discovery/interfaces";
 import type {
-  ProviderRegistry,
   WalletAdapter,
   StorageAdapter,
 } from "./wallet/interfaces";
@@ -49,9 +48,7 @@ export interface RouteRequestOptions {
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching */
   storageAdapter: StorageAdapter;
-  /** Provider registry for tracking available providers */
-  providerRegistry: ProviderRegistry;
-  /** Discovery adapter for model/mint discovery */
+  /** Discovery adapter for model/mint discovery and provider data */
   discoveryAdapter: DiscoveryAdapter;
   /** Optional: additional provider URLs to include */
   includeProviderUrls?: string[];
@@ -121,7 +118,6 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     forcedProvider,
     walletAdapter,
     storageAdapter,
-    providerRegistry,
     discoveryAdapter,
     includeProviderUrls = [],
     torMode = false,
@@ -143,7 +139,6 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
       forcedProvider,
       walletAdapter,
       storageAdapter,
-      providerRegistry,
       discoveryAdapter,
       includeProviderUrls,
       torMode,

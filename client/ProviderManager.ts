@@ -10,11 +10,43 @@
  * Extracted from utils/apiUtils.ts findNextBestProvider and related logic
  */
 
-import type { ProviderRegistry } from "../wallet/interfaces";
-import type { Model, SdkLogger } from "../core/types";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
+import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext } from "../utils/torUtils";
+
+const normalizeBaseUrl = (baseUrl: string): string =>
+  baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+
+/**
+ * Fetch provider info from network if not cached, then cache it.
+ * Replaces the old ProviderRegistry.getProviderInfo() method.
+ */
+const fetchProviderInfo = async (
+  adapter: DiscoveryAdapter,
+  baseUrl: string,
+  logger: SdkLogger,
+): Promise<ProviderInfo | null> => {
+  const normalized = normalizeBaseUrl(baseUrl);
+  const cached = adapter.getCachedProviderInfo()[normalized];
+  if (cached) return cached;
+  try {
+    const response = await fetch(`${normalized}v1/info`);
+    if (!response.ok) {
+      throw new Error(`Failed ${response.status}`);
+    }
+    const info = (await response.json()) as ProviderInfo;
+    adapter.setCachedProviderInfo({
+      ...adapter.getCachedProviderInfo(),
+      [normalized]: info,
+    });
+    return info;
+  } catch (error) {
+    logger.warn(`Failed to fetch provider info from ${normalized}:`, error);
+    return null;
+  }
+};
 
 export interface ModelProviderPrice {
   baseUrl: string;
@@ -193,7 +225,7 @@ export class ProviderManager {
   private readonly logger: SdkLogger;
 
   constructor(
-    private providerRegistry: ProviderRegistry,
+    private discoveryAdapter: DiscoveryAdapter,
     store?: SdkStore,
     logger?: SdkLogger
   ) {
@@ -427,13 +459,13 @@ export class ProviderManager {
     try {
       const torMode = isTorContext();
       const disabledProviders = new Set(
-        this.providerRegistry.getDisabledProviders()
+        this.discoveryAdapter.getDisabledProviders()
       );
 
       this.logger.log(`findNextBestProvider: model=${modelId} disabled=${[...disabledProviders].length} onCooldown=${this.providersOnCoolDown.length}`);
 
       // Get all providers with their models
-      const allProviders = this.providerRegistry.getAllProvidersModels();
+      const allProviders = this.discoveryAdapter.getCachedModels();
       this.logger.log(`findNextBestProvider: total providers=${Object.keys(allProviders).length}`);
 
       // Find all candidate providers
@@ -495,14 +527,14 @@ export class ProviderManager {
     modelId: string
   ): Promise<Model | null> {
     // Get models for this provider
-    const models = this.providerRegistry.getModelsForProvider(baseUrl);
+    const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
     // First try exact match
     const exactMatch = models.find((m) => m.id === modelId);
     if (exactMatch) return exactMatch;
 
     // Try matching by ID suffix (for backward compatibility with v0.1.x providers)
-    const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
+    const providerInfo = await fetchProviderInfo(this.discoveryAdapter, baseUrl, this.logger);
     if (providerInfo?.version && /^0\.1\./.test(providerInfo.version)) {
       const suffix = modelId.split("/").pop();
       const suffixMatch = models.find((m) => m.id === suffix);
@@ -522,9 +554,9 @@ export class ProviderManager {
     cost: number;
   }> {
     const candidates: CandidateProvider[] = [];
-    const allProviders = this.providerRegistry.getAllProvidersModels();
+    const allProviders = this.discoveryAdapter.getCachedModels();
     const disabledProviders = new Set(
-      this.providerRegistry.getDisabledProviders()
+      this.discoveryAdapter.getDisabledProviders()
     );
     const torMode = isTorContext();
 
@@ -553,12 +585,12 @@ export class ProviderManager {
   ): ModelProviderPrice[] {
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
-    const disabledProviderList = this.providerRegistry.getDisabledProviders();
+    const disabledProviderList = this.discoveryAdapter.getDisabledProviders();
     const disabledProviders = new Set(disabledProviderList);
     if (disabledProviderList.length > 0) {
       this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
     }
-    const allModels = this.providerRegistry.getAllProvidersModels();
+    const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
 
     for (const [baseUrl, models] of Object.entries(allModels)) {
@@ -627,7 +659,7 @@ export class ProviderManager {
    * Check if a provider accepts a specific mint
    */
   providerAcceptsMint(baseUrl: string, mintUrl: string): boolean {
-    const providerMints = this.providerRegistry.getProviderMints(baseUrl);
+    const providerMints = this.discoveryAdapter.getCachedMints()[normalizeBaseUrl(baseUrl)] || [];
     if (providerMints.length === 0) {
       // If no mints specified, provider accepts all
       return true;

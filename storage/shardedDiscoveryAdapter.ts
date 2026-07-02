@@ -18,9 +18,7 @@
  */
 
 import type { DiscoveryAdapter } from "../discovery/interfaces";
-import type { ProviderRegistry } from "../wallet/interfaces";
-import type { Model, ProviderInfo, SdkLogger } from "../core/types";
-import { consoleLogger } from "../core/types";
+import type { Model, ProviderInfo } from "../core/types";
 import type { StorageDriver } from "./types";
 import { SDK_STORAGE_KEYS } from "./keys";
 
@@ -358,51 +356,5 @@ export const createShardedDiscoveryAdapter = async (
         timestamp,
       );
     },
-  };
-};
-
-export const createProviderRegistryFromDiscoveryAdapter = (
-  adapter: DiscoveryAdapter,
-  logger?: SdkLogger,
-): ProviderRegistry => {
-  const log = (logger ?? consoleLogger).child("ProviderRegistry");
-
-  return {
-    getModelsForProvider: (baseUrl: string): Model[] => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      return adapter.getCachedModels()[normalized] || [];
-    },
-
-    getDisabledProviders: (): string[] => adapter.getDisabledProviders(),
-
-    getProviderMints: (baseUrl: string): string[] => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      return adapter.getCachedMints()[normalized] || [];
-    },
-
-    getProviderInfo: async (baseUrl: string): Promise<ProviderInfo | null> => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      const cached = adapter.getCachedProviderInfo()[normalized];
-      if (cached) return cached;
-
-      try {
-        const response = await fetch(`${normalized}v1/info`);
-        if (!response.ok) {
-          throw new Error(`Failed ${response.status}`);
-        }
-        const info = (await response.json()) as ProviderInfo;
-        adapter.setCachedProviderInfo({
-          ...adapter.getCachedProviderInfo(),
-          [normalized]: info,
-        });
-        return info;
-      } catch (error) {
-        log.warn(`Failed to fetch provider info from ${normalized}:`, error);
-        return null;
-      }
-    },
-
-    getAllProvidersModels: (): Record<string, Model[]> =>
-      adapter.getCachedModels(),
   };
 };

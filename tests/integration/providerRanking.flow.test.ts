@@ -14,7 +14,6 @@ import { ModelManager } from "../../discovery/ModelManager";
 import { ProviderManager } from "../../client/ProviderManager";
 import {
   createMemoryDriver,
-  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "../../storage";
 
@@ -210,9 +209,8 @@ describe("provider ranking integration flow", () => {
       `${PROVIDER_B_URL}/v1/models`,
     );
 
-    // -- 6. Create ProviderRegistry and ProviderManager from the adapter --
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-    const providerManager = new ProviderManager(registry);
+    // -- 6. Create ProviderManager from the adapter --
+    const providerManager = new ProviderManager(adapter);
 
     // -- 7. Verify provider ranking (cheapest first) --
     const ranking = providerManager.getProviderPriceRankingForModel(
@@ -300,8 +298,7 @@ describe("provider ranking integration flow", () => {
     expect(disabled).not.toContain(`${PROVIDER_B_URL}/`);
 
     // -- 4. Verify ranking: C is excluded, only A and B, sorted by price --
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-    const providerManager = new ProviderManager(registry);
+    const providerManager = new ProviderManager(adapter);
     const ranking = providerManager.getProviderPriceRankingForModel(
       "gpt-4o-mini",
     );
@@ -341,8 +338,7 @@ describe("provider ranking integration flow", () => {
     const adapter = await createShardedDiscoveryAdapter({ driver });
     await ModelManager.init(adapter);
 
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-    const providerManager = new ProviderManager(registry);
+    const providerManager = new ProviderManager(adapter);
     const ranking = providerManager.getProviderPriceRankingForModel(
       "gpt-4o-mini",
     );
@@ -383,8 +379,7 @@ describe("provider ranking integration flow", () => {
     const adapter = await createShardedDiscoveryAdapter({ driver });
     await ModelManager.init(adapter);
 
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-    const providerManager = new ProviderManager(registry);
+    const providerManager = new ProviderManager(adapter);
     const ranking = providerManager.getProviderPriceRankingForModel(
       "gpt-4o-mini",
     );
@@ -455,8 +450,7 @@ describe("provider ranking integration flow", () => {
       ],
     });
 
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-    const providerManager = new ProviderManager(registry);
+    const providerManager = new ProviderManager(adapter);
 
     // torMode=true should only show onion
     const torRanking = providerManager.getProviderPriceRankingForModel(
@@ -517,8 +511,7 @@ describe("provider ranking integration flow", () => {
       [`${PROVIDER_B_URL}/`]: cheapModels,
     });
 
-    const registry = createProviderRegistryFromDiscoveryAdapter(adapter2);
-    const providerManager = new ProviderManager(registry);
+    const providerManager = new ProviderManager(adapter2);
     const ranking = providerManager.getProviderPriceRankingForModel(
       "gpt-4o-mini",
     );
@@ -605,8 +598,8 @@ describe("provider ranking integration flow", () => {
 
     // Ranking excludes disabled provider C — only A and B
     {
-      const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-      const pm = new ProviderManager(registry);
+      const providerManager = new ProviderManager(adapter);
+      const pm = new ProviderManager(adapter);
       const ranking = pm.getProviderPriceRankingForModel("gpt-4o-mini");
       expect(ranking).toHaveLength(2);
       expect(ranking.map((e) => e.baseUrl)).toEqual([
@@ -664,8 +657,8 @@ describe("provider ranking integration flow", () => {
 
     // Ranking only shows A and B — C is excluded (disabled + pruned).
     {
-      const registry = createProviderRegistryFromDiscoveryAdapter(adapter);
-      const pm = new ProviderManager(registry);
+      const providerManager = new ProviderManager(adapter);
+      const pm = new ProviderManager(adapter);
       const ranking = pm.getProviderPriceRankingForModel("gpt-4o-mini");
 
       expect(ranking).toHaveLength(2);

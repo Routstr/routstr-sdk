@@ -35,3 +35,9 @@ scripts/reqRes/
 *.sqlite
 audit.log
 scripts/events.db
+
+# SQLite WAL files
+routstr.sqlite-shm
+routstr.sqlite-wal
+*.sqlite-shm
+*.sqlite-wal

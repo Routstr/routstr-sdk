@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderManager } from "../../client/ProviderManager";
-import type { ProviderRegistry } from "../../wallet/interfaces";
+import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 
 // ---------------------------------------------------------------------------
@@ -14,13 +14,28 @@ const makeModel = (overrides?: Partial<Model>): Model => ({
   ...overrides,
 } as Model);
 
-const createRegistry = (overrides?: Partial<ProviderRegistry>) => {
-  const registry: ProviderRegistry = {
-    getModelsForProvider: () => [],
+const createRegistry = (overrides?: Partial<DiscoveryAdapter>) => {
+  const registry: DiscoveryAdapter = {
+    getCachedModels: () => ({}),
+    setCachedModels: () => {},
+    getCachedMints: () => ({}),
+    setCachedMints: () => {},
+    getCachedProviderInfo: () => ({}),
+    setCachedProviderInfo: () => {},
+    getProviderLastUpdate: () => null,
+    setProviderLastUpdate: () => {},
+    getLastUsedModel: () => null,
+    setLastUsedModel: () => {},
     getDisabledProviders: () => [],
-    getProviderMints: () => [],
-    getProviderInfo: async () => null,
-    getAllProvidersModels: () => ({}),
+    setDisabledProviders: () => {},
+    getBaseUrlsList: () => [],
+    getBaseUrlsLastUpdate: () => null,
+    setBaseUrlsList: () => {},
+    setBaseUrlsLastUpdate: () => {},
+    getRoutstr21Models: () => [],
+    setRoutstr21Models: () => {},
+    getRoutstr21ModelsLastUpdate: () => null,
+    setRoutstr21ModelsLastUpdate: () => {},
     ...overrides,
   };
   return registry;
@@ -44,7 +59,7 @@ describe("ProviderManager", () => {
   describe("model discovery and pricing", () => {
     it("returns providers sorted by total pricing", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "openai/gpt-4o-mini",
@@ -72,7 +87,7 @@ describe("ProviderManager", () => {
 
     it("returns the cheapest provider for a model", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://expensive.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -102,7 +117,7 @@ describe("ProviderManager", () => {
 
     it("returns null when no provider has the model", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "other-model",
@@ -118,7 +133,7 @@ describe("ProviderManager", () => {
 
     it("returns calculated per-million prices in ranking", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -138,7 +153,7 @@ describe("ProviderManager", () => {
 
     it("skips providers without sats_pricing", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             { id: "gpt-4o-mini" } as any, // no sats_pricing
           ],
@@ -153,7 +168,7 @@ describe("ProviderManager", () => {
 
     it("skips providers where prompt or completion is not a number", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -177,7 +192,7 @@ describe("ProviderManager", () => {
 
     it("alphabetical tiebreak when total prices are equal", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://zulu.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -212,7 +227,7 @@ describe("ProviderManager", () => {
 
     it("filters onion URLs when not in tor mode (getAllProvidersForModel)", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -238,7 +253,7 @@ describe("ProviderManager", () => {
 
     it("filters onion URLs in getProviderPriceRankingForModel", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -264,7 +279,7 @@ describe("ProviderManager", () => {
 
     it("includes onion URLs when torMode=true in getProviderPriceRankingForModel", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "http://hidden.onion/": [
             {
               id: "gpt-4o-mini",
@@ -285,7 +300,7 @@ describe("ProviderManager", () => {
 
     it("torMode=true excludes clearnet URLs from ranking", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://clearnet.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -313,7 +328,7 @@ describe("ProviderManager", () => {
     it("filters disabled providers", () => {
       const registry = createRegistry({
         getDisabledProviders: () => ["https://disabled.example.com/"],
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://disabled.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -339,7 +354,7 @@ describe("ProviderManager", () => {
     it("includes disabled when includeDisabled=true", () => {
       const registry = createRegistry({
         getDisabledProviders: () => ["https://disabled.example.com/"],
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://disabled.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -368,7 +383,7 @@ describe("ProviderManager", () => {
 
     it("filters providers on cooldown", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -410,7 +425,7 @@ describe("ProviderManager", () => {
 
     it("returns cheapest available provider", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://expensive.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -434,7 +449,7 @@ describe("ProviderManager", () => {
 
     it("skips the current provider", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -463,7 +478,7 @@ describe("ProviderManager", () => {
     it("skips disabled providers", () => {
       const registry = createRegistry({
         getDisabledProviders: () => ["https://disabled.example.com/"],
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://disabled.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -487,7 +502,7 @@ describe("ProviderManager", () => {
 
     it("skips providers on cooldown", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://cooled.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -523,7 +538,7 @@ describe("ProviderManager", () => {
 
     it("skips onion when not in tor mode", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "http://dark.onion/": [
             {
               id: "gpt-4o-mini",
@@ -549,7 +564,7 @@ describe("ProviderManager", () => {
       stubTorWindow();
 
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "http://dark.onion/": [
             {
               id: "gpt-4o-mini",
@@ -569,7 +584,7 @@ describe("ProviderManager", () => {
 
     it("returns null when no candidates remain", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "gpt-4o-mini",
@@ -591,7 +606,7 @@ describe("ProviderManager", () => {
 
     it("returns null when no provider has the model", () => {
       const registry = createRegistry({
-        getAllProvidersModels: () => ({
+        getCachedModels: () => ({
           "https://alpha.example.com/": [
             {
               id: "other-model",
@@ -830,10 +845,12 @@ describe("ProviderManager", () => {
   describe("getModelForProvider", () => {
     it("returns exact match", async () => {
       const registry = createRegistry({
-        getModelsForProvider: () => [
-          makeModel({ id: "gpt-4o-mini" }),
-          makeModel({ id: "gpt-4o" }),
-        ],
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [
+            makeModel({ id: "gpt-4o-mini" }),
+            makeModel({ id: "gpt-4o" }),
+          ],
+        }),
       });
 
       const manager = new ProviderManager(registry);
@@ -847,8 +864,12 @@ describe("ProviderManager", () => {
 
     it("returns suffix match for v0.1.x providers", async () => {
       const registry = createRegistry({
-        getModelsForProvider: () => [makeModel({ id: "gpt-4o-mini" })],
-        getProviderInfo: async () => ({ version: "0.1.5" } as any),
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [makeModel({ id: "gpt-4o-mini" })],
+        }),
+        getCachedProviderInfo: () => ({
+          "https://alpha.example.com/": { version: "0.1.5" } as any,
+        }),
       });
 
       const manager = new ProviderManager(registry);
@@ -862,8 +883,12 @@ describe("ProviderManager", () => {
 
     it("does not suffix match for non-v0.1.x providers", async () => {
       const registry = createRegistry({
-        getModelsForProvider: () => [makeModel({ id: "gpt-4o-mini" })],
-        getProviderInfo: async () => ({ version: "0.2.0" } as any),
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [makeModel({ id: "gpt-4o-mini" })],
+        }),
+        getCachedProviderInfo: () => ({
+          "https://alpha.example.com/": { version: "0.2.0" } as any,
+        }),
       });
 
       const manager = new ProviderManager(registry);
@@ -877,7 +902,9 @@ describe("ProviderManager", () => {
 
     it("returns null when no match found", async () => {
       const registry = createRegistry({
-        getModelsForProvider: () => [makeModel({ id: "claude-3" })],
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [makeModel({ id: "claude-3" })],
+        }),
       });
 
       const manager = new ProviderManager(registry);
@@ -895,7 +922,7 @@ describe("ProviderManager", () => {
   describe("mint acceptance", () => {
     it("accepts all when no mints are specified", () => {
       const registry = createRegistry({
-        getProviderMints: () => [],
+        getCachedMints: () => ({}),
       });
 
       const manager = new ProviderManager(registry);
@@ -906,7 +933,9 @@ describe("ProviderManager", () => {
 
     it("accepts when mint is listed", () => {
       const registry = createRegistry({
-        getProviderMints: () => ["https://mint-a.example.com/", "https://mint-b.example.com/"],
+        getCachedMints: () => ({
+          "https://alpha.example.com/": ["https://mint-a.example.com/", "https://mint-b.example.com/"],
+        }),
       });
 
       const manager = new ProviderManager(registry);
@@ -917,7 +946,9 @@ describe("ProviderManager", () => {
 
     it("rejects when mint is not listed", () => {
       const registry = createRegistry({
-        getProviderMints: () => ["https://mint-a.example.com/"],
+        getCachedMints: () => ({
+          "https://alpha.example.com/": ["https://mint-a.example.com/"],
+        }),
       });
 
       const manager = new ProviderManager(registry);

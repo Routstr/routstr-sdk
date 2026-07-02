@@ -9,7 +9,6 @@
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
-  ProviderRegistry,
   WalletAdapter,
   StorageAdapter,
 } from "../wallet/interfaces";
@@ -32,9 +31,7 @@ export interface ResolveContextInput {
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching. */
   storageAdapter: StorageAdapter;
-  /** Provider registry for tracking available providers. */
-  providerRegistry: ProviderRegistry;
-  /** Discovery adapter for model/mint discovery. */
+  /** Discovery adapter for model/mint discovery and provider data. */
   discoveryAdapter: DiscoveryAdapter;
   /** Optional: additional provider URLs to include. */
   includeProviderUrls?: string[];
@@ -85,7 +82,6 @@ export async function resolveRequestContext(
     forcedProvider,
     walletAdapter,
     storageAdapter,
-    providerRegistry,
     discoveryAdapter,
     includeProviderUrls = [],
     torMode = false,
@@ -129,7 +125,7 @@ export async function resolveRequestContext(
   // ── ProviderManager ─────────────────────────────────────────────────
   const providerManager =
     providedProviderManager ??
-    new ProviderManager(providerRegistry, sdkStore, logger);
+    new ProviderManager(discoveryAdapter, sdkStore, logger);
 
   // ── Select provider + model ─────────────────────────────────────────
   let baseUrl: string;
@@ -163,7 +159,7 @@ export async function resolveRequestContext(
   }
 
   // ── Mint resolution ─────────────────────────────────────────────────
-  const providerMints = providerRegistry.getProviderMints(baseUrl);
+  const providerMints = discoveryAdapter.getCachedMints()[baseUrl] || [];
   const mintUrl =
     walletAdapter.getActiveMintUrl() ||
     providerMints[0] ||
@@ -179,7 +175,7 @@ export async function resolveRequestContext(
     new RoutstrClient(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       "min",
       mode,
       {

@@ -12,7 +12,6 @@ import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
   createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -153,7 +152,6 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
   const discoveryAdapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
   const storageAdapter = createStorageAdapterFromStore(store);
 
   const modelManager = new ModelManager(discoveryAdapter, {
@@ -165,7 +163,7 @@ async function main(): Promise<void> {
   const mintDiscovery = new MintDiscovery(discoveryAdapter);
   await mintDiscovery.discoverMints(providers);
 
-  const providerManager = new ProviderManager(providerRegistry);
+  const providerManager = new ProviderManager(discoveryAdapter);
   let baseUrl = "";
   let selectedModel = null as
     | ReturnType<
@@ -287,7 +285,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    const providerMints = providerRegistry.getProviderMints(baseUrl);
+    const providerMints = discoveryAdapter.getCachedMints()[baseUrl] || [];
     const mintUrl =
       walletAdapter.getActiveMintUrl() ||
       providerMints[0] ||
@@ -310,7 +308,7 @@ async function main(): Promise<void> {
     const client = new RoutstrClient(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       alertLevel,
       "xcashu"
     );

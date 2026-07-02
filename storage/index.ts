@@ -17,7 +17,7 @@ import type { DiscoveryAdapter } from "../discovery/interfaces";
 export type { StorageDriver } from "./types";
 export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
-export type { StorageAdapter, ProviderRegistry, XCashuTokenEntry } from "../wallet/interfaces";
+export type { StorageAdapter, XCashuTokenEntry } from "../wallet/interfaces";
 export type {
   AggregateUsageOptions,
   ListUsageTrackingOptions,
@@ -30,7 +30,6 @@ export { SDK_STORAGE_KEYS } from "./keys";
 export {
   createSdkStore,
   createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "./store";
 export {
@@ -43,11 +42,9 @@ export {
   createMemoryUsageTrackingDriver,
 } from "./usageTracking";
 import {
-  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "./shardedDiscoveryAdapter";
 export {
-  createProviderRegistryFromDiscoveryAdapter,
   createShardedDiscoveryAdapter,
 } from "./shardedDiscoveryAdapter";
 export type {
@@ -122,6 +119,3 @@ export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> =>
 
 export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
-
-export const getDefaultProviderRegistry = async () =>
-  createProviderRegistryFromDiscoveryAdapter(await getDefaultDiscoveryAdapter());

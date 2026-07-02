@@ -13,8 +13,8 @@
 import type {
   WalletAdapter,
   StorageAdapter,
-  ProviderRegistry,
 } from "./interfaces";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { RefundResult, TopUpResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError } from "../core/errors";
@@ -99,7 +99,7 @@ export class BalanceManager {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry?: ProviderRegistry,
+    private discoveryAdapter?: DiscoveryAdapter,
     cashuSpender?: CashuSpender,
     logger?: SdkLogger
   ) {
@@ -110,7 +110,7 @@ export class BalanceManager {
       this.cashuSpender = new CashuSpender(
         walletAdapter,
         storageAdapter,
-        providerRegistry,
+        discoveryAdapter,
         this,
         this.logger
       );
@@ -564,8 +564,10 @@ export class BalanceManager {
     }
 
     const providerMints =
-      baseUrl && this.providerRegistry
-        ? this.providerRegistry.getProviderMints(baseUrl)
+      baseUrl && this.discoveryAdapter
+        ? this.discoveryAdapter.getCachedMints()[
+            baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`
+          ] || []
         : [];
 
     let requiredAmount = adjustedAmount;

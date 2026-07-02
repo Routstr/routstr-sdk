@@ -61,7 +61,7 @@ export class CashuSpender {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private _providerRegistry?: unknown,
+    private _discoveryAdapter?: unknown,
     private balanceManager?: BalanceManager,
     logger?: SdkLogger
   ) {

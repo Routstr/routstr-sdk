@@ -4,7 +4,8 @@
  */
 
 import type { Message, TransactionHistory } from "../core/types";
-import type { Model, ProviderInfo } from "../core/types";
+import type { ProviderInfo } from "../core/types";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 export { ProviderInfo };
 
 /**
@@ -165,30 +166,6 @@ export interface StorageAdapter {
 }
 
 /**
- * ProviderRegistry - Provides access to provider/model data
- * Used by ProviderManager for failover logic
- */
-export interface ProviderRegistry {
-  /** Get all models available from a provider */
-  getModelsForProvider(baseUrl: string): Model[];
-
-  /** Get list of disabled provider URLs */
-  getDisabledProviders(): string[];
-
-  /** Get mints accepted by a provider */
-  getProviderMints(baseUrl: string): string[];
-
-  /**
-   * Get provider info (version, etc.)
-   * Should fetch from network if not cached, or return cached version
-   */
-  getProviderInfo(baseUrl: string): Promise<ProviderInfo | null>;
-
-  /** Get all providers with their models */
-  getAllProvidersModels(): Record<string, Model[]>;
-}
-
-/**
  * StreamingCallbacks - Callbacks for real-time updates during API calls
  * Used by RoutstrClient to communicate with the UI
  */
@@ -228,8 +205,8 @@ export interface RoutstrClientOptions {
   /** Storage adapter for token management */
   storageAdapter: StorageAdapter;
 
-  /** Provider registry for failover logic */
-  providerRegistry: ProviderRegistry;
+  /** Discovery adapter for provider/model data and failover logic */
+  discoveryAdapter: DiscoveryAdapter;
 
   /** Nostr relay URLs (for future nostr-based features) */
   relayUrls?: string[];

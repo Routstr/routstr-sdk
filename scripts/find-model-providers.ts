@@ -3,7 +3,6 @@ import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
   createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
 } from "@routstr/sdk/storage";
 
 async function main(): Promise<void> {
@@ -23,11 +22,10 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
   const adapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
 
   logStep("Bootstrapping providers and fetching models...");
   const modelManager = await ModelManager.init(adapter);
-  const providerManager = new ProviderManager(providerRegistry);
+  const providerManager = new ProviderManager(adapter);
   logStep("Bootstrapped providers and fetched models.");
 
   logStep("Ranking providers by pricing...");

@@ -12,7 +12,6 @@ import {
 } from "@routstr/sdk/node";
 import {
   createShardedDiscoveryAdapter,
-  createProviderRegistryFromDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -272,7 +271,6 @@ async function main(): Promise<void> {
   store.getState().setDisabledProviders(DISABLED_PROVIDERS);
 
   const discoveryAdapter = await createShardedDiscoveryAdapter({ driver });
-  const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
   const storageAdapter = createStorageAdapterFromStore(store);
 
   const usageTrackingDriver = createSqliteUsageTrackingDriver({ legacyStorageDriver: driver });
@@ -444,7 +442,6 @@ async function main(): Promise<void> {
           mode,
           walletAdapter,
           storageAdapter,
-          providerRegistry,
           discoveryAdapter,
           modelManager,
           usageTrackingDriver,

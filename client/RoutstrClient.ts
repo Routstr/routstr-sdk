@@ -17,8 +17,8 @@ import { consoleLogger } from "../core/types";
 import type {
   WalletAdapter,
   StorageAdapter,
-  ProviderRegistry,
 } from "../wallet/interfaces";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
@@ -110,7 +110,7 @@ export class RoutstrClient {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry: ProviderRegistry,
+    private discoveryAdapter: DiscoveryAdapter,
     alertLevel: AlertLevel,
     mode: RoutstrClientMode = "xcashu",
     options: RoutstrClientConfig = {}
@@ -119,14 +119,14 @@ export class RoutstrClient {
     this.balanceManager = new BalanceManager(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       undefined,
       this.logger
     );
     this.cashuSpender = new CashuSpender(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       this.balanceManager,
       this.logger
     );
@@ -138,7 +138,7 @@ export class RoutstrClient {
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
-      new ProviderManager(providerRegistry, this.sdkStore, this.logger);
+      new ProviderManager(discoveryAdapter, this.sdkStore, this.logger);
   }
 
   /**

@@ -3,7 +3,6 @@ import type {
   StreamingCallbacks,
   WalletAdapter,
   StorageAdapter,
-  ProviderRegistry,
 } from "../wallet/interfaces";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
@@ -31,7 +30,7 @@ export type { ResolveContextInput, ResolvedContext } from "./resolveRequestConte
  *    discovery and ranking.
  *
  * 2. **Auto-discovery**: provide `modelId` + adapters (`discoveryAdapter`,
- *    `walletAdapter`, `storageAdapter`, `providerRegistry`). The function
+ *    `walletAdapter`, `storageAdapter`, `discoveryAdapter`). The function
  *    bootstraps ModelManager, fetches models, ranks providers by price,
  *    resolves a mint, and builds a RoutstrClient internally.
  */
@@ -69,14 +68,12 @@ export interface FetchOptions {
   headers?: Record<string, string>;
 
   // ── Adapters (only needed for auto-discovery path) ────────────────
-  /** Discovery adapter for model/mint discovery */
+  /** Discovery adapter for model/mint discovery and provider data */
   discoveryAdapter?: DiscoveryAdapter;
   /** Wallet adapter for Cashu operations */
   walletAdapter?: WalletAdapter;
   /** Storage adapter for caching */
   storageAdapter?: StorageAdapter;
-  /** Provider registry for tracking available providers */
-  providerRegistry?: ProviderRegistry;
   /** Optional: pre-initialized ModelManager (skips bootstrap if provided) */
   modelManager?: ModelManager;
   /** Optional: shared ProviderManager instance for consistent failure tracking */
@@ -161,12 +158,11 @@ export async function fetchAIResponse(
         discoveryAdapter,
         walletAdapter,
         storageAdapter,
-        providerRegistry,
       } = options;
 
-      if (!discoveryAdapter || !walletAdapter || !storageAdapter || !providerRegistry) {
+      if (!discoveryAdapter || !walletAdapter || !storageAdapter) {
         throw new Error(
-          "fetchAIResponse auto-discovery requires discoveryAdapter, walletAdapter, storageAdapter, and providerRegistry in FetchOptions"
+          "fetchAIResponse auto-discovery requires discoveryAdapter, walletAdapter, and storageAdapter in FetchOptions"
         );
       }
 
@@ -175,7 +171,6 @@ export async function fetchAIResponse(
         forcedProvider: options.forcedProvider,
         walletAdapter,
         storageAdapter,
-        providerRegistry,
         discoveryAdapter,
         includeProviderUrls: options.includeProviderUrls,
         torMode: options.torMode,
@@ -195,7 +190,7 @@ export async function fetchAIResponse(
       client = resolved.client;
     } else {
       throw new Error(
-        "fetchAIResponse requires either (selectedModel + baseUrl + mintUrl + client in deps) or (modelId + discoveryAdapter + walletAdapter + storageAdapter + providerRegistry in options)"
+        "fetchAIResponse requires either (selectedModel + baseUrl + mintUrl + client in deps) or (modelId + discoveryAdapter + walletAdapter + storageAdapter in options)"
       );
     }
 
