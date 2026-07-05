@@ -676,11 +676,41 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorMessage=${errorMessage}`
     );
 
-    this._log(
-      "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
-    );
-    if (params.token.startsWith("cashu")) {
+    // ── Reclaim sats: try the refund token FIRST, then fall back to the ──
+    // original token. This avoids a wasted mint round-trip when the node
+    // already consumed the proofs (the common upstream_error case) and
+    // prevents double-receiving when both are somehow valid.
+    let refundReceived = false;
+
+    if (this.mode === "xcashu" && xCashuRefundToken) {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
+      );
+      const receiveResult =
+        await this.cashuSpender.receiveToken(xCashuRefundToken);
+      if (receiveResult.success) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
+        );
+        // Refund claimed — remove the original spent token from storage so
+        // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        tryNextProvider = true;
+        refundReceived = true;
+      } else {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed, falling back to original token: ${receiveResult.message}`
+        );
+      }
+    }
+
+    // Only try the original token if we didn't get the refund. If the node
+    // already consumed the proofs this will fail gracefully; if the node
+    // errored before consuming them, we reclaim the sats directly.
+    if (!refundReceived && params.token.startsWith("cashu")) {
       const receiveResult = await this.cashuSpender.receiveToken(
         params.token
       );
@@ -701,44 +731,15 @@ export class RoutstrClient {
       }
     }
 
-    if (this.mode === "xcashu") {
-      if (xCashuRefundToken) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
-        );
-        const receiveResult =
-          await this.cashuSpender.receiveToken(xCashuRefundToken);
-        if (receiveResult.success) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
-          );
-          // Refund claimed — remove the original spent token from storage so
-          // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
-          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
-          tryNextProvider = true;
-        } else {
-          this._log(
-            "ERROR",
-            `[xcashu] Failed to receive refund token: ${receiveResult.message}`
-          );
-          throw new ProviderError(
-            baseUrl,
-            status,
-            "[xcashu] Failed to receive refund token",
-            requestId
-          );
-        }
-      } else {
-        if (!tryNextProvider)
-          throw new ProviderError(
-            baseUrl,
-            status,
-            "[xcashu] Failed to receive refund token",
-            requestId
-          );
-      }
+    // In xcashu mode, if neither the refund nor the original was received,
+    // we have no way to recover the sats — throw so the caller can surface it.
+    if (this.mode === "xcashu" && !tryNextProvider) {
+      throw new ProviderError(
+        baseUrl,
+        status,
+        "[xcashu] Failed to receive refund token",
+        requestId
+      );
     }
 
     if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
