@@ -2,7 +2,8 @@ import { RoutstrClient, WalletAdapter } from "@routstr/sdk";
 import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
-  createProviderRegistryFromStore,
+  createShardedDiscoveryAdapter,
+  createProviderRegistryFromDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -99,7 +100,8 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
   const storageAdapter = createStorageAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
+  const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
 
   const cachedReceiveTokens = storageAdapter.getCachedReceiveTokens();
   const apiKeysStored = storageAdapter.getApiKeyDistribution();

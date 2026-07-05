@@ -29,8 +29,6 @@ export type {
 export { SDK_STORAGE_KEYS } from "./keys";
 export {
   createSdkStore,
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "./store";
 export {

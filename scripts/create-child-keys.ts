@@ -1,7 +1,7 @@
 import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
-  createDiscoveryAdapterFromStore,
+  createShardedDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { ModelManager } from "@routstr/sdk";
@@ -46,7 +46,7 @@ async function createChildKeys(
 async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
   const storageAdapter = createStorageAdapterFromStore(store);
 
   const modelManager = new ModelManager(discoveryAdapter);

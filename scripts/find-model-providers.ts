@@ -1,10 +1,9 @@
 import { ModelManager, ProviderManager } from "@routstr/sdk";
-import { createSdkStore } from "@routstr/sdk/storage";
-import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
+  createShardedDiscoveryAdapter,
+  createProviderRegistryFromDiscoveryAdapter,
 } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 
 async function main(): Promise<void> {
   const modelId = process.argv[2]?.trim();
@@ -20,10 +19,8 @@ async function main(): Promise<void> {
   };
 
   logStep(`Starting lookup for model: ${modelId}`);
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
-  await hydrate;
-  const adapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const adapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
+  const providerRegistry = createProviderRegistryFromDiscoveryAdapter(adapter);
 
   logStep("Bootstrapping providers and fetching models...");
   const modelManager = await ModelManager.init(adapter);

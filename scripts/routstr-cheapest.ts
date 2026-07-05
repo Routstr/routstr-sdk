@@ -11,8 +11,8 @@ import { getDecodedToken } from "@cashu/cashu-ts";
 import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
+  createShardedDiscoveryAdapter,
+  createProviderRegistryFromDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -152,8 +152,8 @@ function pickTokenLine(output: string): string {
 async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
+  const providerRegistry = createProviderRegistryFromDiscoveryAdapter(discoveryAdapter);
   const storageAdapter = createStorageAdapterFromStore(store);
 
   const modelManager = new ModelManager(discoveryAdapter, {

@@ -1,11 +1,9 @@
-import { createSdkStore, createDiscoveryAdapterFromStore } from "@routstr/sdk/storage";
+import { createShardedDiscoveryAdapter } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import { ModelManager } from "@routstr/sdk/discovery";
 
 async function fetchRoutstr21Models(): Promise<string[]> {
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
-  await hydrate;
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
 
   const modelManager = new ModelManager(discoveryAdapter);
   const providers = await modelManager.bootstrapProviders(false);

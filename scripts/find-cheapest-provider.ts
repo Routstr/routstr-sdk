@@ -1,9 +1,5 @@
-import { createSdkStore } from "@routstr/sdk/storage";
+import { createShardedDiscoveryAdapter } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
-import {
-  createDiscoveryAdapterFromStore,
-  createStorageAdapterFromStore,
-} from "@routstr/sdk/storage";
 import { ModelManager } from "@routstr/sdk/discovery";
 
 const MODEL_ID = process.argv[2];
@@ -17,9 +13,7 @@ async function findCheapestProvider(): Promise<{
   baseUrl: string;
   price: number;
 } | null> {
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
-  await hydrate;
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
 
   const modelManager = new ModelManager(discoveryAdapter);
   const providers = await modelManager.bootstrapProviders(false);

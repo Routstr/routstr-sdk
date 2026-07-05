@@ -1,11 +1,9 @@
 import { ModelManager } from "@routstr/sdk";
-import { createSdkStore, createDiscoveryAdapterFromStore } from "@routstr/sdk/storage";
+import { createShardedDiscoveryAdapter } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 
 async function main(): Promise<void> {
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
-  await hydrate;
-  const adapter = createDiscoveryAdapterFromStore(store);
+  const adapter = await createShardedDiscoveryAdapter({ driver: createSqliteDriver() });
   const modelManager = new ModelManager(adapter);
   const providers = await modelManager.bootstrapProviders(false);
   await modelManager.fetchModels(providers);
