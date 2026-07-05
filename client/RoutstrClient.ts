@@ -689,6 +689,9 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
+        // The original token is back in the wallet — drop the stored IOU so
+        // getPendingCashuTokenAmount()/refundXcashuTokens() don't double-count it.
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
         tryNextProvider = true;
       } else {
         this._log(
@@ -711,6 +714,9 @@ export class RoutstrClient {
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
           );
+          // Refund claimed — remove the original spent token from storage so
+          // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
+          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
           tryNextProvider = true;
         } else {
           this._log(
