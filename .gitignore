@@ -25,3 +25,6 @@ yarn-error.log*
 
 dist
 package-lock.json
+
+# git worktrees
+.worktrees
