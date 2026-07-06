@@ -11,22 +11,19 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { Message, TransactionHistory, SdkLogger } from "../core/types";
+import type { SdkLogger } from "../core/types";
 import type { Model } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type {
   WalletAdapter,
   StorageAdapter,
-  ProviderRegistry,
-  StreamingCallbacks,
 } from "../wallet/interfaces";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
-import { StreamProcessor } from "./StreamProcessor";
 import { ProviderManager } from "./ProviderManager";
-import type { StreamingResult } from "../core/types";
 import {
   ProviderError,
   FailoverError,
@@ -37,23 +34,16 @@ import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
   extractResponseId,
   extractUsageFromResponseBody,
+  extractUsageFromResponseHeaders,
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
-
-/**
- * Options for fetching AI response
- */
-export interface FetchOptions {
-  messageHistory: Message[];
-  selectedModel: Model;
-  baseUrl: string;
-  mintUrl: string;
-  balance: number;
-  transactionHistory: TransactionHistory[];
-  maxTokens?: number;
-  headers?: Record<string, string>;
-}
+import {
+  isTinfoilModel,
+  getTinfoilUpstreamModelId,
+  prepareTinfoilClient,
+  fetchTinfoilPreservingPlaintextErrors,
+} from "./TinfoilSecure";
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -75,6 +65,25 @@ export interface RouteRequestParams {
   clientApiKey?: string;
 }
 
+export interface RequestResponseLogRequestInput {
+  method: string;
+  url: string;
+  path: string;
+  baseUrl: string;
+  headers: Record<string, string>;
+  body?: unknown;
+  rawBody?: string;
+}
+
+export interface RequestResponseLogSink {
+  logRequest?(input: RequestResponseLogRequestInput): string | undefined | Promise<string | undefined>;
+  logResponseStart?(id: string | undefined, response: Response): void | Promise<void>;
+  logResponseChunk?(id: string | undefined, sequence: number, text: string): void | Promise<void>;
+  logResponseEnd?(id: string | undefined): void | Promise<void>;
+  logResponseError?(id: string | undefined, error: unknown): void | Promise<void>;
+  logResponseBody?(id: string | undefined, response: Response): void | Promise<void>;
+}
+
 export interface RoutstrClientConfig {
   usageTrackingDriver?: UsageTrackingDriver;
   sdkStore?: SdkStore;
@@ -82,12 +91,13 @@ export interface RoutstrClientConfig {
   providerManager?: ProviderManager;
   /** Optional: injectable logger (defaults to consoleLogger) */
   logger?: SdkLogger;
+  /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
+  requestResponseLogSink?: RequestResponseLogSink;
 }
 
 export class RoutstrClient {
   private cashuSpender: CashuSpender;
   private balanceManager: BalanceManager;
-  private streamProcessor: StreamProcessor;
   private providerManager: ProviderManager;
   private alertLevel: AlertLevel;
   private mode: RoutstrClientMode;
@@ -95,11 +105,12 @@ export class RoutstrClient {
   private usageTrackingDriver?: UsageTrackingDriver;
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
+  private requestResponseLogSink?: RequestResponseLogSink;
 
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry: ProviderRegistry,
+    private discoveryAdapter: DiscoveryAdapter,
     alertLevel: AlertLevel,
     mode: RoutstrClientMode = "xcashu",
     options: RoutstrClientConfig = {}
@@ -108,26 +119,26 @@ export class RoutstrClient {
     this.balanceManager = new BalanceManager(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       undefined,
       this.logger
     );
     this.cashuSpender = new CashuSpender(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       this.balanceManager,
       this.logger
     );
-    this.streamProcessor = new StreamProcessor();
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
+    this.requestResponseLogSink = options.requestResponseLogSink;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
-      new ProviderManager(providerRegistry, this.sdkStore, this.logger);
+      new ProviderManager(discoveryAdapter, this.sdkStore, this.logger);
   }
 
   /**
@@ -225,6 +236,8 @@ export class RoutstrClient {
         baseUrl: prepared.baseUrlUsed,
         mintUrl: params.mintUrl,
         initialTokenBalance: prepared.tokenBalanceInSats,
+        initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
+        fallbackSatsSpent: usage?.satsCost,
         response: prepared.response,
         modelId: prepared.modelId,
         usage,
@@ -258,6 +271,7 @@ export class RoutstrClient {
     tokenUsed: string;
     baseUrlUsed: string;
     tokenBalanceInSats: number;
+    tokenBalanceUnknown: boolean;
     modelId?: string;
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
@@ -323,12 +337,6 @@ export class RoutstrClient {
       }
     }
 
-    const { token, tokenBalance, tokenBalanceUnit } = await this._spendToken({
-      mintUrl,
-      amount: requiredSats,
-      baseUrl,
-    });
-
     let requestBody = body;
     if (body && typeof body === "object") {
       const bodyObj = body as Record<string, unknown>;
@@ -339,7 +347,51 @@ export class RoutstrClient {
 
     // Build clean outgoing headers — do NOT pass the incoming client headers here
     const baseHeaders = this._buildBaseHeaders();
-    const requestHeaders = this._withAuthHeader(baseHeaders, token);
+
+    // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
+    const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
+
+    if (tinfoilEnabled) {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] Attesting Tinfoil model ${modelId} before spend`
+      );
+
+      const { verification } = await prepareTinfoilClient({ baseUrl });
+
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] Tinfoil attestation passed, enclave=${verification.enclaveHost}, codeFingerprint=${verification.codeFingerprint.slice(0, 16)}...`
+      );
+
+      // Strip the tinfoil- prefix for the model id inside the encrypted body.
+      // The attested enclave expects the bare model id (e.g. "kimi-k2-6"),
+      // not the caller-facing routstr id (e.g. "tinfoil-kimi-k2-6").
+      // The full id is sent in the X-Routstr-Model header for proxy-side lookup.
+      if (requestBody && typeof requestBody === "object" && modelId) {
+        requestBody = {
+          ...(requestBody as Record<string, unknown>),
+          model: getTinfoilUpstreamModelId(modelId),
+        };
+      }
+    }
+
+    // Spend tokens for the actual request
+    const spendResult = await this._spendToken({
+      mintUrl,
+      amount: requiredSats,
+      baseUrl,
+    });
+
+    const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
+
+    // Build final request headers (auth + Tinfoil model hint)
+    const finalHeaders = this._withAuthAndTinfoilHeaders(
+      baseHeaders,
+      token,
+      tinfoilEnabled,
+      modelId
+    );
 
     const response = await this._makeRequest({
       path: requestPath,
@@ -349,15 +401,31 @@ export class RoutstrClient {
       mintUrl,
       token,
       requiredSats,
-      headers: requestHeaders,
+      headers: finalHeaders,
       baseHeaders,
       selectedModel,
+      tinfoilEnabled,
     });
 
-    const tokenBalanceInSats =
+    let tokenBalanceInSats =
       tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    let initialTokenBalanceUnknown = tokenBalanceUnknown;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
+
+    // If failover occurred, use the initial balance captured when the
+    // failover token was created. Do not query here: by the time fetch returns,
+    // the provider may already have charged the request.
+    if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
+      if (typeof (response as any).initialTokenBalanceInSats === "number") {
+        tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
+        initialTokenBalanceUnknown = Boolean(
+          (response as any).initialTokenBalanceUnknown
+        );
+      } else {
+        initialTokenBalanceUnknown = true;
+      }
+    }
 
     const contentType = response.headers.get("content-type") || "";
     let processedResponse = response;
@@ -372,6 +440,9 @@ export class RoutstrClient {
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
       const [clientStream, inspectStream] = response.body.tee();
+      const requestResponseLogId = (response as any).requestResponseLogId as
+        | string
+        | undefined;
 
       processedResponse = new Response(clientStream, {
         status: response.status,
@@ -381,6 +452,7 @@ export class RoutstrClient {
 
       (processedResponse as any).baseUrl = (response as any).baseUrl;
       (processedResponse as any).token = (response as any).token;
+      (processedResponse as any).requestResponseLogId = requestResponseLogId;
 
       usagePromise = inspectSSEWebStream(
         inspectStream,
@@ -391,8 +463,23 @@ export class RoutstrClient {
         (responseId) => {
           capturedResponseId = responseId;
           (processedResponse as any).requestId = responseId;
+        },
+        {
+          onRawChunk: (_chunk, sequence, text) => {
+            void this.requestResponseLogSink?.logResponseChunk?.(
+              requestResponseLogId,
+              sequence,
+              text
+            );
+          },
         }
-      );
+      ).then(async (result) => {
+        await this.requestResponseLogSink?.logResponseEnd?.(requestResponseLogId);
+        return result;
+      }).catch(async (error) => {
+        await this.requestResponseLogSink?.logResponseError?.(requestResponseLogId, error);
+        throw error;
+      });
 
       (processedResponse as any).usagePromise = usagePromise;
     }
@@ -402,6 +489,7 @@ export class RoutstrClient {
       tokenUsed,
       baseUrlUsed,
       tokenBalanceInSats,
+      tokenBalanceUnknown: initialTokenBalanceUnknown,
       modelId,
       capturedUsage,
       capturedResponseId,
@@ -425,188 +513,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Fetch AI response with streaming
-   */
-  async fetchAIResponse(
-    options: FetchOptions,
-    callbacks: StreamingCallbacks
-  ): Promise<void> {
-    const {
-      messageHistory,
-      selectedModel,
-      baseUrl,
-      mintUrl,
-      balance,
-      transactionHistory,
-      maxTokens,
-      headers,
-    } = options;
-
-    // Convert messages for API
-    const apiMessages = await this._convertMessages(messageHistory);
-
-    // Calculate required amount
-    const requiredSats = this.providerManager.getRequiredSatsForModel(
-      selectedModel,
-      apiMessages,
-      maxTokens
-    );
-
-    try {
-      // Check balance first
-      await this._checkBalance();
-
-      // Spend tokens
-      callbacks.onPaymentProcessing?.(true);
-
-      const spendResult = await this._spendToken({
-        mintUrl,
-        amount: requiredSats,
-        baseUrl,
-      });
-
-      let token = spendResult.token;
-      let tokenBalance = spendResult.tokenBalance;
-      let tokenBalanceUnit = spendResult.tokenBalanceUnit;
-
-      const tokenBalanceInSats =
-        tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
-
-      callbacks.onTokenCreated?.(this._getPendingCashuTokenAmount());
-
-      const baseHeaders = this._buildBaseHeaders(headers);
-      const requestHeaders = this._withAuthHeader(baseHeaders, token);
-
-      // Get provider info for version compatibility
-      const providerInfo = await this.providerRegistry.getProviderInfo(baseUrl);
-      const providerVersion = providerInfo?.version ?? "";
-
-      // Handle v0.1.x providers (only send leaf ID)
-      let modelIdForRequest = selectedModel.id;
-      if (/^0\.1\./.test(providerVersion)) {
-        const newModel = await this.providerManager.getModelForProvider(
-          baseUrl,
-          selectedModel.id
-        );
-        modelIdForRequest = newModel?.id ?? selectedModel.id;
-      }
-
-      const body: any = {
-        model: modelIdForRequest,
-        messages: apiMessages,
-        stream: true,
-      };
-
-      if (maxTokens !== undefined) {
-        body.max_tokens = maxTokens;
-      }
-
-      // Only add tools for OpenAI models
-      if (selectedModel?.name?.startsWith("OpenAI:")) {
-        body.tools = [{ type: "web_search" }];
-      }
-
-      // Make API request
-      const response = await this._makeRequest({
-        path: "/v1/chat/completions",
-        method: "POST",
-        body,
-        selectedModel,
-        baseUrl,
-        mintUrl,
-        token,
-        requiredSats,
-        maxTokens,
-        headers: requestHeaders,
-        baseHeaders,
-      });
-
-      if (!response.body) {
-        throw new Error("Response body is not available");
-      }
-
-      // Process streaming response
-      if (response.status === 200) {
-        const baseUrlUsed = (response as any).baseUrl || baseUrl;
-
-        const streamingResult = await this.streamProcessor.process(
-          response,
-          {
-            onContent: callbacks.onStreamingUpdate,
-            onThinking: callbacks.onThinkingUpdate,
-          },
-          selectedModel.id
-        );
-
-        // Handle finish reason
-        if (streamingResult.finish_reason === "content_filter") {
-          callbacks.onMessageAppend({
-            role: "assistant",
-            content: "Your request was denied due to content filtering.",
-          });
-        } else if (
-          streamingResult.content ||
-          (streamingResult.images && streamingResult.images.length > 0)
-        ) {
-          // Create assistant message
-          const message = await this._createAssistantMessage(streamingResult);
-          callbacks.onMessageAppend(message);
-        } else {
-          // No content received
-          callbacks.onMessageAppend({
-            role: "system",
-            content: "The provider did not respond to this request.",
-          });
-        }
-
-        // Clear streaming
-        callbacks.onStreamingUpdate("");
-        callbacks.onThinkingUpdate("");
-
-        // Handle post-response refund (skip for xcashu mode - refund is in response)
-        const isApikeysEstimate = this.mode === "apikeys";
-        let satsSpent = await this._handlePostResponseBalanceUpdate({
-          token,
-          baseUrl: baseUrlUsed,
-          mintUrl,
-          initialTokenBalance: tokenBalanceInSats,
-          fallbackSatsSpent: isApikeysEstimate
-            ? this._getEstimatedCosts(selectedModel, streamingResult)
-            : undefined,
-          response,
-          modelId: selectedModel.id,
-          usage: streamingResult.usage
-            ? {
-                promptTokens: Number(streamingResult.usage.prompt_tokens ?? 0),
-                completionTokens: Number(
-                  streamingResult.usage.completion_tokens ?? 0
-                ),
-                totalTokens: Number(streamingResult.usage.total_tokens ?? 0),
-                cost: Number(streamingResult.usage.cost ?? 0),
-                satsCost: Number(streamingResult.usage.sats_cost ?? 0),
-              }
-            : undefined,
-          requestId: streamingResult.responseId,
-        });
-        const estimatedCosts = this._getEstimatedCosts(
-          selectedModel,
-          streamingResult
-        );
-        const onLastMessageSatsUpdate = callbacks.onLastMessageSatsUpdate as
-          | ((satsSpent: number, estimatedCosts: number) => void)
-          | undefined;
-        onLastMessageSatsUpdate?.(satsSpent, estimatedCosts);
-      } else {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-    } catch (error) {
-      this._handleError(error, callbacks);
-    } finally {
-      callbacks.onPaymentProcessing?.(false);
-    }
-  }
-
-  /**
    * Make the API request with failover support
    */
   private async _makeRequest(params: {
@@ -622,26 +528,53 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
+    /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
+    tinfoilEnabled?: boolean;
   }): Promise<Response> {
-    const { path, method, body, baseUrl, token, headers } = params;
+    const { path, method, body, baseUrl, token, headers, tinfoilEnabled } = params;
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
-      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
-      const response = await fetch(url, {
+      const requestBodyText =
+        body === undefined || method === "GET" ? undefined : JSON.stringify(body);
+      const requestLogId = await this.requestResponseLogSink?.logRequest?.({
         method,
+        url,
+        path,
+        baseUrl,
         headers,
-        body:
-          body === undefined || method === "GET"
-            ? undefined
-            : JSON.stringify(body),
+        body,
+        rawBody: requestBodyText,
       });
+
+      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+
+      const response = tinfoilEnabled
+        ? await fetchTinfoilPreservingPlaintextErrors(
+            { baseUrl },
+            url,
+            {
+              method,
+              headers,
+              body: requestBodyText,
+            }
+          )
+        : await fetch(url, {
+            method,
+            headers,
+            body: requestBodyText,
+          });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
+      (response as any).requestResponseLogId = requestLogId;
+      await this.requestResponseLogSink?.logResponseStart?.(requestLogId, response);
+
+      const contentType = response.headers.get("content-type") || "";
 
       if (!response.ok) {
+        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
         let bodyText: string | undefined;
@@ -650,6 +583,17 @@ export class RoutstrClient {
         } catch (e) {
           bodyText = undefined;
         }
+
+        this._log("ERROR", "[RoutstrClient] Upstream error response", {
+          baseUrl,
+          url,
+          path,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: bodyText ?? "<unable to read response body>",
+        });
+
         return await this._handleErrorResponse(
           params,
           token,
@@ -663,17 +607,28 @@ export class RoutstrClient {
         );
       }
 
+      if (!contentType.includes("text/event-stream")) {
+        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+      }
+
       return response;
     } catch (error: any) {
       // Handle network errors with failover
       if (isNetworkErrorMessage(error?.message || "")) {
+        const fetchUrl = `${baseUrl.replace(/\/$/, "")}${path}`;
+        this._log("ERROR", "[RoutstrClient] Network error fetching from provider", {
+          baseUrl,
+          url: fetchUrl,
+          path,
+          error: error?.message || String(error),
+        });
         return await this._handleErrorResponse(
           params,
           token,
           -1, // just for Network Error to skip all statuses
           undefined,
           undefined,
-          undefined,
+          error?.message || String(error),
           params.retryCount ?? 0
         );
         // return await this._handleNetworkError(error, params);
@@ -682,6 +637,9 @@ export class RoutstrClient {
     }
   }
 
+  /**
+   * Store request details to a file in the reqs/ folder before fetch.
+   */
   /**
    * Handle error responses with failover
    */
@@ -698,6 +656,7 @@ export class RoutstrClient {
       maxTokens?: number;
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
+      tinfoilEnabled?: boolean;
     },
     token: string,
     status: number,
@@ -717,11 +676,41 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorMessage=${errorMessage}`
     );
 
-    this._log(
-      "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Attempting to receive/restore token for ${baseUrl}`
-    );
-    if (params.token.startsWith("cashu")) {
+    // ── Reclaim sats: try the refund token FIRST, then fall back to the ──
+    // original token. This avoids a wasted mint round-trip when the node
+    // already consumed the proofs (the common upstream_error case) and
+    // prevents double-receiving when both are somehow valid.
+    let refundReceived = false;
+
+    if (this.mode === "xcashu" && xCashuRefundToken) {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
+      );
+      const receiveResult =
+        await this.cashuSpender.receiveToken(xCashuRefundToken);
+      if (receiveResult.success) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
+        );
+        // Refund claimed — remove the original spent token from storage so
+        // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        tryNextProvider = true;
+        refundReceived = true;
+      } else {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed, falling back to original token: ${receiveResult.message}`
+        );
+      }
+    }
+
+    // Only try the original token if we didn't get the refund. If the node
+    // already consumed the proofs this will fail gracefully; if the node
+    // errored before consuming them, we reclaim the sats directly.
+    if (!refundReceived && params.token.startsWith("cashu")) {
       const receiveResult = await this.cashuSpender.receiveToken(
         params.token
       );
@@ -730,6 +719,9 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
+        // The original token is back in the wallet — drop the stored IOU so
+        // getPendingCashuTokenAmount()/refundXcashuTokens() don't double-count it.
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
         tryNextProvider = true;
       } else {
         this._log(
@@ -739,41 +731,15 @@ export class RoutstrClient {
       }
     }
 
-    if (this.mode === "xcashu") {
-      if (xCashuRefundToken) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
-        );
-        const receiveResult =
-          await this.cashuSpender.receiveToken(xCashuRefundToken);
-        if (receiveResult.success) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
-          );
-          tryNextProvider = true;
-        } else {
-          this._log(
-            "ERROR",
-            `[xcashu] Failed to receive refund token: ${receiveResult.message}`
-          );
-          throw new ProviderError(
-            baseUrl,
-            status,
-            "[xcashu] Failed to receive refund token",
-            requestId
-          );
-        }
-      } else {
-        if (!tryNextProvider)
-          throw new ProviderError(
-            baseUrl,
-            status,
-            "[xcashu] Failed to receive refund token",
-            requestId
-          );
-      }
+    // In xcashu mode, if neither the refund nor the original was received,
+    // we have no way to recover the sats — throw so the caller can surface it.
+    if (this.mode === "xcashu" && !tryNextProvider) {
+      throw new ProviderError(
+        baseUrl,
+        status,
+        "[xcashu] Failed to receive refund token",
+        requestId
+      );
     }
 
     if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
@@ -786,22 +752,35 @@ export class RoutstrClient {
           params.token,
           baseUrl
         );
-        const currentBalance =
-          currentBalanceInfo.unit === "msat"
-            ? currentBalanceInfo.amount / 1000
-            : currentBalanceInfo.amount;
-        const reservedBalance =
-          currentBalanceInfo.unit === "msat"
-            ? (currentBalanceInfo.reserved ?? 0) / 1000
-            : (currentBalanceInfo.reserved ?? 0);
+        if (currentBalanceInfo.balanceUnknown) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Current balance unknown for ${baseUrl}; using default topup amount=${topupAmount}`
+          );
+        } else {
+          const currentBalance =
+            currentBalanceInfo.unit === "msat"
+              ? currentBalanceInfo.amount / 1000
+              : currentBalanceInfo.amount;
+          const reservedBalance =
+            currentBalanceInfo.unit === "msat"
+              ? (currentBalanceInfo.reserved ?? 0) / 1000
+              : (currentBalanceInfo.reserved ?? 0);
 
-        const shortfall = Math.max(0, params.requiredSats - currentBalance + reservedBalance);
-        topupAmount = shortfall > (0.21 * params.requiredSats) ? shortfall : (0.21 * params.requiredSats);
+          const shortfall = Math.max(
+            0,
+            params.requiredSats - currentBalance + reservedBalance
+          );
+          topupAmount =
+            shortfall > 0.21 * params.requiredSats
+              ? shortfall
+              : 0.21 * params.requiredSats;
 
-        this._log(
-          "DEBUG",
-          `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
-        );
+          this._log(
+            "DEBUG",
+            `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
+          );
+        }
       } catch (e) {
         this._log(
           "WARN",
@@ -863,7 +842,12 @@ export class RoutstrClient {
           return this._makeRequest({
             ...params,
             token: params.token,
-            headers: this._withAuthHeader(params.baseHeaders, params.token),
+            headers: this._withAuthAndTinfoilHeaders(
+              params.baseHeaders,
+              params.token,
+              params.tinfoilEnabled,
+              params.selectedModel?.id
+            ),
             retryCount: retryCount + 1,
           });
         } else {
@@ -901,8 +885,9 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           tryNextProvider = true;
         } else {
-          const latestTokenBalance =
-            latestBalanceInfo.unit === "msat"
+          const latestTokenBalance = latestBalanceInfo.balanceUnknown
+            ? undefined
+            : latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
 
@@ -917,7 +902,7 @@ export class RoutstrClient {
             retryToken = latestBalanceInfo.apiKey;
           }
 
-          if (latestTokenBalance >= 0) {
+          if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
             this.storageAdapter.updateApiKeyBalance(
               baseUrl,
               latestTokenBalance
@@ -940,7 +925,12 @@ export class RoutstrClient {
         return this._makeRequest({
           ...params,
           token: retryToken,
-          headers: this._withAuthHeader(params.baseHeaders, retryToken),
+          headers: this._withAuthAndTinfoilHeaders(
+            params.baseHeaders,
+            retryToken,
+            params.tinfoilEnabled,
+            params.selectedModel?.id
+          ),
           retryCount: retryCount + 1,
         });
       } else {
@@ -1008,7 +998,11 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
         );
-        if (!refundResult.success && latestBalanceInfo.amount > 0) {
+        if (
+          !refundResult.success &&
+          latestBalanceInfo.amount > 0 &&
+          !latestBalanceInfo.balanceUnknown
+        ) {
           throw new ProviderError(
             baseUrl,
             status,
@@ -1018,10 +1012,17 @@ export class RoutstrClient {
       }
     }
 
-    this.providerManager.markFailed(baseUrl);
+    const failReason = [
+      `status=${status}`,
+      requestId ? `requestId=${requestId}` : null,
+      errorMessage ? `body=${errorMessage.slice(0, 200)}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    this.providerManager.markFailed(baseUrl, failReason);
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed`
+      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed (${failReason})`
     );
 
     if (!selectedModel) {
@@ -1061,6 +1062,14 @@ export class RoutstrClient {
         params.maxTokens
       );
 
+      if (params.tinfoilEnabled) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: Attesting Tinfoil failover provider ${nextProvider} before spend`
+        );
+        await prepareTinfoilClient({ baseUrl: nextProvider });
+      }
+
       this._log(
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
@@ -1071,8 +1080,10 @@ export class RoutstrClient {
         baseUrl: nextProvider,
       });
 
-      // Retry with new provider (reset retry count)
-      return this._makeRequest({
+      // Retry with new provider (reset retry count). Attach the balance that
+      // was observed before the retry request so callers do not have to query
+      // after the provider may already have charged the request.
+      const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
@@ -1081,9 +1092,21 @@ export class RoutstrClient {
         selectedModel: newModel,
         token: spendResult.token!,
         requiredSats: newRequiredSats,
-        headers: this._withAuthHeader(params.baseHeaders, spendResult.token!),
+        headers: this._withAuthAndTinfoilHeaders(
+          params.baseHeaders,
+          spendResult.token!,
+          params.tinfoilEnabled,
+          newModel.id
+        ),
         retryCount: 0,
       });
+      (retryResponse as any).initialTokenBalanceInSats =
+        spendResult.tokenBalanceUnit === "msat"
+          ? spendResult.tokenBalance / 1000
+          : spendResult.tokenBalance;
+      (retryResponse as any).initialTokenBalanceUnknown =
+        spendResult.tokenBalanceUnknown;
+      return retryResponse;
     }
 
     // No more providers to try
@@ -1101,6 +1124,7 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     initialTokenBalance: number;
+    initialTokenBalanceUnknown?: boolean;
     fallbackSatsSpent?: number;
     response?: Response;
     modelId?: string;
@@ -1113,6 +1137,7 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       initialTokenBalance,
+      initialTokenBalanceUnknown,
       fallbackSatsSpent,
       response,
       modelId,
@@ -1155,8 +1180,9 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey,
           baseUrl
         );
-        const latestTokenBalance =
-          latestBalanceInfo.unit === "msat"
+        const latestTokenBalance = latestBalanceInfo.balanceUnknown
+          ? undefined
+          : latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
 
@@ -1168,12 +1194,17 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
-        this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        if (latestTokenBalance !== undefined) {
+          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+        }
 
-        satsSpent = initialTokenBalance - latestTokenBalance;
+        satsSpent =
+          latestTokenBalance !== undefined && !initialTokenBalanceUnknown
+            ? Math.max(0, initialTokenBalance - latestTokenBalance)
+            : (fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
-        satsSpent = fallbackSatsSpent ?? initialTokenBalance;
+        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0;
       }
     }
 
@@ -1204,6 +1235,16 @@ export class RoutstrClient {
     })();
 
     return satsSpent;
+  }
+
+  /**
+   * Extract sats cost from EHBP/Tinfoil response headers as a last-resort
+   * fallback when neither balance delta nor SSE/body usage provides a cost.
+   */
+  private _headerSatsCost(response?: Response): number | undefined {
+    if (!response) return undefined;
+    const headerUsage = extractUsageFromResponseHeaders(response.headers);
+    return headerUsage?.satsCost;
   }
 
   private async _trackResponseUsage(params: {
@@ -1265,7 +1306,31 @@ export class RoutstrClient {
       }
 
       if (!usage) {
-        return;
+        // No usage from SSE/body — try response headers (EHBP/Tinfoil path
+        // where cost is only in headers because the body is encrypted).
+        const headerUsage = extractUsageFromResponseHeaders(response.headers);
+        if (headerUsage) {
+          usage = headerUsage;
+        } else {
+          return;
+        }
+      } else {
+        // Merge header-based costs into SSE/body-extracted usage. For EHBP
+        // requests, the SSE body may have token counts but no cost breakdown;
+        // the headers carry the authoritative cost. Header values take
+        // priority when non-zero.
+        const headerUsage = extractUsageFromResponseHeaders(response.headers);
+        if (headerUsage) {
+          // Only override cost fields that headers actually have
+          if (headerUsage.totalMsats) {
+            usage.totalMsats = headerUsage.totalMsats;
+            usage.satsCost = headerUsage.satsCost;
+          }
+          if (headerUsage.cost) usage.cost = headerUsage.cost;
+          if (headerUsage.inputMsats) usage.inputMsats = headerUsage.inputMsats;
+          if (headerUsage.outputMsats) usage.outputMsats = headerUsage.outputMsats;
+          if (headerUsage.totalUsd) usage.totalUsd = headerUsage.totalUsd;
+        }
       }
 
       const finalRequestId = requestId || "unknown";
@@ -1309,123 +1374,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Convert messages for API format
-   */
-  private async _convertMessages(messages: Message[]): Promise<any[]> {
-    return Promise.all(
-      messages
-        .filter((m) => m.role !== "system")
-        .map(async (m) => ({
-          role: m.role,
-          content: typeof m.content === "string" ? m.content : m.content,
-        }))
-    );
-  }
-
-  /**
-   * Create assistant message from streaming result
-   */
-  private async _createAssistantMessage(
-    result: StreamingResult
-  ): Promise<Message> {
-    if (result.images && result.images.length > 0) {
-      // Multimodal message with images
-      const content: any[] = [];
-
-      if (result.content) {
-        content.push({
-          type: "text",
-          text: result.content,
-          thinking: result.thinking,
-          citations: result.citations,
-          annotations: result.annotations,
-        });
-      }
-
-      for (const img of result.images) {
-        content.push({
-          type: "image_url",
-          image_url: {
-            url: img.image_url.url,
-          },
-        });
-      }
-
-      return {
-        role: "assistant",
-        content,
-      };
-    }
-
-    // Simple text message
-    return {
-      role: "assistant",
-      content: result.content || "",
-    };
-  }
-
-  /**
-   * Calculate estimated costs from usage
-   */
-  private _getEstimatedCosts(
-    selectedModel: Model,
-    streamingResult: StreamingResult
-  ): number {
-    let estimatedCosts = 0;
-    if (streamingResult.usage) {
-      const { completion_tokens, prompt_tokens } = streamingResult.usage;
-      if (completion_tokens !== undefined && prompt_tokens !== undefined) {
-        estimatedCosts =
-          (selectedModel.sats_pricing?.completion ?? 0) * completion_tokens +
-          (selectedModel.sats_pricing?.prompt ?? 0) * prompt_tokens;
-      }
-    }
-    return estimatedCosts;
-  }
-
-  /**
-   * Get pending API key amount
-   */
-  private _getPendingCashuTokenAmount(): number {
-    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
-    return apiKeyDistribution.reduce((total, item) => total + item.amount, 0);
-  }
-
-  /**
-   * Handle errors and notify callbacks
-   */
-  private _handleError(error: unknown, callbacks: StreamingCallbacks): void {
-    this._log("ERROR", "[RoutstrClient] _handleError: Error occurred", error);
-
-    if (error instanceof Error) {
-      const isStreamError =
-        error.message.includes("Error in input stream") ||
-        error.message.includes("Load failed");
-      const modifiedErrorMsg = isStreamError
-        ? "AI stream was cut off, turn on Keep Active or please try again"
-        : error.message;
-
-      this._log(
-        "ERROR",
-        `[RoutstrClient] _handleError: Error type=${error.constructor.name}, message=${modifiedErrorMsg}, isStreamError=${isStreamError}`
-      );
-
-      callbacks.onMessageAppend({
-        role: "system",
-        content:
-          "Uncaught Error: " +
-          modifiedErrorMsg +
-          (this.alertLevel === "max" ? " | " + error.stack : ""),
-      });
-    } else {
-      callbacks.onMessageAppend({
-        role: "system",
-        content: "Unknown Error: Please tag Routstr on Nostr and/or retry.",
-      });
-    }
-  }
-
-  /**
    * Check wallet balance and throw if insufficient
    */
   private async _checkBalance(): Promise<void> {
@@ -1448,6 +1396,7 @@ export class RoutstrClient {
     token: string;
     tokenBalance: number;
     tokenBalanceUnit: "sat" | "msat";
+    tokenBalanceUnknown: boolean;
   }> {
     const { mintUrl, amount, baseUrl } = params;
 
@@ -1530,6 +1479,7 @@ export class RoutstrClient {
 
       let tokenBalance = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
+      let tokenBalanceUnknown = false;
 
       const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
       const distributionForBaseUrl = apiKeyDistribution.find(
@@ -1547,6 +1497,7 @@ export class RoutstrClient {
           );
           tokenBalance = balanceInfo.amount;
           tokenBalanceUnit = balanceInfo.unit;
+          tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
@@ -1561,6 +1512,7 @@ export class RoutstrClient {
         token: parentApiKey?.key ?? "",
         tokenBalance,
         tokenBalanceUnit,
+        tokenBalanceUnknown,
       };
     }
 
@@ -1594,6 +1546,7 @@ export class RoutstrClient {
       token: spendResult.token!,
       tokenBalance: spendResult.balance,
       tokenBalanceUnit: spendResult.unit ?? "sat",
+      tokenBalanceUnknown: false,
     };
   }
 
@@ -1629,4 +1582,27 @@ export class RoutstrClient {
 
     return nextHeaders;
   }
+
+  /**
+   * Attach auth headers and preserve the plaintext model hint required by the
+   * Routstr proxy for Tinfoil/EHBP requests. EHBP encrypts the JSON body, so
+   * retries/failover must not rebuild headers from baseHeaders alone or the
+   * proxy cannot route/price the encrypted request.
+   */
+  private _withAuthAndTinfoilHeaders(
+    headers: Record<string, string>,
+    token: string,
+    tinfoilEnabled?: boolean,
+    modelId?: string
+  ): Record<string, string> {
+    const nextHeaders = this._withAuthHeader(headers, token);
+
+    if (tinfoilEnabled && modelId) {
+      nextHeaders["X-Routstr-Model"] = modelId;
+    }
+
+    return nextHeaders;
+  }
+
 }
+

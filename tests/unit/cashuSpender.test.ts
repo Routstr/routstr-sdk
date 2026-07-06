@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { CashuSpender } from "../wallet/CashuSpender";
-import type { StorageAdapter, WalletAdapter } from "../wallet/interfaces";
+import { CashuSpender } from "../../wallet/CashuSpender";
+import { InsufficientBalanceError } from "../../core";
+import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 
 const createWallet = (overrides?: Partial<WalletAdapter>): WalletAdapter => ({
   getBalances: async () => ({}),
@@ -14,11 +15,12 @@ const createWallet = (overrides?: Partial<WalletAdapter>): WalletAdapter => ({
 const createStorage = (
   overrides?: Partial<StorageAdapter>
 ): StorageAdapter => ({
-  getToken: () => null,
-  setToken: () => {},
-  removeToken: () => {},
-  updateTokenBalance: () => {},
-  getCachedTokenDistribution: () => [],
+  getXcashuTokens: () => ({}),
+  getXcashuTokensForBaseUrl: () => [],
+  addXcashuToken: () => {},
+  removeXcashuToken: () => {},
+  clearXcashuTokensForBaseUrl: () => {},
+  updateXcashuTokenTryCount: () => {},
   getApiKeyDistribution: () => [],
   removeApiKey: () => {},
   saveProviderInfo: () => {},
@@ -38,27 +40,19 @@ const createStorage = (
 });
 
 describe("CashuSpender", () => {
-  it("fails with invalid amount", async () => {
-    const spender = new CashuSpender(createWallet(), createStorage());
-
-    const result = await spender.spend({
-      mintUrl: "https://mint.example.com",
-      amount: NaN,
-      baseUrl: "https://provider.example.com",
-    });
-
-    expect(result.status).toBe("failed");
-    expect(result.error).toBe("Please enter a valid amount");
-  });
-
-  it("reuses stored token when pending balance is sufficient", async () => {
+  it("reuses stored API key when pending balance is sufficient", async () => {
     const spender = new CashuSpender(
       createWallet({
         getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       }),
       createStorage({
-        getToken: () => "stored-token",
-        getCachedTokenDistribution: () => [
+        getApiKey: () => ({
+          key: "stored-api-key",
+          baseUrl: "https://provider.example.com/",
+          balance: 42,
+          lastUsed: null,
+        }),
+        getApiKeyDistribution: () => [
           { baseUrl: "https://provider.example.com", amount: 42 },
         ],
       })
@@ -72,7 +66,7 @@ describe("CashuSpender", () => {
     });
 
     expect(result.status).toBe("success");
-    expect(result.token).toBe("stored-token");
+    expect(result.token).toBe("stored-api-key");
     expect(result.balance).toBe(42);
   });
 
@@ -82,17 +76,15 @@ describe("CashuSpender", () => {
         getBalances: async () => ({ "https://mint.example.com": 5 }),
         getMintUnits: () => ({ "https://mint.example.com": "sat" }),
       }),
-      createStorage({ getCachedTokenDistribution: () => [] })
+      createStorage()
     );
 
-    const result = await spender.spend({
-      mintUrl: "https://mint.example.com",
-      amount: 10,
-      baseUrl: "https://provider.example.com",
-    });
-
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("Insufficient balance");
-    expect(result.error).toContain("need 10 sats");
+    await expect(
+      spender.spend({
+        mintUrl: "https://mint.example.com",
+        amount: 10,
+        baseUrl: "https://provider.example.com",
+      })
+    ).rejects.toThrow(InsufficientBalanceError);
   });
 });

@@ -6,6 +6,44 @@ export interface UsageTrackingData {
   totalTokens: number;
   cost: number;
   satsCost: number;
+  /** Upstream provider/route that handled the request (e.g. "openrouter:openrouter:Anthropic"). */
+  provider?: string;
+  /** Full cost breakdown emitted by the upstream `cost` object. */
+  baseMsats?: number;
+  inputMsats?: number;
+  outputMsats?: number;
+  totalMsats?: number;
+  totalUsd?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  cacheReadMsats?: number;
+  cacheCreationMsats?: number;
+  remainingBalanceMsats?: number;
+}
+
+const numOrUndef = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+/**
+ * Extract the detailed cost breakdown from an upstream `cost` object.
+ * Returns the camelCased fields we persist on a UsageTrackingData/entry.
+ */
+function extractCostBreakdown(
+  costObj: Record<string, unknown> | null | undefined
+): Partial<UsageTrackingData> {
+  if (!costObj || typeof costObj !== "object") return {};
+  return {
+    baseMsats: numOrUndef(costObj.base_msats),
+    inputMsats: numOrUndef(costObj.input_msats),
+    outputMsats: numOrUndef(costObj.output_msats),
+    totalMsats: numOrUndef(costObj.total_msats),
+    totalUsd: numOrUndef(costObj.total_usd),
+    cacheReadInputTokens: numOrUndef(costObj.cache_read_input_tokens),
+    cacheCreationInputTokens: numOrUndef(costObj.cache_creation_input_tokens),
+    cacheReadMsats: numOrUndef(costObj.cache_read_msats),
+    cacheCreationMsats: numOrUndef(costObj.cache_creation_msats),
+    remainingBalanceMsats: numOrUndef(costObj.remaining_balance_msats),
+  };
 }
 
 export function extractUsageFromResponseBody(
@@ -23,6 +61,7 @@ export function extractUsageFromResponseBody(
 
   let cost = 0;
   let satsCost = fallbackSatsCost;
+  let breakdown: Partial<UsageTrackingData> = {};
 
   if (typeof costValue === "number") {
     cost = costValue;
@@ -35,7 +74,13 @@ export function extractUsageFromResponseBody(
     if (typeof totalMsats === "number") {
       satsCost = totalMsats / 1000;
     }
+    breakdown = extractCostBreakdown(costObj);
   }
+
+  const provider =
+    typeof (body as { provider?: unknown }).provider === "string"
+      ? ((body as { provider?: string }).provider as string)
+      : undefined;
 
   if (
     promptTokens === 0 &&
@@ -53,6 +98,8 @@ export function extractUsageFromResponseBody(
     totalTokens,
     cost,
     satsCost,
+    provider,
+    ...breakdown,
   };
 }
 
@@ -72,6 +119,9 @@ export function extractUsageFromSSEJson(
     return null;
   }
 
+  const provider =
+    typeof parsed.provider === "string" ? parsed.provider : undefined;
+
   // Handle standalone cost chunk: {"cost":{"base_msats":...,"input_msats":...,"output_msats":...,"total_msats":2,...}}
   if (!parsed.usage && parsed.cost && typeof parsed.cost === "object") {
     const costObj = parsed.cost;
@@ -84,6 +134,8 @@ export function extractUsageFromSSEJson(
       totalTokens: Number((costObj.input_tokens ?? 0) + (costObj.output_tokens ?? 0)),
       cost: Number(cost),
       satsCost: msats > 0 ? msats / 1000 : fallbackSatsCost,
+      provider,
+      ...extractCostBreakdown(costObj),
     };
   }
 
@@ -96,12 +148,20 @@ export function extractUsageFromSSEJson(
   
   let cost = 0;
   let msats = 0;
+  let breakdown: Partial<UsageTrackingData> = {};
 
   if (typeof usageCost === "number") {
     cost = usageCost;
   } else if (usageCost && typeof usageCost === "object") {
     cost = usageCost.total_usd ?? 0;
     msats = usageCost.total_msats ?? 0;
+    breakdown = extractCostBreakdown(usageCost as Record<string, unknown>);
+  }
+
+  // Some upstreams put the detailed breakdown under metadata.routstr.cost.
+  const routstrCost = parsed.metadata?.routstr?.cost;
+  if (routstrCost && typeof routstrCost === "object") {
+    breakdown = { ...extractCostBreakdown(routstrCost), ...breakdown };
   }
 
   // Fallbacks if not in usage.cost
@@ -125,6 +185,8 @@ export function extractUsageFromSSEJson(
     totalTokens,
     cost: Number(cost ?? 0),
     satsCost: msats > 0 ? msats / 1000 : fallbackSatsCost,
+    provider,
+    ...breakdown,
   };
 
   if (
@@ -138,6 +200,43 @@ export function extractUsageFromSSEJson(
   }
 
   return result;
+}
+
+/**
+ * Extract cost/usage from EHBP/Tinfoil response headers.
+ *
+ * For EHBP requests the proxy cannot inject cost into the JSON/SSE body
+ * (the body is opaque encrypted). Instead it returns cost as response
+ * headers. This parses those headers into the same UsageTrackingData
+ * shape used for SSE/body extraction, so callers can merge or fall back.
+ */
+export function extractUsageFromResponseHeaders(
+  headers: Headers | Record<string, string>
+): UsageTrackingData | null {
+  const get = (name: string): string | null => {
+    if (headers instanceof Headers) return headers.get(name);
+    // Case-insensitive lookup for plain objects
+    const lower = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lower) return v;
+    }
+    return null;
+  };
+
+  const totalMsats = Number(get("X-Routstr-Cost-Msats"));
+  if (!totalMsats || !Number.isFinite(totalMsats)) return null;
+
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cost: Number(get("X-Routstr-Cost-Usd")) || 0,
+    satsCost: totalMsats / 1000,
+    totalMsats,
+    inputMsats: Number(get("X-Routstr-Input-Cost-Msats")) || 0,
+    outputMsats: Number(get("X-Routstr-Output-Cost-Msats")) || 0,
+    totalUsd: Number(get("X-Routstr-Cost-Usd")) || undefined,
+  };
 }
 
 export function toUsageStats(

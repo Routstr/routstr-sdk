@@ -1,8 +1,7 @@
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
-import type { StorageAdapter, ProviderRegistry } from "../wallet/interfaces";
-import type { ProviderInfo, Model, SdkLogger } from "../core";
-import { consoleLogger } from "../core/types";
+import type { StorageAdapter } from "../wallet/interfaces";
+import type { ProviderInfo, Model } from "../core";
 import { SDK_STORAGE_KEYS } from "./keys";
 import type { StorageDriver, SdkStorageState } from "./types";
 
@@ -850,41 +849,3 @@ export const createStorageAdapterFromStore = (
     store.getState().updateXcashuTokenTryCount(token, tryCount);
   },
 });
-
-export const createProviderRegistryFromStore = (
-  store: SdkStore,
-  logger?: SdkLogger
-): ProviderRegistry => {
-  const log = (logger ?? consoleLogger).child("ProviderRegistry");
-  return {
-    getModelsForProvider: (baseUrl) => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      return store.getState().modelsFromAllProviders[normalized] || [];
-    },
-    getDisabledProviders: () => store.getState().disabledProviders,
-    getProviderMints: (baseUrl) => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      return store.getState().mintsFromAllProviders[normalized] || [];
-    },
-    getProviderInfo: async (baseUrl) => {
-      const normalized = normalizeBaseUrl(baseUrl);
-      const cached = store.getState().infoFromAllProviders[normalized];
-      if (cached) return cached;
-      try {
-        const response = await fetch(`${normalized}v1/info`);
-        if (!response.ok) {
-          throw new Error(`Failed ${response.status}`);
-        }
-        const info = (await response.json()) as ProviderInfo;
-        const next = { ...store.getState().infoFromAllProviders };
-        next[normalized] = info;
-        store.getState().setInfoFromAllProviders(next);
-        return info;
-      } catch (error) {
-        log.warn(`Failed to fetch provider info from ${normalized}:`, error);
-        return null;
-      }
-    },
-    getAllProvidersModels: () => store.getState().modelsFromAllProviders,
-  };
-};

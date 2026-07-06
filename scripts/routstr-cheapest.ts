@@ -1,15 +1,17 @@
-import type { Message } from "@/types/chat";
+import type { Message } from "@routstr/sdk";
 import {
   ModelManager,
   MintDiscovery,
   ProviderManager,
   RoutstrClient,
+  fetchAIResponse,
+  consoleLogger,
 } from "@routstr/sdk";
 import { getDecodedToken } from "@cashu/cashu-ts";
-import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
+import { createSdkStore } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
   createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -150,7 +152,6 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
   const discoveryAdapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
   const storageAdapter = createStorageAdapterFromStore(store);
 
   const modelManager = new ModelManager(discoveryAdapter, {
@@ -162,7 +163,7 @@ async function main(): Promise<void> {
   const mintDiscovery = new MintDiscovery(discoveryAdapter);
   await mintDiscovery.discoverMints(providers);
 
-  const providerManager = new ProviderManager(providerRegistry);
+  const providerManager = new ProviderManager(discoveryAdapter);
   let baseUrl = "";
   let selectedModel = null as
     | ReturnType<
@@ -176,7 +177,6 @@ async function main(): Promise<void> {
       : `${forcedProvider}/`;
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
-    console.log(models);
     const match = models.find((model) => model.id === resolvedModelId);
     if (!match) {
       console.error(
@@ -285,7 +285,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    const providerMints = providerRegistry.getProviderMints(baseUrl);
+    const providerMints = discoveryAdapter.getCachedMints()[baseUrl] || [];
     const mintUrl =
       walletAdapter.getActiveMintUrl() ||
       providerMints[0] ||
@@ -308,24 +308,23 @@ async function main(): Promise<void> {
     const client = new RoutstrClient(
       walletAdapter,
       storageAdapter,
-      providerRegistry,
+      discoveryAdapter,
       alertLevel,
       "xcashu"
     );
+    const logger = consoleLogger.child("routstr-cheapest");
 
     const messageHistory: Message[] = [{ role: "user", content: resolvedText }];
     let finalMessage = "";
     let errorMessage = "";
 
     try {
-      await client.fetchAIResponse(
+      await fetchAIResponse(
         {
           messageHistory,
           selectedModel,
           baseUrl,
           mintUrl,
-          balance: totalBalance,
-          transactionHistory: [],
           // maxTokens: 1000,
         },
         {
@@ -337,13 +336,18 @@ async function main(): Promise<void> {
                 typeof message.content === "string"
                   ? message.content
                   : JSON.stringify(message.content);
-              console.log("FULL", message);
+              console.log("=== FULL ASSISTANT MESSAGE ===");
+              console.dir(message, { depth: null, colors: true });
+              console.log("=== END ASSISTANT MESSAGE ===");
             }
             if (message.role === "system") {
               errorMessage =
                 typeof message.content === "string"
                   ? message.content
                   : JSON.stringify(message.content);
+              console.log("=== FULL SYSTEM MESSAGE ===");
+              console.dir(message, { depth: null, colors: true });
+              console.log("=== END SYSTEM MESSAGE ===");
             }
           },
           onBalanceUpdate: () => {},
@@ -362,6 +366,11 @@ async function main(): Promise<void> {
               console.error(`Estimated costs: ${estimatedCosts.toFixed(3)}`);
             }
           },
+        },
+        {
+          client,
+          alertLevel,
+          logger,
         }
       );
     } catch (error) {

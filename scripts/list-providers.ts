@@ -1,6 +1,6 @@
 import { ModelManager } from "@routstr/sdk";
-import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
-import { createDiscoveryAdapterFromStore } from "@routstr/sdk/storage";
+import { createSdkStore, createDiscoveryAdapterFromStore } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 
 async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });

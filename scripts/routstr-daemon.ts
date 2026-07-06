@@ -3,19 +3,22 @@ import { Readable } from "stream";
 import {
   routeRequests,
   createSdkStore,
-  createSqliteDriver,
-  ModelManager,
   InsufficientBalanceError,
 } from "@routstr/sdk";
 import {
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
+  createSqliteDriver,
+  createSqliteUsageTrackingDriver,
+  ModelManager,
+} from "@routstr/sdk/node";
+import {
+  createShardedDiscoveryAdapter,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
 import { getDecodedToken } from "@cashu/cashu-ts";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
+import { FileRequestResponseLogSink } from "./requestResponseLogSink";
 
 const MOCK_ERROR_CODES: Record<string, number> = {
   // 'https://api.provider.com': 429,
@@ -44,6 +47,8 @@ if (process.env.NODE_ENV === "test" || process.env.MOCK_ERRORS) {
 }
 
 const REQUESTS_DIR = join(__dirname, "requests");
+const DEFAULT_REQUEST_RESPONSE_LOG_DIR = join(__dirname, "request-response-logs");
+const EVENT_STORE_DB_PATH = join(__dirname, "events.db");
 
 async function ensureRequestsDir(): Promise<void> {
   try {
@@ -57,6 +62,7 @@ function parseArgs(argv: string[]): {
   port: number;
   provider: string | null;
   mode: "xcashu" | "apikeys";
+  requestResponseLogDir?: string;
 } {
   const portFlagIndex = argv.findIndex((arg) => arg === "--port");
   const providerFlagIndex = argv.findIndex(
@@ -64,6 +70,9 @@ function parseArgs(argv: string[]): {
   );
   const modeFlagIndex = argv.findIndex(
     (arg) => arg === "--mode" || arg === "-m"
+  );
+  const requestResponseLogDirFlagIndex = argv.findIndex(
+    (arg) => arg === "--request-response-log-dir" || arg === "--rr-log-dir"
   );
 
   const port =
@@ -77,8 +86,12 @@ function parseArgs(argv: string[]): {
     modeArg === "xcashu"
       ? modeArg
       : "apikeys";
+  const requestResponseLogDir =
+    requestResponseLogDirFlagIndex !== -1
+      ? argv[requestResponseLogDirFlagIndex + 1]?.trim() || DEFAULT_REQUEST_RESPONSE_LOG_DIR
+      : process.env.ROUTSTR_REQUEST_RESPONSE_LOG_DIR;
 
-  return { port, provider, mode };
+  return { port, provider, mode, requestResponseLogDir };
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -245,24 +258,43 @@ function toForwardHeaders(
 }
 
 async function main(): Promise<void> {
-  const { port, provider, mode } = parseArgs(process.argv);
+  const { port, provider, mode, requestResponseLogDir } = parseArgs(process.argv);
+  const requestResponseLogSink = requestResponseLogDir
+    ? new FileRequestResponseLogSink({ dir: requestResponseLogDir })
+    : undefined;
 
-  const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
+  const driver = createSqliteDriver();
+  const { store, hydrate } = createSdkStore({ driver });
   await hydrate;
 
   // Set hardcoded disabled providers
   store.getState().setDisabledProviders(DISABLED_PROVIDERS);
 
-  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const discoveryAdapter = await createShardedDiscoveryAdapter({ driver });
   const storageAdapter = createStorageAdapterFromStore(store);
 
+  const usageTrackingDriver = createSqliteUsageTrackingDriver({ legacyStorageDriver: driver });
+
   console.log("Bootstrapping providers...");
-  const modelManager = new ModelManager(discoveryAdapter);
+  const modelManager = new ModelManager(discoveryAdapter, {
+    eventStoreDbPath: EVENT_STORE_DB_PATH,
+  });
   const providers = await modelManager.bootstrapProviders(false);
   console.log(`Bootstrapped ${providers.length} providers`);
   await modelManager.fetchModels(providers);
   console.log("Provider bootstrap complete.");
+
+  // Catch up on any Nostr events published since last run
+  await modelManager.refreshNostrEvents();
+  console.log("Initial Nostr refresh complete.");
+
+  // Periodically fetch new Nostr events (new providers, reviews, models)
+  const NOSTR_REFRESH_INTERVAL_MS = 21 * 60 * 1000; // 21 minutes
+  const nostrRefreshInterval = setInterval(() => {
+    modelManager.refreshNostrEvents().catch((err) => {
+      console.error("Periodic Nostr refresh failed:", err);
+    });
+  }, NOSTR_REFRESH_INTERVAL_MS);
 
   let activeMintUrl: string | null = null;
   let mintUnits: Record<string, "sat" | "msat"> = {};
@@ -410,9 +442,10 @@ async function main(): Promise<void> {
           mode,
           walletAdapter,
           storageAdapter,
-          providerRegistry,
           discoveryAdapter,
           modelManager,
+          usageTrackingDriver,
+          requestResponseLogSink,
         });
 
         res.statusCode = response.status;
@@ -471,9 +504,16 @@ async function main(): Promise<void> {
     }
   );
 
+  server.on("close", () => {
+    clearInterval(nostrRefreshInterval);
+  });
+
   server.listen(port, async () => {
     await ensureRequestsDir();
     console.log(`Routstr daemon listening on http://localhost:${port} (mode: ${mode})`);
+    if (requestResponseLogDir) {
+      console.log(`Request/response logs: ${requestResponseLogDir}`);
+    }
   });
 }
 

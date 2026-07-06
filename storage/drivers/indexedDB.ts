@@ -15,17 +15,40 @@ const openDatabase = (
     return Promise.reject(new Error("IndexedDB is not available"));
   }
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
+    // Version 3 — unified with usageTracking driver so both open the same DB
+    // at the same version. Adds `provider` index to the usage_tracking store.
+    const request = indexedDB.open(dbName, 3);
 
     request.onupgradeneeded = () => {
       const db = request.result;
+      // Create our own store
       if (!db.objectStoreNames.contains(storeName)) {
         db.createObjectStore(storeName);
+      }
+      // Also create usage_tracking if it doesn't exist (cross-driver init)
+      if (storeName !== "usage_tracking" && !db.objectStoreNames.contains("usage_tracking")) {
+        const utStore = db.createObjectStore("usage_tracking", { keyPath: "id" });
+        utStore.createIndex("timestamp", "timestamp", { unique: false });
+        utStore.createIndex("modelId", "modelId", { unique: false });
+        utStore.createIndex("baseUrl", "baseUrl", { unique: false });
+        utStore.createIndex("sessionId", "sessionId", { unique: false });
+        utStore.createIndex("client", "client", { unique: false });
+        utStore.createIndex("provider", "provider", { unique: false });
+      }
+      // Also create sdk_storage if it doesn't exist (cross-driver init)
+      if (storeName !== "sdk_storage" && !db.objectStoreNames.contains("sdk_storage")) {
+        db.createObjectStore("sdk_storage");
       }
     };
 
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+    request.onblocked = () => {
+      console.warn(
+        `[IndexedDB driver] open blocked for "${dbName}" (store: "${storeName}") — close other tabs using this DB`
+      );
+      reject(new Error(`IndexedDB "${dbName}" blocked by another connection`));
+    };
   });
 };
 

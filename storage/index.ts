@@ -1,55 +1,55 @@
 import { localStorageDriver } from "./drivers/localStorage";
 import { createMemoryDriver } from "./drivers/memory";
-import {
-  createSqliteDriver,
-  createBunSqliteDriver,
-} from "./drivers/sqlite";
 import { createIndexedDBDriver } from "./drivers/indexedDB";
 import {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
-  createSqliteUsageTrackingDriver,
-  createBunSqliteUsageTrackingDriver,
   type UsageTrackingDriver,
 } from "./usageTracking";
 import type { StorageDriver } from "./types";
 import {
   createSdkStore,
-  createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
   type SdkStore,
 } from "./store";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 
 export type { StorageDriver } from "./types";
 export type { SdkStore } from "./store";
 export type { DiscoveryAdapter } from "../discovery/interfaces";
-export type { StorageAdapter, ProviderRegistry, XCashuTokenEntry } from "../wallet/interfaces";
+export type { StorageAdapter, XCashuTokenEntry } from "../wallet/interfaces";
 export type {
+  AggregateUsageOptions,
+  ListUsageTrackingOptions,
+  UsageAggregateRow,
+  UsageGroupBy,
   UsageTrackingDriver,
   UsageTrackingEntry,
-  ListUsageTrackingOptions,
 } from "./usageTracking";
 export { SDK_STORAGE_KEYS } from "./keys";
 export {
   createSdkStore,
   createDiscoveryAdapterFromStore,
-  createProviderRegistryFromStore,
   createStorageAdapterFromStore,
 } from "./store";
 export {
   localStorageDriver,
   createMemoryDriver,
-  createSqliteDriver,
-  createBunSqliteDriver,
   createIndexedDBDriver,
 };
 export {
   createIndexedDBUsageTrackingDriver,
   createMemoryUsageTrackingDriver,
-  createSqliteUsageTrackingDriver,
-  createBunSqliteUsageTrackingDriver,
 } from "./usageTracking";
+import {
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
+export {
+  createShardedDiscoveryAdapter,
+} from "./shardedDiscoveryAdapter";
+export type {
+  ShardedDiscoveryAdapterOptions,
+} from "./shardedDiscoveryAdapter";
 
 const isBrowser = (): boolean => {
   try {
@@ -62,36 +62,12 @@ const isBrowser = (): boolean => {
   }
 };
 
-const isNode = (): boolean => {
-  try {
-    return (
-      typeof process !== "undefined" &&
-      process.versions != null &&
-      process.versions.node != null
-    );
-  } catch {
-    return false;
-  }
-};
-
 let defaultDriver: StorageDriver | null = null;
-
-const isBun = (): boolean => {
-  return typeof process.versions.bun !== "undefined";
-};
 
 export const getDefaultSdkDriver = (): StorageDriver => {
   if (defaultDriver) return defaultDriver;
   if (isBrowser()) {
     defaultDriver = localStorageDriver;
-    return defaultDriver;
-  }
-  if (isBun()) {
-    defaultDriver = createMemoryDriver();
-    return defaultDriver;
-  }
-  if (isNode()) {
-    defaultDriver = createSqliteDriver();
     return defaultDriver;
   }
   defaultDriver = createMemoryDriver();
@@ -120,18 +96,6 @@ export const getDefaultUsageTrackingDriver = (): UsageTrackingDriver => {
     return defaultUsageTrackingDriver;
   }
 
-  if (isBun()) {
-    defaultUsageTrackingDriver = createBunSqliteUsageTrackingDriver();
-    return defaultUsageTrackingDriver;
-  }
-
-  if (isNode()) {
-    defaultUsageTrackingDriver = createSqliteUsageTrackingDriver({
-      legacyStorageDriver: storageDriver,
-    });
-    return defaultUsageTrackingDriver;
-  }
-
   defaultUsageTrackingDriver = createMemoryUsageTrackingDriver();
   return defaultUsageTrackingDriver;
 };
@@ -143,11 +107,15 @@ export const setDefaultUsageTrackingDriver = (driver: UsageTrackingDriver): void
   defaultUsageTrackingDriver = driver;
 };
 
-export const getDefaultDiscoveryAdapter = async () =>
-  createDiscoveryAdapterFromStore(await getDefaultSdkStore());
+let defaultDiscoveryAdapter: DiscoveryAdapter | null = null;
+
+export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> => {
+  if (defaultDiscoveryAdapter) return defaultDiscoveryAdapter;
+
+  const driver = getDefaultSdkDriver();
+  defaultDiscoveryAdapter = await createShardedDiscoveryAdapter({ driver });
+  return defaultDiscoveryAdapter;
+};
 
 export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
-
-export const getDefaultProviderRegistry = async () =>
-  createProviderRegistryFromStore(await getDefaultSdkStore());

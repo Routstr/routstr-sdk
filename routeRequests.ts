@@ -8,15 +8,27 @@
 import type { Model, Message, SdkLogger } from "./core/types";
 import type { DiscoveryAdapter } from "./discovery/interfaces";
 import type {
-  ProviderRegistry,
   WalletAdapter,
   StorageAdapter,
 } from "./wallet/interfaces";
 import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
-import { RoutstrClient, type DebugLevel } from "./client/RoutstrClient";
+import {
+  RoutstrClient,
+  type DebugLevel,
+  type RequestResponseLogSink,
+} from "./client/RoutstrClient";
 import type { UsageTrackingDriver } from "./storage/usageTracking";
 import type { SdkStore } from "./storage/store";
+import {
+  resolveRequestContext,
+  type ResolveContextInput,
+  type ResolvedContext,
+} from "./client/resolveRequestContext";
+
+// Re-export for consumers that want access to the shared resolver
+export { resolveRequestContext };
+export type { ResolveContextInput, ResolvedContext };
 
 /**
  * Options for routeRequests function
@@ -36,9 +48,7 @@ export interface RouteRequestOptions {
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching */
   storageAdapter: StorageAdapter;
-  /** Provider registry for tracking available providers */
-  providerRegistry: ProviderRegistry;
-  /** Discovery adapter for model/mint discovery */
+  /** Discovery adapter for model/mint discovery and provider data */
   discoveryAdapter: DiscoveryAdapter;
   /** Optional: additional provider URLs to include */
   includeProviderUrls?: string[];
@@ -62,7 +72,9 @@ export interface RouteRequestOptions {
   routstrPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;
-  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, and providerManager. */
+  /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
+  requestResponseLogSink?: RequestResponseLogSink;
+  /** Optional: pre-built RoutstrClient. When provided, skips client creation. Must be configured with the appropriate mode, logger, usageTrackingDriver, sdkStore, providerManager, and requestResponseLogSink. */
   client?: RoutstrClient;
 }
 
@@ -106,7 +118,6 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     forcedProvider,
     walletAdapter,
     storageAdapter,
-    providerRegistry,
     discoveryAdapter,
     includeProviderUrls = [],
     torMode = false,
@@ -118,94 +129,33 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     sdkStore,
     providerManager: providedProviderManager,
     logger,
+    requestResponseLogSink,
   } = options;
 
-  let modelManager: ModelManager;
-  let providers: string[];
-
-  if (providedModelManager) {
-    modelManager = providedModelManager;
-    providers = modelManager.getBaseUrls();
-    if (providers.length === 0) {
-      throw new Error("No providers available - run bootstrap first");
-    }
-  } else {
-    modelManager = new ModelManager(discoveryAdapter, {
-      includeProviderUrls: forcedProvider
-        ? [forcedProvider, ...includeProviderUrls]
-        : includeProviderUrls,
+  // Delegate to shared context resolution
+  const { client: resolvedClient, baseUrl, mintUrl, selectedModel } =
+    await resolveRequestContext({
+      modelId,
+      forcedProvider,
+      walletAdapter,
+      storageAdapter,
+      discoveryAdapter,
+      includeProviderUrls,
+      torMode,
+      forceRefresh,
+      modelManager: providedModelManager,
+      debugLevel,
+      mode,
+      usageTrackingDriver,
+      sdkStore,
+      providerManager: providedProviderManager,
       routstrPubkey: options.routstrPubkey,
       logger,
+      requestResponseLogSink,
+      client: options.client,
     });
 
-    providers = await modelManager.bootstrapProviders(torMode);
-    if (providers.length === 0) {
-      throw new Error("No providers available");
-    }
-
-    await modelManager.fetchModels(providers, forceRefresh);
-  }
-
-  // Use provided ProviderManager or create a new one
-  const providerManager = providedProviderManager ?? new ProviderManager(providerRegistry, sdkStore, logger);
-
-  let baseUrl: string;
-  let selectedModel: Model;
-
-  if (forcedProvider) {
-    const normalizedProvider = forcedProvider.endsWith("/")
-      ? forcedProvider
-      : `${forcedProvider}/`;
-    const cachedModels = modelManager.getAllCachedModels();
-    const models = cachedModels[normalizedProvider] || [];
-    const match = models.find((m) => m.id === modelId);
-    if (!match) {
-      throw new Error(
-        `Provider ${normalizedProvider} does not offer model: ${modelId}`
-      );
-    }
-    baseUrl = normalizedProvider;
-    selectedModel = match;
-  } else {
-    const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
-      torMode,
-      includeDisabled: false,
-    });
-    if (ranking.length === 0) {
-      throw new Error(`No providers found for model: ${modelId}`);
-    }
-    const cheapest = ranking[0];
-    baseUrl = cheapest.baseUrl;
-    selectedModel = cheapest.model;
-  }
-
-  const balances = await walletAdapter.getBalances();
-  const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
-
-  if (totalBalance <= 0) {
-    throw new Error(
-      "Wallet balance is empty. Add a mint and fund it before making requests."
-    );
-  }
-
-  const providerMints = providerRegistry.getProviderMints(baseUrl);
-  const mintUrl =
-    walletAdapter.getActiveMintUrl() ||
-    providerMints[0] ||
-    Object.keys(balances)[0];
-
-  if (!mintUrl) {
-    throw new Error("No mint configured in wallet");
-  }
-
-  const client = options.client ?? new RoutstrClient(
-    walletAdapter,
-    storageAdapter,
-    providerRegistry,
-    "min",
-    mode,
-    { usageTrackingDriver, sdkStore, providerManager, logger }
-  );
+  const client = resolvedClient;
 
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);

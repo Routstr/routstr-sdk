@@ -13,8 +13,8 @@
 import type {
   WalletAdapter,
   StorageAdapter,
-  ProviderRegistry,
 } from "./interfaces";
+import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { RefundResult, TopUpResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError } from "../core/errors";
@@ -99,7 +99,7 @@ export class BalanceManager {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private providerRegistry?: ProviderRegistry,
+    private discoveryAdapter?: DiscoveryAdapter,
     cashuSpender?: CashuSpender,
     logger?: SdkLogger
   ) {
@@ -110,7 +110,7 @@ export class BalanceManager {
       this.cashuSpender = new CashuSpender(
         walletAdapter,
         storageAdapter,
-        providerRegistry,
+        discoveryAdapter,
         this,
         this.logger
       );
@@ -360,16 +360,28 @@ export class BalanceManager {
         response.headers.get("x-routstr-request-id") || undefined;
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        this.logger.warn(
-          `fetchRefundToken: non-ok response for ${url} status=${response.status} statusText=${response.statusText}`,
-          errorData
-        );
+        const responseBody = await response.text().catch(() => undefined);
+        let errorData: any = {};
+        if (responseBody) {
+          try {
+            errorData = JSON.parse(responseBody);
+          } catch {
+            errorData = {};
+          }
+        }
+        this.logger.error("Upstream wallet refund error response", {
+          baseUrl,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: responseBody ?? "<unable to read response body>",
+        });
         return {
           success: false,
           requestId,
           error: `API key refund failed: ${
-            errorData?.detail || response.statusText
+            errorData?.detail || responseBody || response.statusText
           }`,
         };
       }
@@ -527,9 +539,9 @@ export class BalanceManager {
       totalMintBalance + targetProviderBalance < adjustedAmount &&
       totalMintBalance + targetProviderBalance + refundableProviderBalance >=
         adjustedAmount &&
-      retryCount < 2
+      retryCount < 3
     ) {
-      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount);
+      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
       return this.createProviderToken({
         ...options,
         retryCount: retryCount + 1,
@@ -552,8 +564,10 @@ export class BalanceManager {
     }
 
     const providerMints =
-      baseUrl && this.providerRegistry
-        ? this.providerRegistry.getProviderMints(baseUrl)
+      baseUrl && this.discoveryAdapter
+        ? this.discoveryAdapter.getCachedMints()[
+            baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`
+          ] || []
         : [];
 
     let requiredAmount = adjustedAmount;
@@ -717,41 +731,77 @@ export class BalanceManager {
   private async _refundOtherProvidersForTopUp(
     baseUrl: string,
     mintUrl: string,
-    retryCount: number
+    retryCount: number,
+    requiredAmount: number
   ): Promise<void> {
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
 
     // If retryCount >= 2, force refund even if API keys were used recently
     const forceRefund = retryCount >= 2;
 
-    const apiKeysToRefund = apiKeyDistribution.filter(
-      (apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0
-    );
+    // Build full candidate list sorted by lastUsed, oldest first.
+    // This way providers outside the 5-min window are tried first (natural
+    // refund succeeds), and if we must force-refund, we target the oldest
+    // (closest to expiring) locked providers first.
+    const candidates = apiKeyDistribution
+      .filter((apiKey) => apiKey.baseUrl !== baseUrl && apiKey.amount > 0)
+      .map((apiKey) => {
+        const full = this.storageAdapter.getApiKey(apiKey.baseUrl);
+        return {
+          baseUrl: apiKey.baseUrl,
+          amount: apiKey.amount,
+          lastUsed: full?.lastUsed ?? 0,
+          key: full?.key,
+        } as const;
+      })
+      .filter((c) => c.key != null)
+      .sort((a, b) => a.lastUsed - b.lastUsed); // oldest first
 
-    const apiKeyRefundResults = await Promise.allSettled(
-      apiKeysToRefund.map(async (apiKeyEntry) => {
-        const fullApiKeyEntry = this.storageAdapter.getApiKey(
-          apiKeyEntry.baseUrl
-        );
-        if (!fullApiKeyEntry) {
-          return { baseUrl: apiKeyEntry.baseUrl, success: false };
-        }
+    if (candidates.length === 0) return;
 
-        const result = await this.refundApiKey({
+    if (forceRefund) {
+      // Sequential: refund one at a time until we have enough liquid balance
+      // for the target provider, so we only force-refund as few providers as
+      // necessary.
+      //
+      // NOTE: refundApiKey() already calls removeApiKey() on success, so we
+      // don't need to update the balance here — the key is gone.
+      for (const candidate of candidates) {
+        await this.refundApiKey({
           mintUrl,
-          baseUrl: apiKeyEntry.baseUrl,
-          apiKey: fullApiKeyEntry.key,
-          forceRefund,
+          baseUrl: candidate.baseUrl,
+          apiKey: candidate.key!,
+          forceRefund: true,
         });
 
-        return { baseUrl: apiKeyEntry.baseUrl, success: result.success };
-      })
-    );
+        // Check if we've freed enough balance for the target provider
+        const newState = await this.getBalanceState();
+        const newAvailable =
+          (newState.mintBalances[mintUrl] || 0) +
+          (newState.providerBalances[baseUrl] || 0);
 
-    for (const result of apiKeyRefundResults) {
-      if (result.status === "fulfilled" && result.value.success) {
-        this.storageAdapter.updateApiKeyBalance(result.value.baseUrl, 0);
+        if (newAvailable >= requiredAmount) {
+          this.logger.log(
+            `_refundOtherProvidersForTopUp: freed enough balance (${newAvailable} >= ${requiredAmount}), stopping early`
+          );
+          return;
+        }
       }
+    } else {
+      // Non-force: try all in parallel (existing behavior, now sorted by
+      // lastUsed for determinism). Providers outside the 5-min window will
+      // succeed and be cleaned up by refundApiKey; recently-used ones are
+      // skipped without side effects.
+      await Promise.allSettled(
+        candidates.map((candidate) =>
+          this.refundApiKey({
+            mintUrl,
+            baseUrl: candidate.baseUrl,
+            apiKey: candidate.key!,
+            forceRefund: false,
+          })
+        )
+      );
     }
   }
 
@@ -800,12 +850,28 @@ export class BalanceManager {
         response.headers.get("x-routstr-request-id") || undefined;
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const responseBody = await response.text().catch(() => undefined);
+        let errorData: any = {};
+        if (responseBody) {
+          try {
+            errorData = JSON.parse(responseBody);
+          } catch {
+            errorData = {};
+          }
+        }
+        this.logger.error("Upstream wallet topup error response", {
+          baseUrl,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          requestId,
+          body: responseBody ?? "<unable to read response body>",
+        });
         return {
           success: false,
           requestId,
           error:
-            errorData?.detail || `Top up failed with status ${response.status}`,
+            errorData?.detail || responseBody || `Top up failed with status ${response.status}`,
         };
       }
 
@@ -898,6 +964,10 @@ export class BalanceManager {
     unit: "sat" | "msat";
     apiKey: string;
     isInvalidApiKey?: boolean;
+    /** True when the balance could not be determined (network error, non-OK
+     *  response, etc.).  Callers MUST NOT use `amount` in arithmetic when
+     *  this flag is set — it is 0, not a real balance. */
+    balanceUnknown?: boolean;
   }> {
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
@@ -926,19 +996,25 @@ export class BalanceManager {
           data?.detail?.error?.message?.includes("proofs already spent");
 
         return {
-          amount: -1,
+          amount: 0,
           reserved: data.reserved ?? 0,
           unit: "msat",
           apiKey: data.api_key,
           isInvalidApiKey,
+          balanceUnknown: true,
         };
       }
     } catch (error) {
       this.logger.error("getTokenBalance error", error);
-      // Fall through to default
     }
 
-    return { amount: -1, reserved: 0, unit: "sat", apiKey: "" };
+    return {
+      amount: 0,
+      reserved: 0,
+      unit: "sat",
+      apiKey: "",
+      balanceUnknown: true,
+    };
   }
 
   /**

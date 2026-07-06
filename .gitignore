@@ -25,6 +25,19 @@ yarn-error.log*
 
 dist
 package-lock.json
-
-# git worktrees
 .worktrees
+
+# debug request dumps
+reqs/
+scripts/reqRes/
+
+# local db and logs
+*.sqlite
+audit.log
+scripts/events.db
+
+# SQLite WAL files
+routstr.sqlite-shm
+routstr.sqlite-wal
+*.sqlite-shm
+*.sqlite-wal

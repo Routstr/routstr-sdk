@@ -61,7 +61,7 @@ export class CashuSpender {
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
-    private _providerRegistry?: unknown,
+    private _discoveryAdapter?: unknown,
     private balanceManager?: BalanceManager,
     logger?: SdkLogger
   ) {
@@ -660,7 +660,7 @@ export class CashuSpender {
             continue;
           }
 
-          if (balanceResult.amount >= 0) {
+          if (balanceResult.amount >= 0 && !balanceResult.balanceUnknown) {
             const balanceSat = balanceResult.unit === "msat"
               ? Math.floor(balanceResult.amount / 1000)
               : balanceResult.amount;

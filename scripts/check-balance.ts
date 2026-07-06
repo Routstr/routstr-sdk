@@ -1,7 +1,8 @@
 import { RoutstrClient, WalletAdapter } from "@routstr/sdk";
-import { createSdkStore, createSqliteDriver } from "@routstr/sdk/storage";
+import { createSdkStore } from "@routstr/sdk/storage";
+import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
-  createProviderRegistryFromStore,
+  createDiscoveryAdapterFromStore,
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
@@ -84,7 +85,7 @@ async function main(): Promise<void> {
   const { store, hydrate } = createSdkStore({ driver: createSqliteDriver() });
   await hydrate;
   const storageAdapter = createStorageAdapterFromStore(store);
-  const providerRegistry = createProviderRegistryFromStore(store);
+  const discoveryAdapter = createDiscoveryAdapterFromStore(store);
 
   let mintUnits: Record<string, "sat" | "msat"> = {};
 
@@ -135,7 +136,7 @@ async function main(): Promise<void> {
   const client = new RoutstrClient(
     walletAdapter,
     storageAdapter,
-    providerRegistry,
+    discoveryAdapter,
     "min",
     "apikeys"
   );

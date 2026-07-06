@@ -1,6 +1,4 @@
 import type { StorageDriver } from "../types";
-import type { SdkLogger } from "../../core/types";
-import { consoleLogger } from "../../core/types";
 
 type BetterSqlite3Database = {
   prepare: (sql: string) => {
@@ -55,6 +53,8 @@ export const createSqliteDriver = (
   const initDb = async () => {
     if (!db) {
       db = await loadDatabase(dbPath);
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA busy_timeout = 5000");
       db.exec(
         `CREATE TABLE IF NOT EXISTS ${tableName} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`
       );
@@ -111,62 +111,3 @@ export const createSqliteDriver = (
     },
   };
 };
-
-// Bun-specific SQLite driver - requires bun:sqlite at runtime
-// This function is only meant to be used in Bun environments
-export async function createBunSqliteDriver(
-  dbPath: string,
-  options?: { logger?: SdkLogger }
-): Promise<StorageDriver> {
-  const logger = (options?.logger ?? consoleLogger).child("BunSqliteDriver");
-  // @ts-ignore - bun:sqlite is only available at runtime in Bun environments
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore
-  const SQLite = (await import(/* webpackIgnore: true */ "bun:sqlite")).default;
-  const db = new SQLite(dbPath);
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS sdk_storage (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    )
-  `);
-
-  return {
-    async getItem<T>(key: string, defaultValue: T): Promise<T> {
-      try {
-        const row = db
-          .query("SELECT value FROM sdk_storage WHERE key = ?")
-          .get(key) as { value: string } | undefined;
-        if (!row || typeof row.value !== "string") return defaultValue;
-        try {
-          return JSON.parse(row.value) as T;
-        } catch (parseError) {
-          if (typeof defaultValue === "string") {
-            return row.value as T;
-          }
-          throw parseError;
-        }
-      } catch (error) {
-        logger.error(`getItem failed for key "${key}":`, error);
-        return defaultValue;
-      }
-    },
-    async setItem<T>(key: string, value: T): Promise<void> {
-      try {
-        db.query(
-          "INSERT INTO sdk_storage (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-        ).run(key, JSON.stringify(value));
-      } catch (error) {
-        logger.error(`setItem failed for key "${key}":`, error);
-      }
-    },
-    async removeItem(key: string): Promise<void> {
-      try {
-        db.query("DELETE FROM sdk_storage WHERE key = ?").run(key);
-      } catch (error) {
-        logger.error(`removeItem failed for key "${key}":`, error);
-      }
-    },
-  };
-}

@@ -13,7 +13,32 @@ import {
 } from "../core/errors";
 import { onlyEvents, RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
+import type { IEventDatabase } from "applesauce-core";
+import type { NostrEvent } from "applesauce-core/helpers";
 import { tap } from "rxjs";
+
+type SqliteStatement = {
+  run?: (...params: any[]) => unknown;
+  get?: (...params: any[]) => any;
+};
+
+export type PersistentEventDatabase = IEventDatabase & {
+  db?: {
+    exec: (sql: string) => void;
+    prepare: (sql: string) => SqliteStatement;
+  };
+  close?: () => void;
+};
+
+export type PersistentEventDatabaseFactory = (
+  dbPath: string
+) => Promise<PersistentEventDatabase> | PersistentEventDatabase;
+
+export const DEFAULT_NOSTR_RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.routstr.com",
+];
 
 /**
  * Configuration for ModelManager
@@ -25,12 +50,28 @@ export interface ModelManagerConfig {
   includeProviderUrls?: string[];
   /** Provider base URLs to exclude */
   excludeProviderUrls?: string[];
-  /** Cache TTL in milliseconds (default: 21 minutes) */
+  /** Cache TTL in milliseconds (default: 210 minutes) */
   cacheTTL?: number;
   /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
   routstrPubkey?: string;
+  /** Nostr relay URLs for provider/model discovery.
+   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
+   * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
+  nostrRelays?: string[];
   /** Optional injectable logger */
   logger?: SdkLogger;
+  /** Path to database for persistent Nostr event storage.
+   * If provided, events fetched by ModelManager from relays (kinds 38421,
+   * 38423, 38425) are persisted and survive process restarts. The underlying
+   * EventStore can also be accessed for advanced/manual event management.
+   *
+   * Runtime-specific SQLite implementations are intentionally not imported by
+   * the browser-safe default SDK entrypoint. Use @routstr/sdk/node or
+   * @routstr/sdk/bun to get a ModelManager preconfigured with a SQLite-backed
+   * persistentEventDatabaseFactory, or inject your own factory here. */
+  eventStoreDbPath?: string;
+  /** Factory used with eventStoreDbPath to create the persistent event DB. */
+  persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 }
 
 /**
@@ -43,8 +84,15 @@ export class ModelManager {
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
   private readonly routstrPubkey: string;
+  private readonly nostrRelays: string[] | undefined;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
+  /** Persistent event store for relay-fetched events (null if not configured/initialized) */
+  private eventStore: EventStore | null = null;
+  private eventStoreDb: PersistentEventDatabase | null = null;
+  private eventStoreInitPromise: Promise<EventStore | null> | null = null;
+  private readonly eventStoreDbPath?: string;
+  private readonly persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -58,7 +106,11 @@ export class ModelManager {
     this.routstrPubkey =
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
+    this.nostrRelays = config.nostrRelays;
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
+
+    this.eventStoreDbPath = config.eventStoreDbPath;
+    this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
   }
 
   /**
@@ -67,6 +119,178 @@ export class ModelManager {
    */
   getBaseUrls(): string[] {
     return this.adapter.getBaseUrlsList();
+  }
+
+  /**
+   * Lazily initialize the persistent event store.
+   * Returns null if no eventStoreDbPath was provided.
+   */
+  private async ensureEventStore(): Promise<EventStore | null> {
+    if (!this.eventStoreDbPath) return null;
+    if (this.eventStore) return this.eventStore;
+
+    if (!this.eventStoreInitPromise) {
+      this.eventStoreInitPromise = (async () => {
+        try {
+          const db = await this.createPersistentEventDatabase();
+          this.eventStoreDb = db;
+          this.eventStore = new EventStore({ database: db });
+          this.initializeEventStoreMetadata();
+          this.logger.log(
+            `Persistent event store initialized at ${this.eventStoreDbPath}`
+          );
+          return this.eventStore;
+        } catch (error) {
+          this.eventStoreInitPromise = null;
+          throw new Error(
+            `Persistent Nostr event storage requires a runtime-specific database factory. Use @routstr/sdk/node, @routstr/sdk/bun, inject persistentEventDatabaseFactory, or omit eventStoreDbPath. (${error})`
+          );
+        }
+      })();
+    }
+
+    return this.eventStoreInitPromise;
+  }
+
+  /**
+   * Get the persistent event store, initializing it if configured.
+   * Returns null if no eventStoreDbPath was provided.
+   */
+  async getEventStore(): Promise<EventStore | null> {
+    return this.ensureEventStore();
+  }
+
+  private async createPersistentEventDatabase(): Promise<PersistentEventDatabase> {
+    if (!this.eventStoreDbPath) {
+      throw new Error("eventStoreDbPath is required");
+    }
+    if (!this.persistentEventDatabaseFactory) {
+      throw new Error(
+        "persistentEventDatabaseFactory is required. Import ModelManager from @routstr/sdk/node or @routstr/sdk/bun for SQLite-backed persistent event storage."
+      );
+    }
+    return this.persistentEventDatabaseFactory(this.eventStoreDbPath);
+  }
+
+  /** Close the persistent event store database handle, if configured. */
+  closeEventStore(): void {
+    this.eventStoreDb?.close?.();
+    this.eventStore = null;
+    this.eventStoreDb = null;
+    this.eventStoreInitPromise = null;
+  }
+
+  private initializeEventStoreMetadata(): void {
+    this.eventStoreDb?.db?.exec(
+      `CREATE TABLE IF NOT EXISTS routstr_event_cache_metadata (
+        event_id TEXT PRIMARY KEY,
+        fetched_at INTEGER NOT NULL
+      )`
+    );
+  }
+
+  private markEventFetched(event: NostrEvent, fetchedAt: number = Date.now()): void {
+    const db = this.eventStoreDb?.db;
+    if (!db) return;
+
+    db.prepare(
+      `INSERT INTO routstr_event_cache_metadata (event_id, fetched_at)
+       VALUES (?, ?)
+       ON CONFLICT(event_id) DO UPDATE SET fetched_at = excluded.fetched_at`
+    ).run?.(event.id, fetchedAt);
+  }
+
+  private getEventFetchedAt(event: NostrEvent): number | undefined {
+    const db = this.eventStoreDb?.db;
+    if (!db) return undefined;
+
+    const row = db
+      .prepare(
+        `SELECT fetched_at FROM routstr_event_cache_metadata WHERE event_id = ?`
+      )
+      .get?.(event.id);
+    return typeof row?.fetched_at === "number" ? row.fetched_at : undefined;
+  }
+
+  /**
+   * Return all matching events from the persistent event store.
+   * The store accumulates events over time — it is the source of truth,
+   * not a temporary cache. Old events remain valid.
+   */
+  private async getCachedNostrEvents(
+    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[] },
+    forceRefresh: boolean = false
+  ): Promise<NostrEvent[]> {
+    const eventStore = await this.ensureEventStore();
+    if (forceRefresh) return [];
+    if (!eventStore) return [];
+
+    return eventStore.getTimeline(filter);
+  }
+
+  /**
+   * Fetch current events from live Nostr relays for all tracked kinds
+   * (38421 providers, 38425 lgtm reviews, 38423 routstr21 models) and
+   * persist them into the event store. Existing events are not replaced —
+   * new events are merged in. Call this periodically (e.g. every 21 min)
+   * to discover new providers, reviews, and model lists published since
+   * the last fetch.
+   */
+  async refreshNostrEvents(): Promise<void> {
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) {
+      this.logger.warn("refreshNostrEvents: no event store configured, skipping");
+      return;
+    }
+
+    const relays = this.getNostrRelays();
+    const timeoutMs = 5000;
+
+    // Kind 38421 — provider discovery
+    await this.fetchLiveIntoStore({ kinds: [38421], limit: 100 }, relays, timeoutMs);
+
+    // Kind 38425 — lgtm reviews
+    await this.fetchLiveIntoStore(
+      { kinds: [38425], "#t": ["lgtm"], limit: 500, authors: [this.routstrPubkey] },
+      relays,
+      timeoutMs
+    );
+
+    // Kind 38423 — routstr21 curated model list
+    await this.fetchLiveIntoStore(
+      { kinds: [38423], "#d": ["routstr-21-models"], limit: 1, authors: [this.routstrPubkey] },
+      relays,
+      timeoutMs
+    );
+
+    this.logger.log("refreshNostrEvents: live fetch complete");
+  }
+
+  /**
+   * Fetch events from live relays and persist them into the event store.
+   */
+  private async fetchLiveIntoStore(
+    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[]; limit?: number },
+    relays: string[],
+    timeoutMs: number
+  ): Promise<void> {
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) return;
+
+    const pool = new RelayPool();
+    await new Promise<void>((resolve) => {
+      pool
+        .req(relays, filter)
+        .pipe(
+          onlyEvents(),
+          tap((event) => {
+            eventStore.add(event);
+            this.markEventFetched(event);
+          })
+        )
+        .subscribe({ complete: () => resolve() });
+      setTimeout(() => resolve(), timeoutMs);
+    });
   }
 
   static async init(
@@ -107,7 +331,11 @@ export class ModelManager {
             torMode
           );
           await this.fetchRoutstr21Models(forceRefresh);
-          await this.syncReviewedProvidersFromNostr(filteredCachedUrls);
+          await this.syncReviewedProvidersFromNostr(
+            filteredCachedUrls,
+            this.providerNodePubkeysByUrl,
+            forceRefresh
+          );
           return filteredCachedUrls;
         }
       }
@@ -115,13 +343,21 @@ export class ModelManager {
 
     // Try Nostr first (kind 38421)
     try {
-      const nostrProviders = await this.bootstrapFromNostr(38421, torMode);
+      const nostrProviders = await this.bootstrapFromNostr(
+        38421,
+        torMode,
+        forceRefresh
+      );
       if (nostrProviders.length > 0) {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await this.fetchRoutstr21Models(forceRefresh);
-        await this.syncReviewedProvidersFromNostr(filtered);
+        await this.syncReviewedProvidersFromNostr(
+          filtered,
+          this.providerNodePubkeysByUrl,
+          forceRefresh
+        );
         return filtered;
       }
     } catch (e) {
@@ -133,55 +369,73 @@ export class ModelManager {
   }
 
   /**
-   * Bootstrap providers from Nostr network (kind 30421)
+   * Resolve Nostr relay URLs.
+   * Returns user-configured relays if set, otherwise the shared defaults.
+   */
+  private getNostrRelays(): string[] {
+    return this.nostrRelays && this.nostrRelays.length > 0
+      ? this.nostrRelays
+      : DEFAULT_NOSTR_RELAYS;
+  }
+
+  /**
+   * Bootstrap providers from Nostr network (kind 38421)
    * @param kind The Nostr kind to fetch
    * @param torMode Whether running in Tor context
    * @returns Array of provider base URLs
    */
   private async bootstrapFromNostr(
     kind: number,
-    torMode: boolean
+    torMode: boolean,
+    forceRefresh: boolean = false
   ): Promise<string[]> {
-    const DEFAULT_RELAYS = [
-      "wss://relay.primal.net",
-      "wss://nos.lol",
-      "wss://relay.damus.io",
-    ];
+    const relays = this.getNostrRelays();
 
-    const pool = new RelayPool();
-    const localEventStore = new EventStore();
+    // Check persistent store first
+    const cached = await this.getCachedNostrEvents(
+      { kinds: [kind] },
+      forceRefresh
+    );
+    let sessionEvents: NostrEvent[] = cached;
 
-    const timeoutMs = 5000;
+    if (cached.length === 0) {
+      const pool = new RelayPool();
 
-    await new Promise<void>((resolve) => {
-      pool
-        .req(DEFAULT_RELAYS, {
-          kinds: [kind],
-          limit: 100,
-        })
-        .pipe(
-          onlyEvents(),
-          tap((event) => {
-            localEventStore.add(event);
+      const timeoutMs = 5000;
+
+      await new Promise<void>((resolve) => {
+        pool
+          .req(relays, {
+            kinds: [kind],
+            limit: 100,
           })
-        )
-        .subscribe({
-          complete: () => {
-            resolve();
-          },
-        });
+          .pipe(
+            onlyEvents(),
+            tap((event) => {
+              sessionEvents.push(event);
+              // Persist to durable store if configured
+              this.eventStore?.add(event);
+              this.markEventFetched(event);
+            })
+          )
+          .subscribe({
+            complete: () => {
+              resolve();
+            },
+          });
 
-      setTimeout(() => {
-        resolve();
-      }, timeoutMs);
-    });
-
-    const timeline = localEventStore.getTimeline({ kinds: [kind] });
+        setTimeout(() => {
+          resolve();
+        }, timeoutMs);
+      });
+    } else {
+      this.logger.log(`Using ${cached.length} cached kind ${kind} events from persistent store`);
+    }
 
     const bases = new Set<string>();
     this.providerNodePubkeysByUrl = new Map();
 
-    for (const event of timeline) {
+    for (const event of sessionEvents) {
       const eventUrls: string[] = [];
 
       for (const tag of event.tags) {
@@ -310,7 +564,11 @@ export class ModelManager {
         this.adapter.setBaseUrlsList(list);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await this.fetchRoutstr21Models(forceRefresh);
-        await this.syncReviewedProvidersFromNostr(list);
+        await this.syncReviewedProvidersFromNostr(
+          list,
+          this.providerNodePubkeysByUrl,
+          forceRefresh
+        );
       }
 
       return list;
@@ -333,7 +591,8 @@ export class ModelManager {
    */
   async syncReviewedProvidersFromNostr(
     baseUrls: string[] = this.adapter.getBaseUrlsList(),
-    providerNodes: Map<string, Set<string>> = this.providerNodePubkeysByUrl
+    providerNodes: Map<string, Set<string>> = this.providerNodePubkeysByUrl,
+    forceRefresh: boolean = false
   ): Promise<string[]> {
     if (baseUrls.length === 0) return [];
 
@@ -345,33 +604,42 @@ export class ModelManager {
     }
 
     // Fetch kind 38425 lgtm reviews
-    const LGTM_RELAYS = [
-      "wss://relay.primal.net",
-      "wss://nos.lol",
-      "wss://relay.damus.io",
-      "wss://relay.routstr.com",
-    ];
     const reviewedNodePubkeys = new Set<string>();
     {
-      const pool = new RelayPool();
-      const store = new EventStore();
-      const timeoutMs = 5000;
-      await new Promise<void>((resolve) => {
-        pool
-          .req(LGTM_RELAYS, {
-            kinds: [38425],
-            "#t": ["lgtm"],
-            limit: 500,
-            authors: [this.routstrPubkey],
-          })
-          .pipe(
-            onlyEvents(),
-            tap((event) => store.add(event))
-          )
-          .subscribe({ complete: () => resolve() });
-        setTimeout(() => resolve(), timeoutMs);
-      });
-      for (const event of store.getTimeline({ kinds: [38425] })) {
+      // Check persistent store first
+      const cached = await this.getCachedNostrEvents(
+        { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
+        forceRefresh
+      );
+      let sessionEvents: NostrEvent[] = cached;
+
+      if (cached.length === 0) {
+        const lgtmRelays = this.getNostrRelays();
+        const pool = new RelayPool();
+        const timeoutMs = 5000;
+        await new Promise<void>((resolve) => {
+          pool
+            .req(lgtmRelays, {
+              kinds: [38425],
+              "#t": ["lgtm"],
+              limit: 500,
+              authors: [this.routstrPubkey],
+            })
+            .pipe(
+              onlyEvents(),
+              tap((event) => {
+                sessionEvents.push(event);
+                this.eventStore?.add(event);
+                this.markEventFetched(event);
+              })
+            )
+            .subscribe({ complete: () => resolve() });
+          setTimeout(() => resolve(), timeoutMs);
+        });
+      } else {
+        this.logger.log(`Using ${cached.length} cached kind 38425 events from persistent store`);
+      }
+      for (const event of sessionEvents) {
         const hasLgtmTag = event.tags.some(
           (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
         );
@@ -407,6 +675,20 @@ export class ModelManager {
       );
       if (!hasLgtmReview) {
         disabledByReview.push(normalized);
+      }
+    }
+
+    // Carry forward previously-disabled providers that are no longer
+    // in the current bootstrap's baseUrls (e.g. their kind-38421 event
+    // was lost from relays).  Without this, a re-bootstrap silently
+    // re-enables providers whose Nostr event disappeared.
+    const previousDisabled = this.adapter.getDisabledProviders();
+    const currentBaseUrls = new Set(
+      baseUrls.map((url) => this.normalizeUrl(url))
+    );
+    for (const url of previousDisabled) {
+      if (!currentBaseUrls.has(url)) {
+        disabledByReview.push(url);
       }
     }
 
@@ -519,7 +801,7 @@ export class ModelManager {
         if (this.isProviderDownError(error)) {
           this.logger.warn(`Provider ${base} is down right now.`);
         } else {
-          this.logger.warn(`Failed to fetch models from ${base}:`, error);
+          this.logger.warn(`Provider ${base} unreachable: ${(error as Error).message}`);
         }
         this.adapter.setProviderLastUpdate(base, Date.now());
         return { success: false, base };
@@ -528,10 +810,20 @@ export class ModelManager {
 
     await Promise.allSettled(fetchPromises);
 
-    // Cache all provider results
+    // Cache all provider results, pruning stale entries for providers
+    // that are no longer in the current baseUrls (e.g. their Nostr event
+    // was lost).  Without this, stale models from vanished providers
+    // accumulate in the cache forever.
     const existingCache = this.adapter.getCachedModels();
+    const currentBaseUrls = new Set(baseUrls);
+    const prunedExisting: Record<string, Model[]> = {};
+    for (const url of Object.keys(existingCache)) {
+      if (currentBaseUrls.has(url)) {
+        prunedExisting[url] = existingCache[url];
+      }
+    }
     this.adapter.setCachedModels({
-      ...existingCache,
+      ...prunedExisting,
       ...modelsFromAllProviders,
     });
 
@@ -656,49 +948,56 @@ export class ModelManager {
       }
     }
 
-    const DEFAULT_RELAYS = [
-      "wss://relay.damus.io",
-      "wss://nos.lol",
-      "wss://relay.routstr.com",
-    ];
+    const relays = this.getNostrRelays();
 
-    const pool = new RelayPool();
-    const localEventStore = new EventStore();
+    // Check persistent store first
+    const cached = await this.getCachedNostrEvents(
+      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
+      forceRefresh
+    );
+    let sessionEvents: NostrEvent[] = cached;
 
-    const timeoutMs = 5000;
+    if (cached.length === 0) {
+      const pool = new RelayPool();
 
-    await new Promise<void>((resolve) => {
-      pool
-        .req(DEFAULT_RELAYS, {
-          kinds: [38423],
-          "#d": ["routstr-21-models"],
-          limit: 1,
-          authors: [this.routstrPubkey],
-        })
-        .pipe(
-          onlyEvents(),
-          tap((event) => {
-            localEventStore.add(event);
+      const timeoutMs = 5000;
+
+      await new Promise<void>((resolve) => {
+        pool
+          .req(relays, {
+            kinds: [38423],
+            "#d": ["routstr-21-models"],
+            limit: 1,
+            authors: [this.routstrPubkey],
           })
-        )
-        .subscribe({
-          complete: () => {
-            resolve();
-          },
-        });
+          .pipe(
+            onlyEvents(),
+            tap((event) => {
+              sessionEvents.push(event);
+              // Persist to durable store if configured
+              this.eventStore?.add(event);
+              this.markEventFetched(event);
+            })
+          )
+          .subscribe({
+            complete: () => {
+              resolve();
+            },
+          });
 
-      setTimeout(() => {
-        resolve();
-      }, timeoutMs);
-    });
+        setTimeout(() => {
+          resolve();
+        }, timeoutMs);
+      });
+    } else {
+      this.logger.log(`Using ${cached.length} cached kind 38423 events from persistent store`);
+    }
 
-    const timeline = localEventStore.getTimeline({ kinds: [38423] });
-
-    if (timeline.length === 0) {
+    if (sessionEvents.length === 0) {
       return cachedModels.length > 0 ? cachedModels : [];
     }
 
-    const event = timeline[0];
+    const event = sessionEvents[0];
 
     try {
       const content = JSON.parse(event.content);

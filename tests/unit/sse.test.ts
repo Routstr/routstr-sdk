@@ -1,10 +1,11 @@
+import { describe, expect, it } from "vitest";
 import { Readable, Writable } from "stream";
 import { promisify } from "util";
 import { pipeline as pipelineCallback } from "stream";
 import {
   createSSEParserTransform,
   inspectSSEWebStream,
-} from "../client/sse";
+} from "../../client/sse";
 
 const pipeline = promisify(pipelineCallback);
 
