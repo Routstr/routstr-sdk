@@ -250,7 +250,7 @@ export class BalanceManager {
     }
 
     let fetchResult:
-      | { success: boolean; token?: string; requestId?: string; error?: string }
+      | { success: boolean; token?: string; requestId?: string; error?: string; status?: number }
       | undefined;
 
     try {
@@ -322,6 +322,7 @@ export class BalanceManager {
     token?: string;
     requestId?: string;
     error?: string;
+    status?: number;
   }> {
     if (!baseUrl) {
       return {
@@ -380,6 +381,7 @@ export class BalanceManager {
         return {
           success: false,
           requestId,
+          status: response.status,
           error: `API key refund failed: ${
             errorData?.detail || responseBody || response.statusText
           }`,

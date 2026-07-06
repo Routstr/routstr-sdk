@@ -556,6 +556,29 @@ export class CashuSpender {
             true
           );
 
+          // If the provider responds with 404 "Refund not found", the xcashu
+          // token is no longer refundable on the provider side. Remove it from
+          // the store so we don't keep retrying a refund that will never
+          // succeed.
+          if (
+            !fetchResult.success &&
+            fetchResult.status === 404 &&
+            (fetchResult.error || "").includes("Refund not found")
+          ) {
+            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: fetchResult.error,
+            });
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: Provider returned 404 "Refund not found" for ${baseUrl}; removing unrefundable xcashu token from store`
+            );
+            continue;
+          }
+
           if (!fetchResult.success || !fetchResult.token) {
             throw new Error(
               fetchResult.error || "Failed to fetch refund token from provider"
