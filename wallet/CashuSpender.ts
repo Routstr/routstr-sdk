@@ -58,6 +58,16 @@ export class CashuSpender {
   private debugLevel: DebugLevel = "WARN";
   private readonly logger: SdkLogger;
 
+  /** Maximum number of retry attempts for a 404 "Refund not found" xcashu token
+   *  before removing it from the store. */
+  private static readonly MAX_REFUND_RETRIES = 3;
+
+  /** Interval (ms) between background refund retries for 404 xcashu tokens. */
+  private static readonly REFUND_RETRY_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+
+  /** Handle for the background refund-retry interval, or null when not running. */
+  private _refundRetryInterval: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private walletAdapter: WalletAdapter,
     private storageAdapter: StorageAdapter,
@@ -557,25 +567,47 @@ export class CashuSpender {
           );
 
           // If the provider responds with 404 "Refund not found", the xcashu
-          // token is no longer refundable on the provider side. Remove it from
-          // the store so we don't keep retrying a refund that will never
-          // succeed.
+          // token may be temporarily unavailable on the provider side. Instead
+          // of removing it immediately, increment tryCount and schedule a
+          // background retry. Only after MAX_REFUND_RETRIES attempts do we
+          // give up and remove the token from the store.
           if (
             !fetchResult.success &&
             fetchResult.status === 404 &&
             (fetchResult.error || "").includes("Refund not found")
           ) {
-            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            const currentTryCount = xcashuToken.tryCount ?? 0;
+            const newTryCount = currentTryCount + 1;
+
+            if (newTryCount >= CashuSpender.MAX_REFUND_RETRIES) {
+              // Exhausted all retries — remove the unrefundable token.
+              this.storageAdapter.removeXcashuToken(
+                baseUrl,
+                xcashuToken.token
+              );
+              this._log(
+                "WARN",
+                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; removing unrefundable xcashu token from store`
+              );
+            } else {
+              // Keep the token and schedule a background retry.
+              this.storageAdapter.updateXcashuTokenTryCount(
+                xcashuToken.token,
+                newTryCount
+              );
+              this._log(
+                "WARN",
+                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl}; tryCount=${newTryCount}/${CashuSpender.MAX_REFUND_RETRIES}, will retry in ${CashuSpender.REFUND_RETRY_INTERVAL_MS / 1000}s`
+              );
+              this._startRefundRetryInterval(mintUrl);
+            }
+
             results.push({
               baseUrl,
               token: xcashuToken.token,
               success: false,
               error: fetchResult.error,
             });
-            this._log(
-              "WARN",
-              `[CashuSpender] refundXcashuTokens: Provider returned 404 "Refund not found" for ${baseUrl}; removing unrefundable xcashu token from store`
-            );
             continue;
           }
 
@@ -647,8 +679,53 @@ export class CashuSpender {
   }
 
   /**
-   * Refund specific providers without retrying spend
+   * Start a background interval that retries refunding xcashu tokens every
+   * `REFUND_RETRY_INTERVAL_MS` (2 minutes). The interval automatically stops
+   * itself once there are no more xcashu tokens left in the store.
    */
+  private _startRefundRetryInterval(mintUrl: string): void {
+    if (this._refundRetryInterval) return; // already running
+
+    this._log(
+      "DEBUG",
+      `[CashuSpender] Starting refund retry interval (every ${CashuSpender.REFUND_RETRY_INTERVAL_MS / 1000}s)`
+    );
+
+    this._refundRetryInterval = setInterval(async () => {
+      const remainingTokens = this.storageAdapter.getXcashuTokens();
+      const hasTokens = Object.values(remainingTokens).some(
+        (tokens) => tokens.length > 0
+      );
+
+      if (!hasTokens) {
+        this._stopRefundRetryInterval();
+        return;
+      }
+
+      try {
+        await this.refundXcashuTokens(mintUrl);
+      } catch (error) {
+        this._log(
+          "ERROR",
+          `[CashuSpender] Refund retry interval error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }, CashuSpender.REFUND_RETRY_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the background refund retry interval if it is running.
+   */
+  private _stopRefundRetryInterval(): void {
+    if (this._refundRetryInterval) {
+      clearInterval(this._refundRetryInterval);
+      this._refundRetryInterval = null;
+      this._log(
+        "DEBUG",
+        `[CashuSpender] Stopped refund retry interval`
+      );
+    }
+  }
   async refundProviders(
     mintUrl: string,
     forceRefund?: boolean
