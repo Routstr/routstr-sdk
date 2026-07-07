@@ -263,10 +263,19 @@ export async function fetchAIResponse(
     callbacks.onStreamingUpdate("");
     callbacks.onThinkingUpdate("");
 
-    // routeRequest owns usage extraction + balance finalization. For streaming
-    // responses it runs finalization in the background while this function
-    // consumes the client-facing stream. Consumers that need exact cost can read
-    // the persisted usage entry later.
+    // Await finalization so the SDK writes usage tracking to IndexedDB.
+    // This also sets response.requestId which we expose to the caller so
+    // they can look up the exact usage entry for this request.
+    const sdkResponse = response as Response & {
+      finalize?: () => Promise<number>;
+      requestId?: string;
+    };
+    if (sdkResponse.finalize) {
+      await sdkResponse.finalize();
+    }
+    if (sdkResponse.requestId) {
+      callbacks.onRequestId?.(sdkResponse.requestId);
+    }
   } catch (error) {
     handleError(error, callbacks, deps.alertLevel, deps.logger);
   } finally {

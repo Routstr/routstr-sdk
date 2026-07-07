@@ -193,6 +193,9 @@ export interface StreamingCallbacks {
 
   /** Called when sats spent on the last message is known */
   onLastMessageSatsUpdate?: (satsSpent: number, estimatedCosts: number) => void;
+
+  /** Called after the response is finalized with the routstr request ID */
+  onRequestId?: (requestId: string) => void;
 }
 
 /**
