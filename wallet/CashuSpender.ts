@@ -566,6 +566,24 @@ export class CashuSpender {
             true
           );
 
+          // 425 "Refund is pending" is a race condition on the provider side:
+          // the upstream request is still in flight and the refund will be
+          // minted shortly. Do NOT touch tryCount or remove the token — just
+          // record the failure and move on to the next token.
+          if (!fetchResult.success && fetchResult.status === 425) {
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: fetchResult.error,
+            });
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: 425 "Refund is pending" for ${baseUrl}; leaving token in store, tryCount untouched`
+            );
+            continue;
+          }
+
           // If the provider responds with 404 "Refund not found", the xcashu
           // token may be temporarily unavailable on the provider side. Instead
           // of removing it immediately, increment tryCount and schedule a
