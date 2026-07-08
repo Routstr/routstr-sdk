@@ -1,4 +1,5 @@
-import { RoutstrClient, WalletAdapter } from "@routstr/sdk";
+import { RoutstrClient } from "@routstr/sdk";
+import type { WalletAdapter } from "@routstr/sdk";
 import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
