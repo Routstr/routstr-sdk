@@ -85,14 +85,20 @@ export class StreamProcessor {
           const parsed = this._parseLine(line);
           if (!parsed) continue;
 
+          // Handle reasoning/thinking BEFORE content. When a single SSE delta
+          // contains both (common at the reasoning→content transition for
+          // Tinfoil/OpenRouter models), the reasoning must be appended to the
+          // thinking buffer first, then content closes the thinking block and
+          // switches to content accumulation. Processing content first would
+          // close thinking, then reasoning would re-open it, causing all
+          // subsequent content to be misrouted into accumulatedThinking.
+          if (parsed.reasoning) {
+            this._handleThinking(parsed.reasoning, callbacks);
+          }
+
           // Handle content delta
           if (parsed.content) {
             this._handleContent(parsed.content, callbacks, modelId);
-          }
-
-          // Handle reasoning/thinking
-          if (parsed.reasoning) {
-            this._handleThinking(parsed.reasoning, callbacks);
           }
 
           // Extract metadata
@@ -263,6 +269,13 @@ export class StreamProcessor {
    * Handle thinking/reasoning content
    */
   private _handleThinking(reasoning: string, callbacks: StreamCallbacks): void {
+    // Once content has started, ignore any further reasoning deltas.
+    // Some providers send a final reasoning chunk alongside the first content
+    // chunk; once we've switched to content mode, re-opening thinking would
+    // cause _extractThinkingFromContent to misroute content into thinking.
+    if (this.isInContent) {
+      return;
+    }
     if (!this.isInThinking) {
       this.accumulatedThinking += "<thinking> ";
       this.isInThinking = true;
