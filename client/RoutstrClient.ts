@@ -1003,11 +1003,26 @@ export class RoutstrClient {
           latestBalanceInfo.amount > 0 &&
           !latestBalanceInfo.balanceUnknown
         ) {
-          throw new ProviderError(
-            baseUrl,
-            status,
-            refundResult.message ?? "Unknown error"
-          );
+          if (this._isTransientRefundError(refundResult.message)) {
+            // Known transient refund failure: the upstream wallet refuses to
+            // refund a shared API key while other in-flight requests are still
+            // using it (HTTP 400 "Cannot refund key. There are ongoing
+            // requests for this api key."). The sats are still on the key and
+            // will be reclaimed by a later refund sweep — this is not a
+            // terminal provider failure, so fall through to markFailed() +
+            // findNextBestProvider() instead of throwing.
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
+            );
+            tryNextProvider = true;
+          } else {
+            throw new ProviderError(
+              baseUrl,
+              status,
+              refundResult.message ?? "Unknown error"
+            );
+          }
         }
       }
     }
@@ -1113,6 +1128,27 @@ export class RoutstrClient {
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
+    );
+  }
+
+  /**
+   * Classify a refund failure as transient (i.e. safe to ignore and fall
+   * through to provider failover) rather than terminal.
+   *
+   * RefundResult carries no status code (see core/types.ts), so detection is
+   * message-based. The upstream /v1/wallet/refund endpoint returns HTTP 400
+   * with detail "Cannot refund key. There are ongoing requests for this api
+   * key." whenever a shared API key still has in-flight requests — an
+   * inherent race in apikeys mode where one key is reused across concurrent
+   * requests. The balance is still on the key and will be reclaimed by a
+   * later refund sweep, so this must not abort the request.
+   */
+  private _isTransientRefundError(message?: string): boolean {
+    if (!message) return false;
+    const lower = message.toLowerCase();
+    return (
+      lower.includes("ongoing requests for this api key") ||
+      lower.includes("cannot refund key")
     );
   }
 
