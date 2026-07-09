@@ -66,6 +66,8 @@ export interface FetchOptions {
   maxTokens?: number;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /** Optional: abort signal to cancel the in-flight request + stream */
+  abortSignal?: AbortSignal;
 
   // ── Adapters (only needed for auto-discovery path) ────────────────
   /** Discovery adapter for model/mint discovery and provider data */
@@ -93,6 +95,7 @@ interface FetchAIResponseClient {
     baseUrl: string;
     mintUrl: string;
     modelId?: string;
+    signal?: AbortSignal;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
 }
@@ -222,6 +225,7 @@ export async function fetchAIResponse(
       baseUrl,
       mintUrl,
       modelId: selectedModel.id,
+      signal: options.abortSignal,
     });
 
     if (!response.body) {
@@ -239,7 +243,8 @@ export async function fetchAIResponse(
         onContent: callbacks.onStreamingUpdate,
         onThinking: callbacks.onThinkingUpdate,
       },
-      selectedModel.id
+      selectedModel.id,
+      options.abortSignal
     );
 
     if (streamingResult.finish_reason === "content_filter") {
@@ -277,6 +282,16 @@ export async function fetchAIResponse(
       callbacks.onRequestId?.(sdkResponse.requestId);
     }
   } catch (error) {
+    // User-initiated abort: surface as a clean cancellation, not an error.
+    if (error instanceof DOMException && error.name === "AbortError") {
+      callbacks.onStreamingUpdate("");
+      callbacks.onThinkingUpdate("");
+      callbacks.onMessageAppend({
+        role: "system",
+        content: "Generation stopped.",
+      });
+      return;
+    }
     handleError(error, callbacks, deps.alertLevel, deps.logger);
   } finally {
     callbacks.onPaymentProcessing?.(false);

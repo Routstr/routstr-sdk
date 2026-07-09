@@ -41,7 +41,8 @@ export class StreamProcessor {
   async process(
     response: Response,
     callbacks: StreamCallbacks,
-    modelId?: string
+    modelId?: string,
+    signal?: AbortSignal
   ): Promise<StreamingResult> {
     if (!response.body) {
       throw new Error("Response body is not available");
@@ -50,6 +51,12 @@ export class StreamProcessor {
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
+
+    // If already aborted, cancel immediately.
+    if (signal?.aborted) {
+      await reader.cancel().catch(() => {});
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
 
     // Reset state
     this.accumulatedContent = "";
@@ -68,6 +75,11 @@ export class StreamProcessor {
 
     try {
       while (true) {
+        // Check for cancellation before each read.
+        if (signal?.aborted) {
+          await reader.cancel().catch(() => {});
+          throw new DOMException("The operation was aborted.", "AbortError");
+        }
         const { done, value } = await reader.read();
 
         if (done) {

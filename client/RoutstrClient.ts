@@ -63,6 +63,8 @@ export interface RouteRequestParams {
   mintUrl: string;
   modelId?: string;
   clientApiKey?: string;
+  /** Optional: abort the in-flight request and stream consumption. */
+  signal?: AbortSignal;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -405,6 +407,7 @@ export class RoutstrClient {
       baseHeaders,
       selectedModel,
       tinfoilEnabled,
+      signal: params.signal,
     });
 
     let tokenBalanceInSats =
@@ -530,8 +533,15 @@ export class RoutstrClient {
     retryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /** Optional: abort the in-flight request. */
+    signal?: AbortSignal;
   }): Promise<Response> {
-    const { path, method, body, baseUrl, token, headers, tinfoilEnabled } = params;
+    const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
+
+    // Bail out early if already aborted.
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
@@ -557,12 +567,14 @@ export class RoutstrClient {
               method,
               headers,
               body: requestBodyText,
+              signal,
             }
           )
         : await fetch(url, {
             method,
             headers,
             body: requestBodyText,
+            signal,
           });
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
@@ -657,6 +669,7 @@ export class RoutstrClient {
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
+      signal?: AbortSignal;
     },
     token: string,
     status: number,
