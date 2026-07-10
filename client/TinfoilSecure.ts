@@ -242,12 +242,15 @@ async function fetchTinfoilEhbpOnce(
     headers,
     body,
     duplex: "half",
+    signal: normalized.init?.signal,
   } as RequestInit & { duplex: "half" });
 
   const { request: encryptedRequest, context: requestContext } =
     await serverIdentity.encryptRequestWithContext(request);
 
-  const response = await fetch(encryptedRequest);
+  const response = await fetch(encryptedRequest, {
+    signal: normalized.init?.signal,
+  });
   if (!requestContext) {
     return response;
   }

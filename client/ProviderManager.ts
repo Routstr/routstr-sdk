@@ -216,8 +216,8 @@ export class ProviderManager {
   private lastFailed = new Map<string, number>();
   /** Providers on cooldown: [provider_url, cooldown_started_timestamp][] */
   private providersOnCoolDown: [string, number][] = [];
-  /** Cooldown duration in milliseconds (42 seconds) */
-  private static readonly COOLDOWN_DURATION_MS = 42 * 1000;
+  /** Cooldown duration in milliseconds (420 seconds) */
+  private static readonly COOLDOWN_DURATION_MS = 420 * 1000;
   /** Optional persistent store for failure tracking */
   private store: SdkStore | null = null;
   /** Instance ID for debugging */
@@ -258,7 +258,6 @@ export class ProviderManager {
       )
       .map((entry) => [entry.baseUrl, entry.timestamp] as [string, number]);
 
-    this.logger.log(`Hydrated from store: failedProviders=${this.failedProviders.size} lastFailed=${this.lastFailed.size} providersOnCooldown=${this.providersOnCoolDown.length}`);
   }
 
   /**
@@ -274,13 +273,11 @@ export class ProviderManager {
    */
   private cleanupExpiredCooldowns(): void {
     const now = Date.now();
-    const before = this.providersOnCoolDown.length;
     this.providersOnCoolDown = this.providersOnCoolDown.filter(
       ([url, timestamp]) => {
         const age = now - timestamp;
         const isExpired = age >= ProviderManager.COOLDOWN_DURATION_MS;
         if (isExpired) {
-          this.logger.log(`Removing expired cooldown for ${url} (age: ${age}ms)`);
           // Also remove from failedProviders so the provider can be retried
           this.failedProviders.delete(url);
           // Persist to store
@@ -291,10 +288,6 @@ export class ProviderManager {
         return !isExpired;
       }
     );
-    const after = this.providersOnCoolDown.length;
-    if (before !== after) {
-      this.logger.log(`Cleaned up ${before - after} expired cooldown(s), ${after} remaining`);
-    }
   }
 
   /**
@@ -355,13 +348,6 @@ export class ProviderManager {
     const now = Date.now();
     const lastFailure = this.lastFailed.get(baseUrl);
 
-    this.logger.log(`markFailed: ${baseUrl} lastFailure=${lastFailure} now=${now}${reason ? ` reason=[${reason}]` : ""}`);
-
-    if (lastFailure !== undefined) {
-      const timeSinceLastFailure = now - lastFailure;
-      this.logger.log(`markFailed: timeSinceLastFailure=${timeSinceLastFailure}ms withinCooldown=${timeSinceLastFailure < ProviderManager.COOLDOWN_DURATION_MS}`);
-    }
-
     // Track this failure in memory
     this.lastFailed.set(baseUrl, now);
     this.failedProviders.add(baseUrl);
@@ -372,30 +358,18 @@ export class ProviderManager {
       this.store.getState().addFailedProvider(baseUrl);
     }
 
-    this.logger.log(`markFailed: updated ${baseUrl} to ${now}, failedProviders=${this.failedProviders.size}`);
-
     // Check if this is a second failure within the cooldown window
     if (
       lastFailure !== undefined &&
       now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
     ) {
       // Second failure within 5 minutes - add to cooldown
-      this.logger.log(`markFailed: second failure within cooldown window for ${baseUrl}`);
       if (!this.isOnCooldown(baseUrl)) {
         this.providersOnCoolDown.push([baseUrl, now]);
         // Persist to store
         if (this.store) {
           this.store.getState().addProviderOnCooldown(baseUrl, now);
         }
-        this.logger.log(`markFailed: ${baseUrl} added to cooldown`);
-      } else {
-        this.logger.log(`markFailed: ${baseUrl} already on cooldown`);
-      }
-    } else {
-      if (lastFailure === undefined) {
-        this.logger.log(`markFailed: first failure for ${baseUrl}`);
-      } else {
-        this.logger.log(`markFailed: failure outside cooldown window for ${baseUrl} (${now - lastFailure}ms ago)`);
       }
     }
   }
@@ -462,11 +436,8 @@ export class ProviderManager {
         this.discoveryAdapter.getDisabledProviders()
       );
 
-      this.logger.log(`findNextBestProvider: model=${modelId} disabled=${[...disabledProviders].length} onCooldown=${this.providersOnCoolDown.length}`);
-
       // Get all providers with their models
       const allProviders = this.discoveryAdapter.getCachedModels();
-      this.logger.log(`findNextBestProvider: total providers=${Object.keys(allProviders).length}`);
 
       // Find all candidate providers
       const candidates: CandidateProvider[] = [];
@@ -587,9 +558,6 @@ export class ProviderManager {
     const torMode = options.torMode ?? false;
     const disabledProviderList = this.discoveryAdapter.getDisabledProviders();
     const disabledProviders = new Set(disabledProviderList);
-    if (disabledProviderList.length > 0) {
-      this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
-    }
     const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
 
@@ -631,15 +599,6 @@ export class ProviderManager {
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
-
-    if (results.length > 0) {
-      const ranking = results
-        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
-        .join("\n");
-      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
-    } else {
-      this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
-    }
 
     return results;
   }
@@ -704,9 +663,8 @@ export class ProviderManager {
                   // const patchesH = Math.floor((res.height + patchSize - 1) / patchSize);
                   // const tokensFromImage = patchesW * patchesH;
                   imageTokens += tokensFromImage;
-                  this.logger.log(`IMAGE INPUT RESOLUTION width=${res.width} height=${res.height} tokens=${tokensFromImage}`);
                 } else {
-                  this.logger.log("IMAGE INPUT RESOLUTION: unknown format");
+                  // unknown image format
                 }
               }
             }
