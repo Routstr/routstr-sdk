@@ -7,6 +7,7 @@ import type {
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
 import type { AlertLevel, RoutstrClientMode } from "./RoutstrClient";
+import type { ApiKeyManagement } from "./RoutstrClient";
 import {
   resolveRequestContext,
   type ResolveContextInput,
@@ -61,6 +62,10 @@ export interface FetchOptions {
   routstrPubkey?: string;
   /** Client mode (xcashu or apikeys) */
   mode?: "xcashu" | "apikeys";
+  /** Who owns API-key wallet mutations in `apikeys` mode. */
+  apiKeyManagement?: ApiKeyManagement;
+  /** Whether requests may fail over to another provider. */
+  autoProviderFailover?: boolean;
 
   /** Optional: max tokens for the completion */
   maxTokens?: number;
@@ -179,6 +184,8 @@ export async function fetchAIResponse(
         torMode: options.torMode,
         forceRefresh: options.forceRefresh,
         mode: options.mode,
+        apiKeyManagement: options.apiKeyManagement,
+        autoProviderFailover: options.autoProviderFailover,
         routstrPubkey: options.routstrPubkey,
         logger: deps.logger,
         modelManager: options.modelManager,

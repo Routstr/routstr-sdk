@@ -16,6 +16,7 @@ import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
 import {
   RoutstrClient,
+  type ApiKeyManagement,
   type DebugLevel,
   type RequestResponseLogSink,
 } from "./RoutstrClient";
@@ -45,6 +46,10 @@ export interface ResolveContextInput {
   debugLevel?: DebugLevel;
   /** Optional: client mode (xcashu or apikeys). */
   mode?: "xcashu" | "apikeys";
+  /** Who owns API-key wallet mutations in `apikeys` mode. */
+  apiKeyManagement?: ApiKeyManagement;
+  /** Whether requests may fail over to another provider. */
+  autoProviderFailover?: boolean;
   /** Optional: explicit usage tracking driver. */
   usageTrackingDriver?: UsageTrackingDriver;
   /** Optional: explicit SDK store (for using correct DB path). */
@@ -89,6 +94,8 @@ export async function resolveRequestContext(
     modelManager: providedModelManager,
     debugLevel,
     mode = "apikeys",
+    apiKeyManagement = "sdk",
+    autoProviderFailover = true,
     usageTrackingDriver,
     sdkStore,
     providerManager: providedProviderManager,
@@ -160,13 +167,19 @@ export async function resolveRequestContext(
 
   // ── Mint resolution ─────────────────────────────────────────────────
   const providerMints = discoveryAdapter.getCachedMints()[baseUrl] || [];
-  const mintUrl =
-    walletAdapter.getActiveMintUrl() ||
-    providerMints[0] ||
-    Object.keys(await walletAdapter.getBalances())[0];
+  let mintUrl = walletAdapter.getActiveMintUrl() || providerMints[0];
 
   if (!mintUrl) {
-    throw new Error("No mint configured in wallet");
+    if (mode === "apikeys" && apiKeyManagement === "external") {
+      // Externally managed API keys do not use the wallet. Keep the existing
+      // routeRequest shape without forcing callers to configure a dummy mint.
+      mintUrl = "";
+    } else {
+      mintUrl = Object.keys(await walletAdapter.getBalances())[0];
+      if (!mintUrl) {
+        throw new Error("No mint configured in wallet");
+      }
+    }
   }
 
   // ── Client ──────────────────────────────────────────────────────────
@@ -184,6 +197,8 @@ export async function resolveRequestContext(
         providerManager,
         logger,
         requestResponseLogSink: input.requestResponseLogSink,
+        apiKeyManagement,
+        autoProviderFailover,
       }
     );
 

@@ -87,6 +87,40 @@ const client = new RoutstrClient(
 const currentMode = client.getMode(); // Returns the active mode
 ```
 
+### Externally managed API keys
+
+Applications that already own funded Routstr sessions can opt out of SDK
+wallet mutations while continuing to use `apikeys` mode. This is useful when
+API keys and Cashu recovery state have an application-specific persistence or
+sync lifecycle.
+
+```ts
+const client = new RoutstrClient(
+  walletAdapter,
+  storageAdapter, // getApiKey(baseUrl) returns the existing funded key
+  discoveryAdapter,
+  "min",
+  "apikeys",
+  {
+    apiKeyManagement: "external",
+    autoProviderFailover: false,
+  }
+);
+```
+
+With `apiKeyManagement: "external"`, the SDK:
+
+- uses an existing key even when the local Cashu wallet has no balance;
+- never automatically creates, tops up, refunds, removes, or replaces the key
+  during the request pipeline; and
+- fails before making a request when no key exists for the selected provider.
+
+Explicit calls to the public `BalanceManager` remain available to the caller.
+
+Set `autoProviderFailover: false` when the application also owns provider
+selection. An upstream error is then returned without retrying another
+provider. Both options are opt-in; existing SDK behavior remains unchanged.
+
 ## Tests
 
 SDK unit tests live in `sdk/__tests__` and are run with Vitest.
