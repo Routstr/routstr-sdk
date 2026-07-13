@@ -27,6 +27,7 @@ const createStorage = (
   getApiKey: () => null,
   setApiKey: () => {},
   updateApiKeyBalance: () => {},
+  touchApiKeyLastUsed: () => {},
   getAllApiKeys: () => [],
   getChildKey: () => null,
   setChildKey: () => {},
@@ -74,6 +75,11 @@ const createStatefulStorage = (seeds?: {
       const e = apiKeys.get(norm(baseUrl));
       if (e) {
         e.balance = balance;
+      }
+    },
+    touchApiKeyLastUsed: (baseUrl) => {
+      const e = apiKeys.get(norm(baseUrl));
+      if (e) {
         e.lastUsed = Date.now();
       }
     },

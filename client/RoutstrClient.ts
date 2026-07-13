@@ -920,6 +920,7 @@ export class RoutstrClient {
               baseUrl,
               latestTokenBalance
             );
+            this.storageAdapter.touchApiKeyLastUsed(baseUrl);
           }
         }
       } catch (error) {
@@ -1245,6 +1246,7 @@ export class RoutstrClient {
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+          this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
 
         satsSpent =

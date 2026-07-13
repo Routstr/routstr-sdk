@@ -824,10 +824,9 @@ export class CashuSpender {
             `refundProviders: refund failed for ${apiKeyEntry.baseUrl}; currentEntry=${Boolean(currentEntry)} balance=${currentEntry?.balance ?? "none"}. Touching lastUsed to rate-limit retries.`
           );
           if (currentEntry) {
-            this.storageAdapter.updateApiKeyBalance(
-              apiKeyEntry.baseUrl,
-              currentEntry.balance
-            ); // update lastUsed so we only try to refund every 5 mins.
+            this.storageAdapter.touchApiKeyLastUsed(
+              apiKeyEntry.baseUrl
+            ); // rate-limit: don't retry refund for 5 mins.
           }
         }
 
