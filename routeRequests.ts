@@ -25,6 +25,7 @@ import {
   type ResolveContextInput,
   type ResolvedContext,
 } from "./client/resolveRequestContext";
+import { InsufficientBalanceError } from "./core/errors";
 
 // Re-export for consumers that want access to the shared resolver
 export { resolveRequestContext };
@@ -213,17 +214,24 @@ export async function routeRequests(
 
     return response;
   } catch (error) {
-    if (
-      error instanceof Error &&
-      (error.message.includes("401") ||
-        error.message.includes("402") ||
-        error.message.includes("403"))
-    ) {
+    // Preserve typed SDK errors so callers (e.g. routstrd) can instanceof-check
+    // them and map to the correct HTTP status (e.g. 402 for InsufficientBalanceError).
+    if (error instanceof InsufficientBalanceError) {
+      throw error;
+    }
+
+    // Wrap auth failures with a helpful prefix. Match the HTTP status code at
+    // the *start* of the message (e.g. "401 Unauthorized") rather than anywhere
+    // in the body, since balance/error messages may contain digit sequences
+    // like "4022.807" that would otherwise false-match "402".
+    if (error instanceof Error && AUTH_STATUS_RE.test(error.message)) {
       throw new Error(`Authentication failed: ${error.message}`);
     }
     throw error;
   }
 }
+
+const AUTH_STATUS_RE = /^(401|402|403)\b/;
 
 /**
  * Extract message history from request body
