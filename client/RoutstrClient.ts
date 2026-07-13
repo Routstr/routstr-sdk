@@ -300,7 +300,7 @@ export class RoutstrClient {
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
-    await this._checkBalance();
+    await this._checkBalance(baseUrl);
 
     let requiredSats = 1;
     let selectedModel: Model | undefined;
@@ -1427,7 +1427,13 @@ export class RoutstrClient {
   /**
    * Check wallet balance and throw if insufficient
    */
-  private async _checkBalance(): Promise<void> {
+  private async _checkBalance(baseUrl: string): Promise<void> {
+    // In apikeys mode, if a funded API key already exists in storage its
+    // balance lives on the provider — skip the local wallet check.
+    if (this.mode === "apikeys" && this.storageAdapter.getApiKey(baseUrl)) {
+      return;
+    }
+
     const balances = await this.walletAdapter.getBalances();
     const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
 
