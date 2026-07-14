@@ -54,28 +54,45 @@ export function extractUsageFromResponseBody(
   const usage = (body as { usage?: Record<string, unknown> }).usage;
   if (!usage || typeof usage !== "object") return null;
 
-  const promptTokens = Number(usage.prompt_tokens ?? 0);
-  const completionTokens = Number(usage.completion_tokens ?? 0);
-  const totalTokens = Number(usage.total_tokens ?? 0);
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  const completionTokens = Number(
+    usage.completion_tokens ?? usage.output_tokens ?? 0
+  );
+  const totalTokens = Number(
+    usage.total_tokens ?? promptTokens + completionTokens
+  );
   const costValue = usage.cost;
+  const response = body as {
+    cost?: unknown;
+    metadata?: { routstr?: { cost?: unknown } };
+  };
+  const usageCost =
+    costValue && typeof costValue === "object"
+      ? (costValue as Record<string, unknown>)
+      : undefined;
+  const topLevelCost =
+    response.cost && typeof response.cost === "object"
+      ? (response.cost as Record<string, unknown>)
+      : undefined;
+  const metadataCost =
+    response.metadata?.routstr?.cost &&
+    typeof response.metadata.routstr.cost === "object"
+      ? (response.metadata.routstr.cost as Record<string, unknown>)
+      : undefined;
+  const breakdownCost = metadataCost ?? topLevelCost ?? usageCost;
+  const breakdown = extractCostBreakdown(breakdownCost);
 
-  let cost = 0;
-  let satsCost = fallbackSatsCost;
-  let breakdown: Partial<UsageTrackingData> = {};
-
-  if (typeof costValue === "number") {
-    cost = costValue;
-  } else if (costValue && typeof costValue === "object") {
-    const costObj = costValue as Record<string, unknown>;
-    const totalUsd = costObj.total_usd;
-    const totalMsats = costObj.total_msats;
-
-    cost = typeof totalUsd === "number" ? totalUsd : 0;
-    if (typeof totalMsats === "number") {
-      satsCost = totalMsats / 1000;
-    }
-    breakdown = extractCostBreakdown(costObj);
-  }
+  const cost =
+    typeof costValue === "number"
+      ? costValue
+      : numOrUndef(usageCost?.total_usd) ??
+        numOrUndef(breakdownCost?.total_usd) ??
+        0;
+  const totalMsats = numOrUndef(breakdownCost?.total_msats) ?? 0;
+  const satsCost =
+    totalMsats > 0
+      ? totalMsats / 1000
+      : numOrUndef(usage.cost_sats) ?? fallbackSatsCost;
 
   const provider =
     typeof (body as { provider?: unknown }).provider === "string"
@@ -139,67 +156,7 @@ export function extractUsageFromSSEJson(
     };
   }
 
-  if (!parsed.usage) {
-    return null;
-  }
-
-  const usage = parsed.usage;
-  const usageCost = usage.cost;
-  
-  let cost = 0;
-  let msats = 0;
-  let breakdown: Partial<UsageTrackingData> = {};
-
-  if (typeof usageCost === "number") {
-    cost = usageCost;
-  } else if (usageCost && typeof usageCost === "object") {
-    cost = usageCost.total_usd ?? 0;
-    msats = usageCost.total_msats ?? 0;
-    breakdown = extractCostBreakdown(usageCost as Record<string, unknown>);
-  }
-
-  // Some upstreams put the detailed breakdown under metadata.routstr.cost.
-  const routstrCost = parsed.metadata?.routstr?.cost;
-  if (routstrCost && typeof routstrCost === "object") {
-    breakdown = { ...extractCostBreakdown(routstrCost), ...breakdown };
-  }
-
-  // Fallbacks if not in usage.cost
-  if (cost === 0) {
-    cost = parsed.metadata?.routstr?.cost?.total_usd ?? 0;
-  }
-  if (msats === 0) {
-    msats =
-      parsed.metadata?.routstr?.cost?.total_msats ??
-      (typeof usage.cost_sats === "number" ? usage.cost_sats * 1000 : 0);
-  }
-
-  // Support both OpenAI-style (prompt_tokens/completion_tokens) and Anthropic-style (input_tokens/output_tokens)
-  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
-  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
-  const totalTokens = Number(usage.total_tokens ?? (promptTokens + completionTokens));
-
-  const result: UsageTrackingData = {
-    promptTokens,
-    completionTokens,
-    totalTokens,
-    cost: Number(cost ?? 0),
-    satsCost: msats > 0 ? msats / 1000 : fallbackSatsCost,
-    provider,
-    ...breakdown,
-  };
-
-  if (
-    result.promptTokens === 0 &&
-    result.completionTokens === 0 &&
-    result.totalTokens === 0 &&
-    result.cost === 0 &&
-    result.satsCost === 0
-  ) {
-    return null;
-  }
-
-  return result;
+  return extractUsageFromResponseBody(parsed, fallbackSatsCost);
 }
 
 /**
