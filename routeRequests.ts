@@ -15,6 +15,7 @@ import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
 import {
   RoutstrClient,
+  type ApiKeyManagement,
   type DebugLevel,
   type RequestResponseLogSink,
 } from "./client/RoutstrClient";
@@ -62,6 +63,10 @@ export interface RouteRequestOptions {
   debugLevel?: DebugLevel;
   /** Optional: client mode (xcashu or apikeys) */
   mode?: "xcashu" | "apikeys";
+  /** Who owns API-key wallet mutations in `apikeys` mode. */
+  apiKeyManagement?: ApiKeyManagement;
+  /** Whether requests may fail over to another provider. */
+  autoProviderFailover?: boolean;
   /** Optional: explicit usage tracking driver */
   usageTrackingDriver?: UsageTrackingDriver;
   /** Optional: explicit SDK store (for using correct DB path) */
@@ -125,6 +130,8 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     modelManager: providedModelManager,
     debugLevel,
     mode = "apikeys",
+    apiKeyManagement = "sdk",
+    autoProviderFailover = true,
     usageTrackingDriver,
     sdkStore,
     providerManager: providedProviderManager,
@@ -146,6 +153,8 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
       modelManager: providedModelManager,
       debugLevel,
       mode,
+      apiKeyManagement,
+      autoProviderFailover,
       usageTrackingDriver,
       sdkStore,
       providerManager: providedProviderManager,

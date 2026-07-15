@@ -50,6 +50,7 @@ import {
  */
 export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "apikeys";
+export type ApiKeyManagement = "sdk" | "external";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.2;
@@ -95,6 +96,17 @@ export interface RoutstrClientConfig {
   logger?: SdkLogger;
   /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
   requestResponseLogSink?: RequestResponseLogSink;
+  /**
+   * Controls who owns API-key creation, topups, refunds, and removal in
+   * `apikeys` mode. `external` makes the SDK use an existing key without
+   * performing wallet mutations. Defaults to `sdk` for backwards compatibility.
+   */
+  apiKeyManagement?: ApiKeyManagement;
+  /**
+   * Whether a failed request may be retried against another provider.
+   * Defaults to true for backwards compatibility.
+   */
+  autoProviderFailover?: boolean;
 }
 
 export class RoutstrClient {
@@ -108,6 +120,8 @@ export class RoutstrClient {
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
   private requestResponseLogSink?: RequestResponseLogSink;
+  private apiKeyManagement: ApiKeyManagement;
+  private autoProviderFailover: boolean;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -137,6 +151,8 @@ export class RoutstrClient {
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
     this.requestResponseLogSink = options.requestResponseLogSink;
+    this.apiKeyManagement = options.apiKeyManagement ?? "sdk";
+    this.autoProviderFailover = options.autoProviderFailover ?? true;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
@@ -300,7 +316,7 @@ export class RoutstrClient {
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
-    await this._checkBalance();
+    await this._checkBalance(baseUrl);
 
     let requiredSats = 1;
     let selectedModel: Model | undefined;
@@ -755,7 +771,25 @@ export class RoutstrClient {
       );
     }
 
-    if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
+    if (
+      this.mode === "apikeys" &&
+      this.apiKeyManagement === "external" &&
+      !this.autoProviderFailover
+    ) {
+      throw new ProviderError(
+        baseUrl,
+        status,
+        errorMessage || "Request failed",
+        requestId
+      );
+    }
+
+    if (
+      status === 402 &&
+      !tryNextProvider &&
+      this.mode === "apikeys" &&
+      this.apiKeyManagement === "sdk"
+    ) {
       this.storageAdapter.getApiKey(baseUrl);
 
       let topupAmount = params.requiredSats;
@@ -879,7 +913,8 @@ export class RoutstrClient {
     if (
       isInsufficientBalance413 &&
       !tryNextProvider &&
-      this.mode === "apikeys"
+      this.mode === "apikeys" &&
+      this.apiKeyManagement === "sdk"
     ) {
       let retryToken = params.token;
 
@@ -956,7 +991,11 @@ export class RoutstrClient {
       }
     }
 
-    if (status === 401 && this.mode === "apikeys") {
+    if (
+      status === 401 &&
+      this.mode === "apikeys" &&
+      this.apiKeyManagement === "sdk"
+    ) {
       this._log(
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${token}`
@@ -985,11 +1024,14 @@ export class RoutstrClient {
         status === 521) &&
       !tryNextProvider
     ) {
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Status ${status} (${status === 429 ? "rate limited" : "auth/server error"}), attempting refund for ${baseUrl}, mode=${this.mode}`
-      );
-      if (this.mode === "apikeys") {
+      if (
+        this.mode === "apikeys" &&
+        this.apiKeyManagement === "sdk"
+      ) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: Status ${status} (${status === 429 ? "rate limited" : "auth/server error"}), attempting refund for ${baseUrl}, mode=${this.mode}`
+        );
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
@@ -1039,6 +1081,15 @@ export class RoutstrClient {
           }
         }
       }
+    }
+
+    if (!this.autoProviderFailover) {
+      throw new ProviderError(
+        baseUrl,
+        status,
+        errorMessage || "Request failed",
+        requestId
+      );
     }
 
     const failReason = [
@@ -1238,6 +1289,7 @@ export class RoutstrClient {
 
         const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
         if (
+          this.apiKeyManagement === "sdk" &&
           storedApiKeyEntry?.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
@@ -1427,7 +1479,17 @@ export class RoutstrClient {
   /**
    * Check wallet balance and throw if insufficient
    */
-  private async _checkBalance(): Promise<void> {
+  private async _checkBalance(baseUrl: string): Promise<void> {
+    if (this.mode === "apikeys" && this.apiKeyManagement === "external") {
+      const existingApiKey = this.storageAdapter.getApiKey(baseUrl);
+      if (!existingApiKey?.key) {
+        throw new Error(
+          `No externally managed API key available for provider: ${baseUrl}`
+        );
+      }
+      return;
+    }
+
     const balances = await this.walletAdapter.getBalances();
     const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
 
@@ -1459,6 +1521,11 @@ export class RoutstrClient {
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       if (!parentApiKey) {
+        if (this.apiKeyManagement === "external") {
+          throw new Error(
+            `No externally managed API key available for provider: ${baseUrl}`
+          );
+        }
         this._log(
           "DEBUG",
           `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
@@ -1666,4 +1733,3 @@ export class RoutstrClient {
   }
 
 }
-
