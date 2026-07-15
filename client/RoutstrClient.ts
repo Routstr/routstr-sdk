@@ -1463,9 +1463,19 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
         );
+        // Enforce a minimum deposit of 10 sats when creating a brand-new
+        // API key.  Without this, a tiny probe request (e.g. a 10-token
+        // health check with max_tokens=10) can price at well under 1 sat,
+        // and Math.ceil rounds it up to exactly 1 sat — leaving the new
+        // key with a balance too small to serve any real request.
+        const MIN_INITIAL_DEPOSIT = 7;
+        const initialAmount = Math.max(
+          Math.ceil(amount * TOPUP_MARGIN),
+          MIN_INITIAL_DEPOSIT
+        );
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
-          amount: amount * TOPUP_MARGIN,
+          amount: initialAmount,
           baseUrl: "",
           reuseToken: false,
         });
