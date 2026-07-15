@@ -703,12 +703,18 @@ export class ProviderManager {
       }
 
       // Calculate based on token usage (similar to getTokenAmountForModel in apiUtils.ts)
+      // Include the per-request base fee (sp.request) so that even a tiny
+      // probe request (e.g. a 10-token health check) prices at least the
+      // base fee.  Without this, a near-zero token count produces a
+      // sub-sat total that Math.ceil rounds up to just 1 sat, leaving the
+      // newly-created API key with a worthless balance.
+      const requestFee = sp.request || 0;
       const promptCosts = (sp.prompt || 0) * totalInputTokens;
       let completionCost = sp.max_completion_cost;
       if (maxTokens !== undefined && sp.completion) {
         completionCost = sp.completion * maxTokens;
       }
-      const totalEstimatedCosts = (promptCosts + completionCost) * 1.05;
+      const totalEstimatedCosts = (promptCosts + completionCost + requestFee) * 1.05;
       // return totalEstimatedCosts > sp.max_cost ? sp.max_cost : totalEstimatedCosts; // in some image input calculations, this cost balloons up. Now includes image tokens via 32px patches.
       return totalEstimatedCosts; // Backend has a bug here.it's calculating image tokens wrong. gotta switch to different logic once its fixed
     } catch (e) {
