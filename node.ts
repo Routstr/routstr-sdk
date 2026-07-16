@@ -16,9 +16,6 @@ import {
   type ModelManagerConfig,
 } from "./discovery/ModelManager";
 import type { DiscoveryAdapter } from "./discovery/interfaces";
-import { configureNodeAuditLogger } from "./wallet/AuditLoggerNode";
-
-configureNodeAuditLogger();
 
 const createNodePersistentEventDatabase = async (dbPath: string) => {
   const { BetterSqlite3EventDatabase } = await import(

@@ -12,8 +12,10 @@ The SDK now has browser-safe default exports and explicit runtime-specific entry
 
 The browser build is regression-tested as a complete dependency bundle. The
 Web SSE inspector is isolated from the Node `Transform` parser, and file-backed
-audit logging is configured only by the Node/Bun entrypoints. Tinfoil's
-capability-gated `zlib` fallback can be mapped to `@routstr/sdk/browser/zlib`.
+audit logging is configurable through an explicit runtime sink. Node and Bun
+consumers can opt into file-backed logging with `configureNodeAuditLogger()`.
+Tinfoil's capability-gated `zlib` fallback maps to
+`@routstr/sdk/browser/zlib` during strict browser bundling.
 
 ## Root Cause
 
