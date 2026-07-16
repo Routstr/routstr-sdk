@@ -28,6 +28,7 @@ const createStorage = (
   getApiKey: () => null,
   setApiKey: () => {},
   updateApiKeyBalance: () => {},
+  touchApiKeyLastUsed: () => {},
   getAllApiKeys: () => [],
   getChildKey: () => null,
   setChildKey: () => {},

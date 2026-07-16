@@ -300,7 +300,7 @@ export class RoutstrClient {
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
-    await this._checkBalance();
+    await this._checkBalance(baseUrl);
 
     let requiredSats = 1;
     let selectedModel: Model | undefined;
@@ -920,6 +920,7 @@ export class RoutstrClient {
               baseUrl,
               latestTokenBalance
             );
+            this.storageAdapter.touchApiKeyLastUsed(baseUrl);
           }
         }
       } catch (error) {
@@ -1245,6 +1246,7 @@ export class RoutstrClient {
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+          this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
 
         satsSpent =
@@ -1425,7 +1427,13 @@ export class RoutstrClient {
   /**
    * Check wallet balance and throw if insufficient
    */
-  private async _checkBalance(): Promise<void> {
+  private async _checkBalance(baseUrl: string): Promise<void> {
+    // In apikeys mode, if a funded API key already exists in storage its
+    // balance lives on the provider — skip the local wallet check.
+    if (this.mode === "apikeys" && this.storageAdapter.getApiKey(baseUrl)) {
+      return;
+    }
+
     const balances = await this.walletAdapter.getBalances();
     const totalBalance = Object.values(balances).reduce((sum, v) => sum + v, 0);
 
@@ -1461,9 +1469,19 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
         );
+        // Enforce a minimum deposit of 10 sats when creating a brand-new
+        // API key.  Without this, a tiny probe request (e.g. a 10-token
+        // health check with max_tokens=10) can price at well under 1 sat,
+        // and Math.ceil rounds it up to exactly 1 sat — leaving the new
+        // key with a balance too small to serve any real request.
+        const MIN_INITIAL_DEPOSIT = 7;
+        const initialAmount = Math.max(
+          Math.ceil(amount * TOPUP_MARGIN),
+          MIN_INITIAL_DEPOSIT
+        );
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
-          amount: amount * TOPUP_MARGIN,
+          amount: initialAmount,
           baseUrl: "",
           reuseToken: false,
         });

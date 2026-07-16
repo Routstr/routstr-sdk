@@ -91,8 +91,14 @@ export interface StorageAdapter {
   /** Store API key for a provider */
   setApiKey(baseUrl: string, key: string): void;
 
-  /** Update balance for an existing stored API key (based on provider response) */
+  /** Update balance for an existing stored API key (based on provider response).
+   *  Does NOT touch `lastUsed` — call `touchApiKeyLastUsed()` separately when
+   *  the key was actually used for a request. */
   updateApiKeyBalance(baseUrl: string, balance: number): void;
+
+  /** Mark an API key as recently used (sets `lastUsed = Date.now()`)
+   *  without changing its balance.  Used for rate-limiting refund retries. */
+  touchApiKeyLastUsed(baseUrl: string): void;
 
   /** Remove API key for a provider */
   removeApiKey(baseUrl: string): void;

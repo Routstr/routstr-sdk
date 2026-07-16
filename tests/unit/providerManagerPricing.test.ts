@@ -1035,6 +1035,29 @@ describe("ProviderManager", () => {
       expect(withMaxTokens).not.toBe(withDefault);
     });
 
+    it("includes the per-request base fee (sp.request) in the total", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "deepseek-v4-flash",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.00022588,
+          completion: 0.00045176,
+          max_completion_cost: 5,
+          request: 1,
+        } as any,
+      };
+
+      // Tiny probe: a single short message with maxTokens=10.
+      // Without the request fee this would price at well under 1 sat.
+      const messages = [{ role: "user", content: "hi" }];
+      const cost = manager.getRequiredSatsForModel(model, messages, 10);
+
+      // The request fee alone (1 sat) × 1.05 = 1.05, so the total must be
+      // at least 1.05 — not rounded down to ~0.008.
+      expect(cost).toBeGreaterThanOrEqual(1.05);
+    });
+
     it("returns 0 when an error occurs during calculation", () => {
       const manager = new ProviderManager(createRegistry());
       const model: Model = {
