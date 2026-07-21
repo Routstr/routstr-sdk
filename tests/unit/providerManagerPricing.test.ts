@@ -628,7 +628,7 @@ describe("ProviderManager", () => {
   describe("cooldown state machine", () => {
     it("returns cooldown duration", () => {
       const manager = new ProviderManager(createRegistry());
-      expect(manager.getCooldownDurationMs()).toBe(42_000);
+      expect(manager.getCooldownDurationMs()).toBe(210_000);
     });
 
     it("isOnCooldown returns false initially", () => {
@@ -651,7 +651,7 @@ describe("ProviderManager", () => {
       vi.setSystemTime(t0);
       manager.markFailed("https://alpha.example.com/");
 
-      // Second failure well within the 42s window
+      // Second failure well within the cooldown window
       vi.setSystemTime(t0 + 5_000);
       manager.markFailed("https://alpha.example.com/");
 
@@ -668,7 +668,7 @@ describe("ProviderManager", () => {
       manager.markFailed("https://alpha.example.com/");
 
       // Second failure after the cooldown window
-      vi.setSystemTime(t0 + 43_000);
+      vi.setSystemTime(t0 + manager.getCooldownDurationMs() + 1_000);
       manager.markFailed("https://alpha.example.com/");
 
       expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(false);
@@ -690,7 +690,7 @@ describe("ProviderManager", () => {
       expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(true);
 
       // Advance past cooldown duration from the second failure
-      vi.setSystemTime(t0 + 1_000 + 42_001);
+      vi.setSystemTime(t0 + 1_000 + manager.getCooldownDurationMs() + 1);
 
       // cleanupExpiredCooldowns runs inside isOnCooldown
       expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(false);
@@ -1133,8 +1133,8 @@ describe("ProviderManager", () => {
           providersOnCooldown: [
             // Fresh cooldown — should be kept
             { baseUrl: "https://fresh.example.com/", timestamp: now - 5_000 },
-            // Expired cooldown — should be filtered out
-            { baseUrl: "https://stale.example.com/", timestamp: now - 50_000 },
+            // Expired cooldown — older than COOLDOWN_DURATION_MS (210s), should be filtered out
+            { baseUrl: "https://stale.example.com/", timestamp: now - 220_000 },
           ],
           removeFailedProvider: vi.fn(),
           setFailedProviders: vi.fn(),
