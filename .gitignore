@@ -27,6 +27,8 @@ dist
 package-lock.json
 .worktrees
 
+graphify-out
+
 # debug request dumps
 reqs/
 scripts/reqRes/
