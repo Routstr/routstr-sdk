@@ -168,6 +168,33 @@ export class BalanceManager {
     }
   }
 
+  /**
+   * Parse an HTTP error response body, distinguishing JSON error payloads
+   * (which may contain a `detail` field) from non-JSON bodies such as
+   * Cloudflare HTML error pages.
+   *
+   * @returns `errorDetail` — the `detail` string from a JSON body, or
+   *          `undefined` when the body is not JSON or has no `detail`.
+   *          `isJson`     — `true` when the body parsed as JSON.
+   */
+  private _parseErrorBody(
+    responseBody: string | undefined
+  ): { errorDetail: string | undefined; isJson: boolean } {
+    if (!responseBody) {
+      return { errorDetail: undefined, isJson: false };
+    }
+    try {
+      const parsed = JSON.parse(responseBody);
+      return {
+        errorDetail: parsed?.detail != null ? String(parsed.detail) : undefined,
+        isJson: true,
+      };
+    } catch {
+      // Not JSON (e.g. Cloudflare 502 HTML error page)
+      return { errorDetail: undefined, isJson: false };
+    }
+  }
+
   async getBalanceState(): Promise<BalanceState> {
     const mintBalances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
@@ -362,14 +389,7 @@ export class BalanceManager {
 
       if (!response.ok) {
         const responseBody = await response.text().catch(() => undefined);
-        let errorData: any = {};
-        if (responseBody) {
-          try {
-            errorData = JSON.parse(responseBody);
-          } catch {
-            errorData = {};
-          }
-        }
+        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
         this.logger.error("Upstream wallet refund error response", {
           baseUrl,
           url,
@@ -383,7 +403,9 @@ export class BalanceManager {
           requestId,
           status: response.status,
           error: `API key refund failed: ${
-            errorData?.detail || responseBody || response.statusText
+            errorDetail ||
+            (isJson ? responseBody : undefined) ||
+            `${response.status} ${response.statusText}`
           }`,
         };
       }
@@ -853,14 +875,7 @@ export class BalanceManager {
 
       if (!response.ok) {
         const responseBody = await response.text().catch(() => undefined);
-        let errorData: any = {};
-        if (responseBody) {
-          try {
-            errorData = JSON.parse(responseBody);
-          } catch {
-            errorData = {};
-          }
-        }
+        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
         this.logger.error("Upstream wallet topup error response", {
           baseUrl,
           url,
@@ -873,7 +888,9 @@ export class BalanceManager {
           success: false,
           requestId,
           error:
-            errorData?.detail || responseBody || `Top up failed with status ${response.status}`,
+            errorDetail ||
+            (isJson ? responseBody : undefined) ||
+            `Top up failed with status ${response.status}`,
         };
       }
 
@@ -988,8 +1005,18 @@ export class BalanceManager {
         };
       } else {
         this.logger.warn(`getTokenBalance: status=${response.status}`);
-        const data = await response.json();
-        this.logger.warn("getTokenBalance: FAILED", data);
+        const responseBody = await response.text().catch(() => undefined);
+        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
+        if (isJson) {
+          this.logger.warn(`getTokenBalance: FAILED status=${response.status} detail=${errorDetail ?? "none"}`);
+        } else {
+          this.logger.warn(`getTokenBalance: non-JSON response (status=${response.status} ${response.statusText})`);
+        }
+
+        let data: any = {};
+        if (isJson && responseBody) {
+          try { data = JSON.parse(responseBody); } catch { data = {}; }
+        }
 
         // Check for invalid/expired API key error (proofs already spent)
         const isInvalidApiKey =
