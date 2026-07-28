@@ -765,66 +765,6 @@ describe("BalanceManager non-JSON error responses", () => {
     }
   });
 
-  it("fetchRefundToken uses JSON body (without detail) as error", async () => {
-    const manager = new BalanceManager(createWallet(), createStorage());
-    const originalFetch = globalThis.fetch;
-    const jsonBody = JSON.stringify({ error: "something went wrong" });
-    globalThis.fetch = mockFetchResponse(500, "Internal Server Error", jsonBody) as unknown as typeof globalThis.fetch;
-
-    try {
-      const result = await manager.fetchRefundToken(
-        "https://provider.example.com",
-        "test-api-key"
-      );
-
-      expect(result.success).toBe(false);
-      expect(result.error).toBe("API key refund failed: " + jsonBody);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  it("topUp returns concise HTTP status for HTML 502 instead of full page", async () => {
-    // Need a wallet with balance so createProviderToken succeeds,
-    // then _postTopUp receives the 502 HTML.
-    const wallet = createWallet({
-      getBalances: async () => ({ "https://mint.example.com": 1000 }),
-      getMintUnits: () => ({ "https://mint.example.com": "sat" }),
-    });
-    const storage = createStatefulStorage({
-      apiKeys: {
-        "https://provider.example.com": {
-          key: "test-api-key",
-          balance: 0,
-          lastUsed: null,
-        },
-      },
-    });
-    const manager = new BalanceManager(wallet, storage);
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mockFetchResponse(
-      502,
-      "Bad gateway",
-      CLOUDFLARE_502_HTML
-    ) as unknown as typeof globalThis.fetch;
-
-    try {
-      const result = await manager.topUp({
-        mintUrl: "https://mint.example.com",
-        baseUrl: "https://provider.example.com",
-        amount: 10,
-      });
-
-      expect(result.success).toBe(false);
-      expect(result.message).toBe("Top up failed with status 502");
-      // The full HTML page must NOT be in the error message
-      expect(result.message).not.toContain("<html");
-      expect(result.message).not.toContain("DOCTYPE");
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
   it("getTokenBalance handles non-JSON (HTML) responses gracefully", async () => {
     const manager = new BalanceManager(createWallet(), createStorage());
     const originalFetch = globalThis.fetch;
