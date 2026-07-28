@@ -46,6 +46,28 @@ import {
 } from "./TinfoilSecure";
 
 /**
+ * Extract a Cashu refund token from an error response body.
+ *
+ * Some upstream providers (e.g. routstr-core) return the refund token in the
+ * JSON body (`error.refund_token`) on 402 responses, rather than in an
+ * `x-cashu` response header. If we only check the header we miss the refund
+ * and throw a ProviderError instead of receiving the sats and failing over.
+ */
+function extractRefundTokenFromBody(bodyText?: string): string | undefined {
+  if (!bodyText) return undefined;
+  try {
+    const parsed = JSON.parse(bodyText);
+    const token = parsed?.error?.refund_token;
+    if (typeof token === "string" && token.startsWith("cashu")) {
+      return token;
+    }
+  } catch {
+    // Not JSON — no refund token to extract.
+  }
+  return undefined;
+}
+
+/**
  * RoutstrClient is the main SDK entry point
  */
 export type AlertLevel = "max" | "min";
@@ -612,7 +634,7 @@ export class RoutstrClient {
           response.status,
           requestId,
           this.mode === "xcashu"
-            ? (response.headers.get("x-cashu") ?? undefined)
+            ? (response.headers.get("x-cashu") ?? extractRefundTokenFromBody(bodyText))
             : undefined,
           bodyText,
           params.retryCount ?? 0
@@ -745,14 +767,18 @@ export class RoutstrClient {
     }
 
     // In xcashu mode, if neither the refund nor the original was received,
-    // we have no way to recover the sats — throw so the caller can surface it.
+    // log a warning but DON'T throw — fall through to the provider failover
+    // logic below (findNextBestProvider) so the request can retry on the
+    // next configured provider instead of dying with a ProviderError.
+    // The sats are lost (proofs consumed but no refund), but the request
+    // still succeeds — better UX than a hard failure.
     if (this.mode === "xcashu" && !tryNextProvider) {
-      throw new ProviderError(
-        baseUrl,
-        status,
-        "[xcashu] Failed to receive refund token",
-        requestId
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: xcashu refund not received from ${baseUrl} (status=${status}), falling through to provider failover`
       );
+      // Mark this provider as failed so findNextBestProvider skips it
+      tryNextProvider = true;
     }
 
     if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
@@ -1206,9 +1232,21 @@ export class RoutstrClient {
         if (receiveResult.success) {
           // Remove the spent token from storage
           this.storageAdapter.removeXcashuToken(baseUrl, token);
-          satsSpent =
-            initialTokenBalance -
+          const refundSats =
             receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          // Guard against double-refund races: if the background
+          // refundXcashuTokens sweep also receives this token (or the
+          // same proofs), the refund amount can exceed the initial token
+          // balance, producing a negative satsSpent that corrupts
+          // usage_tracking (e.g. sats_cost = -8176 for a 57-sat request).
+          // Clamp at 0 and log the anomaly so it's visible.
+          if (refundSats > initialTokenBalance) {
+            this._log(
+              "WARN",
+              `[xcashu] Refund amount (${refundSats} sats) exceeds initial token balance (${initialTokenBalance} sats) for ${baseUrl} — likely double-refund race; clamping satsSpent to 0`
+            );
+          }
+          satsSpent = Math.max(0, initialTokenBalance - refundSats);
         } else {
           this._log(
             "ERROR",

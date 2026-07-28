@@ -9,7 +9,11 @@ export function isNetworkErrorMessage(message: string): boolean {
     message.includes("ERR_TLS_CERT_NOT_YET_VALID") ||
     message.includes("ERR_TLS_CERT_EXPIRED") ||
     message.includes("UNABLE_TO_VERIFY_LEAF_SIGNATURE") ||
-    message.includes("SELF_SIGNED_CERT_IN_CHAIN")
+    message.includes("SELF_SIGNED_CERT_IN_CHAIN") ||
+    // Bun-specific fetch errors when the upstream is unreachable
+    message.includes("Unable to connect") ||
+    message.includes("ECONNREFUSED") ||
+    message.includes("Connection refused")
   );
 }
 
