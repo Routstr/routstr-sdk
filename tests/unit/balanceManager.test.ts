@@ -686,3 +686,105 @@ describe("BalanceManager force-refund escalation", () => {
     }
   });
 });
+
+describe("BalanceManager non-JSON error responses", () => {
+  const CLOUDFLARE_502_HTML = `<!DOCTYPE html>
+<html lang="en-US">
+<head><title>routstr.com | 502: Bad gateway</title></head>
+<body><h1>Bad gateway</h1><p>Error code 502</p></body>
+</html>`;
+
+  /** Minimal helper to create a fetch mock returning a fixed response. */
+  const mockFetchResponse = (
+    status: number,
+    statusText: string,
+    body: string,
+    headers: Record<string, string> = {}
+  ) => {
+    const response = {
+      ok: status >= 200 && status < 300,
+      status,
+      statusText,
+      text: async () => body,
+      json: async () => JSON.parse(body),
+      headers: {
+        get: (name: string) => headers[name] ?? null,
+      },
+    } as unknown as Response;
+    return () => Promise.resolve(response);
+  };
+
+  it("fetchRefundToken returns concise HTTP status for HTML 502 instead of full page", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetchResponse(
+      502,
+      "Bad gateway",
+      CLOUDFLARE_502_HTML
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.fetchRefundToken(
+        "https://provider.example.com",
+        "test-api-key"
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe(502);
+      expect(result.error).toBe("API key refund failed: 502 Bad gateway");
+      // The full HTML page must NOT be in the error message
+      expect(result.error).not.toContain("<html");
+      expect(result.error).not.toContain("DOCTYPE");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fetchRefundToken still uses JSON detail field when present", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    const jsonBody = JSON.stringify({
+      detail: "No balance to refund",
+    });
+    globalThis.fetch = mockFetchResponse(400, "Bad Request", jsonBody, {
+      "x-routstr-request-id": "req-123",
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.fetchRefundToken(
+        "https://provider.example.com",
+        "test-api-key"
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe(400);
+      expect(result.error).toBe("API key refund failed: No balance to refund");
+      expect(result.requestId).toBe("req-123");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("getTokenBalance handles non-JSON (HTML) responses gracefully", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetchResponse(
+      502,
+      "Bad gateway",
+      CLOUDFLARE_502_HTML
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.getTokenBalance(
+        "test-api-key",
+        "https://provider.example.com/"
+      );
+
+      expect(result.amount).toBe(0);
+      expect(result.balanceUnknown).toBe(true);
+      expect(result.isInvalidApiKey).toBeFalsy();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
