@@ -18,6 +18,7 @@ export interface SdkStorageStore extends SdkStorageState {
   setBaseUrlsList: (value: string[]) => void;
   setBaseUrlsLastUpdate: (value: number | null) => void;
   setDisabledProviders: (value: string[]) => void;
+  setManuallyDisabledProviders: (value: string[]) => void;
   setMintsFromAllProviders: (value: Record<string, string[]>) => void;
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
@@ -100,6 +101,7 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     baseUrlsList: [],
     lastBaseUrlsUpdate: null,
     disabledProviders: [],
+    manuallyDisabledProviders: [],
     mintsFromAllProviders: {},
     infoFromAllProviders: {},
     lastModelsUpdate: {},
@@ -141,6 +143,11 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
       const normalized = value.map((url) => normalizeBaseUrl(url));
       void driver.setItem(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, normalized);
       set({ disabledProviders: normalized });
+    },
+    setManuallyDisabledProviders: (value) => {
+      const normalized = value.map((url) => normalizeBaseUrl(url));
+      void driver.setItem(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, normalized);
+      set({ manuallyDisabledProviders: normalized });
     },
     setMintsFromAllProviders: (value) => {
       const normalized: Record<string, string[]> = {};
@@ -364,6 +371,7 @@ const hydrateStoreFromDriver = async (
     rawBaseUrls,
     lastBaseUrlsUpdate,
     rawDisabledProviders,
+    rawManuallyDisabledProviders,
     rawMints,
     rawInfo,
     rawLastModelsUpdate,
@@ -386,6 +394,7 @@ const hydrateStoreFromDriver = async (
     driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, []),
     driver.getItem<Record<string, string[]>>(
       SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
       {}
@@ -467,6 +476,10 @@ const hydrateStoreFromDriver = async (
   const baseUrlsList = rawBaseUrls.map((url) => normalizeBaseUrl(url));
 
   const disabledProviders = rawDisabledProviders.map((url) =>
+    normalizeBaseUrl(url)
+  );
+
+  const manuallyDisabledProviders = rawManuallyDisabledProviders.map((url) =>
     normalizeBaseUrl(url)
   );
 
@@ -555,6 +568,7 @@ const hydrateStoreFromDriver = async (
     baseUrlsList,
     lastBaseUrlsUpdate,
     disabledProviders,
+    manuallyDisabledProviders,
     mintsFromAllProviders,
     infoFromAllProviders,
     lastModelsUpdate,
@@ -605,8 +619,13 @@ export const createDiscoveryAdapterFromStore = (
   },
   getLastUsedModel: () => store.getState().lastUsedModel,
   setLastUsedModel: (modelId) => store.getState().setLastUsedModel(modelId),
-  getDisabledProviders: () => store.getState().disabledProviders,
+  getDisabledProviders: () => {
+    const { disabledProviders, manuallyDisabledProviders } = store.getState();
+    return [...new Set([...disabledProviders, ...manuallyDisabledProviders])];
+  },
   setDisabledProviders: (urls) => store.getState().setDisabledProviders(urls),
+  getManuallyDisabledProviders: () => store.getState().manuallyDisabledProviders,
+  setManuallyDisabledProviders: (urls) => store.getState().setManuallyDisabledProviders(urls),
   getBaseUrlsList: () => store.getState().baseUrlsList,
   setBaseUrlsList: (urls) => store.getState().setBaseUrlsList(urls),
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
