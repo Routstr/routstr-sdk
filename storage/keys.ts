@@ -3,6 +3,7 @@ export const SDK_STORAGE_KEYS = {
   LAST_USED_MODEL: "lastUsedModel",
   BASE_URLS_LIST: "base_urls_list",
   DISABLED_PROVIDERS: "disabled_providers",
+  MANUALLY_DISABLED_PROVIDERS: "manually_disabled_providers",
   MINTS_FROM_ALL_PROVIDERS: "mints_from_all_providers",
   INFO_FROM_ALL_PROVIDERS: "info_from_all_providers",
   LAST_MODELS_UPDATE: "lastModelsUpdate",
