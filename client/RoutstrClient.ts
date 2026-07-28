@@ -326,6 +326,7 @@ export class RoutstrClient {
 
     let requiredSats = 1;
     let selectedModel: Model | undefined;
+    let requestMaxTokens: number | undefined;
     if (modelId) {
       const providerModel = await this.providerManager.getModelForProvider(
         baseUrl,
@@ -336,11 +337,11 @@ export class RoutstrClient {
         const requestMessages = Array.isArray(
           (body as { messages?: unknown })?.messages
         )
-          ? ((body as { messages?: unknown }).messages as any[])
+          ? ((body as { messages?: unknown })?.messages as any[])
           : [];
-        const requestMaxTokens =
+        requestMaxTokens =
           typeof (body as { max_tokens?: unknown })?.max_tokens === "number"
-            ? ((body as { max_tokens?: unknown }).max_tokens as number)
+            ? ((body as { max_tokens?: unknown })?.max_tokens as number)
             : undefined;
 
         this._log(
@@ -425,6 +426,7 @@ export class RoutstrClient {
       mintUrl,
       token,
       requiredSats,
+      maxTokens: requestMaxTokens,
       headers: finalHeaders,
       baseHeaders,
       selectedModel,
