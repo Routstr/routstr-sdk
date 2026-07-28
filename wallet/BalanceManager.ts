@@ -94,6 +94,8 @@ export class BalanceManager {
   > = new Map();
   /** Cooldown (ms) between opposite operations on the same provider */
   private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
+  /** Providers that have timed out during the current refund cascade. */
+  private _refundTimedOutProviders: Set<string> = new Set();
   private readonly logger: SdkLogger;
 
   constructor(
@@ -337,7 +339,7 @@ export class BalanceManager {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
       controller.abort();
-    }, 60000);
+    }, 30000);
 
     try {
       const headers: Record<string, string> = {
@@ -402,7 +404,7 @@ export class BalanceManager {
         if (error.name === "AbortError") {
           return {
             success: false,
-            error: "Request timed out after 1 minute",
+            error: "Request timed out after 30 seconds",
           };
         }
         return {
@@ -521,6 +523,11 @@ export class BalanceManager {
       this.logger.error(`createProviderToken: invalid amount=${amount}`);
       return { success: false, error: "Invalid top up amount" };
     }
+
+    // Clear the timed-out set on a fresh (top-level) call so that providers
+    // that were unreachable during a previous createProviderToken run get a
+    // fresh chance.
+    if (retryCount === 0) this._refundTimedOutProviders.clear();
 
     const balanceState = await this.getBalanceState();
     const balances = await this.walletAdapter.getBalances();
@@ -756,7 +763,7 @@ export class BalanceManager {
           key: full?.key,
         } as const;
       })
-      .filter((c) => c.key != null)
+      .filter((c) => c.key != null && !this._refundTimedOutProviders.has(c.baseUrl))
       .sort((a, b) => a.lastUsed - b.lastUsed); // oldest first
 
     if (candidates.length === 0) return;
@@ -769,12 +776,16 @@ export class BalanceManager {
       // NOTE: refundApiKey() already calls removeApiKey() on success, so we
       // don't need to update the balance here — the key is gone.
       for (const candidate of candidates) {
-        await this.refundApiKey({
+        const refundResult = await this.refundApiKey({
           mintUrl,
           baseUrl: candidate.baseUrl,
           apiKey: candidate.key!,
           forceRefund: true,
         });
+
+        if (!refundResult.success && refundResult.message?.includes("timed out")) {
+          this._refundTimedOutProviders.add(candidate.baseUrl);
+        }
 
         // Check if we've freed enough balance for the target provider
         const newState = await this.getBalanceState();
@@ -794,7 +805,7 @@ export class BalanceManager {
       // lastUsed for determinism). Providers outside the 5-min window will
       // succeed and be cleaned up by refundApiKey; recently-used ones are
       // skipped without side effects.
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         candidates.map((candidate) =>
           this.refundApiKey({
             mintUrl,
@@ -804,6 +815,18 @@ export class BalanceManager {
           })
         )
       );
+
+      // Track which providers timed out so we skip them on subsequent retry
+      // rounds.
+      results.forEach((r, i) => {
+        if (
+          r.status === "fulfilled" &&
+          !r.value.success &&
+          r.value.message?.includes("timed out")
+        ) {
+          this._refundTimedOutProviders.add(candidates[i].baseUrl);
+        }
+      });
     }
   }
 
@@ -834,7 +857,7 @@ export class BalanceManager {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
       controller.abort();
-    }, 60000);
+    }, 30000);
 
     try {
       const response = await fetch(url, {
@@ -886,7 +909,7 @@ export class BalanceManager {
         if (error.name === "AbortError") {
           return {
             success: false,
-            error: "Request timed out after 1 minute",
+            error: "Request timed out after 30 seconds",
           };
         }
         return {
