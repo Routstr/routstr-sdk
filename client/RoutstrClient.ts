@@ -1206,9 +1206,21 @@ export class RoutstrClient {
         if (receiveResult.success) {
           // Remove the spent token from storage
           this.storageAdapter.removeXcashuToken(baseUrl, token);
-          satsSpent =
-            initialTokenBalance -
+          const refundSats =
             receiveResult.amount * (receiveResult.unit == "sat" ? 1 : 1000);
+          // Guard against double-refund races: if the background
+          // refundXcashuTokens sweep also receives this token (or the
+          // same proofs), the refund amount can exceed the initial token
+          // balance, producing a negative satsSpent that corrupts
+          // usage_tracking (e.g. sats_cost = -8176 for a 57-sat request).
+          // Clamp at 0 and log the anomaly so it's visible.
+          if (refundSats > initialTokenBalance) {
+            this._log(
+              "WARN",
+              `[xcashu] Refund amount (${refundSats} sats) exceeds initial token balance (${initialTokenBalance} sats) for ${baseUrl} — likely double-refund race; clamping satsSpent to 0`
+            );
+          }
+          satsSpent = Math.max(0, initialTokenBalance - refundSats);
         } else {
           this._log(
             "ERROR",
