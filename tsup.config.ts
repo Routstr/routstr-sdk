@@ -4,6 +4,7 @@ export default defineConfig({
   entry: [
     "index.ts",
     "browser.ts",
+    "browser-zlib.ts",
     "node.ts",
     "bun.ts",
     "storage/index.ts",

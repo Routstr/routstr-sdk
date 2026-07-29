@@ -1,5 +1,5 @@
 import { Readable } from "stream";
-import { createSSEParserTransform } from "@routstr/sdk";
+import { createSSEParserTransform } from "@routstr/sdk/node";
 import type { UsageTrackingData } from "@routstr/sdk";
 import * as fs from "fs";
 import * as readline from "readline";

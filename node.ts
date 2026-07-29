@@ -3,6 +3,8 @@
 // browser-safe default and @routstr/sdk/browser entrypoints.
 
 export * from "./index";
+export { createSSEParserTransform } from "./client/sse";
+export { configureNodeAuditLogger } from "./wallet/AuditLoggerNode";
 export { createSqliteDriver, type SqliteDriverOptions } from "./storage/drivers/sqlite";
 export {
   createSqliteUsageTrackingDriver,
