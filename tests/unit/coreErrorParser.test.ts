@@ -145,6 +145,7 @@ describe("parseCoreError", () => {
       const parsed = parseCoreError("Internal Server Error", 500);
       expect(parsed.message).toBe("Internal Server Error");
       expect(parsed.raw).toBe(true);
+      expect(parsed.json).toBe(false);
     });
 
     it("handles JSON without error/detail fields", () => {
@@ -180,6 +181,8 @@ describe("parseCoreError", () => {
 
       expect(parsed.type).toBe("internal_error");
       expect(parsed.message).toBe("Something went wrong");
+      expect(parsed.raw).toBe(false);
+      expect(parsed.json).toBe(true);
     });
   });
 });

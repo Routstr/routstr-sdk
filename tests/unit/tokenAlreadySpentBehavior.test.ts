@@ -179,6 +179,31 @@ describe("RoutstrClient._handleErrorResponse — token_already_spent", () => {
     expect(receiveSpy).not.toHaveBeenCalled();
   });
 
+  it("propagates a request ID found only in the response body", async () => {
+    const { storage } = createStorage();
+    const client = new RoutstrClient(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "xcashu"
+    );
+
+    const promise = (client as any)._handleErrorResponse(
+      errorParams("cashu_spent_token_body_request_id"),
+      "cashu_spent_token_body_request_id",
+      400,
+      undefined,
+      undefined,
+      SPENT_BODY,
+      0
+    );
+
+    await expect(promise).rejects.toMatchObject({
+      requestId: "req-123",
+    });
+  });
+
   it("apikeys mode: removes the spent API key and throws TokenAlreadySpentError when exhausted", async () => {
     const { storage, removedApiKeys } = createStorage();
     const client = new RoutstrClient(
@@ -189,7 +214,7 @@ describe("RoutstrClient._handleErrorResponse — token_already_spent", () => {
       "apikeys"
     );
 
-    const token = "apikey_whose_proofs_are_spent";
+    const token = API_KEY;
     const promise = (client as any)._handleErrorResponse(
       errorParams(token),
       token,
@@ -202,6 +227,40 @@ describe("RoutstrClient._handleErrorResponse — token_already_spent", () => {
 
     await expect(promise).rejects.toBeInstanceOf(TokenAlreadySpentError);
     expect(removedApiKeys).toEqual([BASE_URL]);
+  });
+
+  it("apikeys mode: preserves a replacement key when a stale spent response arrives", async () => {
+    const { storage, removedApiKeys } = createStorage({
+      getApiKey: (baseUrl: string) =>
+        baseUrl === BASE_URL
+          ? {
+              key: "replacement-api-key",
+              baseUrl: BASE_URL,
+              balance: 42,
+              lastUsed: null,
+            }
+          : null,
+    });
+    const client = new RoutstrClient(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "apikeys"
+    );
+
+    const promise = (client as any)._handleErrorResponse(
+      errorParams("stale-spent-api-key"),
+      "stale-spent-api-key",
+      400,
+      "req-stale",
+      undefined,
+      SPENT_BODY,
+      0
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(TokenAlreadySpentError);
+    expect(removedApiKeys).toEqual([]);
   });
 
   it("xcashu mode: fails over to the next provider with a fresh token when available", async () => {
@@ -289,6 +348,51 @@ describe("BalanceManager.refundApiKey — spent API key", () => {
 
     expect(result.success).toBe(false);
     expect(removedApiKeys).toEqual([BASE_URL]);
+    expect(cashuSpender.receiveToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("BalanceManager.refundApiKey — stale spent response", () => {
+  it("preserves a replacement key stored while the refund was in flight", async () => {
+    const { storage, removedApiKeys } = createStorage({
+      getApiKey: (baseUrl: string) =>
+        baseUrl === BASE_URL
+          ? {
+              key: "replacement-api-key",
+              baseUrl: BASE_URL,
+              balance: 42,
+              lastUsed: null,
+            }
+          : null,
+    });
+    const cashuSpender = { receiveToken: vi.fn() } as any;
+    const manager = new BalanceManager(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      cashuSpender
+    );
+    vi.spyOn(manager, "fetchRefundToken").mockResolvedValue({
+      success: false,
+      status: 400,
+      error: "Token already spent: nope",
+      parsedError: {
+        type: "token_already_spent",
+        code: "cashu_token_already_spent",
+        message: "nope",
+        raw: false,
+      },
+    });
+
+    const result = await manager.refundApiKey({
+      mintUrl: MINT_URL,
+      baseUrl: BASE_URL,
+      apiKey: API_KEY,
+      forceRefund: true,
+    });
+
+    expect(result.success).toBe(false);
+    expect(removedApiKeys).toEqual([]);
     expect(cashuSpender.receiveToken).not.toHaveBeenCalled();
   });
 });

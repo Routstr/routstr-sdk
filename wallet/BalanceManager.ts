@@ -175,33 +175,6 @@ export class BalanceManager {
     }
   }
 
-  /**
-   * Parse an HTTP error response body, distinguishing JSON error payloads
-   * (which may contain a `detail` field) from non-JSON bodies such as
-   * Cloudflare HTML error pages.
-   *
-   * @returns `errorDetail` — the `detail` string from a JSON body, or
-   *          `undefined` when the body is not JSON or has no `detail`.
-   *          `isJson`     — `true` when the body parsed as JSON.
-   */
-  private _parseErrorBody(
-    responseBody: string | undefined
-  ): { errorDetail: string | undefined; isJson: boolean } {
-    if (!responseBody) {
-      return { errorDetail: undefined, isJson: false };
-    }
-    try {
-      const parsed = JSON.parse(responseBody);
-      return {
-        errorDetail: parsed?.detail != null ? String(parsed.detail) : undefined,
-        isJson: true,
-      };
-    } catch {
-      // Not JSON (e.g. Cloudflare 502 HTML error page)
-      return { errorDetail: undefined, isJson: false };
-    }
-  }
-
   async getBalanceState(): Promise<BalanceState> {
     const mintBalances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
@@ -300,9 +273,13 @@ export class BalanceManager {
       // to refund and keeping the key wastes future refund attempts.
       if (fetchResult.parsedError?.type === CoreErrorType.TOKEN_ALREADY_SPENT) {
         this.logger.warn(
-          `refundApiKey: token_already_spent for ${baseUrl}; removing API key`
+          `refundApiKey: token_already_spent for ${baseUrl}; removing API key if it is still current`
         );
-        this.storageAdapter.removeApiKey(baseUrl);
+        // The refund response may belong to a key that was replaced while the
+        // request was in flight. Never delete a newer key for the same provider.
+        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
         return {
           success: false,
           message: fetchResult.error || "Token already spent",
@@ -414,30 +391,25 @@ export class BalanceManager {
 
         // Parse the structured error envelope from routstr-core
         const parsedError = parseCoreError(responseBody, response.status, requestId);
-        // Concise detail extraction for error messages — never dump a raw
-        // HTML error page (e.g. Cloudflare 502) into the surfaced message.
-        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
+        const resolvedRequestId = parsedError.requestId ?? requestId;
 
         this.logger.error("Upstream wallet refund error response", {
           baseUrl,
           url,
           status: response.status,
           statusText: response.statusText,
-          requestId,
+          requestId: resolvedRequestId,
           errorType: parsedError.type ?? "unknown",
           errorCode: parsedError.code ?? "unknown",
           body: responseBody ?? "<unable to read response body>",
         });
 
-        // Prefer the structured core message when the body was parseable
-        // JSON, otherwise the concise `detail` / bare HTTP status.
-        const conciseDetail =
-          errorDetail ||
-          (isJson ? responseBody : undefined) ||
+        // Prefer the parsed message, then a JSON body, and never surface a
+        // raw HTML error page (e.g. Cloudflare 502).
+        const structuredMessage =
+          (!parsedError.raw ? parsedError.message : undefined) ||
+          (parsedError.json ? responseBody : undefined) ||
           `${response.status} ${response.statusText}`;
-        const structuredMessage = !parsedError.raw && parsedError.message
-          ? parsedError.message
-          : conciseDetail;
 
         // If the xcashu token is already spent, there's nothing to refund.
         // Surface a clear error so callers can clean up the token.
@@ -448,7 +420,7 @@ export class BalanceManager {
 
         return {
           success: false,
-          requestId,
+          requestId: resolvedRequestId,
           status: response.status,
           error: errorMessage,
           parsedError,
@@ -953,35 +925,30 @@ export class BalanceManager {
 
         // Parse the structured error envelope from routstr-core
         const parsedError = parseCoreError(responseBody, response.status, requestId);
-        // Concise detail extraction for error messages — never dump a raw
-        // HTML error page (e.g. Cloudflare 502) into the surfaced message.
-        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
+        const resolvedRequestId = parsedError.requestId ?? requestId;
 
         this.logger.error("Upstream wallet topup error response", {
           baseUrl,
           url,
           status: response.status,
           statusText: response.statusText,
-          requestId,
+          requestId: resolvedRequestId,
           errorType: parsedError.type ?? "unknown",
           errorCode: parsedError.code ?? "unknown",
           body: responseBody ?? "<unable to read response body>",
         });
 
-        // Prefer the structured core message when the body was parseable
-        // JSON, otherwise the concise `detail` / bare HTTP status.
+        // Prefer the parsed message, then a JSON body, and never surface a
+        // raw HTML error page (e.g. Cloudflare 502).
         const conciseDetail =
-          errorDetail ||
-          (isJson ? responseBody : undefined) ||
+          (!parsedError.raw ? parsedError.message : undefined) ||
+          (parsedError.json ? responseBody : undefined) ||
           `Top up failed with status ${response.status}`;
 
         return {
           success: false,
-          requestId,
-          error:
-            !parsedError.raw && parsedError.message
-              ? parsedError.message
-              : conciseDetail,
+          requestId: resolvedRequestId,
+          error: conciseDetail,
           parsedError,
         };
       }
@@ -1098,15 +1065,15 @@ export class BalanceManager {
       } else {
         this.logger.warn(`getTokenBalance: status=${response.status}`);
         const responseBody = await response.text().catch(() => undefined);
-        const { errorDetail, isJson } = this._parseErrorBody(responseBody);
-        if (isJson) {
-          this.logger.warn(`getTokenBalance: FAILED status=${response.status} detail=${errorDetail ?? "none"}`);
+        const parsedError = parseCoreError(responseBody, response.status);
+        if (parsedError.json) {
+          this.logger.warn(`getTokenBalance: FAILED status=${response.status} detail=${parsedError.message ?? "none"}`);
         } else {
           this.logger.warn(`getTokenBalance: non-JSON response (status=${response.status} ${response.statusText})`);
         }
 
         let data: any = {};
-        if (isJson && responseBody) {
+        if (parsedError.json && responseBody) {
           try { data = JSON.parse(responseBody); } catch { data = {}; }
         }
 

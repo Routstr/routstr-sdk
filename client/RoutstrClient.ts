@@ -688,10 +688,11 @@ export class RoutstrClient {
 
     // ── Parse structured error from routstr-core ────────────────────────
     const parsedError = parseCoreError(responseBody, status, requestId);
+    const resolvedRequestId = parsedError.requestId ?? requestId;
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
 
     // ── Handle token_already_spent ────────────────────────────────────
@@ -708,8 +709,18 @@ export class RoutstrClient {
         // retrying a permanently-spent token.
         this.storageAdapter.removeXcashuToken(baseUrl, params.token);
       } else if (this.mode === "apikeys") {
-        // The API key's proofs are spent — remove it so we don't reuse it.
-        this.storageAdapter.removeApiKey(baseUrl);
+        // Only remove the key that actually failed. Another concurrent request
+        // may already have replaced the bootstrap Cashu token with the
+        // provider's canonical API key while this response was in flight.
+        const storedApiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (storedApiKey?.key === params.token) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        } else if (storedApiKey) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: preserving replacement API key for ${baseUrl}; spent response belongs to an older key`
+          );
+        }
       }
       tryNextProvider = true;
     }
@@ -1069,7 +1080,7 @@ export class RoutstrClient {
 
     const failReason = [
       `status=${status}`,
-      requestId ? `requestId=${requestId}` : null,
+      resolvedRequestId ? `requestId=${resolvedRequestId}` : null,
       parsedError.type ? `type=${parsedError.type}` : null,
       parsedError.code ? `code=${parsedError.code}` : null,
       errorMessage ? `body=${errorMessage.slice(0, 200)}` : null,
@@ -1175,7 +1186,7 @@ export class RoutstrClient {
         statusCode: status,
         mintUrl,
         parsedError,
-        requestId,
+        requestId: resolvedRequestId,
       });
     }
 

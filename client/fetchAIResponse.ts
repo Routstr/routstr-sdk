@@ -229,14 +229,9 @@ export async function fetchAIResponse(
       signal: options.abortSignal,
     });
 
-    if (!response.body) {
-      throw new Error("Response body is not available");
-    }
-
     if (response.status !== 200) {
       // Parse the structured error envelope from routstr-core instead of
-      // surfacing a bare "400 Bad Request" — callers can branch on the
-      // specific error type (e.g. token_already_spent).
+      // surfacing a bare "400 Bad Request".
       let bodyText: string | undefined;
       try {
         bodyText = await response.text();
@@ -247,6 +242,10 @@ export async function fetchAIResponse(
         response.headers.get("x-routstr-request-id") || undefined;
       const parsedError = parseCoreError(bodyText, response.status, requestId);
       throw new Error(summarizeCoreError(parsedError));
+    }
+
+    if (!response.body) {
+      throw new Error("Response body is not available");
     }
 
     const streamProcessor = new StreamProcessor();

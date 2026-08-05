@@ -740,6 +740,36 @@ describe("BalanceManager non-JSON error responses", () => {
     }
   });
 
+  it("fetchRefundToken propagates a request ID found only in the JSON body", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    const jsonBody = JSON.stringify({
+      error: {
+        type: "token_already_spent",
+        code: "cashu_token_already_spent",
+        message: "Token already spent",
+      },
+      request_id: "req-from-body",
+    });
+    globalThis.fetch = mockFetchResponse(
+      400,
+      "Bad Request",
+      jsonBody
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.fetchRefundToken(
+        "https://provider.example.com",
+        "test-api-key"
+      );
+
+      expect(result.requestId).toBe("req-from-body");
+      expect(result.parsedError?.requestId).toBe("req-from-body");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("fetchRefundToken still uses JSON detail field when present", async () => {
     const manager = new BalanceManager(createWallet(), createStorage());
     const originalFetch = globalThis.fetch;

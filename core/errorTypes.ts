@@ -87,8 +87,10 @@ export interface ParsedCoreError {
   status?: number;
   /** The request ID from headers or response body */
   requestId?: string;
-  /** `true` when the body was plain text or unparseable (no structured fields) */
+  /** `true` when the body was plain text or had no recognized structured fields */
   raw: boolean;
+  /** `true` when the response body was valid JSON */
+  json?: boolean;
 }
 
 /**
@@ -116,8 +118,10 @@ export function parseCoreError(
   let data: unknown;
   try {
     data = JSON.parse(bodyText);
+    result.json = true;
   } catch {
     // Not JSON — treat the raw text as the message
+    result.json = false;
     result.message = bodyText;
     return result;
   }
@@ -196,6 +200,7 @@ export function parseCoreError(
   if (typeof obj.message === "string") result.message = obj.message;
   if (typeof obj.type === "string") result.type = obj.type;
   if (typeof obj.code === "string") result.code = obj.code;
+  if (result.message || result.type || result.code) result.raw = false;
 
   return result;
 }
