@@ -7,6 +7,7 @@ import type {
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
 import type { AlertLevel, RoutstrClientMode } from "./RoutstrClient";
+import { parseCoreError, summarizeCoreError } from "../core/errorTypes";
 import {
   resolveRequestContext,
   type ResolveContextInput,
@@ -233,7 +234,19 @@ export async function fetchAIResponse(
     }
 
     if (response.status !== 200) {
-      throw new Error(`${response.status} ${response.statusText}`);
+      // Parse the structured error envelope from routstr-core instead of
+      // surfacing a bare "400 Bad Request" — callers can branch on the
+      // specific error type (e.g. token_already_spent).
+      let bodyText: string | undefined;
+      try {
+        bodyText = await response.text();
+      } catch {
+        bodyText = undefined;
+      }
+      const requestId =
+        response.headers.get("x-routstr-request-id") || undefined;
+      const parsedError = parseCoreError(bodyText, response.status, requestId);
+      throw new Error(summarizeCoreError(parsedError));
     }
 
     const streamProcessor = new StreamProcessor();

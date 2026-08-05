@@ -3,6 +3,8 @@
  * Provides specific error types for different failure modes
  */
 
+import type { ParsedCoreError } from "./errorTypes";
+
 /**
  * Error thrown when balance is insufficient for an operation
  */
@@ -132,6 +134,46 @@ export class NoProvidersAvailableError extends Error {
   constructor() {
     super("No providers are available for model discovery");
     this.name = "NoProvidersAvailableError";
+  }
+}
+
+/**
+ * Error thrown when a Cashu token has already been spent/redeemed.
+ *
+ * Corresponds to routstr-core's `token_already_spent` error type (HTTP 400).
+ * The token is permanently gone — callers must not retry with the same token.
+ */
+export class TokenAlreadySpentError extends Error {
+  /** The provider base URL that returned the error */
+  baseUrl: string;
+  /** HTTP status from the error response (always 400 for this error) */
+  statusCode: number;
+  /** The mint URL the token was from (if known) */
+  mintUrl?: string;
+  /** The parsed structured error from routstr-core */
+  parsedError?: ParsedCoreError;
+  /** Request ID from the error response */
+  requestId?: string;
+
+  constructor(opts: {
+    baseUrl: string;
+    statusCode?: number;
+    mintUrl?: string;
+    message?: string;
+    parsedError?: ParsedCoreError;
+    requestId?: string;
+  }) {
+    super(
+      opts.message ??
+        opts.parsedError?.message ??
+        "Cashu token already spent — do not retry with the same token"
+    );
+    this.name = "TokenAlreadySpentError";
+    this.baseUrl = opts.baseUrl;
+    this.statusCode = opts.statusCode ?? 400;
+    if (opts.mintUrl !== undefined) this.mintUrl = opts.mintUrl;
+    if (opts.parsedError) this.parsedError = opts.parsedError;
+    if (opts.requestId) this.requestId = opts.requestId;
   }
 }
 

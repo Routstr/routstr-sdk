@@ -14,6 +14,7 @@ import type { WalletAdapter, StorageAdapter } from "./interfaces";
 import type { SpendResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError } from "../core/errors";
+import { CoreErrorType } from "../core/errorTypes";
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
@@ -580,6 +581,28 @@ export class CashuSpender {
             this._log(
               "WARN",
               `[CashuSpender] refundXcashuTokens: 425 "Refund is pending" for ${baseUrl}; leaving token in store, tryCount untouched`
+            );
+            continue;
+          }
+
+          // If the provider reports the token as already spent, it can NEVER
+          // be refunded — no amount of retrying will change that. Remove it
+          // immediately instead of burning MAX_REFUND_RETRIES attempts over
+          // several minutes before finally giving up.
+          if (
+            !fetchResult.success &&
+            fetchResult.parsedError?.type === CoreErrorType.TOKEN_ALREADY_SPENT
+          ) {
+            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: fetchResult.error,
+            });
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: token_already_spent for ${baseUrl}; removing permanently-spent xcashu token from store`
             );
             continue;
           }

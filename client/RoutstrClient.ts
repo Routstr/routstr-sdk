@@ -28,7 +28,9 @@ import {
   ProviderError,
   FailoverError,
   InsufficientBalanceError,
+  TokenAlreadySpentError,
 } from "../core/errors";
+import { parseCoreError, CoreErrorType } from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
@@ -684,18 +686,42 @@ export class RoutstrClient {
 
     const errorMessage = responseBody;
 
+    // ── Parse structured error from routstr-core ────────────────────────
+    const parsedError = parseCoreError(responseBody, status, requestId);
+
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorMessage=${errorMessage}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${requestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
+
+    // ── Handle token_already_spent ────────────────────────────────────
+    // The token is permanently spent — core deliberately withholds the
+    // X-Cashu refund header for this case. Don't attempt refund/receive
+    // (the token is gone), just clean up storage and failover.
+    if (parsedError.type === CoreErrorType.TOKEN_ALREADY_SPENT) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: token_already_spent detected for ${baseUrl}, mode=${this.mode}, cleaning up and failing over`
+      );
+      if (this.mode === "xcashu") {
+        // Remove the spent xcashu IOU so future refund sweeps don't keep
+        // retrying a permanently-spent token.
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+      } else if (this.mode === "apikeys") {
+        // The API key's proofs are spent — remove it so we don't reuse it.
+        this.storageAdapter.removeApiKey(baseUrl);
+      }
+      tryNextProvider = true;
+    }
 
     // ── Reclaim sats: try the refund token FIRST, then fall back to the ──
     // original token. This avoids a wasted mint round-trip when the node
     // already consumed the proofs (the common upstream_error case) and
     // prevents double-receiving when both are somehow valid.
+    // Skipped entirely for token_already_spent (handled above).
     let refundReceived = false;
 
-    if (this.mode === "xcashu" && xCashuRefundToken) {
+    if (!tryNextProvider && this.mode === "xcashu" && xCashuRefundToken) {
       this._log(
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
@@ -723,7 +749,7 @@ export class RoutstrClient {
     // Only try the original token if we didn't get the refund. If the node
     // already consumed the proofs this will fail gracefully; if the node
     // errored before consuming them, we reclaim the sats directly.
-    if (!refundReceived && params.token.startsWith("cashu")) {
+    if (!tryNextProvider && !refundReceived && params.token.startsWith("cashu")) {
       const receiveResult = await this.cashuSpender.receiveToken(
         params.token
       );
@@ -1044,6 +1070,8 @@ export class RoutstrClient {
     const failReason = [
       `status=${status}`,
       requestId ? `requestId=${requestId}` : null,
+      parsedError.type ? `type=${parsedError.type}` : null,
+      parsedError.code ? `code=${parsedError.code}` : null,
       errorMessage ? `body=${errorMessage.slice(0, 200)}` : null,
     ]
       .filter(Boolean)
@@ -1138,7 +1166,19 @@ export class RoutstrClient {
       return retryResponse;
     }
 
-    // No more providers to try
+    // No more providers to try. If the root cause was a specific core error
+    // type (e.g. token_already_spent), surface that instead of a generic
+    // FailoverError so callers can branch on the specific failure.
+    if (parsedError.type === CoreErrorType.TOKEN_ALREADY_SPENT) {
+      throw new TokenAlreadySpentError({
+        baseUrl,
+        statusCode: status,
+        mintUrl,
+        parsedError,
+        requestId,
+      });
+    }
+
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
