@@ -11,11 +11,10 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
-import { onlyEvents, RelayPool } from "applesauce-relay";
+import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
 import type { NostrEvent } from "applesauce-core/helpers";
-import { tap } from "rxjs";
 
 type SqliteStatement = {
   run?: (...params: any[]) => unknown;
@@ -42,6 +41,9 @@ export const DEFAULT_NOSTR_RELAYS = [
 
 // A hanging provider must not hold a fetch pass open indefinitely.
 const PROVIDER_FETCH_TIMEOUT_MS = 10_000;
+
+// Backstop for relays that never send EOSE; queries normally finish earlier.
+const NOSTR_QUERY_TIMEOUT_MS = 5000;
 
 /**
  * Configuration for ModelManager
@@ -78,6 +80,17 @@ export interface ModelManagerConfig {
 }
 
 /**
+ * Progress callbacks for bootstrapProviders. Nostr discovery only: the
+ * cached, HTTP-fallback, and includeProviderUrls paths do not report.
+ */
+export interface BootstrapOptions {
+  /** Fires with the cumulative count of provider events as they arrive. */
+  onEventsFound?: (count: number) => void;
+  /** Fires as each new provider base URL is discovered. */
+  onProvider?: (baseUrl: string) => void;
+}
+
+/**
  * ModelManager handles all model discovery and caching logic
  * Abstracts away storage details via DiscoveryAdapter
  */
@@ -90,6 +103,8 @@ export class ModelManager {
   private readonly nostrRelays: string[] | undefined;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
+  /** One pool for all queries, so repeated bootstraps reuse relay sockets. */
+  private relayPool: RelayPool | null = null;
   /** Persistent event store for relay-fetched events (null if not configured/initialized) */
   private eventStore: EventStore | null = null;
   private eventStoreDb: PersistentEventDatabase | null = null;
@@ -280,19 +295,9 @@ export class ModelManager {
     const eventStore = await this.ensureEventStore();
     if (!eventStore) return;
 
-    const pool = new RelayPool();
-    await new Promise<void>((resolve) => {
-      pool
-        .req(relays, filter)
-        .pipe(
-          onlyEvents(),
-          tap((event) => {
-            eventStore.add(event);
-            this.markEventFetched(event);
-          })
-        )
-        .subscribe({ complete: () => resolve() });
-      setTimeout(() => resolve(), timeoutMs);
+    await this.collectNostrEvents(filter, relays, timeoutMs, (event) => {
+      eventStore.add(event);
+      this.markEventFetched(event);
     });
   }
 
@@ -319,7 +324,8 @@ export class ModelManager {
    */
   async bootstrapProviders(
     torMode: boolean = false,
-    forceRefresh: boolean = false
+    forceRefresh: boolean = false,
+    options: BootstrapOptions = {}
   ): Promise<string[]> {
     // First try cache
     if (!forceRefresh) {
@@ -333,12 +339,14 @@ export class ModelManager {
             cachedUrls,
             torMode
           );
-          await this.fetchRoutstr21Models(forceRefresh);
-          await this.syncReviewedProvidersFromNostr(
-            filteredCachedUrls,
-            this.providerNodePubkeysByUrl,
-            forceRefresh
-          );
+          await Promise.all([
+            this.fetchRoutstr21Models(forceRefresh),
+            this.syncReviewedProvidersFromNostr(
+              filteredCachedUrls,
+              this.providerNodePubkeysByUrl,
+              forceRefresh
+            ),
+          ]);
           return filteredCachedUrls;
         }
       }
@@ -346,20 +354,34 @@ export class ModelManager {
 
     // Try Nostr first (kind 38421)
     try {
+      // The queries are independent: run them concurrently so a cold
+      // bootstrap costs one relay round trip. Prefetch failures fall back
+      // to empty; a broken event store still surfaces via the 38421 query.
+      const routstr21Prefetch = this.fetchRoutstr21Models(forceRefresh).catch(
+        () => [] as string[]
+      );
+      // Skip the review query when the adapter cannot store its result,
+      // matching the wrapper's early return instead of waiting it out.
+      const reviewPrefetch = this.adapter.setDisabledProviders
+        ? this.fetchLgtmReviewPubkeys(forceRefresh).catch(
+            () => new Set<string>()
+          )
+        : Promise.resolve(new Set<string>());
       const nostrProviders = await this.bootstrapFromNostr(
         38421,
         torMode,
-        forceRefresh
+        forceRefresh,
+        options
       );
       if (nostrProviders.length > 0) {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await this.fetchRoutstr21Models(forceRefresh);
-        await this.syncReviewedProvidersFromNostr(
+        await routstr21Prefetch;
+        this.applyReviewDisables(
           filtered,
           this.providerNodePubkeysByUrl,
-          forceRefresh
+          await reviewPrefetch
         );
         return filtered;
       }
@@ -382,6 +404,55 @@ export class ModelManager {
   }
 
   /**
+   * Collect events for a one-shot query. Resolves once every relay has sent
+   * EOSE (connection failures count as EOSE) or after timeoutMs, whichever
+   * comes first. Events are deduplicated by id across relays.
+   */
+  private async collectNostrEvents(
+    filter: {
+      kinds?: number[];
+      authors?: string[];
+      "#t"?: string[];
+      "#d"?: string[];
+      limit?: number;
+    },
+    relays: string[],
+    timeoutMs: number,
+    onEvent: (event: NostrEvent) => void
+  ): Promise<void> {
+    if (!this.relayPool) this.relayPool = new RelayPool();
+    const pool = this.relayPool;
+    const seen = new Set<string>();
+
+    await new Promise<void>((resolve) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let subscription: { unsubscribe(): void } | undefined;
+      // The stream can complete synchronously (all relays cached/failed), so
+      // finish must tolerate timer and subscription not being assigned yet.
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer !== undefined) clearTimeout(timer);
+        subscription?.unsubscribe();
+        resolve();
+      };
+
+      subscription = pool.request(relays, filter).subscribe({
+        next: (event) => {
+          if (seen.has(event.id)) return;
+          seen.add(event.id);
+          onEvent(event);
+        },
+        error: finish,
+        complete: finish,
+      });
+
+      if (!done) timer = setTimeout(finish, timeoutMs);
+    });
+  }
+
+  /**
    * Bootstrap providers from Nostr network (kind 38421)
    * @param kind The Nostr kind to fetch
    * @param torMode Whether running in Tor context
@@ -390,55 +461,38 @@ export class ModelManager {
   private async bootstrapFromNostr(
     kind: number,
     torMode: boolean,
-    forceRefresh: boolean = false
+    forceRefresh: boolean = false,
+    options: BootstrapOptions = {}
   ): Promise<string[]> {
     const relays = this.getNostrRelays();
 
-    // Check persistent store first
-    const cached = await this.getCachedNostrEvents(
-      { kinds: [kind] },
-      forceRefresh
-    );
-    let sessionEvents: NostrEvent[] = cached;
-
-    if (cached.length === 0) {
-      const pool = new RelayPool();
-
-      const timeoutMs = 5000;
-
-      await new Promise<void>((resolve) => {
-        pool
-          .req(relays, {
-            kinds: [kind],
-            limit: 100,
-          })
-          .pipe(
-            onlyEvents(),
-            tap((event) => {
-              sessionEvents.push(event);
-              // Persist to durable store if configured
-              this.eventStore?.add(event);
-              this.markEventFetched(event);
-            })
-          )
-          .subscribe({
-            complete: () => {
-              resolve();
-            },
-          });
-
-        setTimeout(() => {
-          resolve();
-        }, timeoutMs);
-      });
-    } else {
-      this.logger.log(`Using ${cached.length} cached kind ${kind} events from persistent store`);
-    }
-
     const bases = new Set<string>();
     this.providerNodePubkeysByUrl = new Map();
+    const excluded = new Set(
+      this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
+    );
+    let eventsFound = 0;
 
-    for (const event of sessionEvents) {
+    const addBase = (url: string, pubkey?: string) => {
+      const isNew = !bases.has(url);
+      bases.add(url);
+      this.addProviderNode(this.providerNodePubkeysByUrl, url, pubkey);
+      // Announce only URLs that survive the caller's final Tor filter, so
+      // the callback set matches the returned list by construction.
+      if (
+        isNew &&
+        !excluded.has(url) &&
+        this.filterBaseUrlsForTor([url], torMode).length > 0
+      ) {
+        options.onProvider?.(url);
+      }
+    };
+
+    // Events are parsed as they arrive so callers can show live progress.
+    const collectFromEvent = (event: NostrEvent) => {
+      eventsFound += 1;
+      options.onEventsFound?.(eventsFound);
+
       const eventUrls: string[] = [];
 
       for (const tag of event.tags) {
@@ -451,15 +505,10 @@ export class ModelManager {
         for (const url of eventUrls) {
           const normalized = this.normalizeUrl(url);
           if (!torMode || normalized.includes(".onion")) {
-            bases.add(normalized);
-            this.addProviderNode(
-              this.providerNodePubkeysByUrl,
-              normalized,
-              event.pubkey
-            );
+            addBase(normalized, event.pubkey);
           }
         }
-        continue;
+        return;
       }
 
       try {
@@ -471,12 +520,7 @@ export class ModelManager {
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
           for (const endpoint of endpoints) {
-            bases.add(endpoint);
-            this.addProviderNode(
-              this.providerNodePubkeysByUrl,
-              endpoint,
-              p?.pubkey || event.pubkey
-            );
+            addBase(endpoint, p?.pubkey || event.pubkey);
           }
         }
       } catch {
@@ -486,12 +530,7 @@ export class ModelManager {
             for (const p of providers) {
               const endpoints = this.getProviderEndpoints(p, torMode);
               for (const endpoint of endpoints) {
-                bases.add(endpoint);
-                this.addProviderNode(
-                  this.providerNodePubkeysByUrl,
-                  endpoint,
-                  p?.pubkey || event.pubkey
-                );
+                addBase(endpoint, p?.pubkey || event.pubkey);
               }
             }
           }
@@ -502,6 +541,31 @@ export class ModelManager {
           );
         }
       }
+    };
+
+    // Check persistent store first
+    const cached = await this.getCachedNostrEvents(
+      { kinds: [kind] },
+      forceRefresh
+    );
+
+    if (cached.length > 0) {
+      this.logger.log(`Using ${cached.length} cached kind ${kind} events from persistent store`);
+      for (const event of cached) {
+        collectFromEvent(event);
+      }
+    } else {
+      await this.collectNostrEvents(
+        { kinds: [kind], limit: 100 },
+        relays,
+        NOSTR_QUERY_TIMEOUT_MS,
+        (event) => {
+          // Persist to durable store if configured
+          this.eventStore?.add(event);
+          this.markEventFetched(event);
+          collectFromEvent(event);
+        }
+      );
     }
 
     // Add additional configured providers
@@ -511,10 +575,6 @@ export class ModelManager {
         bases.add(normalized);
       }
     }
-
-    const excluded = new Set(
-      this.excludeProviderUrls.map((url) => this.normalizeUrl(url))
-    );
 
     const result = Array.from(bases).filter((base) => !excluded.has(base));
 
@@ -566,12 +626,14 @@ export class ModelManager {
       if (list.length > 0) {
         this.adapter.setBaseUrlsList(list);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await this.fetchRoutstr21Models(forceRefresh);
-        await this.syncReviewedProvidersFromNostr(
-          list,
-          this.providerNodePubkeysByUrl,
-          forceRefresh
-        );
+        await Promise.all([
+          this.fetchRoutstr21Models(forceRefresh),
+          this.syncReviewedProvidersFromNostr(
+            list,
+            this.providerNodePubkeysByUrl,
+            forceRefresh
+          ),
+        ]);
       }
 
       return list;
@@ -606,53 +668,79 @@ export class ModelManager {
       return [];
     }
 
-    // Fetch kind 38425 lgtm reviews
-    const reviewedNodePubkeys = new Set<string>();
-    {
-      // Check persistent store first
-      const cached = await this.getCachedNostrEvents(
-        { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
-        forceRefresh
-      );
-      let sessionEvents: NostrEvent[] = cached;
+    const reviewedNodePubkeys = await this.fetchLgtmReviewPubkeys(forceRefresh);
+    return this.applyReviewDisables(baseUrls, providerNodes, reviewedNodePubkeys);
+  }
 
-      if (cached.length === 0) {
-        const lgtmRelays = this.getNostrRelays();
-        const pool = new RelayPool();
-        const timeoutMs = 5000;
-        await new Promise<void>((resolve) => {
-          pool
-            .req(lgtmRelays, {
-              kinds: [38425],
-              "#t": ["lgtm"],
-              limit: 500,
-              authors: [this.routstrPubkey],
-            })
-            .pipe(
-              onlyEvents(),
-              tap((event) => {
-                sessionEvents.push(event);
-                this.eventStore?.add(event);
-                this.markEventFetched(event);
-              })
-            )
-            .subscribe({ complete: () => resolve() });
-          setTimeout(() => resolve(), timeoutMs);
-        });
-      } else {
-        this.logger.log(`Using ${cached.length} cached kind 38425 events from persistent store`);
-      }
-      for (const event of sessionEvents) {
-        const hasLgtmTag = event.tags.some(
-          (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
-        );
-        if (!hasLgtmTag) continue;
-        for (const tag of event.tags) {
-          if (tag[0] === "node" && typeof tag[1] === "string" && tag[1]) {
-            reviewedNodePubkeys.add(tag[1]);
-          }
+  /**
+   * Fetch the kind 38425 lgtm review events (persistent store or live) and
+   * return the set of reviewed node pubkeys.
+   */
+  private async fetchLgtmReviewPubkeys(
+    forceRefresh: boolean = false
+  ): Promise<Set<string>> {
+    const reviewedNodePubkeys = new Set<string>();
+
+    const collectFromEvent = (event: NostrEvent) => {
+      const hasLgtmTag = event.tags.some(
+        (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
+      );
+      if (!hasLgtmTag) return;
+      for (const tag of event.tags) {
+        if (tag[0] === "node" && typeof tag[1] === "string" && tag[1]) {
+          reviewedNodePubkeys.add(tag[1]);
         }
       }
+    };
+
+    // Check persistent store first
+    const cached = await this.getCachedNostrEvents(
+      { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
+      forceRefresh
+    );
+
+    if (cached.length > 0) {
+      this.logger.log(`Using ${cached.length} cached kind 38425 events from persistent store`);
+      for (const event of cached) {
+        collectFromEvent(event);
+      }
+    } else {
+      await this.collectNostrEvents(
+        {
+          kinds: [38425],
+          "#t": ["lgtm"],
+          limit: 500,
+          authors: [this.routstrPubkey],
+        },
+        this.getNostrRelays(),
+        NOSTR_QUERY_TIMEOUT_MS,
+        (event) => {
+          this.eventStore?.add(event);
+          this.markEventFetched(event);
+          collectFromEvent(event);
+        }
+      );
+    }
+
+    return reviewedNodePubkeys;
+  }
+
+  /**
+   * Disable providers whose node pubkeys carry no lgtm review.
+   * Compute-only counterpart of syncReviewedProvidersFromNostr.
+   */
+  private applyReviewDisables(
+    baseUrls: string[],
+    providerNodes: Map<string, Set<string>>,
+    reviewedNodePubkeys: Set<string>
+  ): string[] {
+    if (baseUrls.length === 0) return [];
+
+    if (!this.adapter.setDisabledProviders) {
+      this.logger.warn(
+        "NostrReviews: adapter does not support setDisabledProviders; skipping provider disable sync"
+      );
+      return [];
     }
 
     if (reviewedNodePubkeys.size === 0) {
@@ -987,49 +1075,33 @@ export class ModelManager {
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
       forceRefresh
     );
-    let sessionEvents: NostrEvent[] = cached;
+    let event: NostrEvent | null = null;
 
     if (cached.length === 0) {
-      const pool = new RelayPool();
-
-      const timeoutMs = 5000;
-
-      await new Promise<void>((resolve) => {
-        pool
-          .req(relays, {
-            kinds: [38423],
-            "#d": ["routstr-21-models"],
-            limit: 1,
-            authors: [this.routstrPubkey],
-          })
-          .pipe(
-            onlyEvents(),
-            tap((event) => {
-              sessionEvents.push(event);
-              // Persist to durable store if configured
-              this.eventStore?.add(event);
-              this.markEventFetched(event);
-            })
-          )
-          .subscribe({
-            complete: () => {
-              resolve();
-            },
-          });
-
-        setTimeout(() => {
-          resolve();
-        }, timeoutMs);
-      });
+      await this.collectNostrEvents(
+        {
+          kinds: [38423],
+          "#d": ["routstr-21-models"],
+          limit: 1,
+          authors: [this.routstrPubkey],
+        },
+        relays,
+        NOSTR_QUERY_TIMEOUT_MS,
+        (e) => {
+          // Persist to durable store if configured
+          this.eventStore?.add(e);
+          this.markEventFetched(e);
+          if (!event) event = e;
+        }
+      );
     } else {
       this.logger.log(`Using ${cached.length} cached kind 38423 events from persistent store`);
+      event = cached[0];
     }
 
-    if (sessionEvents.length === 0) {
+    if (!event) {
       return cachedModels.length > 0 ? cachedModels : [];
     }
-
-    const event = sessionEvents[0];
 
     try {
       const content = JSON.parse(event.content);
