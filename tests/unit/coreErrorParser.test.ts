@@ -237,13 +237,36 @@ describe("isRetryableCoreError", () => {
     expect(isRetryableCoreError(parsed)).toBe(false);
   });
 
-  it("returns false for mint_error", () => {
+  it("returns false for mint_error with fee-exceeds-amount code", () => {
     const parsed = parseCoreError(
       JSON.stringify({
         error: {
           type: "mint_error",
           code: "cashu_token_swap_fees_exceed_amount",
         },
+      }),
+      422
+    );
+    expect(isRetryableCoreError(parsed)).toBe(false);
+  });
+
+  it("returns true for mint_error with foreign-mint-swap-failed code (different mint may work)", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: {
+          type: "mint_error",
+          code: "cashu_foreign_mint_swap_failed",
+        },
+      }),
+      422
+    );
+    expect(isRetryableCoreError(parsed)).toBe(true);
+  });
+
+  it("returns false for mint_error without a known code (conservative)", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: { type: "mint_error", message: "melt failed" },
       }),
       422
     );

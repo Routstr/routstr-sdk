@@ -222,9 +222,22 @@ export function isCoreErrorType(
  * Everything else is a permanent property of the token and must not be
  * blindly retried. `token_consumed` (500) means the token was already
  * spent — a retry would fail as `token_already_spent`.
+ *
+ * `mint_error` (422) is code-dependent:
+ * - `cashu_foreign_mint_swap_failed` — a different mint may succeed.
+ * - `cashu_token_swap_fees_exceed_amount` — the token is too small for
+ *   fees; only a fresh, larger token would help (retrying the same token
+ *   is pointless).
+ * - unknown/unclassified mint errors default to not retryable.
  */
 export function isRetryableCoreError(parsed: ParsedCoreError): boolean {
-  return parsed.type === CoreErrorType.MINT_UNREACHABLE;
+  if (parsed.type === CoreErrorType.MINT_UNREACHABLE) {
+    return true;
+  }
+  if (parsed.type === CoreErrorType.MINT_ERROR) {
+    return parsed.code === CoreErrorCode.CASHU_FOREIGN_MINT_SWAP_FAILED;
+  }
+  return false;
 }
 
 /**
