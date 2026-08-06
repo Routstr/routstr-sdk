@@ -736,6 +736,9 @@ export class ModelManager {
 
     const bestById = new Map<string, { model: Model; base: string }>();
     const modelsFromAllProviders: Record<string, Model[]> = {};
+    // Only network-fetched bases get a new stamp, so cache hits do not
+    // slide the expiry window and failed fetches are retried next pass.
+    const freshlyFetched = new Set<string>();
     const disabledProviders = this.adapter.getDisabledProviders();
 
     // Helper to estimate minimum cost for a model
@@ -762,22 +765,24 @@ export class ModelManager {
           const lastUpdate = this.adapter.getProviderLastUpdate(base);
           const cacheValid =
             lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+          const cachedModels = this.adapter.getCachedModels();
 
-          if (cacheValid) {
-            const cachedModels = this.adapter.getCachedModels();
-            const cachedList = cachedModels[base] || [];
-            list = cachedList;
+          // Trust a stamp only when its payload actually exists: stamps
+          // written without payloads (older SDK versions) must refetch.
+          if (cacheValid && base in cachedModels) {
+            list = cachedModels[base];
           } else {
             // Cache expired or doesn't exist, fetch fresh
             list = await this.fetchModelsFromProvider(base);
+            freshlyFetched.add(base);
           }
         } else {
           // Force refresh
           list = await this.fetchModelsFromProvider(base);
+          freshlyFetched.add(base);
         }
 
         modelsFromAllProviders[base] = list;
-        this.adapter.setProviderLastUpdate(base, Date.now());
 
         // Update best-priced models if provider not disabled
         if (!disabledProviders.includes(base)) {
@@ -810,7 +815,8 @@ export class ModelManager {
         } else {
           this.logger.warn(`Provider ${base} unreachable: ${(error as Error).message}`);
         }
-        this.adapter.setProviderLastUpdate(base, Date.now());
+        // No stamp on failure, or the provider is served as "offers
+        // nothing" until the TTL expires; last known models keep serving.
         return { success: false, base };
       }
     });
@@ -827,12 +833,22 @@ export class ModelManager {
     for (const url of Object.keys(existingCache)) {
       if (currentBaseUrls.has(url)) {
         prunedExisting[url] = existingCache[url];
+      } else {
+        // A pruned payload must take its freshness stamp with it, or the
+        // provider reads as valid-but-empty until the TTL expires.
+        this.adapter.setProviderLastUpdate(url, 0);
       }
     }
     this.adapter.setCachedModels({
       ...prunedExisting,
       ...modelsFromAllProviders,
     });
+    // Stamp after the payload write so no reader ever sees a fresh stamp
+    // with a missing payload.
+    const stampTime = Date.now();
+    for (const base of freshlyFetched) {
+      this.adapter.setProviderLastUpdate(base, stampTime);
+    }
 
     // Return combined models array
     return Array.from(bestById.values()).map((v) => v.model);
@@ -883,16 +899,23 @@ export class ModelManager {
    */
   clearProviderCache(baseUrl: string): void {
     const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+    // Stamp first: a reader between the two writes must see stale, not
+    // fresh-and-empty.
+    this.adapter.setProviderLastUpdate(base, 0);
     const cached = this.adapter.getCachedModels();
     delete cached[base];
     this.adapter.setCachedModels(cached);
-    this.adapter.setProviderLastUpdate(base, 0);
   }
 
   /**
    * Clear all model caches
    */
   clearAllCache(): void {
+    // Stamps die with their payloads or the cleared providers read as
+    // fresh-and-empty until the TTL expires.
+    for (const base of Object.keys(this.adapter.getCachedModels())) {
+      this.adapter.setProviderLastUpdate(base, 0);
+    }
     this.adapter.setCachedModels({});
   }
 
