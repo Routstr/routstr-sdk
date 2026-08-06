@@ -27,6 +27,9 @@ export interface MintDiscoveryConfig {
 export class MintDiscovery {
   private readonly cacheTTL: number;
   private readonly logger: SdkLogger;
+  // Tracked here, not via the adapter's provider timestamp: that stamp
+  // belongs to the model cache and mint refreshes kept it alive forever.
+  private lastMintFetch = new Map<string, number>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -62,7 +65,7 @@ export class MintDiscovery {
       const base = url.endsWith("/") ? url : `${url}/`;
       try {
         if (!forceRefresh) {
-          const lastUpdate = this.adapter.getProviderLastUpdate(base);
+          const lastUpdate = this.lastMintFetch.get(base);
           const cacheValid =
             lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
           if (cacheValid) {
@@ -101,11 +104,10 @@ export class MintDiscovery {
         // Save provider mints and full info
         mintsFromAllProviders[base] = normalizedMints;
         infoFromAllProviders[base] = json;
-        this.adapter.setProviderLastUpdate(base, Date.now());
+        this.lastMintFetch.set(base, Date.now());
 
         return { success: true, base, mints: normalizedMints, info: json };
       } catch (error) {
-        this.adapter.setProviderLastUpdate(base, Date.now());
         if (this.isProviderDownError(error)) {
           this.logger.warn(`Provider ${base} is down right now.`);
         } else {
