@@ -7,6 +7,9 @@ import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import type { SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 
+// A hanging provider must not hold an info pass open indefinitely.
+const INFO_FETCH_TIMEOUT_MS = 10_000;
+
 /**
  * Configuration for MintDiscovery
  */
@@ -78,7 +81,9 @@ export class MintDiscovery {
           }
         }
 
-        const res = await fetch(`${base}v1/info`);
+        const res = await fetch(`${base}v1/info`, {
+          signal: AbortSignal.timeout(INFO_FETCH_TIMEOUT_MS),
+        });
         if (!res.ok) {
           throw new Error(`Failed to fetch info: ${res.status}`);
         }

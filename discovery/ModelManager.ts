@@ -40,6 +40,9 @@ export const DEFAULT_NOSTR_RELAYS = [
   "wss://relay.routstr.com",
 ];
 
+// A hanging provider must not hold a fetch pass open indefinitely.
+const PROVIDER_FETCH_TIMEOUT_MS = 10_000;
+
 /**
  * Configuration for ModelManager
  */
@@ -841,7 +844,9 @@ export class ModelManager {
    * @returns Array of models from provider
    */
   private async fetchModelsFromProvider(baseUrl: string): Promise<Model[]> {
-    const res = await fetch(`${baseUrl}v1/models`);
+    const res = await fetch(`${baseUrl}v1/models`, {
+      signal: AbortSignal.timeout(PROVIDER_FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) {
       throw new Error(`Failed to fetch models: ${res.status}`);
     }
