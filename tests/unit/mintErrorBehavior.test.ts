@@ -1,7 +1,7 @@
 /**
  * Behavior tests for the `mint_error` (HTTP 422) handling across the SDK.
  *
- * The parser (`parseCoreError`) and `isRetryableCoreError` have their own
+ * The parser (`parseCoreError`) and `shouldFailoverToAnotherMint` have their own
  * unit tests — these cover the *actual* behavior changes from the
  * handle-core-error-codes task:
  *
