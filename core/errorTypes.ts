@@ -216,14 +216,18 @@ export function isCoreErrorType(
 }
 
 /**
- * Check if a parsed core error is retryable.
+ * Determine whether this error should be retried using another Cashu mint.
  *
- * Only `mint_unreachable` (503) means the same token will work again later.
- * Everything else is a permanent property of the token and must not be
- * blindly retried. `token_consumed` (500) means the token was already
- * spent — a retry would fail as `token_already_spent`.
+ * This does not control provider failover. Provider failover may still handle
+ * `mint_error` responses by trying another provider. Only `mint_unreachable`
+ * (503) indicates that selecting another mint can recover the operation.
+ * Everything else is non-retryable at the mint level. In particular,
+ * `cashu_foreign_mint_swap_failed` and `cashu_token_swap_fees_exceed_amount`
+ * must not trigger mint failover.
  */
-export function isRetryableCoreError(parsed: ParsedCoreError): boolean {
+export function shouldFailoverToAnotherMint(
+  parsed: ParsedCoreError
+): boolean {
   return parsed.type === CoreErrorType.MINT_UNREACHABLE;
 }
 

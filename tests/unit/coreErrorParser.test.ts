@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseCoreError,
   isCoreErrorType,
-  isRetryableCoreError,
+  shouldFailoverToAnotherMint,
   summarizeCoreError,
   CoreErrorType,
   CoreErrorCode,
@@ -209,7 +209,7 @@ describe("isCoreErrorType", () => {
   });
 });
 
-describe("isRetryableCoreError", () => {
+describe("shouldFailoverToAnotherMint", () => {
   it("returns true for mint_unreachable", () => {
     const parsed = parseCoreError(
       JSON.stringify({
@@ -221,7 +221,7 @@ describe("isRetryableCoreError", () => {
       }),
       503
     );
-    expect(isRetryableCoreError(parsed)).toBe(true);
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
   });
 
   it("returns false for token_already_spent", () => {
@@ -234,10 +234,10 @@ describe("isRetryableCoreError", () => {
       }),
       400
     );
-    expect(isRetryableCoreError(parsed)).toBe(false);
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
   });
 
-  it("returns false for mint_error", () => {
+  it("returns false for mint_error with fee-exceeds-amount code", () => {
     const parsed = parseCoreError(
       JSON.stringify({
         error: {
@@ -247,12 +247,35 @@ describe("isRetryableCoreError", () => {
       }),
       422
     );
-    expect(isRetryableCoreError(parsed)).toBe(false);
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
+  });
+
+  it("returns false for mint_error with foreign-mint-swap-failed code", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: {
+          type: "mint_error",
+          code: "cashu_foreign_mint_swap_failed",
+        },
+      }),
+      422
+    );
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
+  });
+
+  it("returns false for mint_error without a known code", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: { type: "mint_error", message: "melt failed" },
+      }),
+      422
+    );
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
   });
 
   it("returns false for unknown/raw errors", () => {
     const parsed = parseCoreError("something broke", 500);
-    expect(isRetryableCoreError(parsed)).toBe(false);
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
   });
 });
 

@@ -29,6 +29,7 @@ import {
   FailoverError,
   InsufficientBalanceError,
   TokenAlreadySpentError,
+  MintError,
 } from "../core/errors";
 import { parseCoreError, CoreErrorType } from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
@@ -784,12 +785,37 @@ export class RoutstrClient {
     // In xcashu mode, if neither the refund nor the original was received,
     // we have no way to recover the sats — throw so the caller can surface it.
     if (this.mode === "xcashu" && !tryNextProvider) {
+      if (parsedError.type === CoreErrorType.MINT_ERROR) {
+        throw new MintError({
+          baseUrl,
+          statusCode: status,
+          mintUrl,
+          code: parsedError.code,
+          parsedError,
+          requestId: resolvedRequestId,
+        });
+      }
       throw new ProviderError(
         baseUrl,
         status,
         "[xcashu] Failed to receive refund token",
         requestId
       );
+    }
+
+    // ── Handle mint_error (HTTP 422) ───────────────────────────────────
+    // The mint rejected the fee/melt — the token was NOT consumed, so the
+    // reclaim path above already restored the sats (xcashu). For apikeys the
+    // balance is intact on the key. A refund would just hit the same failing
+    // mint, so skip it and fail over: another provider may use a different
+    // mint, or a fresh larger token may clear the fee threshold. Surface a
+    // typed MintError when every provider is exhausted (final throw below).
+    if (parsedError.type === CoreErrorType.MINT_ERROR && !tryNextProvider) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: mint_error detected for ${baseUrl}, mode=${this.mode}, code=${parsedError.code ?? "unknown"}; skipping refund (mint rejected the melt) and failing over`
+      );
+      tryNextProvider = true;
     }
 
     if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
@@ -1185,6 +1211,17 @@ export class RoutstrClient {
         baseUrl,
         statusCode: status,
         mintUrl,
+        parsedError,
+        requestId: resolvedRequestId,
+      });
+    }
+
+    if (parsedError.type === CoreErrorType.MINT_ERROR) {
+      throw new MintError({
+        baseUrl,
+        statusCode: status,
+        mintUrl,
+        code: parsedError.code,
         parsedError,
         requestId: resolvedRequestId,
       });
