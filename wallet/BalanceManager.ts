@@ -31,6 +31,29 @@ import {
 } from "./tokenUtils";
 
 /**
+ * Detect a provider "key not found" response (HTTP 401).
+ *
+ * Nodes before routstr-core 0.4.5 return a bare
+ * `{"detail":"Key not found. Deposit first via /v1/wallet/create before
+ * requesting a refund."}` body instead of the structured
+ * `{"detail":{"error":{...,"code":"key_not_found"}}}` envelope added in
+ * 0.4.5. Both mean the key is permanently dead — it was never funded (or its
+ * proofs were consumed locally) — so it can never authenticate and should be
+ * purged instead of retried. Once all nodes run 0.4.5, switch to matching the
+ * structured `key_not_found` code (tracked as a routstr-sdk task).
+ */
+function isKeyNotFoundResponse(
+  status: number,
+  body: string | undefined
+): boolean {
+  return (
+    status === 401 &&
+    typeof body === "string" &&
+    body.includes("Key not found")
+  );
+}
+
+/**
  * Options for refunding API key balance
  */
 export interface RefundApiKeyOptions {
@@ -257,7 +280,7 @@ export class BalanceManager {
     }
 
     let fetchResult:
-      | { success: boolean; token?: string; requestId?: string; error?: string; status?: number; parsedError?: ParsedCoreError }
+      | { success: boolean; token?: string; requestId?: string; error?: string; status?: number; parsedError?: ParsedCoreError; keyNotFound?: boolean }
       | undefined;
 
     try {
@@ -283,6 +306,24 @@ export class BalanceManager {
         return {
           success: false,
           message: fetchResult.error || "Token already spent",
+          requestId: fetchResult.requestId,
+        };
+      }
+
+      // Pre-0.4.5 nodes answer a refund for an unknown key with 401
+      // "Key not found" — the key is permanently dead, so clean it up instead
+      // of leaving it for endless refund sweeps. Same "only if still current"
+      // guard as token_already_spent above.
+      if (fetchResult.keyNotFound) {
+        this.logger.warn(
+          `refundApiKey: key not found for ${baseUrl}; removing dead API key`
+        );
+        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
+        return {
+          success: false,
+          message: "Key not found, removed dead API key",
           requestId: fetchResult.requestId,
         };
       }
@@ -349,6 +390,8 @@ export class BalanceManager {
     error?: string;
     status?: number;
     parsedError?: ParsedCoreError;
+    /** True when the provider replied 401 "Key not found" (pre-0.4.5 body). */
+    keyNotFound?: boolean;
   }> {
     if (!baseUrl) {
       return {
@@ -424,6 +467,9 @@ export class BalanceManager {
           status: response.status,
           error: errorMessage,
           parsedError,
+          // Pre-0.4.5 nodes reply 401 "Key not found" to refunds for an
+          // unknown/dead key — a deterministic signal the key should be purged.
+          keyNotFound: isKeyNotFoundResponse(response.status, responseBody),
         };
       }
 
@@ -1077,11 +1123,17 @@ export class BalanceManager {
           try { data = JSON.parse(responseBody); } catch { data = {}; }
         }
 
-        // Check for invalid/expired API key error (proofs already spent)
+        // Check for invalid/expired API key error. Two body shapes mean the
+        // key is permanently dead and should be purged:
+        //  - structured: 401 {detail:{error:{code:"invalid_api_key",
+        //    message:"...proofs already spent"}}}
+        //  - pre-0.4.5 nodes: 401 {detail:"Key not found. Deposit first via
+        //    /v1/wallet/create before requesting a refund."}
         const isInvalidApiKey =
-          response.status === 401 &&
-          data?.detail?.error?.code === "invalid_api_key" &&
-          data?.detail?.error?.message?.includes("proofs already spent");
+          isKeyNotFoundResponse(response.status, responseBody) ||
+          (response.status === 401 &&
+            data?.detail?.error?.code === "invalid_api_key" &&
+            data?.detail?.error?.message?.includes("proofs already spent"));
 
         return {
           amount: 0,

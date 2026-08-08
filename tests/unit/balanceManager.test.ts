@@ -817,4 +817,71 @@ describe("BalanceManager non-JSON error responses", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("getTokenBalance marks 'Key not found' (pre-0.4.5 body) as an invalid API key", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    const keyNotFoundBody = JSON.stringify({
+      detail:
+        "Key not found. Deposit first via /v1/wallet/create before requesting a refund.",
+      request_id: "req-key-not-found",
+    });
+    globalThis.fetch = mockFetchResponse(
+      401,
+      "Unauthorized",
+      keyNotFoundBody
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.getTokenBalance(
+        "cashu_dead_bootstrap_key",
+        "https://provider.example.com/"
+      );
+
+      expect(result.isInvalidApiKey).toBe(true);
+      expect(result.balanceUnknown).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("refundApiKey removes the key when the refund endpoint replies 'Key not found' (pre-0.4.5 body)", async () => {
+    const Provider = "https://provider.example.com/";
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [Provider]: {
+          key: "cashu_dead_bootstrap_key",
+          balance: 0,
+          lastUsed: null,
+        },
+      },
+    });
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    const keyNotFoundBody = JSON.stringify({
+      detail:
+        "Key not found. Deposit first via /v1/wallet/create before requesting a refund.",
+      request_id: "req-key-not-found",
+    });
+    globalThis.fetch = mockFetchResponse(
+      401,
+      "Unauthorized",
+      keyNotFoundBody
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "cashu_dead_bootstrap_key",
+        forceRefund: true,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe("Key not found, removed dead API key");
+      expect(storage.getApiKey(Provider)).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
