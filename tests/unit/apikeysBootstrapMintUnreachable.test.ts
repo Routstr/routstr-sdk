@@ -207,10 +207,11 @@ describe("RoutstrClient._handleErrorResponse — apikeys bootstrap, 503 mint_unr
     // Sats reclaimed by receiving the bootstrap token directly.
     expect(receiveSpy).toHaveBeenCalledOnce();
     expect(receiveSpy).toHaveBeenCalledWith(BOOTSTRAP_TOKEN);
-    // Stale bootstrap key purged from the apiKeys store (the removeXcashuToken
-    // call is a no-op there, which is the bug this guards against).
+    // Stale bootstrap key purged from the apiKeys store.
     expect(storage.removedApiKeys).toEqual([BASE_URL]);
-    expect(storage.removedXcashu).toEqual([[BASE_URL, BOOTSTRAP_TOKEN]]);
+    // The xcashu store is untouched in apikeys mode — the bootstrap token was
+    // never an xcashu IOU, so removeXcashuToken must not be called.
+    expect(storage.removedXcashu).toEqual([]);
     // The 503 refund branch is short-circuited — no refund round-trip.
     expect(getBalanceSpy).not.toHaveBeenCalled();
     expect(refundSpy).not.toHaveBeenCalled();

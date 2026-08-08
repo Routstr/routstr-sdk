@@ -769,16 +769,13 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
-        // The original token is back in the wallet — drop the stored IOU so
-        // getPendingCashuTokenAmount()/refundXcashuTokens() don't double-count it.
-        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
-        // In apikeys bootstrap the same token is stored as the provider's API
-        // key entry (setApiKey) rather than an xcashu IOU, so removeXcashuToken
-        // above is a no-op. The wallet just consumed its proofs, making that
-        // stored key permanently dead — purge it, unless a concurrent request
-        // already replaced it with the provider's canonical key (which must be
-        // preserved, mirroring the token_already_spent branch).
-        if (
+        // The original token is back in the wallet. Drop the stored
+        // credential: an xcashu IOU in xcashu mode, or the (now permanently
+        // dead) bootstrap API key in apikeys mode — but only if a concurrent
+        // request hasn't already swapped in the provider's canonical key.
+        if (this.mode === "xcashu") {
+          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        } else if (
           this.mode === "apikeys" &&
           this.storageAdapter.getApiKey(baseUrl)?.key === params.token
         ) {
