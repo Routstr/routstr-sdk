@@ -30,7 +30,11 @@ import {
   InsufficientBalanceError,
   TokenAlreadySpentError,
 } from "../core/errors";
-import { parseCoreError, CoreErrorType } from "../core/errorTypes";
+import {
+  parseCoreError,
+  CoreErrorCode,
+  CoreErrorType,
+} from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
@@ -793,119 +797,146 @@ export class RoutstrClient {
     }
 
     if (status === 402 && !tryNextProvider && this.mode === "apikeys") {
-      this.storageAdapter.getApiKey(baseUrl);
+      // Only routstr-core's own API-key balance error authorizes a top-up.
+      // Upstream providers can also return 402 (for example when the router's
+      // OpenRouter account is empty); minting more user funds cannot fix that.
+      const isLocalInsufficientBalance =
+        parsedError.type === CoreErrorType.INSUFFICIENT_QUOTA &&
+        parsedError.code === CoreErrorCode.INSUFFICIENT_BALANCE;
 
-      let topupAmount = params.requiredSats;
-
-      try {
-        const currentBalanceInfo = await this.balanceManager.getTokenBalance(
-          params.token,
-          baseUrl
-        );
-        if (currentBalanceInfo.balanceUnknown) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Current balance unknown for ${baseUrl}; using default topup amount=${topupAmount}`
-          );
-        } else {
-          const currentBalance =
-            currentBalanceInfo.unit === "msat"
-              ? currentBalanceInfo.amount / 1000
-              : currentBalanceInfo.amount;
-          const reservedBalance =
-            currentBalanceInfo.unit === "msat"
-              ? (currentBalanceInfo.reserved ?? 0) / 1000
-              : (currentBalanceInfo.reserved ?? 0);
-
-          const shortfall = Math.max(
-            0,
-            params.requiredSats - currentBalance + reservedBalance
-          );
-          topupAmount =
-            shortfall > 0.21 * params.requiredSats
-              ? shortfall
-              : 0.21 * params.requiredSats;
-
-          this._log(
-            "DEBUG",
-            `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${currentBalance - reservedBalance}`
-          );
-        }
-      } catch (e) {
+      if (!isLocalInsufficientBalance) {
         this._log(
           "WARN",
-          "Could not get current token balance for topup calculation:",
-          e
+          `[RoutstrClient] _handleErrorResponse: Skipping topup for unrecognized/provider 402 from ${baseUrl} (type=${parsedError.type ?? "unknown"}, code=${parsedError.code ?? "unknown"})`
         );
-      }
-
-      const topupResult = await this.balanceManager.topUp({
-        mintUrl,
-        baseUrl,
-        amount: topupAmount * TOPUP_MARGIN,
-        token: params.token,
-      });
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
-      );
-
-      if (!topupResult.success) {
-        const message = topupResult.message || "";
-        if (message.includes("Insufficient balance")) {
-          const needMatch = message.match(/need (\d+)/);
-          const haveMatch = message.match(/have (\d+)/);
-          const required = needMatch
-            ? parseInt(needMatch[1], 10)
-            : params.requiredSats;
-          const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
-          );
-          throw new InsufficientBalanceError(
-            required,
-            available,
-            0,
-            "",
-            message
-          );
-        } else {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Topup failed with non-insufficient-balance error, will try next provider`
-          );
-          tryNextProvider = true;
-        }
+        tryNextProvider = true;
       } else {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
-        );
-      }
-      if (!tryNextProvider) {
-        if (retryCount < MAX_RETRIES_PER_PROVIDER) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
+        let topupAmount = params.requiredSats;
+        let balanceValidated = false;
+
+        try {
+          const currentBalanceInfo = await this.balanceManager.getTokenBalance(
+            params.token,
+            baseUrl
           );
-          return this._makeRequest({
-            ...params,
-            token: params.token,
-            headers: this._withAuthAndTinfoilHeaders(
-              params.baseHeaders,
-              params.token,
-              params.tinfoilEnabled,
-              params.selectedModel?.id
-            ),
-            retryCount: retryCount + 1,
-          });
-        } else {
+          if (currentBalanceInfo.balanceUnknown) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; current API-key balance is unknown`
+            );
+          } else {
+            const currentBalance =
+              currentBalanceInfo.unit === "msat"
+                ? currentBalanceInfo.amount / 1000
+                : currentBalanceInfo.amount;
+            const reservedBalance =
+              currentBalanceInfo.unit === "msat"
+                ? (currentBalanceInfo.reserved ?? 0) / 1000
+                : (currentBalanceInfo.reserved ?? 0);
+            const availableBalance = currentBalance - reservedBalance;
+            const shortfall = Math.max(
+              0,
+              params.requiredSats - availableBalance
+            );
+
+            if (shortfall <= 0) {
+              this._log(
+                "WARN",
+                `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; API-key balance is sufficient (required=${params.requiredSats}, available=${availableBalance})`
+              );
+            } else {
+              balanceValidated = true;
+              topupAmount =
+                shortfall > 0.21 * params.requiredSats
+                  ? shortfall
+                  : 0.21 * params.requiredSats;
+
+              this._log(
+                "DEBUG",
+                `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${availableBalance}`
+              );
+            }
+          }
+        } catch (e) {
           this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: 402 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
+            "WARN",
+            `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; could not validate current API-key balance`,
+            e
           );
+        }
+
+        if (!balanceValidated) {
           tryNextProvider = true;
+        } else {
+          const topupResult = await this.balanceManager.topUp({
+            mintUrl,
+            baseUrl,
+            amount: topupAmount * TOPUP_MARGIN,
+            token: params.token,
+          });
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
+          );
+
+          if (!topupResult.success) {
+            const message = topupResult.message || "";
+            if (message.includes("Insufficient balance")) {
+              const needMatch = message.match(/need (\d+)/);
+              const haveMatch = message.match(/have (\d+)/);
+              const required = needMatch
+                ? parseInt(needMatch[1], 10)
+                : params.requiredSats;
+              const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
+              );
+              throw new InsufficientBalanceError(
+                required,
+                available,
+                0,
+                "",
+                message
+              );
+            } else {
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: Topup failed with non-insufficient-balance error, will try next provider`
+              );
+              tryNextProvider = true;
+            }
+          } else {
+            this._log(
+              "DEBUG",
+              `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
+            );
+          }
+          if (!tryNextProvider) {
+            if (retryCount < MAX_RETRIES_PER_PROVIDER) {
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
+              );
+              return this._makeRequest({
+                ...params,
+                token: params.token,
+                headers: this._withAuthAndTinfoilHeaders(
+                  params.baseHeaders,
+                  params.token,
+                  params.tinfoilEnabled,
+                  params.selectedModel?.id
+                ),
+                retryCount: retryCount + 1,
+              });
+            } else {
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: 402 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
+              );
+              tryNextProvider = true;
+            }
+          }
         }
       }
     }
