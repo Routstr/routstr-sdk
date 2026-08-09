@@ -770,9 +770,22 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
-        // The original token is back in the wallet — drop the stored IOU so
-        // getPendingCashuTokenAmount()/refundXcashuTokens() don't double-count it.
-        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        // The original token is back in the wallet. Drop the stored
+        // credential: an xcashu IOU in xcashu mode, or the (now permanently
+        // dead) bootstrap API key in apikeys mode — but only if a concurrent
+        // request hasn't already swapped in the provider's canonical key.
+        if (this.mode === "xcashu") {
+          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        } else if (
+          this.mode === "apikeys" &&
+          this.storageAdapter.getApiKey(baseUrl)?.key === params.token
+        ) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Removing dead bootstrap API key for ${baseUrl} (token restored to wallet)`
+          );
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
         tryNextProvider = true;
       } else {
         this._log(
@@ -1552,6 +1565,36 @@ export class RoutstrClient {
 
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+
+      // A stored key that is still a bootstrap Cashu token (i.e. the
+      // provider's canonical key was never swapped in) may be a zombie: if the
+      // first request failed before the swap (e.g. 503 mint_unreachable) the
+      // wallet received its proofs back, so the token can never authenticate
+      // again. Detect it via the provider's balance endpoint and recreate
+      // instead of blindly reusing a dead key.
+      if (parentApiKey && parentApiKey.key.startsWith("cashu")) {
+        try {
+          const balanceInfo = await this.balanceManager.getTokenBalance(
+            parentApiKey.key,
+            baseUrl
+          );
+          if (balanceInfo.isInvalidApiKey) {
+            this._log(
+              "DEBUG",
+              `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
+            );
+            this.storageAdapter.removeApiKey(baseUrl);
+            parentApiKey = null;
+          }
+        } catch (e) {
+          this._log(
+            "WARN",
+            "Could not validate existing API key before reuse, keeping it:",
+            e
+          );
+        }
+      }
+
       if (!parentApiKey) {
         this._log(
           "DEBUG",

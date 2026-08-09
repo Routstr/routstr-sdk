@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: typecheck · tests · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          # Must be >= 10.26 / 11 to honor `allowBuilds` in pnpm-workspace.yaml
+          # (needed for better-sqlite3 + esbuild build scripts).
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        # Build first: scripts/*.ts import the package by name
+        # (@routstr/sdk) via package exports, which resolve to dist/.
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test:sdk
+
+      - name: Integration tests
+        run: pnpm test:sdk:integration
