@@ -41,6 +41,10 @@ export const CoreErrorType = {
   MINT_UNREACHABLE: "mint_unreachable",
   /** Other expected wallet errors (400, not retryable) */
   CASHU_ERROR: "cashu_error",
+  /** API-key balance is below the amount required for the request (402) */
+  INSUFFICIENT_QUOTA: "insufficient_quota",
+  /** X-Cashu token is below the model's minimum required balance (402) */
+  MINIMUM_BALANCE_REQUIRED: "minimum_balance_required",
   /** Token was spent but crediting failed (500, not retryable) */
   TOKEN_CONSUMED: "token_consumed",
   /** Unexpected server-side fault (500, maybe retryable) */
@@ -66,6 +70,10 @@ export const CoreErrorCode = {
   CASHU_TOKEN_CONSUMED: "cashu_token_consumed",
   INTERNAL_ERROR: "internal_error",
   INVALID_API_KEY: "invalid_api_key",
+  /** The API key's available balance is below the request requirement */
+  INSUFFICIENT_BALANCE: "insufficient_balance",
+  /** A configured spending cap was reached; adding funds will not fix it */
+  BALANCE_LIMIT_EXCEEDED: "balance_limit_exceeded",
 } as const;
 
 export type CoreErrorCodeValue =
