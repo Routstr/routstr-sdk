@@ -21,6 +21,7 @@ import { InsufficientBalanceError } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorType,
+  shouldFailoverToAnotherMint,
   type ParsedCoreError,
 } from "../core/errorTypes";
 import { CashuSpender } from "./CashuSpender";
@@ -524,7 +525,10 @@ export class BalanceManager {
     }
   }
 
-  private async _topUpImpl(options: TopUpOptions): Promise<TopUpResult> {
+  private async _topUpImpl(
+    options: TopUpOptions,
+    excludeMints: string[] = []
+  ): Promise<TopUpResult> {
     const { mintUrl, baseUrl, amount, token: providedToken } = options;
 
     if (!amount || amount <= 0) {
@@ -548,6 +552,7 @@ export class BalanceManager {
         mintUrl,
         baseUrl,
         amount,
+        excludeMints,
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -566,18 +571,40 @@ export class BalanceManager {
       if (!topUpResult.success) {
         // If the cashu token sent for topup was already spent, there's no
         // point trying to receive it back — it's permanently gone.
-        if (topUpResult.parsedError?.type !== CoreErrorType.TOKEN_ALREADY_SPENT) {
+        const canRecover =
+          topUpResult.parsedError?.type !== CoreErrorType.TOKEN_ALREADY_SPENT;
+        if (canRecover) {
           await this._recoverFailedTopUp(cashuToken);
         } else {
           this.logger.warn(
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
           );
         }
+
+        // A foreign-mint swap failure can be retried against the same provider
+        // with another mint it advertises. Keep the exclusion local to this
+        // topup operation; fee/amount and unknown mint errors do not qualify.
+        if (
+          canRecover &&
+          tokenResult.selectedMintUrl &&
+          topUpResult.parsedError &&
+          shouldFailoverToAnotherMint(topUpResult.parsedError) &&
+          !excludeMints.includes(tokenResult.selectedMintUrl)
+        ) {
+          this.logger.warn(
+            `topUp: mint ${tokenResult.selectedMintUrl} failed for ${baseUrl}; retrying with another supported mint`
+          );
+          return this._topUpImpl(options, [
+            ...excludeMints,
+            tokenResult.selectedMintUrl,
+          ]);
+        }
+
         return {
           success: false,
           message: topUpResult.error || "Top up failed",
           requestId,
-          recoveredToken: topUpResult.parsedError?.type !== CoreErrorType.TOKEN_ALREADY_SPENT,
+          recoveredToken: canRecover,
         };
       }
 
@@ -681,17 +708,6 @@ export class BalanceManager {
       excludeMints,
       allowedMints: supportedMintsOnly ? providerMints : undefined,
     });
-
-    if (candidates.length === 0 && supportedMintsOnly) {
-      requiredAmount += 2;
-      candidates = this._selectCandidateMints({
-        balances,
-        units,
-        amount: requiredAmount,
-        preferredMintUrl: mintUrl,
-        excludeMints,
-      });
-    }
 
     if (candidates.length === 0) {
       let maxBalance = 0;
