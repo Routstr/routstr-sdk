@@ -25,6 +25,8 @@ import type { Model } from "../../core/types";
 const BASE_URL = "https://provider.example.com/";
 const SECOND_BASE_URL = "https://provider2.example.com/";
 const MINT_URL = "https://mint.example.com";
+const SECOND_MINT_URL = "https://mint2.example.com";
+const FALLBACK_MINT_URL = "https://mint3.example.com";
 const API_KEY = "stored-api-key";
 const MINT_ERROR_BODY = JSON.stringify({
   error: {
@@ -288,7 +290,7 @@ describe("RoutstrClient._handleErrorResponse — mint_error (422)", () => {
     expect(removedApiKeys).toEqual([]);
   });
 
-  it("fails over to the next provider with a fresh token when available", async () => {
+  it("retries the same provider with the actual failed mint excluded", async () => {
     const { storage } = createStorage();
     const providerManager = {
       markFailed: vi.fn(),
@@ -305,19 +307,24 @@ describe("RoutstrClient._handleErrorResponse — mint_error (422)", () => {
       "xcashu",
       { providerManager }
     );
-    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
-      token: "cashu_fresh_failover_token",
+    const spendSpy = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_fallback_token",
       tokenBalance: 1000,
       tokenBalanceUnit: "sat",
       tokenBalanceUnknown: false,
+      selectedMintUrl: FALLBACK_MINT_URL,
     });
     const makeRequestSpy = vi
       .spyOn(client as any, "_makeRequest")
       .mockResolvedValue(new Response("ok", { status: 200 }));
 
     const token = "cashu_mint_error_token_456";
+    const params = {
+      ...errorParams(token),
+      selectedMintUrl: SECOND_MINT_URL,
+    };
     const response = await (client as any)._handleErrorResponse(
-      errorParams(token),
+      params,
       token,
       422,
       "req-789",
@@ -327,16 +334,20 @@ describe("RoutstrClient._handleErrorResponse — mint_error (422)", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(providerManager.markFailed).toHaveBeenCalledWith(
-      BASE_URL,
-      expect.stringContaining("type=mint_error")
-    );
-    expect(providerManager.findNextBestProvider).toHaveBeenCalled();
-    // Retry went to the failover provider with a fresh token.
+    expect(spendSpy).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+      excludeMints: [SECOND_MINT_URL],
+    });
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
     expect(makeRequestSpy).toHaveBeenCalledOnce();
     const retryParams = makeRequestSpy.mock.calls[0][0];
-    expect(retryParams.baseUrl).toBe(SECOND_BASE_URL);
-    expect(retryParams.token).toBe("cashu_fresh_failover_token");
+    expect(retryParams.baseUrl).toBe(BASE_URL);
+    expect(retryParams.token).toBe("cashu_fresh_fallback_token");
+    expect(retryParams.selectedMintUrl).toBe(FALLBACK_MINT_URL);
+    expect(retryParams.excludeMints).toEqual([SECOND_MINT_URL]);
   });
 });
 

@@ -35,6 +35,7 @@ import {
   parseCoreError,
   CoreErrorCode,
   CoreErrorType,
+  shouldFailoverToAnotherMint,
 } from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
@@ -392,7 +393,13 @@ export class RoutstrClient {
       baseUrl,
     });
 
-    const { token, tokenBalance, tokenBalanceUnit, tokenBalanceUnknown } = spendResult;
+    const {
+      token,
+      tokenBalance,
+      tokenBalanceUnit,
+      tokenBalanceUnknown,
+      selectedMintUrl,
+    } = spendResult;
 
     // Build final request headers (auth + Tinfoil model hint)
     const finalHeaders = this._withAuthAndTinfoilHeaders(
@@ -413,6 +420,7 @@ export class RoutstrClient {
       headers: finalHeaders,
       baseHeaders,
       selectedModel,
+      selectedMintUrl,
       tinfoilEnabled,
       signal: params.signal,
     });
@@ -462,6 +470,8 @@ export class RoutstrClient {
 
       (processedResponse as any).baseUrl = (response as any).baseUrl;
       (processedResponse as any).token = (response as any).token;
+      (processedResponse as any).selectedMintUrl =
+        (response as any).selectedMintUrl;
       (processedResponse as any).requestResponseLogId = requestResponseLogId;
 
       usagePromise = inspectSSEWebStream(
@@ -532,6 +542,10 @@ export class RoutstrClient {
     selectedModel?: Model;
     baseUrl: string;
     mintUrl: string;
+    /** Actual mint used for this token; mintUrl is only the preference. */
+    selectedMintUrl?: string;
+    /** Mints already rejected while handling this request. */
+    excludeMints?: string[];
     token: string;
     requiredSats: number;
     maxTokens?: number;
@@ -587,6 +601,7 @@ export class RoutstrClient {
 
       (response as any).baseUrl = baseUrl;
       (response as any).token = token;
+      (response as any).selectedMintUrl = params.selectedMintUrl;
       (response as any).requestResponseLogId = requestLogId;
       await this.requestResponseLogSink?.logResponseStart?.(requestLogId, response);
 
@@ -670,6 +685,8 @@ export class RoutstrClient {
       selectedModel?: Model;
       baseUrl: string;
       mintUrl: string;
+      selectedMintUrl?: string;
+      excludeMints?: string[];
       token: string;
       requiredSats: number;
       maxTokens?: number;
@@ -799,6 +816,69 @@ export class RoutstrClient {
       }
     }
 
+    // A foreign-mint swap failure identifies the mint, not the provider.
+    // Once the rejected token has been reclaimed, retry this same provider
+    // first with that mint excluded. Candidate selection will still enforce
+    // the provider's advertised mint list and available wallet balance.
+    if (
+      params.token.startsWith("cashu") &&
+      tryNextProvider &&
+      parsedError.type === CoreErrorType.MINT_ERROR &&
+      shouldFailoverToAnotherMint(parsedError) &&
+      retryCount < MAX_RETRIES_PER_PROVIDER
+    ) {
+      const failedMintUrl = params.selectedMintUrl || mintUrl;
+      const excludeMints = Array.from(
+        new Set([...(params.excludeMints || []), failedMintUrl])
+      );
+
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: mint_error from ${failedMintUrl}; retrying provider ${baseUrl} with another supported mint`
+      );
+
+      let spendResult:
+        | Awaited<ReturnType<RoutstrClient["_spendToken"]>>
+        | undefined;
+      try {
+        spendResult = await this._spendToken({
+          mintUrl,
+          amount: params.requiredSats,
+          baseUrl,
+          excludeMints,
+        });
+      } catch (error) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: no compatible alternative mint for ${baseUrl}; trying provider failover`,
+          error
+        );
+      }
+
+      if (spendResult) {
+        const retryResponse = await this._makeRequest({
+          ...params,
+          token: spendResult.token,
+          selectedMintUrl: spendResult.selectedMintUrl,
+          excludeMints,
+          headers: this._withAuthAndTinfoilHeaders(
+            params.baseHeaders,
+            spendResult.token,
+            params.tinfoilEnabled,
+            params.selectedModel?.id
+          ),
+          retryCount: retryCount + 1,
+        });
+        (retryResponse as any).initialTokenBalanceInSats =
+          spendResult.tokenBalanceUnit === "msat"
+            ? spendResult.tokenBalance / 1000
+            : spendResult.tokenBalance;
+        (retryResponse as any).initialTokenBalanceUnknown =
+          spendResult.tokenBalanceUnknown;
+        return retryResponse;
+      }
+    }
+
     // In xcashu mode, if neither the refund nor the original was received,
     // we have no way to recover the sats — throw so the caller can surface it.
     if (this.mode === "xcashu" && !tryNextProvider) {
@@ -806,7 +886,7 @@ export class RoutstrClient {
         throw new MintError({
           baseUrl,
           statusCode: status,
-          mintUrl,
+          mintUrl: params.selectedMintUrl || mintUrl,
           code: parsedError.code,
           parsedError,
           requestId: resolvedRequestId,
@@ -821,16 +901,14 @@ export class RoutstrClient {
     }
 
     // ── Handle mint_error (HTTP 422) ───────────────────────────────────
-    // The mint rejected the fee/melt — the token was NOT consumed, so the
-    // reclaim path above already restored the sats (xcashu). For apikeys the
-    // balance is intact on the key. A refund would just hit the same failing
-    // mint, so skip it and fail over: another provider may use a different
-    // mint, or a fresh larger token may clear the fee threshold. Surface a
-    // typed MintError when every provider is exhausted (final throw below).
+    // The token was not consumed. xcashu's mint-specific retry was attempted
+    // above after reclaiming it. API-key balances remain intact, and
+    // non-retryable mint codes (such as fee-exceeds-amount) must not cycle
+    // through unrelated mints. Skip refund and proceed to provider failover.
     if (parsedError.type === CoreErrorType.MINT_ERROR && !tryNextProvider) {
       this._log(
         "WARN",
-        `[RoutstrClient] _handleErrorResponse: mint_error detected for ${baseUrl}, mode=${this.mode}, code=${parsedError.code ?? "unknown"}; skipping refund (mint rejected the melt) and failing over`
+        `[RoutstrClient] _handleErrorResponse: mint_error detected for ${baseUrl}, mode=${this.mode}, code=${parsedError.code ?? "unknown"}; skipping refund and trying provider failover`
       );
       tryNextProvider = true;
     }
@@ -1212,11 +1290,29 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
       );
-      const spendResult = await this._spendToken({
-        mintUrl,
-        amount: newRequiredSats,
-        baseUrl: nextProvider,
-      });
+      // Mint exclusions are scoped to a provider attempt. A different
+      // provider may successfully handle the same mint, so do not carry the
+      // previous provider's rejection into cross-provider failover.
+      let spendResult: Awaited<ReturnType<RoutstrClient["_spendToken"]>>;
+      try {
+        spendResult = await this._spendToken({
+          mintUrl,
+          amount: newRequiredSats,
+          baseUrl: nextProvider,
+        });
+      } catch (error) {
+        if (parsedError.type === CoreErrorType.MINT_ERROR) {
+          throw new MintError({
+            baseUrl,
+            statusCode: status,
+            mintUrl: params.selectedMintUrl || mintUrl,
+            code: parsedError.code,
+            parsedError,
+            requestId: resolvedRequestId,
+          });
+        }
+        throw error;
+      }
 
       // Retry with new provider (reset retry count). Attach the balance that
       // was observed before the retry request so callers do not have to query
@@ -1229,6 +1325,8 @@ export class RoutstrClient {
         baseUrl: nextProvider,
         selectedModel: newModel,
         token: spendResult.token!,
+        selectedMintUrl: spendResult.selectedMintUrl,
+        excludeMints: undefined,
         requiredSats: newRequiredSats,
         headers: this._withAuthAndTinfoilHeaders(
           params.baseHeaders,
@@ -1264,7 +1362,7 @@ export class RoutstrClient {
       throw new MintError({
         baseUrl,
         statusCode: status,
-        mintUrl,
+        mintUrl: params.selectedMintUrl || mintUrl,
         code: parsedError.code,
         parsedError,
         requestId: resolvedRequestId,
@@ -1581,13 +1679,15 @@ export class RoutstrClient {
     mintUrl: string;
     amount: number;
     baseUrl: string;
+    excludeMints?: string[];
   }): Promise<{
     token: string;
     tokenBalance: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
+    selectedMintUrl?: string;
   }> {
-    const { mintUrl, amount, baseUrl } = params;
+    const { mintUrl, amount, baseUrl, excludeMints = [] } = params;
 
     this._log(
       "DEBUG",
@@ -1596,6 +1696,7 @@ export class RoutstrClient {
 
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+      let selectedMintUrl: string | undefined;
 
       // A stored key that is still a bootstrap Cashu token (i.e. the
       // provider's canonical key was never swapped in) may be a zombie: if the
@@ -1644,9 +1745,12 @@ export class RoutstrClient {
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,
           amount: initialAmount,
-          baseUrl: "",
+          baseUrl,
           reuseToken: false,
+          excludeMints,
         });
+
+        selectedMintUrl = spendResult.selectedMintUrl;
 
         if (!spendResult.token) {
           this._log(
@@ -1742,6 +1846,7 @@ export class RoutstrClient {
         tokenBalance,
         tokenBalanceUnit,
         tokenBalanceUnknown,
+        selectedMintUrl,
       };
     }
 
@@ -1752,8 +1857,9 @@ export class RoutstrClient {
     const spendResult = await this.cashuSpender.spend({
       mintUrl,
       amount,
-      baseUrl: "",
+      baseUrl,
       reuseToken: false,
+      excludeMints,
     });
 
     if (!spendResult.token) {
@@ -1776,6 +1882,7 @@ export class RoutstrClient {
       tokenBalance: spendResult.balance,
       tokenBalanceUnit: spendResult.unit ?? "sat",
       tokenBalanceUnknown: false,
+      selectedMintUrl: spendResult.selectedMintUrl,
     };
   }
 

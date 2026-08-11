@@ -250,7 +250,7 @@ describe("shouldFailoverToAnotherMint", () => {
     expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
   });
 
-  it("returns false for mint_error with foreign-mint-swap-failed code", () => {
+  it("returns true for mint_error with foreign-mint-swap-failed code", () => {
     const parsed = parseCoreError(
       JSON.stringify({
         error: {
@@ -260,7 +260,7 @@ describe("shouldFailoverToAnotherMint", () => {
       }),
       422
     );
-    expect(shouldFailoverToAnotherMint(parsed)).toBe(false);
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
   });
 
   it("returns false for mint_error without a known code", () => {

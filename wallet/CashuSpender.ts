@@ -450,6 +450,7 @@ export class CashuSpender {
       balance: spentAmount,
       unit:
         (selectedMintUrl ? units[selectedMintUrl] : units[mintUrl]) || "sat",
+      selectedMintUrl: selectedMintUrl || mintUrl,
     };
   }
 

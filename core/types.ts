@@ -122,6 +122,8 @@ export interface SpendResult {
   status: "success" | "failed";
   balance: number;
   unit?: "sat" | "msat";
+  /** Actual mint used to create the token after candidate selection. */
+  selectedMintUrl?: string;
   error?: string;
   errorDetails?: {
     required: number;
