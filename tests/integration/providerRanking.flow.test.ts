@@ -128,6 +128,9 @@ vi.mock("applesauce-relay", () => {
       req() {
         return rxjs.of(...mockNostrEvents);
       }
+      request() {
+        return rxjs.of(...mockNostrEvents);
+      }
     },
     onlyEvents: () => (source: rxjs.Observable<any>) =>
       source.pipe(rxjs.filter((e: any) => e !== "EOSE")),
@@ -204,9 +207,11 @@ describe("provider ranking integration flow", () => {
     // Verify fetch was called for both providers
     expect(fetchSpy).toHaveBeenCalledWith(
       `${PROVIDER_A_URL}/v1/models`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(fetchSpy).toHaveBeenCalledWith(
       `${PROVIDER_B_URL}/v1/models`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
     // -- 6. Create ProviderManager from the adapter --

@@ -7,6 +7,9 @@ import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import type { SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 
+// A hanging provider must not hold an info pass open indefinitely.
+const INFO_FETCH_TIMEOUT_MS = 10_000;
+
 /**
  * Configuration for MintDiscovery
  */
@@ -24,6 +27,9 @@ export interface MintDiscoveryConfig {
 export class MintDiscovery {
   private readonly cacheTTL: number;
   private readonly logger: SdkLogger;
+  // Tracked here, not via the adapter's provider timestamp: that stamp
+  // belongs to the model cache and mint refreshes kept it alive forever.
+  private lastMintFetch = new Map<string, number>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -59,7 +65,7 @@ export class MintDiscovery {
       const base = url.endsWith("/") ? url : `${url}/`;
       try {
         if (!forceRefresh) {
-          const lastUpdate = this.adapter.getProviderLastUpdate(base);
+          const lastUpdate = this.lastMintFetch.get(base);
           const cacheValid =
             lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
           if (cacheValid) {
@@ -78,7 +84,9 @@ export class MintDiscovery {
           }
         }
 
-        const res = await fetch(`${base}v1/info`);
+        const res = await fetch(`${base}v1/info`, {
+          signal: AbortSignal.timeout(INFO_FETCH_TIMEOUT_MS),
+        });
         if (!res.ok) {
           throw new Error(`Failed to fetch info: ${res.status}`);
         }
@@ -96,11 +104,10 @@ export class MintDiscovery {
         // Save provider mints and full info
         mintsFromAllProviders[base] = normalizedMints;
         infoFromAllProviders[base] = json;
-        this.adapter.setProviderLastUpdate(base, Date.now());
+        this.lastMintFetch.set(base, Date.now());
 
         return { success: true, base, mints: normalizedMints, info: json };
       } catch (error) {
-        this.adapter.setProviderLastUpdate(base, Date.now());
         if (this.isProviderDownError(error)) {
           this.logger.warn(`Provider ${base} is down right now.`);
         } else {
