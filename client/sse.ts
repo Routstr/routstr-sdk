@@ -122,20 +122,16 @@ export async function inspectSSEWebStream(
   const inspectDataPayload = (jsonText: string): void => {
     const trimmed = jsonText.trim();
     if (!trimmed || trimmed === "[DONE]") {
-      if (trimmed === "[DONE]") console.log("[routstr:sse] [DONE]");
       return;
     }
     if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-      console.log("[routstr:sse] non-JSON payload:", trimmed.slice(0, 200));
       return;
     }
 
     try {
       const data = JSON.parse(trimmed) as any;
-      console.log("[routstr:sse] chunk:", JSON.stringify(data));
 
       if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
-        console.log("[routstr:sse] (inspection already complete, skipping)");
         return;
       }
 
@@ -150,18 +146,14 @@ export async function inspectSSEWebStream(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
-        // console.log("[routstr:sse] → usage detected:", usage);
         const merged = mergeUsage(capturedUsage, usage);
         if (hasUsageChanged(capturedUsage, merged)) {
           capturedUsage = merged;
-          // console.log("[routstr:sse] → merged (changed):", merged);
           onUsage(merged);
-        } else {
-          // console.log("[routstr:sse] → merged (no change)");
         }
       }
     } catch {
-      console.log("[routstr:sse] failed to parse payload:", trimmed.slice(0, 200));
+      // Swallow parse errors — inspection is best-effort.
     }
   };
 
@@ -255,20 +247,16 @@ export function createSSEParserTransform(
   const inspectDataPayload = (jsonText: string): void => {
     const trimmed = jsonText.trim();
     if (!trimmed || trimmed === "[DONE]") {
-      if (trimmed === "[DONE]") console.log("[routstr:sse] [DONE]");
       return;
     }
     if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-      console.log("[routstr:sse] non-JSON payload:", trimmed.slice(0, 200));
       return;
     }
 
     try {
       const data = JSON.parse(trimmed) as any;
-      console.log("[routstr:sse] chunk:", JSON.stringify(data));
 
       if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
-        console.log("[routstr:sse] (inspection already complete, skipping)");
         return;
       }
 
@@ -282,18 +270,14 @@ export function createSSEParserTransform(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
-        console.log("[routstr:sse] → usage detected:", usage);
         const mergedUsage = mergeUsage(capturedUsage, usage);
         if (hasUsageChanged(capturedUsage, mergedUsage)) {
           capturedUsage = mergedUsage;
-          console.log("[routstr:sse] → merged (changed):", mergedUsage);
           onUsage(mergedUsage);
-        } else {
-          console.log("[routstr:sse] → merged (no change)");
         }
       }
     } catch {
-      console.log("[routstr:sse] failed to parse payload:", trimmed.slice(0, 200));
+      // Swallow parse errors — inspection is best-effort.
     }
   };
 
