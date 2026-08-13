@@ -315,6 +315,114 @@ describe("RoutstrClient redemption recovery and provider failover", () => {
   });
 });
 
+describe("RoutstrClient purge unusable stored credential on permanent errors", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const noFailover = { markFailed: vi.fn(), getFailedProviders: () => new Set([BASE_URL]), findNextBestProvider: vi.fn(() => null) } as any;
+
+  it.each([
+    [CoreErrorType.INVALID_TOKEN, CoreErrorCode.INVALID_CASHU_TOKEN, "apikeys", "cashu_bad_bootstrap", "api-key"],
+    [CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED, "apikeys", "cashu_bad_bootstrap", "api-key"],
+    [CoreErrorType.CASHU_ERROR, CoreErrorCode.CASHU_TOKEN_ZERO_VALUE, "apikeys", "cashu_bad_bootstrap", "api-key"],
+  ])("apikeys: purges bootstrap key on permanent %s", async (type, code, mode, token, stored) => {
+    const store = storage();
+    store.getApiKey = () => ({
+      key: token,
+      baseUrl: BASE_URL,
+      balance: 100,
+      lastUsed: null,
+    });
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", mode, { providerManager: noFailover });
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 0, unit: "sat", message: "nope" } as any);
+    vi.spyOn(client.getBalanceManager(), "refundApiKey").mockResolvedValue({ success: false, message: "refund failed" });
+
+    const promise = (client as any)._handleErrorResponse(
+      params(token),
+      token,
+      400,
+      "req-purge",
+      undefined,
+      body(type, code),
+      0
+    );
+
+    await expect(promise).rejects.toBeTruthy();
+    expect(store.removeApiKey).toHaveBeenCalledWith(BASE_URL);
+    void stored;
+  });
+
+  it("apikeys: preserves replacement key when unusable response is stale", async () => {
+    const store = storage();
+    store.getApiKey = () => ({
+      key: "replacement-key",
+      baseUrl: BASE_URL,
+      balance: 42,
+      lastUsed: null,
+    });
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", "apikeys", { providerManager: noFailover });
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 0, unit: "sat", message: "nope" } as any);
+    vi.spyOn(client.getBalanceManager(), "refundApiKey").mockResolvedValue({ success: false, message: "refund failed" });
+
+    const token = "stale-invalid-token";
+    const promise = (client as any)._handleErrorResponse(
+      params(token),
+      token,
+      400,
+      "req-purge-stale",
+      undefined,
+      body(CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED),
+      0
+    );
+
+    await expect(promise).rejects.toBeTruthy();
+    expect(store.removeApiKey).not.toHaveBeenCalled();
+  });
+
+  it("xcashu: purges unusable xcashu token on token_consumed", async () => {
+    const store = storage();
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", "xcashu", { providerManager: noFailover });
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 0, unit: "sat", message: "nope" } as any);
+
+    const token = "cashu_consumed_xyz";
+    const promise = (client as any)._handleErrorResponse(
+      params(token),
+      token,
+      500,
+      "req-purge-xcashu",
+      undefined,
+      body(CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED),
+      0
+    );
+
+    await expect(promise).rejects.toBeTruthy();
+    expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, token);
+  });
+
+  it.each([
+    [CoreErrorType.CASHU_ERROR, CoreErrorCode.CASHU_TOKEN_REDEMPTION_FAILED],
+    [CoreErrorType.API_ERROR, CoreErrorCode.INTERNAL_ERROR],
+  ])("apikeys: preserves credential for ambiguous %s", async (type, code) => {
+    const store = storage();
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", "apikeys", { providerManager: noFailover });
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 0, unit: "sat", message: "nope" } as any);
+    vi.spyOn(client.getBalanceManager(), "refundApiKey").mockResolvedValue({ success: false, message: "refund failed" });
+
+    const token = "cashu_ambiguous";
+    const promise = (client as any)._handleErrorResponse(
+      params(token),
+      token,
+      type === CoreErrorType.API_ERROR ? 500 : 400,
+      "req-ambiguous",
+      undefined,
+      body(type, code),
+      0
+    );
+
+    await expect(promise).rejects.toBeTruthy();
+    expect(store.removeApiKey).not.toHaveBeenCalled();
+  });
+});
+
 describe("CashuSpender background redemption recovery", () => {
   it("tries the provider refund first, then receives the stored original token", async () => {
     const token = "cashu_stored_original";

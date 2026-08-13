@@ -279,6 +279,27 @@ export function isHandledRedemptionError(
 }
 
 /**
+ * True when a structured redemption error means the stored credential will
+ * never be usable again and should not be blindly reused on later requests.
+ *
+ * The token is permanently lost (consumed or redeemed-to-zero) or permanently
+ * malformed/undecodable, so replaying the same stored key/token can only fail
+ * again. The ambiguous failures (`cashu_token_redemption_failed` and
+ * `api_error/internal_error`, whose token state is unknown) are preserved so a
+ * later refund sweep can still attempt recovery.
+ */
+export function shouldPurgeStoredCredential(
+  parsed: ParsedCoreError
+): boolean {
+  return (
+    isTokenConsumedError(parsed) ||
+    isInvalidTokenError(parsed) ||
+    (isCashuRedemptionError(parsed) &&
+      parsed.code === CoreErrorCode.CASHU_TOKEN_ZERO_VALUE)
+  );
+}
+
+/**
  * Determine whether this error should be retried using another Cashu mint.
  *
  * This does not control provider failover. A mint-unreachable response and a

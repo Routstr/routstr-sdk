@@ -45,6 +45,7 @@ import {
   isCoreInternalError,
   isHandledRedemptionError,
   shouldFailoverToAnotherMint,
+  shouldPurgeStoredCredential,
   type ParsedCoreError,
 } from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
@@ -1266,6 +1267,43 @@ export class RoutstrClient {
               refundResult.message ?? "Unknown error"
             );
           }
+        }
+      }
+    }
+
+    // ── Purge permanently-unusable stored credentials ──────────────────
+    // For a redemption error that proves the stored credential can never work
+    // again (consumed, redeemed-to-zero, or a malformed/undecodable token),
+    // remove it so a later request doesn't blindly reuse the same bad
+    // credential and re-fail. Ambiguous failures (cashu_token_redemption_failed,
+    // api_error/internal_error) are preserved so a refund sweep can still try.
+    // Only when recovery failed — success already removed the credential above.
+    if (
+      handledRedemptionError &&
+      shouldPurgeStoredCredential(parsedError) &&
+      !recoverySucceeded
+    ) {
+      if (this.mode === "xcashu") {
+        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: Removing unusable xcashu token for ${baseUrl} (type=${parsedError.type} code=${parsedError.code})`
+        );
+      } else if (this.mode === "apikeys") {
+        // Same concurrency guard as token_already_spent: only remove the exact
+        // key that failed, never a replacement key swapped in meanwhile.
+        const storedApiKey = this.storageAdapter.getApiKey(baseUrl);
+        if (storedApiKey?.key === params.token) {
+          this.storageAdapter.removeApiKey(baseUrl);
+          this._log(
+            "WARN",
+            `[RoutstrClient] _handleErrorResponse: Removing unusable API key for ${baseUrl} (type=${parsedError.type} code=${parsedError.code})`
+          );
+        } else if (storedApiKey) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: preserving replacement API key for ${baseUrl}; unusable response belongs to an older key`
+          );
         }
       }
     }
