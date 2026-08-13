@@ -14,7 +14,10 @@ import type { WalletAdapter, StorageAdapter } from "./interfaces";
 import type { SpendResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError } from "../core/errors";
-import { CoreErrorType } from "../core/errorTypes";
+import {
+  CoreErrorType,
+  isHandledRedemptionError,
+} from "../core/errorTypes";
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
@@ -606,6 +609,38 @@ export class CashuSpender {
               `[CashuSpender] refundXcashuTokens: token_already_spent for ${baseUrl}; removing permanently-spent xcashu token from store`
             );
             continue;
+          }
+
+          // For structured redemption failures, the provider-side refund was
+          // attempted first. Try receiving the stored original token directly
+          // before scheduling another refund retry. Keep it in storage when
+          // both recovery paths fail so a later sweep can try again.
+          if (
+            !fetchResult.success &&
+            fetchResult.parsedError &&
+            isHandledRedemptionError(fetchResult.parsedError)
+          ) {
+            const directReceive = await this.receiveToken(xcashuToken.token);
+            if (directReceive.success) {
+              this.storageAdapter.removeXcashuToken(
+                baseUrl,
+                xcashuToken.token
+              );
+              results.push({
+                baseUrl,
+                token: xcashuToken.token,
+                success: true,
+              });
+              this._log(
+                "DEBUG",
+                `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError.type}/${fetchResult.parsedError.code}; recovered original token directly, amount=${directReceive.amount}`
+              );
+              continue;
+            }
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError.type}/${fetchResult.parsedError.code}; direct original-token recovery also failed: ${directReceive.message ?? "unknown error"}`
+            );
           }
 
           // If the provider responds with 404 "Refund not found", the xcashu

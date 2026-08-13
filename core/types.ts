@@ -141,6 +141,8 @@ export interface RefundResult {
   refundedAmount?: number;
   message?: string;
   requestId?: string;
+  /** Structured routstr-core error when the provider returned one. */
+  parsedError?: import("./errorTypes").ParsedCoreError;
 }
 
 /**
@@ -151,7 +153,10 @@ export interface TopUpResult {
   toppedUpAmount?: number;
   message?: string;
   requestId?: string;
+  /** True only when the failed top-up token was actually received back. */
   recoveredToken?: boolean;
+  /** Structured routstr-core error when the provider returned one. */
+  parsedError?: import("./errorTypes").ParsedCoreError;
 }
 
 /**

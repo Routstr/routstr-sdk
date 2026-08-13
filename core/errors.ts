@@ -177,6 +177,96 @@ export class TokenAlreadySpentError extends Error {
   }
 }
 
+export interface CoreRedemptionErrorOptions {
+  baseUrl: string;
+  statusCode?: number;
+  mintUrl?: string;
+  code?: string;
+  message?: string;
+  parsedError?: ParsedCoreError;
+  requestId?: string;
+  recoveryAttempted?: boolean;
+  recoverySucceeded?: boolean;
+}
+
+/** Shared context for structured routstr-core token-redemption failures. */
+class CoreRedemptionError extends Error {
+  baseUrl: string;
+  statusCode: number;
+  mintUrl?: string;
+  code?: string;
+  parsedError?: ParsedCoreError;
+  requestId?: string;
+  recoveryAttempted: boolean;
+  recoverySucceeded: boolean;
+
+  constructor(
+    name: string,
+    defaultStatus: number,
+    defaultMessage: string,
+    opts: CoreRedemptionErrorOptions
+  ) {
+    super(opts.message ?? opts.parsedError?.message ?? defaultMessage);
+    this.name = name;
+    this.baseUrl = opts.baseUrl;
+    this.statusCode = opts.statusCode ?? defaultStatus;
+    this.recoveryAttempted = opts.recoveryAttempted ?? false;
+    this.recoverySucceeded = opts.recoverySucceeded ?? false;
+    if (opts.mintUrl !== undefined) this.mintUrl = opts.mintUrl;
+    if (opts.code !== undefined) this.code = opts.code;
+    if (opts.parsedError) this.parsedError = opts.parsedError;
+    if (opts.requestId) this.requestId = opts.requestId;
+  }
+}
+
+/** Error thrown after provider failover is exhausted for an invalid token. */
+export class InvalidTokenError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "InvalidTokenError",
+      400,
+      "Invalid Cashu token — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
+/** Error thrown after provider failover is exhausted for a Cashu wallet error. */
+export class CashuRedemptionError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "CashuRedemptionError",
+      400,
+      "Cashu token redemption failed — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
+/** Error thrown when a consumed token cannot be recovered after failover. */
+export class TokenConsumedError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "TokenConsumedError",
+      500,
+      "Cashu token was consumed but not credited — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
+/** Error thrown for a routstr-core internal redemption fault after failover. */
+export class CoreInternalError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "CoreInternalError",
+      500,
+      "Internal error during token redemption — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
 /**
  * Error thrown when the Cashu mint rejects a fee/melt/swap operation.
  *

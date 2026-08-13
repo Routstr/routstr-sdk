@@ -30,12 +30,22 @@ import {
   InsufficientBalanceError,
   TokenAlreadySpentError,
   MintError,
+  InvalidTokenError,
+  CashuRedemptionError,
+  TokenConsumedError,
+  CoreInternalError,
 } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorCode,
   CoreErrorType,
+  isInvalidTokenError,
+  isCashuRedemptionError,
+  isTokenConsumedError,
+  isCoreInternalError,
+  isHandledRedemptionError,
   shouldFailoverToAnotherMint,
+  type ParsedCoreError,
 } from "../core/errorTypes";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
@@ -711,6 +721,9 @@ export class RoutstrClient {
     // ── Parse structured error from routstr-core ────────────────────────
     const parsedError = parseCoreError(responseBody, status, requestId);
     const resolvedRequestId = parsedError.requestId ?? requestId;
+    const handledRedemptionError = isHandledRedemptionError(parsedError);
+    let recoveryAttempted = false;
+    let recoverySucceeded = false;
 
     this._log(
       "DEBUG",
@@ -759,6 +772,7 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
       );
+      recoveryAttempted = true;
       const receiveResult =
         await this.cashuSpender.receiveToken(xCashuRefundToken);
       if (receiveResult.success) {
@@ -771,21 +785,27 @@ export class RoutstrClient {
         this.storageAdapter.removeXcashuToken(baseUrl, params.token);
         tryNextProvider = true;
         refundReceived = true;
+        recoverySucceeded = true;
       } else {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed, falling back to original token: ${receiveResult.message}`
+          `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed${xCashuRefundToken === params.token ? " (same as original; not receiving twice)" : ", falling back to original token"}: ${receiveResult.message}`
         );
       }
     }
 
-    // Only try the original token if we didn't get the refund. If the node
-    // already consumed the proofs this will fail gracefully; if the node
-    // errored before consuming them, we reclaim the sats directly.
-    if (!tryNextProvider && !refundReceived && params.token.startsWith("cashu")) {
-      const receiveResult = await this.cashuSpender.receiveToken(
-        params.token
-      );
+    // Only try the original token if we didn't get the refund. If the response
+    // token is byte-for-byte identical, it was already attempted above and
+    // must not be received twice. If it differs, try the response token first
+    // and fall back to the original only when the first receive failed.
+    if (
+      !tryNextProvider &&
+      !refundReceived &&
+      params.token.startsWith("cashu") &&
+      (!xCashuRefundToken || xCashuRefundToken !== params.token)
+    ) {
+      recoveryAttempted = true;
+      const receiveResult = await this.cashuSpender.receiveToken(params.token);
       if (receiveResult.success) {
         this._log(
           "DEBUG",
@@ -808,6 +828,7 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         tryNextProvider = true;
+        recoverySucceeded = true;
       } else {
         this._log(
           "DEBUG",
@@ -879,8 +900,23 @@ export class RoutstrClient {
       }
     }
 
-    // In xcashu mode, if neither the refund nor the original was received,
-    // we have no way to recover the sats — throw so the caller can surface it.
+    // For recognized redemption errors, a failed receive is still a provider
+    // failure: preserve the stored token for later recovery, mark this provider
+    // failed below, and retry with a fresh token on a different provider.
+    if (
+      this.mode === "xcashu" &&
+      handledRedemptionError &&
+      !tryNextProvider
+    ) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: recovery failed for structured redemption error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
+      );
+      tryNextProvider = true;
+    }
+
+    // In xcashu mode, if neither the refund nor the original was received for
+    // an unclassified error, we have no safe recovery/failover policy.
     if (this.mode === "xcashu" && !tryNextProvider) {
       if (parsedError.type === CoreErrorType.MINT_ERROR) {
         throw new MintError({
@@ -1187,12 +1223,14 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
         );
+        recoveryAttempted = true;
         const refundResult = await this.balanceManager.refundApiKey({
           mintUrl,
           baseUrl,
           apiKey: token,
           forceRefund: true,
         });
+        if (refundResult.success) recoverySucceeded = true;
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
@@ -1213,6 +1251,12 @@ export class RoutstrClient {
             this._log(
               "WARN",
               `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
+            );
+            tryNextProvider = true;
+          } else if (handledRedemptionError) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: API key recovery failed for structured redemption error; preserving key and trying provider failover`
             );
             tryNextProvider = true;
           } else {
@@ -1242,6 +1286,17 @@ export class RoutstrClient {
     );
 
     if (!selectedModel) {
+      if (handledRedemptionError) {
+        throw this._createRedemptionError({
+          parsedError,
+          baseUrl,
+          status,
+          mintUrl: params.selectedMintUrl || mintUrl,
+          requestId: resolvedRequestId,
+          recoveryAttempted,
+          recoverySucceeded,
+        });
+      }
       throw new ProviderError(
         baseUrl,
         status,
@@ -1311,6 +1366,17 @@ export class RoutstrClient {
             requestId: resolvedRequestId,
           });
         }
+        if (handledRedemptionError) {
+          throw this._createRedemptionError({
+            parsedError,
+            baseUrl,
+            status,
+            mintUrl: params.selectedMintUrl || mintUrl,
+            requestId: resolvedRequestId,
+            recoveryAttempted,
+            recoverySucceeded,
+          });
+        }
         throw error;
       }
 
@@ -1369,9 +1435,65 @@ export class RoutstrClient {
       });
     }
 
+    if (handledRedemptionError) {
+      throw this._createRedemptionError({
+        parsedError,
+        baseUrl,
+        status,
+        mintUrl: params.selectedMintUrl || mintUrl,
+        requestId: resolvedRequestId,
+        recoveryAttempted,
+        recoverySucceeded,
+      });
+    }
+
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
+    );
+  }
+
+  private _createRedemptionError(opts: {
+    parsedError: ParsedCoreError;
+    baseUrl: string;
+    status: number;
+    mintUrl?: string;
+    requestId?: string;
+    recoveryAttempted: boolean;
+    recoverySucceeded: boolean;
+  }):
+    | InvalidTokenError
+    | CashuRedemptionError
+    | TokenConsumedError
+    | CoreInternalError {
+    const shared = {
+      baseUrl: opts.baseUrl,
+      statusCode: opts.status,
+      mintUrl: opts.mintUrl,
+      code: opts.parsedError.code,
+      parsedError: opts.parsedError,
+      requestId: opts.requestId,
+      recoveryAttempted: opts.recoveryAttempted,
+      recoverySucceeded: opts.recoverySucceeded,
+    };
+
+    if (isInvalidTokenError(opts.parsedError)) {
+      return new InvalidTokenError(shared);
+    }
+    if (isCashuRedemptionError(opts.parsedError)) {
+      return new CashuRedemptionError(shared);
+    }
+    if (isTokenConsumedError(opts.parsedError)) {
+      return new TokenConsumedError(shared);
+    }
+    if (isCoreInternalError(opts.parsedError)) {
+      return new CoreInternalError(shared);
+    }
+
+    // Callers guard this helper with isHandledRedemptionError(). Keep a hard
+    // failure here so future taxonomy additions cannot silently become generic.
+    throw new Error(
+      `Unsupported routstr-core redemption error: ${opts.parsedError.type ?? "unknown"}/${opts.parsedError.code ?? "unknown"}`
     );
   }
 

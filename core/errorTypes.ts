@@ -19,9 +19,9 @@
  *   { "detail": { "error": { "type": "...", "code": "...", "message": "..." } } }
  *   ```
  *
- * - **POST /v1/wallet/topup** (plain string):
+ * - **POST /v1/wallet/topup** (same structured FastAPI envelope as Bearer):
  *   ```json
- *   { "detail": "Cashu mint is unreachable" }
+ *   { "detail": { "error": { "type": "...", "code": "...", "message": "..." } } }
  *   ```
  */
 
@@ -221,6 +221,61 @@ export function isCoreErrorType(
   type: CoreErrorTypeValue
 ): boolean {
   return parsed.type === type;
+}
+
+/** A malformed/undecodable Cashu token rejected by routstr-core. */
+export function isInvalidTokenError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.INVALID_TOKEN &&
+    parsed.code === CoreErrorCode.INVALID_CASHU_TOKEN
+  );
+}
+
+/**
+ * An expected Cashu redemption failure.
+ *
+ * Match the redemption codes explicitly: routstr-core also uses the broad
+ * `cashu_error` type for API-key errors such as `invalid_api_key`, which must
+ * remain on the existing API-key cleanup path.
+ */
+export function isCashuRedemptionError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.CASHU_ERROR &&
+    (parsed.code === CoreErrorCode.CASHU_TOKEN_REDEMPTION_FAILED ||
+      parsed.code === CoreErrorCode.CASHU_TOKEN_ZERO_VALUE)
+  );
+}
+
+/** A token that was redeemed but could not be credited by routstr-core. */
+export function isTokenConsumedError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.TOKEN_CONSUMED &&
+    parsed.code === CoreErrorCode.CASHU_TOKEN_CONSUMED
+  );
+}
+
+/** An unexpected internal fault during token redemption. */
+export function isCoreInternalError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.API_ERROR &&
+    parsed.code === CoreErrorCode.INTERNAL_ERROR
+  );
+}
+
+/**
+ * True for the four structured redemption failures handled by provider
+ * recovery/failover. This intentionally excludes `token_already_spent` and
+ * `mint_error`, which have their own specialized flows.
+ */
+export function isHandledRedemptionError(
+  parsed: ParsedCoreError
+): boolean {
+  return (
+    isInvalidTokenError(parsed) ||
+    isCashuRedemptionError(parsed) ||
+    isTokenConsumedError(parsed) ||
+    isCoreInternalError(parsed)
+  );
 }
 
 /**

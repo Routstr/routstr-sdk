@@ -462,7 +462,7 @@ describe("BalanceManager.topUp — spent topup token", () => {
     });
     const recoverSpy = vi
       .spyOn(manager as any, "_recoverFailedTopUp")
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(true);
 
     const result = await manager.topUp({
       mintUrl: MINT_URL,

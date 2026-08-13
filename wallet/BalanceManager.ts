@@ -21,6 +21,7 @@ import { InsufficientBalanceError } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorType,
+  isHandledRedemptionError,
   shouldFailoverToAnotherMint,
   type ParsedCoreError,
 } from "../core/errorTypes";
@@ -308,6 +309,7 @@ export class BalanceManager {
           success: false,
           message: fetchResult.error || "Token already spent",
           requestId: fetchResult.requestId,
+          parsedError: fetchResult.parsedError,
         };
       }
 
@@ -330,6 +332,34 @@ export class BalanceManager {
       }
 
       if (!fetchResult.success) {
+        // A bootstrap Cashu token can still be recovered directly when the
+        // provider-side refund endpoint returns a structured redemption error.
+        // Canonical API keys are not Cashu tokens and remain stored for a later
+        // refund attempt. Only remove the exact key this response belongs to.
+        if (
+          apiKey.startsWith("cashu") &&
+          fetchResult.parsedError &&
+          isHandledRedemptionError(fetchResult.parsedError)
+        ) {
+          const directReceive = await this.cashuSpender.receiveToken(apiKey);
+          if (directReceive.success) {
+            if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+              this.storageAdapter.removeApiKey(baseUrl);
+            }
+            const refundedAmount =
+              directReceive.unit === "msat"
+                ? directReceive.amount
+                : directReceive.amount * 1000;
+            return {
+              success: true,
+              refundedAmount,
+              message: "Recovered bootstrap Cashu token directly",
+              requestId: fetchResult.requestId,
+              parsedError: fetchResult.parsedError,
+            };
+          }
+        }
+
         this.logger.warn(
           `refundApiKey: fetch failed for ${baseUrl}: ${fetchResult.error || "API key refund failed"}`
         );
@@ -337,6 +367,7 @@ export class BalanceManager {
           success: false,
           message: fetchResult.error || "API key refund failed",
           requestId: fetchResult.requestId,
+          parsedError: fetchResult.parsedError,
         };
       }
 
@@ -346,6 +377,7 @@ export class BalanceManager {
           success: false,
           message: "No token received from API key refund",
           requestId: fetchResult.requestId,
+          parsedError: fetchResult.parsedError,
         };
       }
 
@@ -370,6 +402,7 @@ export class BalanceManager {
         refundedAmount: totalAmountMsat,
         message: receiveResult.message,
         requestId: fetchResult.requestId,
+        parsedError: fetchResult.parsedError,
       };
     } catch (error) {
       this.logger.error("API key refund error", error);
@@ -573,8 +606,9 @@ export class BalanceManager {
         // point trying to receive it back — it's permanently gone.
         const canRecover =
           topUpResult.parsedError?.type !== CoreErrorType.TOKEN_ALREADY_SPENT;
+        let recoveredToken = false;
         if (canRecover) {
-          await this._recoverFailedTopUp(cashuToken);
+          recoveredToken = await this._recoverFailedTopUp(cashuToken);
         } else {
           this.logger.warn(
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
@@ -604,7 +638,8 @@ export class BalanceManager {
           success: false,
           message: topUpResult.error || "Top up failed",
           requestId,
-          recoveredToken: canRecover,
+          recoveredToken,
+          parsedError: topUpResult.parsedError,
         };
       }
 
@@ -1043,11 +1078,18 @@ export class BalanceManager {
   /**
    * Attempt to receive token back after failed top up
    */
-  private async _recoverFailedTopUp(cashuToken: string): Promise<void> {
+  private async _recoverFailedTopUp(cashuToken: string): Promise<boolean> {
     try {
-      await this.cashuSpender.receiveToken(cashuToken);
+      const result = await this.cashuSpender.receiveToken(cashuToken);
+      if (!result.success) {
+        this.logger.warn(
+          `_recoverFailedTopUp: receive failed: ${result.message ?? "unknown error"}`
+        );
+      }
+      return result.success;
     } catch (error) {
       this.logger.error("_recoverFailedTopUp: failed to recover token", error);
+      return false;
     }
   }
 
