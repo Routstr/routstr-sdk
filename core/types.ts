@@ -141,6 +141,12 @@ export interface RefundResult {
   refundedAmount?: number;
   message?: string;
   requestId?: string;
+  /**
+   * HTTP status from the provider's refund endpoint when the refund itself
+   * failed (e.g. a 500/502/503 from `/v1/wallet/refund`). Undefined when the
+   * refund never reached the provider (network/mint errors) or succeeded.
+   */
+  status?: number;
   /** Structured routstr-core error when the provider returned one. */
   parsedError?: import("./errorTypes").ParsedCoreError;
 }

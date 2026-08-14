@@ -309,6 +309,7 @@ export class BalanceManager {
           success: false,
           message: fetchResult.error || "Token already spent",
           requestId: fetchResult.requestId,
+          status: fetchResult.status,
           parsedError: fetchResult.parsedError,
         };
       }
@@ -328,6 +329,7 @@ export class BalanceManager {
           success: false,
           message: "Key not found, removed dead API key",
           requestId: fetchResult.requestId,
+          status: fetchResult.status,
         };
       }
 
@@ -367,6 +369,7 @@ export class BalanceManager {
           success: false,
           message: fetchResult.error || "API key refund failed",
           requestId: fetchResult.requestId,
+          status: fetchResult.status,
           parsedError: fetchResult.parsedError,
         };
       }
@@ -377,6 +380,7 @@ export class BalanceManager {
           success: false,
           message: "No token received from API key refund",
           requestId: fetchResult.requestId,
+          status: fetchResult.status,
           parsedError: fetchResult.parsedError,
         };
       }

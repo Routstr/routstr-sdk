@@ -1254,6 +1254,15 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
             );
             tryNextProvider = true;
+          } else if (this._isRefundEndpointServerError(refundResult.status)) {
+            // The upstream /v1/wallet/refund endpoint itself returned a server
+            // error. The sats are still on the key and will be reclaimed by a
+            // later refund sweep, so fail over instead of aborting.
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: Refund endpoint returned ${refundResult.status} for ${baseUrl}; leaving key for sweep and failing over to next provider`
+            );
+            tryNextProvider = true;
           } else if (handledRedemptionError) {
             this._log(
               "WARN",
@@ -1539,11 +1548,11 @@ export class RoutstrClient {
    * Classify a refund failure as transient (i.e. safe to ignore and fall
    * through to provider failover) rather than terminal.
    *
-   * RefundResult carries no status code (see core/types.ts), so detection is
-   * message-based. The upstream /v1/wallet/refund endpoint returns HTTP 400
-   * with detail "Cannot refund key. There are ongoing requests for this api
-   * key." whenever a shared API key still has in-flight requests — an
-   * inherent race in apikeys mode where one key is reused across concurrent
+   * This race is message-based because its HTTP status (400) is shared with
+   * terminal refund failures. The upstream /v1/wallet/refund endpoint returns
+   * HTTP 400 with detail "Cannot refund key. There are ongoing requests for
+   * this api key." whenever a shared API key still has in-flight requests —
+   * an inherent race in apikeys mode where one key is reused across concurrent
    * requests. The balance is still on the key and will be reclaimed by a
    * later refund sweep, so this must not abort the request.
    */
@@ -1553,6 +1562,22 @@ export class RoutstrClient {
     return (
       lower.includes("ongoing requests for this api key") ||
       lower.includes("cannot refund key")
+    );
+  }
+
+  /**
+   * Whether the provider's own refund endpoint failed with an upstream server
+   * error. In that case the sats are still on the API key and a later refund
+   * sweep can reclaim them, so this must fail over rather than abort the
+   * request.
+   */
+  private _isRefundEndpointServerError(status?: number): boolean {
+    return (
+      status === 500 ||
+      status === 502 ||
+      status === 503 ||
+      status === 504 ||
+      status === 521
     );
   }
 

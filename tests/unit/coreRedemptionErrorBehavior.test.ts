@@ -278,6 +278,50 @@ describe("RoutstrClient redemption recovery and provider failover", () => {
     });
   });
 
+  it("fails over when the provider refund endpoint itself returns a server error", async () => {
+    const providerManager = {
+      markFailed: vi.fn(),
+      getFailedProviders: () => new Set([BASE_URL]),
+      findNextBestProvider: vi.fn(() => NEXT_URL),
+      getModelForProvider: vi.fn(async () => MODEL),
+      getRequiredSatsForModel: vi.fn(() => 100),
+    } as any;
+    const client = new RoutstrClient(wallet(), storage(), discovery(), "ERROR", "apikeys", { providerManager });
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 2271555,
+      balanceUnknown: false,
+    } as any);
+    vi.spyOn(client.getBalanceManager(), "refundApiKey").mockResolvedValue({
+      success: false,
+      message: "API key refund failed: Internal server error, please contact support with the request ID.",
+      status: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "fresh-provider-api-key",
+      tokenBalance: 100,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    const request = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(new Response("ok"));
+
+    await (client as any)._handleErrorResponse(
+      params("canonical-api-key"),
+      "canonical-api-key",
+      500,
+      "req-refund-500",
+      undefined,
+      JSON.stringify({ detail: "Internal server error, please contact support with the request ID." }),
+      0
+    );
+
+    expect(client.getBalanceManager().refundApiKey).toHaveBeenCalled();
+    expect(providerManager.markFailed).toHaveBeenCalled();
+    expect(request.mock.calls[0][0]).toMatchObject({
+      baseUrl: NEXT_URL,
+      token: "fresh-provider-api-key",
+    });
+  });
+
   it("marks the provider failed and retries a different provider with a fresh token", async () => {
     const providerManager = {
       markFailed: vi.fn(),
