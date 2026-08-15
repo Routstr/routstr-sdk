@@ -997,9 +997,7 @@ export class BalanceManager {
     }
 
     const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-    const url = `${normalizedBaseUrl}v1/wallet/topup?cashu_token=${encodeURIComponent(
-      cashuToken
-    )}`;
+    const url = `${normalizedBaseUrl}v1/wallet/topup`;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
@@ -1013,6 +1011,7 @@ export class BalanceManager {
           Authorization: `Bearer ${storedToken}`,
           "Content-Type": "application/json",
         },
+        body: JSON.stringify({ cashu_token: cashuToken }),
         signal: controller.signal,
       });
 
