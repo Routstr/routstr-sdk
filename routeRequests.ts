@@ -172,7 +172,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     proxiedBody.stream = stream;
   }
 
-  if (maxTokens !== undefined) {
+  if (maxTokens !== undefined && typeof (requestBody as any)?.max_tokens === "number") {
     proxiedBody.max_tokens = maxTokens;
   }
 
@@ -267,7 +267,9 @@ function extractMaxTokens(requestBody: unknown): number | undefined {
   }
 
   const body = requestBody as Record<string, unknown>;
-  const maxTokens = body.max_tokens;
+  // Chat/completions use max_tokens; the OpenAI Responses API uses
+  // max_output_tokens. Both cap the completion budget for pricing.
+  const maxTokens = body.max_tokens ?? body.max_output_tokens;
 
   return typeof maxTokens === "number" ? maxTokens : undefined;
 }

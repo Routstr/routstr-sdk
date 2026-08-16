@@ -335,10 +335,13 @@ export class RoutstrClient {
         )
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
+        const requestBodyForPricing = (body ?? {}) as Record<string, unknown>;
         const requestMaxTokens =
-          typeof (body as { max_tokens?: unknown })?.max_tokens === "number"
-            ? ((body as { max_tokens?: unknown }).max_tokens as number)
-            : undefined;
+          typeof requestBodyForPricing.max_tokens === "number"
+            ? (requestBodyForPricing.max_tokens as number)
+            : typeof requestBodyForPricing.max_output_tokens === "number"
+              ? (requestBodyForPricing.max_output_tokens as number)
+              : undefined;
 
         this._log(
           "DEBUG",
