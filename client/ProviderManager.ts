@@ -558,6 +558,9 @@ export class ProviderManager {
     const torMode = options.torMode ?? false;
     const disabledProviderList = this.discoveryAdapter.getDisabledProviders();
     const disabledProviders = new Set(disabledProviderList);
+    if (disabledProviderList.length > 0) {
+      this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
+    }
     const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
 
@@ -599,6 +602,15 @@ export class ProviderManager {
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
+
+    if (results.length > 0) {
+      const ranking = results
+        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
+        .join("\n");
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
+    } else {
+      this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
+    }
 
     return results;
   }
