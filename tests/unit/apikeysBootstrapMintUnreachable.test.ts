@@ -5,7 +5,9 @@
  * a bootstrap Cashu token (created by `_spendToken` and stored via
  * `setApiKey` — i.e. the canonical API key swap has not happened yet). If that
  * request fails with 503 `cashu_mint_unreachable`, the provider never consumed
- * the proofs, so the SDK receives the bootstrap token back into the wallet.
+ * the proofs, so the SDK receives the bootstrap token back into the wallet and
+ * — because the failure identifies the mint, not the provider — retries the
+ * same provider with the failed mint excluded.
  *
  * The fixes under test:
  *
@@ -13,6 +15,9 @@
  *   (which is now permanently dead) when the token is restored, instead of
  *   leaving a zombie `apiKeys[]` entry. It preserves a concurrently-swapped
  *   canonical key.
+ * - `RoutstrClient._handleErrorResponse` treats `mint_unreachable` as retryable
+ *   and re-spends from another mint against the same provider (no provider
+ *   failover) when one is available.
  * - `RoutstrClient._spendToken` validates a stored cashu-prefixed key before
  *   reuse and recreates it when the provider reports it dead.
  */
@@ -166,7 +171,7 @@ describe("RoutstrClient._handleErrorResponse — apikeys bootstrap, 503 mint_unr
     vi.unstubAllGlobals();
   });
 
-  it("restores the bootstrap token, removes the dead API key, skips refundApiKey, and fails over", async () => {
+  it("restores the bootstrap token, removes the dead API key, skips refundApiKey, and retries the same provider with the failed mint excluded", async () => {
     const storage = createStorage(BOOTSTRAP_TOKEN);
     const providerManager = failoverProviderManager();
     const client = new RoutstrClient(
@@ -183,11 +188,12 @@ describe("RoutstrClient._handleErrorResponse — apikeys bootstrap, 503 mint_unr
       "getTokenBalance"
     );
     const refundSpy = vi.spyOn(client.getBalanceManager(), "refundApiKey");
-    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+    const spendSpy = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
       token: "cashu_fresh_failover_token",
       tokenBalance: 1000,
       tokenBalanceUnit: "sat",
       tokenBalanceUnknown: false,
+      selectedMintUrl: "https://fallback-mint.example.com",
     });
     const makeRequestSpy = vi
       .spyOn(client as any, "_makeRequest")
@@ -215,15 +221,25 @@ describe("RoutstrClient._handleErrorResponse — apikeys bootstrap, 503 mint_unr
     // The 503 refund branch is short-circuited — no refund round-trip.
     expect(getBalanceSpy).not.toHaveBeenCalled();
     expect(refundSpy).not.toHaveBeenCalled();
-    // Provider marked failed and the request retried on the failover provider.
-    expect(providerManager.markFailed).toHaveBeenCalledWith(
-      BASE_URL,
-      expect.stringContaining("type=mint_unreachable")
-    );
+    // mint_unreachable is retryable: the failure identified the mint, not the
+    // provider, so the failed mint is excluded and the SAME provider is
+    // retried with a fresh token from another mint — no provider failover.
+    expect(spendSpy).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+      excludeMints: [MINT_URL],
+    });
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
     expect(makeRequestSpy).toHaveBeenCalledOnce();
     const retryParams = makeRequestSpy.mock.calls[0][0];
-    expect(retryParams.baseUrl).toBe(SECOND_BASE_URL);
+    expect(retryParams.baseUrl).toBe(BASE_URL);
     expect(retryParams.token).toBe("cashu_fresh_failover_token");
+    expect(retryParams.excludeMints).toEqual([MINT_URL]);
+    expect(retryParams.selectedMintUrl).toBe(
+      "https://fallback-mint.example.com"
+    );
   });
 
   it("preserves a canonical API key swapped in while the 503 response was in flight", async () => {

@@ -838,14 +838,14 @@ export class RoutstrClient {
       }
     }
 
-    // A foreign-mint swap failure identifies the mint, not the provider.
-    // Once the rejected token has been reclaimed, retry this same provider
-    // first with that mint excluded. Candidate selection will still enforce
-    // the provider's advertised mint list and available wallet balance.
+    // A foreign-mint swap failure (mint_error) and an unreachable mint
+    // (mint_unreachable) both identify the mint, not the provider. Once the
+    // rejected token has been reclaimed, retry this same provider first with
+    // that mint excluded. Candidate selection will still enforce the
+    // provider's advertised mint list and available wallet balance.
     if (
       params.token.startsWith("cashu") &&
       tryNextProvider &&
-      parsedError.type === CoreErrorType.MINT_ERROR &&
       shouldFailoverToAnotherMint(parsedError) &&
       retryCount < MAX_RETRIES_PER_PROVIDER
     ) {
@@ -856,7 +856,7 @@ export class RoutstrClient {
 
       this._log(
         "WARN",
-        `[RoutstrClient] _handleErrorResponse: mint_error from ${failedMintUrl}; retrying provider ${baseUrl} with another supported mint`
+        `[RoutstrClient] _handleErrorResponse: ${parsedError.type ?? "mint_error"} from ${failedMintUrl}; retrying provider ${baseUrl} with another supported mint`
       );
 
       let spendResult:
