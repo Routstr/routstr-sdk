@@ -1098,11 +1098,8 @@ export class RoutstrClient {
       }
     }
 
-    const isInsufficientBalance413 =
-      status === 413 && responseBody?.includes("Insufficient balance");
-
     if (
-      isInsufficientBalance413 &&
+      status === 413 &&
       !tryNextProvider &&
       this.mode === "apikeys"
     ) {
