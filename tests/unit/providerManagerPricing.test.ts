@@ -1035,6 +1035,27 @@ describe("ProviderManager", () => {
       expect(withMaxTokens).not.toBe(withDefault);
     });
 
+    it("ignores maxTokens for Tinfoil/EHBP models (no completion discount)", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "tinfoil-kimi-k2-6",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+        } as any,
+      };
+
+      const messages = [{ role: "user", content: "Hi" }];
+      const withDefault = manager.getRequiredSatsForModel(model, messages);
+      const withMaxTokens = manager.getRequiredSatsForModel(model, messages, 500);
+
+      // Tinfoil/EHBP bodies are encrypted client-side, so max_tokens cannot be
+      // enforced yet; pricing must stay at max_completion_cost.
+      expect(withMaxTokens).toBe(withDefault);
+    });
+
     it("includes the per-request base fee (sp.request) in the total", () => {
       const manager = new ProviderManager(createRegistry());
       const model: Model = {
