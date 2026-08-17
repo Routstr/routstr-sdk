@@ -15,6 +15,7 @@ import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext } from "../utils/torUtils";
+import { isTinfoilModel } from "./TinfoilSecure";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
@@ -723,7 +724,10 @@ export class ProviderManager {
       const requestFee = sp.request || 0;
       const promptCosts = (sp.prompt || 0) * totalInputTokens;
       let completionCost = sp.max_completion_cost;
-      if (maxTokens !== undefined && sp.completion) {
+      // Tinfoil/EHBP models encrypt the request body client-side, so the
+      // proxy/enclave cannot enforce max_tokens yet. Never apply the maxTokens
+      // completion discount for these models — always reserve max_completion_cost.
+      if (maxTokens !== undefined && sp.completion && !isTinfoilModel(model.id)) {
         completionCost = sp.completion * maxTokens;
       }
       const totalEstimatedCosts = (promptCosts + completionCost + requestFee) * 1.05;
