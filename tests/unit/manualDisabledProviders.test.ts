@@ -89,6 +89,33 @@ describe("manual vs auto disabled providers — storage layer", () => {
     expect(adapter.getDisabledProviders()).not.toContain(providerUrl);
   });
 
+  it("manually enabling a review-disabled provider overrides the review disable", async () => {
+    const adapter = makeAdapter();
+
+    const providerUrl = "https://review-bad.example.com/";
+
+    // Review sync disables a provider without an lgtm review
+    adapter.setDisabledProviders!([providerUrl]);
+    expect(adapter.getDisabledProviders()).toContain(providerUrl);
+
+    // User force-enables it
+    adapter.setManuallyEnabledProviders!([providerUrl]);
+    expect(adapter.getDisabledProviders()).not.toContain(providerUrl);
+  });
+
+  it("setDisabledProviders (review sync) respects manually-enabled providers", async () => {
+    const adapter = makeAdapter();
+
+    const providerUrl = "https://review-bad.example.com/";
+
+    adapter.setManuallyEnabledProviders!([providerUrl]);
+
+    // Review sync runs and would disable the provider, but it is manually enabled
+    adapter.setDisabledProviders!([providerUrl]);
+
+    expect(adapter.getDisabledProviders()).not.toContain(providerUrl);
+  });
+
   it("getManuallyDisabledProviders returns only user-intent disables", async () => {
     const adapter = makeAdapter();
 

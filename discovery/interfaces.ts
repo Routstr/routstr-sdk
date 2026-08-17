@@ -99,6 +99,20 @@ export interface DiscoveryAdapter {
   setManuallyDisabledProviders?(urls: string[]): void;
 
   /**
+   * Get list of manually enabled provider base URLs (user override of
+   * review-based disables). A manually-enabled provider is excluded from
+   * the effective disabled set even if the review sync would disable it.
+   * @returns Array of manually enabled provider URLs
+   */
+  getManuallyEnabledProviders(): string[];
+
+  /**
+   * Save list of manually enabled provider base URLs
+   * @param urls Array of manually enabled provider URLs
+   */
+  setManuallyEnabledProviders?(urls: string[]): void;
+
+  /**
    * Get list of configured provider base URLs
    * @returns Array of provider base URLs
    */

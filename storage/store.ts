@@ -19,6 +19,7 @@ export interface SdkStorageStore extends SdkStorageState {
   setBaseUrlsLastUpdate: (value: number | null) => void;
   setDisabledProviders: (value: string[]) => void;
   setManuallyDisabledProviders: (value: string[]) => void;
+  setManuallyEnabledProviders: (value: string[]) => void;
   setMintsFromAllProviders: (value: Record<string, string[]>) => void;
   setInfoFromAllProviders: (value: Record<string, ProviderInfo>) => void;
   setLastModelsUpdate: (value: Record<string, number>) => void;
@@ -102,6 +103,7 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     lastBaseUrlsUpdate: null,
     disabledProviders: [],
     manuallyDisabledProviders: [],
+    manuallyEnabledProviders: [],
     mintsFromAllProviders: {},
     infoFromAllProviders: {},
     lastModelsUpdate: {},
@@ -148,6 +150,11 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
       const normalized = value.map((url) => normalizeBaseUrl(url));
       void driver.setItem(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, normalized);
       set({ manuallyDisabledProviders: normalized });
+    },
+    setManuallyEnabledProviders: (value) => {
+      const normalized = value.map((url) => normalizeBaseUrl(url));
+      void driver.setItem(SDK_STORAGE_KEYS.MANUALLY_ENABLED_PROVIDERS, normalized);
+      set({ manuallyEnabledProviders: normalized });
     },
     setMintsFromAllProviders: (value) => {
       const normalized: Record<string, string[]> = {};
@@ -372,6 +379,7 @@ const hydrateStoreFromDriver = async (
     lastBaseUrlsUpdate,
     rawDisabledProviders,
     rawManuallyDisabledProviders,
+    rawManuallyEnabledProviders,
     rawMints,
     rawInfo,
     rawLastModelsUpdate,
@@ -395,6 +403,7 @@ const hydrateStoreFromDriver = async (
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_ENABLED_PROVIDERS, []),
     driver.getItem<Record<string, string[]>>(
       SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
       {}
@@ -480,6 +489,10 @@ const hydrateStoreFromDriver = async (
   );
 
   const manuallyDisabledProviders = rawManuallyDisabledProviders.map((url) =>
+    normalizeBaseUrl(url)
+  );
+
+  const manuallyEnabledProviders = rawManuallyEnabledProviders.map((url) =>
     normalizeBaseUrl(url)
   );
 
@@ -569,6 +582,7 @@ const hydrateStoreFromDriver = async (
     lastBaseUrlsUpdate,
     disabledProviders,
     manuallyDisabledProviders,
+    manuallyEnabledProviders,
     mintsFromAllProviders,
     infoFromAllProviders,
     lastModelsUpdate,
@@ -620,12 +634,21 @@ export const createDiscoveryAdapterFromStore = (
   getLastUsedModel: () => store.getState().lastUsedModel,
   setLastUsedModel: (modelId) => store.getState().setLastUsedModel(modelId),
   getDisabledProviders: () => {
-    const { disabledProviders, manuallyDisabledProviders } = store.getState();
-    return [...new Set([...disabledProviders, ...manuallyDisabledProviders])];
+    const {
+      disabledProviders,
+      manuallyDisabledProviders,
+      manuallyEnabledProviders,
+    } = store.getState();
+    const enabled = new Set(manuallyEnabledProviders);
+    return [...new Set([...disabledProviders, ...manuallyDisabledProviders])].filter(
+      (url) => !enabled.has(url)
+    );
   },
   setDisabledProviders: (urls) => store.getState().setDisabledProviders(urls),
   getManuallyDisabledProviders: () => store.getState().manuallyDisabledProviders,
   setManuallyDisabledProviders: (urls) => store.getState().setManuallyDisabledProviders(urls),
+  getManuallyEnabledProviders: () => store.getState().manuallyEnabledProviders,
+  setManuallyEnabledProviders: (urls) => store.getState().setManuallyEnabledProviders(urls),
   getBaseUrlsList: () => store.getState().baseUrlsList,
   setBaseUrlsList: (urls) => store.getState().setBaseUrlsList(urls),
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,

@@ -10,6 +10,7 @@ export interface SdkStorageState {
   baseUrlsList: string[];
   disabledProviders: string[];
   manuallyDisabledProviders: string[];
+  manuallyEnabledProviders: string[];
   mintsFromAllProviders: Record<string, string[]>;
   infoFromAllProviders: Record<string, import("../core").ProviderInfo>;
   lastModelsUpdate: Record<string, number>;

@@ -658,14 +658,14 @@ export class ModelManager {
     baseUrls: string[] = this.adapter.getBaseUrlsList(),
     providerNodes: Map<string, Set<string>> = this.providerNodePubkeysByUrl,
     forceRefresh: boolean = false
-  ): Promise<string[]> {
-    if (baseUrls.length === 0) return [];
+  ): Promise<string[] | null> {
+    if (baseUrls.length === 0) return null;
 
     if (!this.adapter.setDisabledProviders) {
       this.logger.warn(
         "NostrReviews: adapter does not support setDisabledProviders; skipping provider disable sync"
       );
-      return [];
+      return null;
     }
 
     const reviewedNodePubkeys = await this.fetchLgtmReviewPubkeys(forceRefresh);
@@ -733,29 +733,37 @@ export class ModelManager {
     baseUrls: string[],
     providerNodes: Map<string, Set<string>>,
     reviewedNodePubkeys: Set<string>
-  ): string[] {
-    if (baseUrls.length === 0) return [];
+  ): string[] | null {
+    if (baseUrls.length === 0) return null;
 
     if (!this.adapter.setDisabledProviders) {
       this.logger.warn(
         "NostrReviews: adapter does not support setDisabledProviders; skipping provider disable sync"
       );
-      return [];
+      return null;
     }
 
     if (reviewedNodePubkeys.size === 0) {
       this.logger.warn(
         "NostrReviews: no kind 38425 lgtm reviews found; keeping disabled providers unchanged"
       );
-      return [];
+      return null;
     }
 
     if (providerNodes.size === 0) {
       this.logger.warn(
         "NostrReviews: no kind 38421 provider node metadata found; keeping disabled providers unchanged"
       );
-      return [];
+      return null;
     }
+
+    // Providers the user explicitly re-enabled must not be re-disabled by
+    // the review sync, even when their node has no lgtm review.
+    const manuallyEnabled = new Set(
+      (this.adapter.getManuallyEnabledProviders?.() ?? []).map((url) =>
+        this.normalizeUrl(url)
+      )
+    );
 
     // Build the review-disabled set: providers whose node pubkeys lack an lgtm review.
     // This only updates the auto/review-based disabled list — manually disabled
@@ -764,6 +772,7 @@ export class ModelManager {
     const disabledByReview: string[] = [];
     for (const url of baseUrls) {
       const normalized = this.normalizeUrl(url);
+      if (manuallyEnabled.has(normalized)) continue;
       const nodePubkeys = providerNodes.get(normalized) || new Set<string>();
       const hasLgtmReview = Array.from(nodePubkeys).some((pubkey) =>
         reviewedNodePubkeys.has(pubkey)
