@@ -5,6 +5,9 @@ export function isNetworkErrorMessage(message: string): boolean {
     message.includes("NetworkError when attempting to fetch resource") ||
     message.includes("Failed to fetch") ||
     message.includes("Load failed") ||
+    // Bun runtime connection failures (host down, refused, DNS, bad host/port)
+    message.includes("Unable to connect") ||
+    message.includes("Was there a typo in the url or port") ||
     message.includes("ERR_TLS_CERT_ALTNAME_INVALID") ||
     message.includes("ERR_TLS_CERT_NOT_YET_VALID") ||
     message.includes("ERR_TLS_CERT_EXPIRED") ||
