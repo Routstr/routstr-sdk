@@ -65,6 +65,10 @@ function hasUsageChanged(
     previous.satsCost !== next.satsCost ||
     previous.provider !== next.provider ||
     previous.totalMsats !== next.totalMsats ||
+    previous.cacheReadInputTokens !== next.cacheReadInputTokens ||
+    previous.cacheCreationInputTokens !== next.cacheCreationInputTokens ||
+    previous.cacheReadMsats !== next.cacheReadMsats ||
+    previous.cacheCreationMsats !== next.cacheCreationMsats ||
     previous.remainingBalanceMsats !== next.remainingBalanceMsats
   );
 }

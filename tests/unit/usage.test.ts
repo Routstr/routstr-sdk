@@ -97,6 +97,57 @@ describe("usage extraction", () => {
     });
   });
 
+  it("extracts OpenAI-style prompt_tokens_details cache tokens (Tinfoil/vLLM)", () => {
+    const response = {
+      id: "chatcmpl-aa8734bc7bae2956",
+      usage: {
+        prompt_tokens: 5481,
+        completion_tokens: 14,
+        total_tokens: 5495,
+        prompt_tokens_details: {
+          cached_tokens: 768,
+          created_cache_tokens: 4608,
+        },
+      },
+    };
+
+    const body = extractUsageFromResponseBody(response);
+    const streaming = extractUsageFromSSEJson(response);
+
+    expect(body).toEqual(streaming);
+    expect(body).toMatchObject({
+      promptTokens: 5481,
+      completionTokens: 14,
+      totalTokens: 5495,
+      cacheReadInputTokens: 768,
+      cacheCreationInputTokens: 4608,
+    });
+  });
+
+  it("prefers cost-object cache fields over prompt_tokens_details when both exist", () => {
+    const response = {
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+        prompt_tokens_details: {
+          cached_tokens: 1,
+          created_cache_tokens: 2,
+        },
+      },
+      cost: {
+        cache_read_input_tokens: 30,
+        cache_creation_input_tokens: 40,
+      },
+    };
+
+    const extracted = extractUsageFromResponseBody(response);
+    expect(extracted).toMatchObject({
+      cacheReadInputTokens: 30,
+      cacheCreationInputTokens: 40,
+    });
+  });
+
   it("uses the same token and sats fallbacks for streaming and non-streaming responses", () => {
     const response = {
       provider: "test-provider",
