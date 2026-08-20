@@ -14,6 +14,11 @@
  */
 
 import type { SecureClient as SecureClientType, VerificationDocument } from "tinfoil";
+import {
+  injectUserCacheSecret,
+  isUserCacheSecretEligible,
+  resolveUserCacheSecret,
+} from "./TinfoilCacheSecret";
 
 export interface TinfoilClientContext {
   client: SecureClientType;
@@ -29,6 +34,16 @@ export interface TinfoilClientOptions {
   enclaveURL?: string;
   /** Optional source repo for code verification when enclaveURL is explicit. */
   configRepo?: string;
+  /**
+   * Optional secret scoping Tinfoil's prompt cache for this client.
+   *
+   * Under the same Tinfoil API identity, requests carrying the same secret
+   * share cached prefixes; requests carrying different secrets cannot observe
+   * each other's cache timing. When omitted, resolution falls back to the
+   * TINFOIL_USER_CACHE_SECRET environment variable, then to a generated secret
+   * persisted at ~/.tinfoil/user_cache_secret.
+   */
+  userCacheSecret?: string;
 }
 
 const TINFOIL_MODEL_PREFIX = "tinfoil-";
@@ -203,7 +218,8 @@ async function fetchTinfoilEhbpOnce(
   context: TinfoilClientContext,
   options: TinfoilClientOptions,
   normalized: NormalizedFetchArgs,
-  ehbp: EhbpModule
+  ehbp: EhbpModule,
+  userCacheSecret: string
 ): Promise<Response> {
   const { Identity, PROTOCOL, decryptResponseWithToken, extractSessionRecoveryToken } =
     ehbp;
@@ -232,7 +248,28 @@ async function fetchTinfoilEhbpOnce(
   }
 
   const method = normalized.init?.method ?? "GET";
-  const body = normalized.init?.body ?? null;
+  let body = normalized.init?.body ?? null;
+
+  // Inject the prompt-cache scoping field into eligible JSON bodies before the
+  // EHBP transport seals the request. The field must never be added to
+  // non-object bodies or non-cacheable endpoints (embeddings, audio, files).
+  if (
+    userCacheSecret !== "" &&
+    typeof body === "string" &&
+    isUserCacheSecretEligible(method, targetUrl.pathname)
+  ) {
+    const injected = injectUserCacheSecret(body, userCacheSecret);
+    if (injected !== null) {
+      body = injected;
+      if (headers.has("content-length")) {
+        headers.set(
+          "content-length",
+          String(new TextEncoder().encode(injected).byteLength)
+        );
+      }
+    }
+  }
+
   const serverIdentity = await Identity.fromPublicKeyHex(
     context.verification.hpkePublicKey
   );
@@ -288,9 +325,16 @@ export async function fetchTinfoilPreservingPlaintextErrors(
   const context = await prepareTinfoilClient(options);
   const ehbp = await import("ehbp");
   const normalized = normalizeFetchArgs(input, init);
+  const userCacheSecret = await resolveUserCacheSecret(options.userCacheSecret);
 
   try {
-    return await fetchTinfoilEhbpOnce(context, options, normalized, ehbp);
+    return await fetchTinfoilEhbpOnce(
+      context,
+      options,
+      normalized,
+      ehbp,
+      userCacheSecret
+    );
   } catch (error) {
     // Channel recovery: server rotated EHBP keys, request was never processed.
     // Mirror tinfoil SecureClient.fetch by re-attesting and retrying once.
@@ -305,7 +349,13 @@ export async function fetchTinfoilPreservingPlaintextErrors(
         throw reattestError;
       }
 
-      return await fetchTinfoilEhbpOnce(context, options, normalized, ehbp);
+      return await fetchTinfoilEhbpOnce(
+        context,
+        options,
+        normalized,
+        ehbp,
+        userCacheSecret
+      );
     }
 
     throw error;

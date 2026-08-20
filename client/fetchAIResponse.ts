@@ -67,6 +67,11 @@ export interface FetchOptions {
   maxTokens?: number;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /**
+   * Optional secret scoping Tinfoil's prompt cache for this request. Prefer a
+   * stable, opaque, per-end-user value in multi-user deployments.
+   */
+  userCacheSecret?: string;
   /** Optional: abort signal to cancel the in-flight request + stream */
   abortSignal?: AbortSignal;
 
@@ -96,6 +101,7 @@ interface FetchAIResponseClient {
     baseUrl: string;
     mintUrl: string;
     modelId?: string;
+    userCacheSecret?: string;
     signal?: AbortSignal;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
@@ -226,6 +232,7 @@ export async function fetchAIResponse(
       baseUrl,
       mintUrl,
       modelId: selectedModel.id,
+      userCacheSecret: options.userCacheSecret,
       signal: options.abortSignal,
     });
 

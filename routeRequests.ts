@@ -43,6 +43,14 @@ export interface RouteRequestOptions {
   path?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /**
+   * Optional per-request secret scoping Tinfoil's prompt cache. Prefer a
+   * stable, opaque, per-end-user value in multi-user deployments so users
+   * under the same Tinfoil API identity cannot observe each other's cache
+   * timing. Falls back to the TINFOIL_USER_CACHE_SECRET environment variable,
+   * then a generated secret persisted at ~/.tinfoil/user_cache_secret.
+   */
+  userCacheSecret?: string;
   /** Optional: force a specific provider base URL */
   forcedProvider?: string;
   /** Wallet adapter for Cashu operations */
@@ -206,6 +214,7 @@ export async function routeRequests(
       baseUrl,
       mintUrl,
       modelId,
+      userCacheSecret: options.userCacheSecret,
     });
 
     if (!response.ok) {
