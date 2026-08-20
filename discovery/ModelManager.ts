@@ -39,6 +39,17 @@ export const DEFAULT_NOSTR_RELAYS = [
   "wss://relay.routstr.com",
 ];
 
+/** Kind 38425 review labels that mark a provider node as OK to route to. */
+const POSITIVE_REVIEW_LABELS = new Set(["trusted", "verified", "lgtm"]);
+
+/** Kind 38425 review labels that mark a provider node as unsafe to route to. */
+const NEGATIVE_REVIEW_LABELS = new Set([
+  "suspicious",
+  "avoid",
+  "blacklisted",
+  "removed",
+]);
+
 // A hanging provider must not hold a fetch pass open indefinitely.
 const PROVIDER_FETCH_TIMEOUT_MS = 10_000;
 
@@ -248,11 +259,10 @@ export class ModelManager {
 
   /**
    * Fetch current events from live Nostr relays for all tracked kinds
-   * (38421 providers, 38425 lgtm reviews, 38423 routstr21 models) and
-   * persist them into the event store. Existing events are not replaced —
-   * new events are merged in. Call this periodically (e.g. every 21 min)
-   * to discover new providers, reviews, and model lists published since
-   * the last fetch.
+   * (38421 providers, 38425 reviews, 38423 routstr21 models) and persist them
+   * into the event store. Existing events are not replaced — new events are
+   * merged in. Call this periodically (e.g. every 21 min) to discover new
+   * providers, reviews, and model lists published since the last fetch.
    */
   async refreshNostrEvents(): Promise<void> {
     const eventStore = await this.ensureEventStore();
@@ -267,9 +277,11 @@ export class ModelManager {
     // Kind 38421 — provider discovery
     await this.fetchLiveIntoStore({ kinds: [38421], limit: 100 }, relays, timeoutMs);
 
-    // Kind 38425 — lgtm reviews
+    // Kind 38425 — provider review/audit events (lgtm, avoid, ...). Fetch all
+    // labels so a provider that was later re-reviewed as `avoid` is discovered;
+    // querying only `#t:["lgtm"]` here would silently keep stale approvals.
     await this.fetchLiveIntoStore(
-      { kinds: [38425], "#t": ["lgtm"], limit: 500, authors: [this.routstrPubkey] },
+      { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
       relays,
       timeoutMs
     );
@@ -282,6 +294,11 @@ export class ModelManager {
     );
 
     this.logger.log("refreshNostrEvents: live fetch complete");
+
+    // Re-apply review-based provider disables against the freshly-updated
+    // store. A newly published `avoid` review (or an lgtm→avoid reversal) must
+    // take effect now, not on the next bootstrap/manual refresh.
+    await this.syncReviewedProvidersFromNostr();
   }
 
   /**
@@ -363,10 +380,10 @@ export class ModelManager {
       // Skip the review query when the adapter cannot store its result,
       // matching the wrapper's early return instead of waiting it out.
       const reviewPrefetch = this.adapter.setDisabledProviders
-        ? this.fetchLgtmReviewPubkeys(forceRefresh).catch(
-            () => new Set<string>()
+        ? this.fetchReviewLabels(forceRefresh).catch(
+            () => new Map<string, string>()
           )
-        : Promise.resolve(new Set<string>());
+        : Promise.resolve(new Map<string, string>());
       const nostrProviders = await this.bootstrapFromNostr(
         38421,
         torMode,
@@ -645,11 +662,16 @@ export class ModelManager {
 
   /**
    * Fetch Routstr review events from Nostr (kind 38425) and disable providers
-   * whose 38421 node pubkey does not have at least one review tagged `t=lgtm`.
+   * whose 38421 node pubkey does not have a positive review (`lgtm` and friends)
+   * or whose latest review is negative (`avoid` and friends).
    *
    * Review events are expected to have:
    * - `node`: the reviewed 38421 provider event pubkey
-   * - `t`: review label, where `lgtm` means the node looks good
+   * - `t`: review label, where `lgtm`/`trusted`/`verified` mean the node looks
+   *   good and `avoid`/`suspicious`/`blacklisted`/`removed` mean it is unsafe
+   *
+   * Kind 38425 is not replaceable, so several review events can exist for one
+   * node; the newest event (by `created_at`) is authoritative.
    *
    * @param baseUrls Current provider base URLs to evaluate
    * @returns Array of provider base URLs disabled by the review set
@@ -668,39 +690,112 @@ export class ModelManager {
       return null;
     }
 
-    const reviewedNodePubkeys = await this.fetchLgtmReviewPubkeys(forceRefresh);
-    return this.applyReviewDisables(baseUrls, providerNodes, reviewedNodePubkeys);
+    // On a warm bootstrap the base URL list is served from the adapter cache
+    // and the Nostr discovery pass (which builds providerNodePubkeysByUrl) is
+    // skipped, leaving the node map empty. Rebuild it from the persisted 38421
+    // events so review-based disabling still works across restarts.
+    if (providerNodes.size === 0) {
+      providerNodes = await this.rebuildProviderNodesFromStore();
+      this.providerNodePubkeysByUrl = providerNodes;
+    }
+
+    const reviewLabels = await this.fetchReviewLabels(forceRefresh);
+    return this.applyReviewDisables(baseUrls, providerNodes, reviewLabels);
   }
 
   /**
-   * Fetch the kind 38425 lgtm review events (persistent store or live) and
-   * return the set of reviewed node pubkeys.
+   * Rebuild the url → node-pubkeys map from persisted kind 38421 events.
+   * Used when a warm bootstrap skipped the live Nostr discovery pass.
    */
-  private async fetchLgtmReviewPubkeys(
+  private async rebuildProviderNodesFromStore(): Promise<
+    Map<string, Set<string>>
+  > {
+    const map = new Map<string, Set<string>>();
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) return map;
+
+    const addNode = (url: string, pubkey?: string) => {
+      if (!pubkey) return;
+      const normalized = this.normalizeUrl(url);
+      const existing = map.get(normalized) || new Set<string>();
+      existing.add(pubkey);
+      map.set(normalized, existing);
+    };
+
+    const events = eventStore.getTimeline({ kinds: [38421] });
+    for (const event of events) {
+      const eventUrls: string[] = [];
+      for (const tag of event.tags) {
+        if (tag[0] === "u" && typeof tag[1] === "string" && tag[1]) {
+          eventUrls.push(tag[1]);
+        }
+      }
+
+      if (eventUrls.length > 0) {
+        for (const url of eventUrls) {
+          addNode(url, event.pubkey);
+        }
+        continue;
+      }
+
+      try {
+        const content = JSON.parse(event.content);
+        const providers = Array.isArray(content)
+          ? content
+          : content.providers || [];
+        for (const p of providers) {
+          const endpoints = this.getProviderEndpoints(p, false);
+          for (const endpoint of endpoints) {
+            addNode(endpoint, p?.pubkey || event.pubkey);
+          }
+        }
+      } catch {
+        /* unparseable content — ignore */
+      }
+    }
+
+    return map;
+  }
+
+  /**
+   * Fetch kind 38425 review/audit events (persistent store or live) authored
+   * by the routstr pubkey and return the latest label per reviewed node pubkey.
+   */
+  private async fetchReviewLabels(
     forceRefresh: boolean = false
-  ): Promise<Set<string>> {
-    const reviewedNodePubkeys = new Set<string>();
+  ): Promise<Map<string, string>> {
+    const latestByNode = new Map<string, NostrEvent>();
 
     const collectFromEvent = (event: NostrEvent) => {
-      const hasLgtmTag = event.tags.some(
-        (tag) => tag[0] === "t" && tag[1]?.toLowerCase() === "lgtm"
-      );
-      if (!hasLgtmTag) return;
-      for (const tag of event.tags) {
-        if (tag[0] === "node" && typeof tag[1] === "string" && tag[1]) {
-          reviewedNodePubkeys.add(tag[1]);
-        }
+      const node = event.tags.find(
+        (tag) => tag[0] === "node" && typeof tag[1] === "string" && tag[1]
+      )?.[1];
+      const label = event.tags.find(
+        (tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1]
+      )?.[1]?.toLowerCase();
+
+      if (!node || !label) return;
+
+      const previous = latestByNode.get(node);
+      if (
+        !previous ||
+        event.created_at > previous.created_at ||
+        (event.created_at === previous.created_at && event.id > previous.id)
+      ) {
+        latestByNode.set(node, event);
       }
     };
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
-      { kinds: [38425], "#t": ["lgtm"], authors: [this.routstrPubkey] },
+      { kinds: [38425], authors: [this.routstrPubkey] },
       forceRefresh
     );
 
     if (cached.length > 0) {
-      this.logger.log(`Using ${cached.length} cached kind 38425 events from persistent store`);
+      this.logger.log(
+        `Using ${cached.length} cached kind 38425 review events from persistent store`
+      );
       for (const event of cached) {
         collectFromEvent(event);
       }
@@ -708,7 +803,6 @@ export class ModelManager {
       await this.collectNostrEvents(
         {
           kinds: [38425],
-          "#t": ["lgtm"],
           limit: 500,
           authors: [this.routstrPubkey],
         },
@@ -722,17 +816,28 @@ export class ModelManager {
       );
     }
 
-    return reviewedNodePubkeys;
+    const labels = new Map<string, string>();
+    for (const [node, event] of latestByNode) {
+      const label = event.tags
+        .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
+        ?.[1]?.toLowerCase();
+      if (label) labels.set(node, label);
+    }
+    return labels;
   }
 
   /**
-   * Disable providers whose node pubkeys carry no lgtm review.
+   * Disable providers whose node pubkeys carry no positive review, or whose
+   * latest review is negative. A provider stays enabled only when at least one
+   * of its node pubkeys has a positive latest label and none of its node
+   * pubkeys has a negative latest label.
+   *
    * Compute-only counterpart of syncReviewedProvidersFromNostr.
    */
   private applyReviewDisables(
     baseUrls: string[],
     providerNodes: Map<string, Set<string>>,
-    reviewedNodePubkeys: Set<string>
+    reviewLabels: Map<string, string>
   ): string[] | null {
     if (baseUrls.length === 0) return null;
 
@@ -743,9 +848,9 @@ export class ModelManager {
       return null;
     }
 
-    if (reviewedNodePubkeys.size === 0) {
+    if (reviewLabels.size === 0) {
       this.logger.warn(
-        "NostrReviews: no kind 38425 lgtm reviews found; keeping disabled providers unchanged"
+        "NostrReviews: no kind 38425 review events found; keeping disabled providers unchanged"
       );
       return null;
     }
@@ -758,26 +863,35 @@ export class ModelManager {
     }
 
     // Providers the user explicitly re-enabled must not be re-disabled by
-    // the review sync, even when their node has no lgtm review.
+    // the review sync, even when their node has no positive review.
     const manuallyEnabled = new Set(
       (this.adapter.getManuallyEnabledProviders?.() ?? []).map((url) =>
         this.normalizeUrl(url)
       )
     );
 
-    // Build the review-disabled set: providers whose node pubkeys lack an lgtm review.
-    // This only updates the auto/review-based disabled list — manually disabled
-    // providers are tracked separately via setManuallyDisabledProviders and the
-    // effective disabled set is the union of both (returned by getDisabledProviders).
+    const isPositive = (label: string | undefined) =>
+      !!label && POSITIVE_REVIEW_LABELS.has(label);
+    const isNegative = (label: string | undefined) =>
+      !!label && NEGATIVE_REVIEW_LABELS.has(label);
+
+    // Build the review-disabled set. A negative label always disables (even if
+    // an older positive review exists); otherwise a node without a positive
+    // review stays disabled by default. This only updates the auto/review-based
+    // disabled list — manually disabled providers are tracked separately via
+    // setManuallyDisabledProviders and the effective disabled set is the union
+    // of both (returned by getDisabledProviders).
     const disabledByReview: string[] = [];
     for (const url of baseUrls) {
       const normalized = this.normalizeUrl(url);
       if (manuallyEnabled.has(normalized)) continue;
       const nodePubkeys = providerNodes.get(normalized) || new Set<string>();
-      const hasLgtmReview = Array.from(nodePubkeys).some((pubkey) =>
-        reviewedNodePubkeys.has(pubkey)
+      const labels = Array.from(nodePubkeys).map((pubkey) =>
+        reviewLabels.get(pubkey)
       );
-      if (!hasLgtmReview) {
+      const hasNegative = labels.some(isNegative);
+      const hasPositive = labels.some(isPositive);
+      if (hasNegative || !hasPositive) {
         disabledByReview.push(normalized);
       }
     }
