@@ -82,6 +82,14 @@ export function extractUsageFromResponseBody(
   const breakdownCost = metadataCost ?? topLevelCost ?? usageCost;
   const breakdown = extractCostBreakdown(breakdownCost);
 
+  // OpenAI-style prompt cache details (e.g. Tinfoil/vLLM). These live on
+  // `usage.prompt_tokens_details` rather than in a Routstr `cost` object.
+  const promptDetails = usage.prompt_tokens_details;
+  const details =
+    promptDetails && typeof promptDetails === "object"
+      ? (promptDetails as Record<string, unknown>)
+      : undefined;
+
   const cost =
     typeof costValue === "number"
       ? costValue
@@ -117,6 +125,11 @@ export function extractUsageFromResponseBody(
     satsCost,
     provider,
     ...breakdown,
+    cacheReadInputTokens:
+      breakdown.cacheReadInputTokens ?? numOrUndef(details?.cached_tokens),
+    cacheCreationInputTokens:
+      breakdown.cacheCreationInputTokens ??
+      numOrUndef(details?.created_cache_tokens),
   };
 }
 
