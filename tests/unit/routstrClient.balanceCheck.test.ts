@@ -63,8 +63,7 @@ describe("RoutstrClient balance check", () => {
     vi.unstubAllGlobals();
   });
 
-  it("routes with an existing API key when the local wallet has zero balance", async () => {
-    const getBalances = vi.fn(async () => ({}));
+  const createApiKeyClient = (getBalances = vi.fn(async () => ({}))) => {
     const wallet: WalletAdapter = {
       getBalances,
       getMintUnits: () => ({}),
@@ -74,14 +73,6 @@ describe("RoutstrClient balance check", () => {
       },
       receiveToken: async () => ({ success: true, amount: 0, unit: "sat" }),
     };
-    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      expect(new Headers(init?.headers).get("authorization")).toBe(
-        `Bearer ${API_KEY}`
-      );
-      return Response.json({ ok: true });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
     const client = new RoutstrClient(
       wallet,
       createStorage(),
@@ -95,6 +86,18 @@ describe("RoutstrClient balance check", () => {
       unit: "msat",
       apiKey: API_KEY,
     });
+    return { client, getBalances };
+  };
+
+  it("routes with an existing API key when the local wallet has zero balance", async () => {
+    const { client, getBalances } = createApiKeyClient();
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        `Bearer ${API_KEY}`
+      );
+      return Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     const response = await client.routeRequest({
       path: "/v1/chat/completions",
@@ -107,5 +110,36 @@ describe("RoutstrClient balance check", () => {
     expect(response.ok).toBe(true);
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(getBalances).not.toHaveBeenCalled();
+  });
+
+  it("forwards app attribution without forwarding client authorization", async () => {
+    const { client } = createApiKeyClient();
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("http-referer")).toBe("https://hermes-agent.nousresearch.com");
+      expect(headers.get("x-title")).toBe("Hermes Agent");
+      expect(headers.get("authorization")).toBe(`Bearer ${API_KEY}`);
+      expect(headers.get("cookie")).toBeNull();
+      expect(headers.get("x-client-only")).toBeNull();
+      return Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [] },
+      headers: {
+        "http-referer": "https://hermes-agent.nousresearch.com",
+        "X-TITLE": "Hermes Agent",
+        Authorization: "Bearer client-facing-key",
+        Cookie: "session=client-secret",
+        "X-Client-Only": "do-not-forward",
+      },
+      baseUrl: BASE_URL,
+      mintUrl: MINT_URL,
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

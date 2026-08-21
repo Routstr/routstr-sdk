@@ -73,6 +73,11 @@ export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.2;
 
+const ATTRIBUTION_HEADERS = new Map([
+  ["http-referer", "HTTP-Referer"],
+  ["x-title", "X-Title"],
+]);
+
 export interface RouteRequestParams {
   path: string;
   method: string;
@@ -313,9 +318,9 @@ export class RoutstrClient {
       clientApiKey: providedClientApiKey,
     } = params;
 
-    // Extract clientApiKey from incoming headers then discard them — they must
-    // not be forwarded upstream (the client's Authorization Bearer key would
-    // overwrite the Cashu/API-key auth we attach ourselves).
+    // Extract clientApiKey from incoming headers. Only non-secret app
+    // attribution headers are forwarded below; client auth and other headers
+    // must not reach the upstream provider.
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
@@ -370,8 +375,9 @@ export class RoutstrClient {
       }
     }
 
-    // Build clean outgoing headers — do NOT pass the incoming client headers here
-    const baseHeaders = this._buildBaseHeaders();
+    const baseHeaders = this._buildBaseHeaders(
+      this._extractAttributionHeaders(headers)
+    );
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
     const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
@@ -2086,6 +2092,21 @@ export class RoutstrClient {
     };
 
     return headers;
+  }
+
+  private _extractAttributionHeaders(
+    headers: Record<string, string>
+  ): Record<string, string> {
+    const attributionHeaders: Record<string, string> = {};
+
+    for (const [name, value] of Object.entries(headers)) {
+      const canonicalName = ATTRIBUTION_HEADERS.get(name.toLowerCase());
+      if (canonicalName) {
+        attributionHeaders[canonicalName] = value;
+      }
+    }
+
+    return attributionHeaders;
   }
 
   /**
