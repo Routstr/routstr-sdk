@@ -286,9 +286,11 @@ export class ModelManager {
       timeoutMs
     );
 
-    // Kind 38423 — routstr21 curated model list
+    // Kind 38423 — routstr21 curated model list. Fetch every published
+    // version so the latest one can be selected from the persistent store;
+    // limiting to 1 here could persist a stale event.
     await this.fetchLiveIntoStore(
-      { kinds: [38423], "#d": ["routstr-21-models"], limit: 1, authors: [this.routstrPubkey] },
+      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
       relays,
       timeoutMs
     );
@@ -1205,7 +1207,6 @@ export class ModelManager {
         {
           kinds: [38423],
           "#d": ["routstr-21-models"],
-          limit: 1,
           authors: [this.routstrPubkey],
         },
         relays,
@@ -1214,12 +1215,18 @@ export class ModelManager {
           // Persist to durable store if configured
           this.eventStore?.add(e);
           this.markEventFetched(e);
-          if (!event) event = e;
+          // Relay arrival order is not guaranteed to be chronological, so
+          // keep the most recently published event rather than the first one.
+          if (!event || e.created_at > event.created_at) event = e;
         }
       );
     } else {
       this.logger.log(`Using ${cached.length} cached kind 38423 events from persistent store`);
-      event = cached[0];
+      // The store accumulates events over time; always act on the latest one.
+      event = cached.reduce((latest, e) =>
+        e.created_at > latest.created_at ? e : latest,
+        cached[0]!
+      );
     }
 
     if (!event) {
