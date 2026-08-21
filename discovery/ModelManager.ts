@@ -769,22 +769,26 @@ export class ModelManager {
     const latestByNode = new Map<string, NostrEvent>();
 
     const collectFromEvent = (event: NostrEvent) => {
-      const node = event.tags.find(
-        (tag) => tag[0] === "node" && typeof tag[1] === "string" && tag[1]
-      )?.[1];
+      const nodes = event.tags
+        .filter(
+          (tag) => tag[0] === "node" && typeof tag[1] === "string" && tag[1]
+        )
+        .map((tag) => tag[1]!);
       const label = event.tags.find(
         (tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1]
       )?.[1]?.toLowerCase();
 
-      if (!node || !label) return;
+      if (nodes.length === 0 || !label) return;
 
-      const previous = latestByNode.get(node);
-      if (
-        !previous ||
-        event.created_at > previous.created_at ||
-        (event.created_at === previous.created_at && event.id > previous.id)
-      ) {
-        latestByNode.set(node, event);
+      for (const node of nodes) {
+        const previous = latestByNode.get(node);
+        if (
+          !previous ||
+          event.created_at > previous.created_at ||
+          (event.created_at === previous.created_at && event.id > previous.id)
+        ) {
+          latestByNode.set(node, event);
+        }
       }
     };
 
