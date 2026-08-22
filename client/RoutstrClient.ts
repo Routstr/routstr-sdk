@@ -78,6 +78,9 @@ const ATTRIBUTION_HEADERS = new Map([
   ["x-title", "X-Title"],
 ]);
 
+/** Marks attribution that was forwarded through routstrd (e.g. `routstrd:Hermes`). */
+const ROUTSTRD_FORWARD_PREFIX = "routstrd:";
+
 export interface RouteRequestParams {
   path: string;
   method: string;
@@ -269,6 +272,7 @@ export class RoutstrClient {
         usage,
         requestId,
         clientApiKey: prepared.clientApiKey,
+        appName: prepared.appName,
       });
       (prepared.response as any).satsSpent = satsSpent;
       (prepared.response as any).usage = usage;
@@ -302,6 +306,7 @@ export class RoutstrClient {
     capturedUsage?: UsageTrackingData;
     capturedResponseId?: string;
     clientApiKey?: string;
+    appName?: string;
     usagePromise: Promise<{
       capturedUsage?: UsageTrackingData;
       capturedResponseId?: string;
@@ -375,9 +380,22 @@ export class RoutstrClient {
       }
     }
 
-    const baseHeaders = this._buildBaseHeaders(
-      this._extractAttributionHeaders(headers)
-    );
+    const attributionHeaders = this._extractAttributionHeaders(headers);
+
+    // The local client field carries the bare app name (no transit marker).
+    const appName =
+      attributionHeaders["X-Title"] ?? attributionHeaders["HTTP-Referer"];
+
+    // When forwarding upstream, tag the attribution so OpenRouter shows e.g.
+    // `routstrd:Hermes Agent` rather than the bare client app name. Only the
+    // non-secret attribution headers are forwarded; client auth and other
+    // headers never reach the provider.
+    if (attributionHeaders["X-Title"]) {
+      attributionHeaders["X-Title"] =
+        `${ROUTSTRD_FORWARD_PREFIX}${attributionHeaders["X-Title"]}`;
+    }
+
+    const baseHeaders = this._buildBaseHeaders(attributionHeaders);
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
     const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
@@ -536,6 +554,7 @@ export class RoutstrClient {
       capturedUsage,
       capturedResponseId,
       clientApiKey,
+      appName,
       usagePromise,
     };
   }
@@ -1604,6 +1623,7 @@ export class RoutstrClient {
     usage?: UsageTrackingData;
     requestId?: string;
     clientApiKey?: string;
+    appName?: string;
   }): Promise<number> {
     const {
       token,
@@ -1617,6 +1637,7 @@ export class RoutstrClient {
       usage,
       requestId,
       clientApiKey,
+      appName,
     } = params;
 
     let satsSpent: number = initialTokenBalance;
@@ -1691,6 +1712,7 @@ export class RoutstrClient {
       usage,
       requestId,
       clientApiKey,
+      appName,
     });
 
     // Fire-and-forget async spinoff - does not block
@@ -1730,6 +1752,7 @@ export class RoutstrClient {
     usage?: UsageTrackingData;
     requestId?: string;
     clientApiKey?: string;
+    appName?: string;
   }): Promise<void> {
     const {
       token,
@@ -1740,6 +1763,7 @@ export class RoutstrClient {
       usage: providedUsage,
       requestId: providedRequestId,
       clientApiKey,
+      appName,
     } = params;
 
     if (!response || !modelId) {
@@ -1832,7 +1856,7 @@ export class RoutstrClient {
         modelId,
         baseUrl,
         requestId: finalRequestId,
-        client: matchingClient?.clientId,
+        client: appName ?? matchingClient?.clientId,
         ...usage,
       };
 
