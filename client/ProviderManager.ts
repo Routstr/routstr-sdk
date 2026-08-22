@@ -448,11 +448,13 @@ export class ProviderManager {
         if (baseUrl === currentBaseUrl) {
           continue;
         }
-        // if (this.failedProviders.has(baseUrl)) {
-        //   console.log(`[findNextBestProvider:${this.instanceId}] SKIP (failed): ${baseUrl}`);
-        //   skippedFailed++;
-        //   continue;
-        // }
+        // A provider that already failed for this client should not be
+        // re-picked mid-chain: each failover attempt mints a fresh token
+        // (sats leave the wallet before the LLM call), so cycling back to
+        // failed providers burns sats without serving the request.
+        if (this.failedProviders.has(baseUrl)) {
+          continue;
+        }
         if (disabledProviders.has(baseUrl)) {
           continue;
         }

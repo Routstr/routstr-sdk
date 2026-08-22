@@ -127,6 +127,12 @@ export class RoutstrClient {
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
   private requestResponseLogSink?: RequestResponseLogSink;
+  /**
+   * Consecutive provider-side mint-fatal rejections across failover
+   * (swap-fee floor / melts disabled / untrusted mint). Two in a row
+   * aborts the chain — see _handleErrorResponse.
+   */
+  private _consecutiveMintFatal: number = 0;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -568,6 +574,14 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
+    /**
+     * Number of provider failovers already attempted for this request.
+     * Caps the failover chain (MAX_FAILOVER_DEPTH) so a broken wallet/mint
+     * does not mint a fresh token at every provider in the pool — each
+     * failover mints sats BEFORE the LLM call, so uncapped chains can drain
+     * the wallet without delivering any tokens.
+     */
+    failoverDepth?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
     /** Optional: abort the in-flight request. */
@@ -708,6 +722,8 @@ export class RoutstrClient {
       maxTokens?: number;
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
+      /** Provider failovers already attempted for this request (depth cap). */
+      failoverDepth?: number;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
     },
@@ -719,10 +735,69 @@ export class RoutstrClient {
     retryCount: number = 0
   ): Promise<Response> {
     const MAX_RETRIES_PER_PROVIDER = 2;
+    // Cap cross-provider failover chains. Each failover mints a fresh token
+    // (sats leave the wallet BEFORE the LLM call), so an uncapped chain
+    // against a broken mint or dead provider pool can drain the wallet
+    // without delivering anything (observed: 19 consecutive mints, ~2k
+    // sats, single request, zero responses).
+    const MAX_FAILOVER_DEPTH = 3;
+    // Provider-side rejections that indicate the token's proofs cannot be
+    // redeemed (broken/unmeltable mint or below swap-fee floor). Two in a
+    // row across different providers = the wallet's mint is the problem,
+    // not any single provider — continuing just mints more dead proofs.
+    const MINT_FATAL_CODES = new Set([
+      "cashu_token_swap_fees_exceed_amount",
+      "cashu_token_melt_disabled",
+    ]);
+    const MINT_FATAL_TEXT = [
+      "too small to cover swap fees",
+      "melts disabled",
+      "is not trusted",
+    ];
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
 
     const errorMessage = responseBody;
+
+    const failoverDepth = params.failoverDepth ?? 0;
+    const isMintFatalText = (text: string | undefined): boolean => {
+      if (!text) return false;
+      const lower = text.toLowerCase();
+      return (
+        MINT_FATAL_CODES.has(lower) ||
+        MINT_FATAL_TEXT.some((needle) => lower.includes(needle))
+      );
+    };
+    const providerMintFatal = isMintFatalText(errorMessage);
+    if (providerMintFatal) {
+      this._consecutiveMintFatal += 1;
+    } else {
+      this._consecutiveMintFatal = 0;
+    }
+    if (failoverDepth >= MAX_FAILOVER_DEPTH) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: failover depth cap (${MAX_FAILOVER_DEPTH}) reached after ${baseUrl} — stopping chain to preserve wallet sats`
+      );
+      throw new FailoverError(
+        baseUrl,
+        Array.from(this.providerManager.getFailedProviders()),
+        `Failover depth cap of ${MAX_FAILOVER_DEPTH} reached after trying ${baseUrl}. Aborting to preserve wallet sats.`
+      );
+    }
+    if (providerMintFatal && this._consecutiveMintFatal >= 2) {
+      const count = this._consecutiveMintFatal;
+      this._consecutiveMintFatal = 0;
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: ${count} consecutive mint-fatal rejections (last: ${errorMessage?.slice(0, 120)}) — the wallet's mint cannot be redeemed; aborting failover chain`
+      );
+      throw new FailoverError(
+        baseUrl,
+        Array.from(this.providerManager.getFailedProviders()),
+        `Mint-fatal: ${count} consecutive providers rejected the proofs (${MINT_FATAL_TEXT.join(" / ")}). The wallet's mint is broken or below the swap-fee floor — minting more tokens would burn sats without serving the request.`
+      );
+    }
 
     // ── Parse structured error from routstr-core ────────────────────────
     const parsedError = parseCoreError(responseBody, status, requestId);
@@ -1450,6 +1525,7 @@ export class RoutstrClient {
           newModel.id
         ),
         retryCount: 0,
+        failoverDepth: failoverDepth + 1,
       });
       (retryResponse as any).initialTokenBalanceInSats =
         spendResult.tokenBalanceUnit === "msat"
