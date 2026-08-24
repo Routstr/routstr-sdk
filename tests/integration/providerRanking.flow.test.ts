@@ -120,6 +120,16 @@ const { mockNostrEvents } = vi.hoisted(() => ({
   mockNostrEvents: [] as NostrEvent[],
 }));
 
+// These tests exercise the ranking/review flow with synthetic
+// pubkeys/signatures, so bypass cryptographic verification here.
+// Trust-gate behavior with real signatures is covered by
+// tests/unit/modelManagerEventTrust.test.ts.
+vi.mock("applesauce-core/helpers", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("applesauce-core/helpers")>();
+  return { ...actual, verifyEvent: () => true };
+});
+
 vi.mock("applesauce-relay", () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const rxjs = require("rxjs") as typeof import("rxjs");

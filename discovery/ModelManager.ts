@@ -14,6 +14,7 @@ import {
 import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
+import { verifyEvent } from "applesauce-core/helpers";
 import type { NostrEvent } from "applesauce-core/helpers";
 
 type SqliteStatement = {
@@ -55,6 +56,9 @@ const PROVIDER_FETCH_TIMEOUT_MS = 10_000;
 
 // Backstop for relays that never send EOSE; queries normally finish earlier.
 const NOSTR_QUERY_TIMEOUT_MS = 5000;
+
+// Drop events with a forged far-future created_at so they can't win "latest".
+const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
 
 /**
  * Configuration for ModelManager
@@ -261,7 +265,10 @@ export class ModelManager {
     if (forceRefresh) return [];
     if (!eventStore) return [];
 
-    return eventStore.getTimeline(filter);
+    return eventStore
+      .getTimeline(filter)
+      // Drop far-future state persisted before this fix.
+      .filter((event) => !this.isFutureDated(event));
   }
 
   /**
@@ -429,6 +436,40 @@ export class ModelManager {
       : DEFAULT_NOSTR_RELAYS;
   }
 
+  /** True when the event's created_at is beyond a sane future-drift window. */
+  private isFutureDated(event: NostrEvent): boolean {
+    const max = Math.floor(Date.now() / 1000) + MAX_EVENT_FUTURE_DRIFT_SECONDS;
+    return event.created_at > max;
+  }
+
+  /**
+   * Gate every relay-delivered event before use: verify the signature and
+   * reject far-future timestamps. Verification must run here, not only on
+   * EventStore.add(), since that path is optional (no persistent store in
+   * the browser default) and its result is otherwise ignored.
+   */
+  private isNostrEventTrustworthy(event: NostrEvent): boolean {
+    let valid = false;
+    try {
+      valid = verifyEvent(event);
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
+      this.logger.warn(
+        `Nostr: dropping kind ${event.kind} event ${event.id}: invalid signature`
+      );
+      return false;
+    }
+    if (this.isFutureDated(event)) {
+      this.logger.warn(
+        `Nostr: dropping kind ${event.kind} event ${event.id}: created_at ${event.created_at} is too far in the future`
+      );
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Collect events for a one-shot query. Resolves once every relay has sent
    * EOSE (connection failures count as EOSE) or after timeoutMs, whichever
@@ -468,6 +509,7 @@ export class ModelManager {
         next: (event) => {
           if (seen.has(event.id)) return;
           seen.add(event.id);
+          if (!this.isNostrEventTrustworthy(event)) return;
           onEvent(event);
         },
         error: finish,
@@ -682,6 +724,10 @@ export class ModelManager {
    * Kind 38425 is not replaceable, so several review events can exist for one
    * node; the newest event (by `created_at`) is authoritative.
    *
+   * Fails CLOSED: when reviews (or 38421 node metadata) are unavailable,
+   * providers are treated as unreviewed and disabled, not left enabled.
+   * Manually re-enabled providers are exempt.
+   *
    * @param baseUrls Current provider base URLs to evaluate
    * @returns Array of provider base URLs disabled by the review set
    */
@@ -776,22 +822,25 @@ export class ModelManager {
     const latestByNode = new Map<string, NostrEvent>();
 
     const collectFromEvent = (event: NostrEvent) => {
-      const node = event.tags.find(
-        (tag) => tag[0] === "node" && typeof tag[1] === "string" && tag[1]
-      )?.[1];
-      const label = event.tags.find(
-        (tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1]
-      )?.[1]?.toLowerCase();
+      const label = event.tags
+        .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
+        ?.[1]?.toLowerCase();
 
-      if (!node || !label) return;
+      if (!label) return;
 
-      const previous = latestByNode.get(node);
-      if (
-        !previous ||
-        event.created_at > previous.created_at ||
-        (event.created_at === previous.created_at && event.id > previous.id)
-      ) {
-        latestByNode.set(node, event);
+      // Apply the label to every "node" tag, not just the first.
+      for (const tag of event.tags) {
+        if (tag[0] !== "node" || typeof tag[1] !== "string" || !tag[1])
+          continue;
+        const node = tag[1];
+        const previous = latestByNode.get(node);
+        if (
+          !previous ||
+          event.created_at > previous.created_at ||
+          (event.created_at === previous.created_at && event.id > previous.id)
+        ) {
+          latestByNode.set(node, event);
+        }
       }
     };
 
@@ -857,18 +906,17 @@ export class ModelManager {
       return null;
     }
 
+    // Fail closed: no evidence means unreviewed, and unreviewed is disabled.
     if (reviewLabels.size === 0) {
       this.logger.warn(
-        "NostrReviews: no kind 38425 review events found; keeping disabled providers unchanged"
+        "NostrReviews: no kind 38425 review events found; treating all providers as unreviewed (fail-closed)"
       );
-      return null;
     }
 
     if (providerNodes.size === 0) {
       this.logger.warn(
-        "NostrReviews: no kind 38421 provider node metadata found; keeping disabled providers unchanged"
+        "NostrReviews: no kind 38421 provider node metadata found; treating all providers as unreviewed (fail-closed)"
       );
-      return null;
     }
 
     // Providers the user explicitly re-enabled must not be re-disabled by
