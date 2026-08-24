@@ -29,6 +29,9 @@ package-lock.json
 
 graphify-out
 
+# Findings
+findings/
+
 # debug request dumps
 reqs/
 scripts/reqRes/
