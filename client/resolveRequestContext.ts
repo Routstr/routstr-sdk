@@ -51,8 +51,10 @@ export interface ResolveContextInput {
   sdkStore?: SdkStore;
   /** Optional: shared ProviderManager instance for consistent failure tracking. */
   providerManager?: ProviderManager;
-  /** Nostr pubkey for routstr review/model events (kind 38425/38423). */
+  /** Nostr pubkey for routstr review/audit events (kind 38425). */
   routstrPubkey?: string;
+  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  routstrModelsPubkey?: string;
   /** Optional: injectable logger. */
   logger?: SdkLogger;
   /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
@@ -93,6 +95,7 @@ export async function resolveRequestContext(
     sdkStore,
     providerManager: providedProviderManager,
     routstrPubkey,
+    routstrModelsPubkey,
     logger,
   } = input;
 
@@ -111,6 +114,7 @@ export async function resolveRequestContext(
         ? [forcedProvider, ...includeProviderUrls]
         : includeProviderUrls,
       routstrPubkey,
+      routstrModelsPubkey,
       logger,
     });
 

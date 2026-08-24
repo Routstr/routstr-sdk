@@ -66,10 +66,12 @@ export interface ModelManagerConfig {
   includeProviderUrls?: string[];
   /** Provider base URLs to exclude */
   excludeProviderUrls?: string[];
-  /** Cache TTL in milliseconds (default: 210 minutes) */
+  /** Cache TTL in milliseconds (default: 21 minutes) */
   cacheTTL?: number;
-  /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
+  /** Nostr pubkey for routstr review/audit events (kind 38425). Defaults to routstr's key. */
   routstrPubkey?: string;
+  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  routstrModelsPubkey?: string;
   /** Nostr relay URLs for provider/model discovery.
    * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
    * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
@@ -111,6 +113,7 @@ export class ModelManager {
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
   private readonly routstrPubkey: string;
+  private readonly routstrModelsPubkey: string;
   private readonly nostrRelays: string[] | undefined;
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
@@ -129,10 +132,14 @@ export class ModelManager {
   ) {
     this.providerDirectoryUrl =
       config.providerDirectoryUrl || "https://api.routstr.com/v1/providers/";
-    this.cacheTTL = config.cacheTTL || 210 * 60 * 1000; // 21 minutes
+    this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
     this.routstrPubkey =
+      config.routstrPubkey ||
+      "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
+    this.routstrModelsPubkey =
+      config.routstrModelsPubkey ||
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
     this.nostrRelays = config.nostrRelays;
@@ -290,7 +297,7 @@ export class ModelManager {
     // version so the latest one can be selected from the persistent store;
     // limiting to 1 here could persist a stale event.
     await this.fetchLiveIntoStore(
-      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
+      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
       relays,
       timeoutMs
     );
@@ -1197,7 +1204,7 @@ export class ModelManager {
 
     // Check persistent store first
     const cached = await this.getCachedNostrEvents(
-      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrPubkey] },
+      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
       forceRefresh
     );
     let event: NostrEvent | null = null;
@@ -1207,7 +1214,7 @@ export class ModelManager {
         {
           kinds: [38423],
           "#d": ["routstr-21-models"],
-          authors: [this.routstrPubkey],
+          authors: [this.routstrModelsPubkey],
         },
         relays,
         NOSTR_QUERY_TIMEOUT_MS,

@@ -69,8 +69,10 @@ export interface RouteRequestOptions {
   sdkStore?: SdkStore;
   /** Optional: shared ProviderManager instance for consistent failure tracking */
   providerManager?: ProviderManager;
-  /** Nostr pubkey for routstr review/model events (kind 38425/38423). Defaults to routstr's key. */
+  /** Nostr pubkey for routstr review/audit events (kind 38425). Defaults to routstr's key. */
   routstrPubkey?: string;
+  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  routstrModelsPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;
   /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
@@ -151,6 +153,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
       sdkStore,
       providerManager: providedProviderManager,
       routstrPubkey: options.routstrPubkey,
+      routstrModelsPubkey: options.routstrModelsPubkey,
       logger,
       requestResponseLogSink,
       client: options.client,

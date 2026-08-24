@@ -58,8 +58,10 @@ export interface FetchOptions {
   torMode?: boolean;
   /** Force refresh of cached data */
   forceRefresh?: boolean;
-  /** Nostr pubkey for routstr review/model events */
+  /** Nostr pubkey for routstr review/audit events (kind 38425) */
   routstrPubkey?: string;
+  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  routstrModelsPubkey?: string;
   /** Client mode (xcashu or apikeys) */
   mode?: "xcashu" | "apikeys";
 
@@ -181,6 +183,7 @@ export async function fetchAIResponse(
         forceRefresh: options.forceRefresh,
         mode: options.mode,
         routstrPubkey: options.routstrPubkey,
+        routstrModelsPubkey: options.routstrModelsPubkey,
         logger: deps.logger,
         modelManager: options.modelManager,
         providerManager: options.providerManager,
