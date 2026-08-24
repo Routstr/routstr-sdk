@@ -26,6 +26,16 @@ const { relayStream } = vi.hoisted(() => ({
   },
 }));
 
+// These tests exercise collection mechanics (EOSE, timeout, dedupe) with
+// synthetic pubkeys/signatures, so bypass cryptographic verification here.
+// Trust-gate behavior with real signatures is covered by
+// modelManagerEventTrust.test.ts.
+vi.mock("applesauce-core/helpers", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("applesauce-core/helpers")>();
+  return { ...actual, verifyEvent: () => true };
+});
+
 vi.mock("applesauce-relay", () => ({
   RelayPool: class {
     request(_relays: unknown, filter: unknown) {
