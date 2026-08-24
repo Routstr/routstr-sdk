@@ -905,18 +905,13 @@ export class ModelManager {
       }
     }
 
-    // Carry forward previously-disabled providers that are no longer
-    // in the current bootstrap's baseUrls (e.g. their kind-38421 event
-    // was lost from relays).  Without this, a re-bootstrap silently
-    // re-enables providers whose Nostr event disappeared.
+    // Carry forward ALL previously-disabled providers.  Without this, a
+    // re-bootstrap silently re-enables providers whose kind-38421 event
+    // disappeared from relays — or whose lgtm review is stale — wiping
+    // operator decisions on every sync.
     const previousDisabled = this.adapter.getDisabledProviders();
-    const currentBaseUrls = new Set(
-      baseUrls.map((url) => this.normalizeUrl(url))
-    );
     for (const url of previousDisabled) {
-      if (!currentBaseUrls.has(url)) {
-        disabledByReview.push(url);
-      }
+      disabledByReview.push(url);
     }
 
     this.adapter.setDisabledProviders(Array.from(new Set(disabledByReview)));
