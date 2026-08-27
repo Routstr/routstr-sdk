@@ -255,7 +255,6 @@ export class RoutstrClient {
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
-        mintUrl: params.mintUrl,
         initialTokenBalance: prepared.tokenBalanceInSats,
         initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
         fallbackSatsSpent: usage?.satsCost,
@@ -1589,7 +1588,6 @@ export class RoutstrClient {
   private async _handlePostResponseBalanceUpdate(params: {
     token: string;
     baseUrl: string;
-    mintUrl: string;
     initialTokenBalance: number;
     initialTokenBalanceUnknown?: boolean;
     fallbackSatsSpent?: number;
@@ -1602,7 +1600,6 @@ export class RoutstrClient {
     const {
       token,
       baseUrl,
-      mintUrl,
       initialTokenBalance,
       initialTokenBalanceUnknown,
       fallbackSatsSpent,
