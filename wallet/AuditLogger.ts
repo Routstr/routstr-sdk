@@ -1,6 +1,6 @@
 /**
  * AuditLogger - Transaction audit logging utility
- * Writes JSON-formatted transaction logs to audit.log
+ * Emits JSON-formatted transaction logs through a runtime-configurable sink.
  */
 
 export interface AuditLogEntry {
@@ -14,6 +14,22 @@ export interface AuditLogEntry {
   baseUrl?: string;
   status: "success" | "failed";
   details?: string;
+}
+
+export type AuditLogSink = (
+  entry: AuditLogEntry,
+  serializedEntry: string
+) => void | Promise<void>;
+
+const consoleAuditLogSink: AuditLogSink = (_entry, serializedEntry) => {
+  console.log("[AUDIT]", serializedEntry.trim());
+};
+
+let auditLogSink: AuditLogSink = consoleAuditLogSink;
+
+/** Configure audit persistence for the active runtime. */
+export function setAuditLogSink(sink?: AuditLogSink): void {
+  auditLogSink = sink ?? consoleAuditLogSink;
 }
 
 export class AuditLogger {
@@ -34,17 +50,10 @@ export class AuditLogger {
 
     const logLine = JSON.stringify(fullEntry) + "\n";
 
-    if (typeof window === "undefined") {
-      try {
-        const fs = await import("fs");
-        const path = await import("path");
-        const logPath = path.join(process.cwd(), "audit.log");
-        fs.appendFileSync(logPath, logLine);
-      } catch (error) {
-        console.error("[AuditLogger] Failed to write to file:", error);
-      }
-    } else {
-      console.log("[AUDIT]", logLine.trim());
+    try {
+      await auditLogSink(fullEntry, logLine);
+    } catch (error) {
+      console.error("[AuditLogger] Failed to write audit entry:", error);
     }
   }
 
