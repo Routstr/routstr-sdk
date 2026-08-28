@@ -15,6 +15,11 @@
 import type { StreamingResult, ImageData, AnnotationData } from "../core/types";
 import { extractUsageFromSSEJson, toUsageStats } from "./usage";
 
+const INLINE_THINKING_OPEN_TAGS = ["<think>", "<thinking>"] as const;
+const INLINE_THINKING_CLOSE_TAGS = ["</think>", "</thinking>"] as const;
+
+type InlineStreamState = "leading" | "thinking" | "content";
+
 interface ParsedStreamEvent {
   content?: string;
   reasoning?: string;
@@ -25,6 +30,28 @@ interface ParsedStreamEvent {
   annotations?: AnnotationData[];
   images?: ImageData[];
   responseId?: string;
+}
+
+function extractReasoningDetails(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const text: string[] = [];
+  const summaries: string[] = [];
+  for (const detail of value) {
+    if (!detail || typeof detail !== "object") continue;
+
+    const entry = detail as Record<string, unknown>;
+    if (entry.type === "reasoning.text" && typeof entry.text === "string") {
+      text.push(entry.text);
+    } else if (
+      entry.type === "reasoning.summary" &&
+      typeof entry.summary === "string"
+    ) {
+      summaries.push(entry.summary);
+    }
+  }
+
+  return text.join("") || summaries.join("") || undefined;
 }
 
 /**
@@ -44,8 +71,8 @@ export class StreamProcessor {
   private accumulatedContent = "";
   private accumulatedThinking = "";
   private accumulatedImages: ImageData[] = [];
-  private isInThinking = false;
-  private isInContent = false;
+  private inlineBuffer = "";
+  private inlineState: InlineStreamState = "leading";
 
   /**
    * Process a streaming response
@@ -53,6 +80,7 @@ export class StreamProcessor {
   async process(
     response: Response,
     callbacks: StreamCallbacks,
+    // Retained for API compatibility: inline extraction no longer gates on the model.
     modelId?: string,
     signal?: AbortSignal
   ): Promise<StreamingResult> {
@@ -70,12 +98,17 @@ export class StreamProcessor {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
 
+    const abortReader = () => {
+      void reader.cancel().catch(() => {});
+    };
+    signal?.addEventListener("abort", abortReader, { once: true });
+
     // Reset state
     this.accumulatedContent = "";
     this.accumulatedThinking = "";
     this.accumulatedImages = [];
-    this.isInThinking = false;
-    this.isInContent = false;
+    this.inlineBuffer = "";
+    this.inlineState = "leading";
 
     // Result accumulators
     let usage: StreamingResult["usage"];
@@ -86,15 +119,14 @@ export class StreamProcessor {
     let responseId: string | undefined;
 
     const handleEvent = (parsed: ParsedStreamEvent): void => {
-      // Reasoning must run before content. A delta carrying both is common at the
-      // reasoning-to-content transition, and processing content first would close
-      // thinking, letting reasoning re-open it and misroute the rest of the answer.
+      // Reasoning first: it switches off inline tag scanning, so content in the same
+      // delta is taken literally instead of re-parsed for tags already reported here.
       if (parsed.reasoning) {
         this._handleThinking(parsed.reasoning, callbacks);
       }
 
       if (parsed.content) {
-        this._handleContent(parsed.content, callbacks, modelId);
+        this._handleContent(parsed.content, callbacks);
       }
 
       if (parsed.usage) usage = parsed.usage;
@@ -115,6 +147,10 @@ export class StreamProcessor {
         }
         const { done, value } = await reader.read();
 
+        if (signal?.aborted) {
+          throw new DOMException("The operation was aborted.", "AbortError");
+        }
+
         if (done) {
           break;
         }
@@ -132,7 +168,10 @@ export class StreamProcessor {
           if (parsed) handleEvent(parsed);
         }
       }
+
+      this._flushInlineBuffer(callbacks);
     } finally {
+      signal?.removeEventListener("abort", abortReader);
       reader.releaseLock();
     }
 
@@ -164,9 +203,15 @@ export class StreamProcessor {
         result.content = parsed.choices[0].delta.content;
       }
 
-      // Extract reasoning (OpenRouter style)
-      if (parsed.choices?.[0]?.delta?.reasoning) {
-        result.reasoning = parsed.choices[0].delta.reasoning;
+      const delta = parsed.choices?.[0]?.delta;
+      const plainReasoning = [
+        delta?.reasoning_content,
+        delta?.reasoning,
+      ].find((value) => typeof value === "string" && value.length > 0);
+      const reasoning =
+        plainReasoning || extractReasoningDetails(delta?.reasoning_details);
+      if (reasoning) {
+        result.reasoning = reasoning;
       }
 
       // Extract usage (usually in final chunk)
@@ -225,73 +270,119 @@ export class StreamProcessor {
   /**
    * Handle content delta with thinking support
    */
-  private _handleContent(
-    content: string,
-    callbacks: StreamCallbacks,
-    modelId?: string
-  ): void {
-    // If we were in thinking mode and now got content, close thinking tag
-    if (this.isInThinking && !this.isInContent) {
-      this.accumulatedThinking += "</thinking>";
-      callbacks.onThinking(this.accumulatedThinking);
-      this.isInThinking = false;
-      this.isInContent = true;
-    }
-
-    // For models that use <thinking> tags inline
-    if (modelId) {
-      this._extractThinkingFromContent(content, callbacks);
-    } else {
+  private _handleContent(content: string, callbacks: StreamCallbacks): void {
+    if (this.inlineState === "content") {
       this.accumulatedContent += content;
+      callbacks.onContent(this.accumulatedContent);
+      return;
     }
 
-    callbacks.onContent(this.accumulatedContent);
+    this.inlineBuffer += content;
+    this._drainInlineBuffer(callbacks);
   }
 
   /**
    * Handle thinking/reasoning content
    */
   private _handleThinking(reasoning: string, callbacks: StreamCallbacks): void {
-    // Once content has started, ignore any further reasoning deltas.
-    // Some providers send a final reasoning chunk alongside the first content
-    // chunk; once we've switched to content mode, re-opening thinking would
-    // cause _extractThinkingFromContent to misroute content into thinking.
-    if (this.isInContent) {
-      return;
-    }
-    if (!this.isInThinking) {
-      this.accumulatedThinking += "<thinking> ";
-      this.isInThinking = true;
+    // An open inline block keeps its buffer: it may hold a partial closing tag.
+    // Otherwise the buffer is answer text the tag lookahead held, so flush it.
+    if (this.inlineState !== "thinking") {
+      this._flushInlineBuffer(callbacks);
+      this.inlineState = "content";
     }
     this.accumulatedThinking += reasoning;
     callbacks.onThinking(this.accumulatedThinking);
   }
 
   /**
-   * Extract thinking blocks from content (for models with inline thinking)
+   * Extract a leading inline thinking block without consuming literal tags in answers.
    */
-  private _extractThinkingFromContent(
-    content: string,
-    callbacks: StreamCallbacks
-  ): void {
-    // Simple extraction - models that wrap thinking in <thinking> tags
-    const parts = content.split(/(<thinking>|<\/thinking>)/);
+  private _drainInlineBuffer(callbacks: StreamCallbacks): void {
+    while (this.inlineBuffer) {
+      if (this.inlineState === "leading") {
+        const firstVisible = this.inlineBuffer.search(/\S/);
+        if (firstVisible === -1) return;
 
-    for (const part of parts) {
-      if (part === "<thinking>") {
-        this.isInThinking = true;
-        if (!this.accumulatedThinking.includes("<thinking>")) {
-          this.accumulatedThinking += "<thinking> ";
+        const candidate = this.inlineBuffer.slice(firstVisible);
+        const opener = INLINE_THINKING_OPEN_TAGS.find((tag) =>
+          candidate.startsWith(tag)
+        );
+
+        if (opener) {
+          this.inlineBuffer = candidate.slice(opener.length);
+          this.inlineState = "thinking";
+          continue;
         }
-      } else if (part === "</thinking>") {
-        this.isInThinking = false;
-        this.accumulatedThinking += "</thinking>";
-      } else if (this.isInThinking) {
-        this.accumulatedThinking += part;
-      } else {
-        this.accumulatedContent += part;
+
+        if (INLINE_THINKING_OPEN_TAGS.some((tag) => tag.startsWith(candidate))) {
+          return;
+        }
+
+        this.inlineState = "content";
+        continue;
+      }
+
+      if (this.inlineState === "thinking") {
+        const { index, length } = this._closeTagSplit(this.inlineBuffer);
+        this._appendThinking(this.inlineBuffer.slice(0, index), callbacks);
+        this.inlineBuffer = this.inlineBuffer.slice(index + length);
+        if (length === 0) return;
+        this.inlineState = "content";
+        continue;
+      }
+
+      this.accumulatedContent += this.inlineBuffer;
+      this.inlineBuffer = "";
+      callbacks.onContent(this.accumulatedContent);
+      return;
+    }
+  }
+
+  private _flushInlineBuffer(callbacks: StreamCallbacks): void {
+    if (!this.inlineBuffer) return;
+
+    if (this.inlineState === "thinking") {
+      this._appendThinking(this.inlineBuffer, callbacks);
+    } else {
+      this.accumulatedContent += this.inlineBuffer;
+      callbacks.onContent(this.accumulatedContent);
+    }
+    this.inlineBuffer = "";
+  }
+
+  private _appendThinking(value: string, callbacks: StreamCallbacks): void {
+    if (!value) return;
+    this.accumulatedThinking += value;
+    callbacks.onThinking(this.accumulatedThinking);
+  }
+
+  /**
+   * Locate the earliest complete closing tag. If none is present, `length` is 0 and
+   * `index` is where a partial tag starts, so the caller can hold that back.
+   */
+  private _closeTagSplit(value: string): { index: number; length: number } {
+    let found: { index: number; length: number } | null = null;
+    for (const tag of INLINE_THINKING_CLOSE_TAGS) {
+      const index = value.indexOf(tag);
+      if (index !== -1 && (!found || index < found.index)) {
+        found = { index, length: tag.length };
       }
     }
+    if (found) return found;
+
+    const maxPending = Math.min(
+      value.length,
+      Math.max(...INLINE_THINKING_CLOSE_TAGS.map((tag) => tag.length - 1))
+    );
+    for (let length = maxPending; length > 0; length -= 1) {
+      const suffix = value.slice(-length);
+      if (INLINE_THINKING_CLOSE_TAGS.some((tag) => tag.startsWith(suffix))) {
+        return { index: value.length - length, length: 0 };
+      }
+    }
+
+    return { index: value.length, length: 0 };
   }
 
   /**

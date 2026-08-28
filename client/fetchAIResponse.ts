@@ -1,4 +1,4 @@
-import type { Message, Model, StreamingResult, SdkLogger } from "../core/types";
+import type { Message, MessageContentType, Model, StreamingResult, SdkLogger } from "../core/types";
 import type {
   StreamingCallbacks,
   WalletAdapter,
@@ -269,6 +269,9 @@ export async function fetchAIResponse(
       });
     } else if (
       streamingResult.content ||
+      streamingResult.thinking ||
+      (streamingResult.citations && streamingResult.citations.length > 0) ||
+      (streamingResult.annotations && streamingResult.annotations.length > 0) ||
       (streamingResult.images && streamingResult.images.length > 0)
     ) {
       const message = await createAssistantMessage(streamingResult);
@@ -314,31 +317,44 @@ export async function fetchAIResponse(
 }
 
 async function convertMessages(messages: Message[]): Promise<any[]> {
-  return Promise.all(
-    messages
-      .filter((m) => m.role !== "system")
-      .map(async (m) => ({
-        role: m.role,
-        content: typeof m.content === "string" ? m.content : m.content,
-      }))
-  );
+  return messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      role: m.role,
+      content:
+        typeof m.content === "string"
+          ? m.content
+          : m.content
+              .map(({ thinking, citations, annotations, ...part }) => part)
+              // A reasoning-only turn is stored as an empty text part carrying its
+              // thinking, so once the metadata is stripped there is nothing to send.
+              .filter((part) => part.type !== "text" || (part.text ?? "") !== ""),
+    }))
+    .filter((m) => typeof m.content === "string" || m.content.length > 0);
 }
 
 async function createAssistantMessage(result: StreamingResult): Promise<Message> {
-  if (result.images && result.images.length > 0) {
-    const content: any[] = [];
+  const hasMetadata = Boolean(
+    result.thinking ||
+      result.citations?.length ||
+      result.annotations?.length
+  );
 
-    if (result.content) {
-      content.push({
+  if (hasMetadata || (result.images && result.images.length > 0)) {
+    const content: MessageContentType[] = [];
+
+    if (result.content || hasMetadata) {
+      const textPart: MessageContentType = {
         type: "text",
         text: result.content,
-        thinking: result.thinking,
-        citations: result.citations,
-        annotations: result.annotations,
-      });
+      };
+      if (result.thinking) textPart.thinking = result.thinking;
+      if (result.citations?.length) textPart.citations = result.citations;
+      if (result.annotations?.length) textPart.annotations = result.annotations;
+      content.push(textPart);
     }
 
-    for (const img of result.images) {
+    for (const img of result.images ?? []) {
       content.push({
         type: "image_url",
         image_url: {
