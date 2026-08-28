@@ -15,6 +15,18 @@
 import type { StreamingResult, ImageData, AnnotationData } from "../core/types";
 import { extractUsageFromSSEJson, toUsageStats } from "./usage";
 
+interface ParsedStreamEvent {
+  content?: string;
+  reasoning?: string;
+  usage?: StreamingResult["usage"];
+  model?: string;
+  finish_reason?: string;
+  citations?: string[];
+  annotations?: AnnotationData[];
+  images?: ImageData[];
+  responseId?: string;
+}
+
 /**
  * Callbacks for streaming updates
  */
@@ -73,6 +85,27 @@ export class StreamProcessor {
     let annotations: AnnotationData[] | undefined;
     let responseId: string | undefined;
 
+    const handleEvent = (parsed: ParsedStreamEvent): void => {
+      // Reasoning must run before content. A delta carrying both is common at the
+      // reasoning-to-content transition, and processing content first would close
+      // thinking, letting reasoning re-open it and misroute the rest of the answer.
+      if (parsed.reasoning) {
+        this._handleThinking(parsed.reasoning, callbacks);
+      }
+
+      if (parsed.content) {
+        this._handleContent(parsed.content, callbacks, modelId);
+      }
+
+      if (parsed.usage) usage = parsed.usage;
+      if (parsed.model) model = parsed.model;
+      if (parsed.finish_reason) finish_reason = parsed.finish_reason;
+      if (parsed.responseId) responseId = parsed.responseId;
+      if (parsed.citations) citations = parsed.citations;
+      if (parsed.annotations) annotations = parsed.annotations;
+      if (parsed.images) this._mergeImages(parsed.images);
+    };
+
     try {
       while (true) {
         // Check for cancellation before each read.
@@ -94,49 +127,9 @@ export class StreamProcessor {
         buffer = lines.pop() || ""; // Keep incomplete line in buffer
 
         for (const line of lines) {
-          const parsed = this._parseLine(line);
-          if (!parsed) continue;
-
-          // Handle reasoning/thinking BEFORE content. When a single SSE delta
-          // contains both (common at the reasoning→content transition for
-          // Tinfoil/OpenRouter models), the reasoning must be appended to the
-          // thinking buffer first, then content closes the thinking block and
-          // switches to content accumulation. Processing content first would
-          // close thinking, then reasoning would re-open it, causing all
-          // subsequent content to be misrouted into accumulatedThinking.
-          if (parsed.reasoning) {
-            this._handleThinking(parsed.reasoning, callbacks);
-          }
-
-          // Handle content delta
-          if (parsed.content) {
-            this._handleContent(parsed.content, callbacks, modelId);
-          }
-
-          // Extract metadata
-          if (parsed.usage) {
-            usage = parsed.usage;
-          }
-          if (parsed.model) {
-            model = parsed.model;
-          }
-          if (parsed.finish_reason) {
-            finish_reason = parsed.finish_reason;
-          }
-          if (parsed.responseId) {
-            responseId = parsed.responseId;
-          }
-          if (parsed.citations) {
-            citations = parsed.citations;
-          }
-          if (parsed.annotations) {
-            annotations = parsed.annotations;
-          }
-
-          // Handle images
-          if (parsed.images) {
-            this._mergeImages(parsed.images);
-          }
+          if (!line.startsWith("data: ")) continue;
+          const parsed = this._parseEvent(line.slice(6));
+          if (parsed) handleEvent(parsed);
         }
       }
     } finally {
@@ -157,36 +150,14 @@ export class StreamProcessor {
   }
 
   /**
-   * Parse a single SSE line
+   * Parse a single SSE event
    */
-  private _parseLine(line: string): {
-    content?: string;
-    reasoning?: string;
-    usage?: StreamingResult["usage"];
-    model?: string;
-    finish_reason?: string;
-    citations?: string[];
-    annotations?: AnnotationData[];
-    images?: ImageData[];
-    responseId?: string;
-  } | null {
-    if (!line.trim()) return null;
-
-    // SSE data lines start with "data: "
-    if (!line.startsWith("data: ")) {
-      // Show "Generating..." for non-data lines if no content yet
-      return null;
-    }
-
-    const jsonData = line.slice(6);
-
-    if (jsonData === "[DONE]") {
-      return null;
-    }
+  private _parseEvent(data: string): ParsedStreamEvent | null {
+    if (data.trim() === "[DONE]") return null;
 
     try {
-      const parsed = JSON.parse(jsonData);
-      const result: ReturnType<typeof this._parseLine> = {};
+      const parsed = JSON.parse(data);
+      const result: ParsedStreamEvent = {};
 
       // Extract content delta
       if (parsed.choices?.[0]?.delta?.content) {
