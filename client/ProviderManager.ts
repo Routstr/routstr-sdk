@@ -156,13 +156,23 @@ function getImageResolutionFromDataUrl(
  *
  * For low detail: 85 tokens
  * For high detail/auto: 85 base tokens + 170 tokens per 512px tile
+ * For original detail: patch-based pricing at the image's original
+ *   resolution — ceil(patches * 1.2) tokens at 32x32px patches, bounded
+ *   by the 30,000-patch rejection limit (36,000 tokens worst case).
  */
 function calculateImageTokens(
   width: number,
   height: number,
-  detail: "low" | "high" | "auto" = "auto"
+  detail: "low" | "high" | "auto" | "original" = "auto"
 ): number {
   if (detail === "low") return 85;
+
+  if (detail === "original") {
+    const patches =
+      Math.ceil(width / IMAGE_PATCH_PX) *
+      Math.ceil(height / IMAGE_PATCH_PX);
+    return Math.ceil(Math.min(patches, MAX_IMAGE_PATCHES) * 1.2);
+  }
 
   let w = width;
   let h = height;
@@ -197,6 +207,193 @@ function calculateImageTokens(
   const numTiles = tilesWidth * tilesHeight;
 
   return 85 + 170 * numTiles;
+}
+
+/** 32x32px patch grid used for detail="original" image billing. */
+const IMAGE_PATCH_PX = 32;
+/** OpenAI rejects images above 30,000 patches. */
+const MAX_IMAGE_PATCHES = 30_000;
+
+/** Max 512px tiles after the 2048px/768px downscaling passes. */
+const MAX_TILED_IMAGE_TOKENS = 85 + 170 * 4; // 765
+/** 30,000 patches * 1.2 multiplier. */
+const MAX_ORIGINAL_IMAGE_TOKENS = Math.ceil(MAX_IMAGE_PATCHES * 1.2); // 36,000
+
+/**
+ * Worst-case tokens a single image can bill at each detail level, used
+ * when dimensions are unknown (file_id references, remote URLs, or data
+ * URLs in formats the local parser cannot read — the node's full image
+ * library handles those).
+ */
+function worstCaseImageTokensForDetail(detail: string): number {
+  if (detail === "low") return 85;
+  if (detail === "original") return MAX_ORIGINAL_IMAGE_TOKENS;
+  return MAX_TILED_IMAGE_TOKENS;
+}
+
+/**
+ * Estimate tokens for a single image_url payload at a given detail level.
+ * Remote URLs get the worst case for the detail level: the node fetches
+ * and measures them, so a local 0 would under-deposit.
+ */
+function estimateImageTokensForUrl(
+  url: string | undefined,
+  detail: string
+): number {
+  if (!url || typeof url !== "string") return 0;
+  if (url.startsWith("data:")) {
+    const res = getImageResolutionFromDataUrl(url);
+    if (res) {
+      return calculateImageTokens(
+        res.width,
+        res.height,
+        detail as "low" | "high" | "auto" | "original"
+      );
+    }
+    return worstCaseImageTokensForDetail(detail);
+  }
+  return worstCaseImageTokensForDetail(detail);
+}
+
+/**
+ * Estimate tokens for a Responses API input_image item. Honors the
+ * item-level (sibling) detail; file_id references without a usable
+ * image_url use the worst case for the detail level.
+ */
+function estimateInputImageTokens(item: any): number {
+  const detail =
+    typeof item?.detail === "string" && item?.detail ? item.detail : "auto";
+  const url =
+    typeof item?.image_url === "string"
+      ? item.image_url
+      : item?.image_url?.url;
+  const fromUrl = estimateImageTokensForUrl(url, detail);
+  if (fromUrl > 0 || !item?.file_id) return fromUrl;
+  return worstCaseImageTokensForDetail(detail);
+}
+
+/**
+ * Count image tokens across chat-completions messages: image_url parts
+ * (nested detail) and input_image parts (sibling detail), matching the
+ * node's messages-side estimator.
+ */
+function countImageTokensInMessages(apiMessages: any[]): number {
+  let total = 0;
+  for (const msg of apiMessages ?? []) {
+    const content = (msg as any)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      if (part.type === "image_url") {
+        const detail =
+          typeof part.image_url?.detail === "string" &&
+          part.image_url?.detail
+            ? part.image_url.detail
+            : "auto";
+        const url =
+          typeof part.image_url === "string"
+            ? part.image_url
+            : part.image_url?.url;
+        total += estimateImageTokensForUrl(url, detail);
+      } else if (part.type === "input_image") {
+        total += estimateInputImageTokens(part);
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Count image tokens across a Responses API input list: top-level
+ * input_image items and input_image parts inside message content lists.
+ */
+function countImageTokensInResponsesInput(input: any): number {
+  if (!Array.isArray(input)) return 0;
+  let total = 0;
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "input_image") {
+      total += estimateInputImageTokens(item);
+      continue;
+    }
+    if (Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (
+          part &&
+          typeof part === "object" &&
+          part.type === "input_image"
+        ) {
+          total += estimateInputImageTokens(part);
+        }
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * JSON.stringify that never throws (circular references etc. return null
+ * so callers can fall back to a conservative token count).
+ */
+function safeStringify(value: unknown): string | null {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strip image parts (and their base64 payloads) from chat-completions
+ * messages before serializing them for the text token estimate.
+ */
+function stripImagesFromMessages(apiMessages: any[]): any[] {
+  return (apiMessages as any[]).map((m: any) => {
+    if (Array.isArray(m?.content)) {
+      const filtered = m.content.filter(
+        (p: any) =>
+          !(
+            p &&
+            typeof p === "object" &&
+            (p.type === "image_url" || p.type === "input_image")
+          )
+      );
+      return { ...m, content: filtered };
+    }
+    return m;
+  });
+}
+
+/**
+ * Strip image items/parts and encrypted reasoning payloads from a
+ * Responses API input list before serializing it for the text token
+ * estimate: base64 image data and encrypted_content massively overstate
+ * the prompt, and the node counts neither as prompt text.
+ */
+function stripImagesFromResponsesInput(input: any[]): any[] {
+  const result: any[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") {
+      result.push(item);
+      continue;
+    }
+    if (item.type === "input_image") continue; // dropped entirely
+    if (item.type === "reasoning" && typeof item.encrypted_content === "string") {
+      const { encrypted_content, ...rest } = item;
+      result.push(rest);
+      continue;
+    }
+    if (Array.isArray(item.content)) {
+      const filtered = item.content.filter(
+        (p: any) =>
+          !(p && typeof p === "object" && p.type === "input_image")
+      );
+      result.push({ ...item, content: filtered });
+      continue;
+    }
+    result.push(item);
+  }
+  return result;
 }
 
 /**
@@ -640,67 +837,97 @@ export class ProviderManager {
   }
 
   /**
-   * Get required sats for a model based on message history
-   * Simple estimation based on typical usage
+   * Get required sats for a model based on the request body shape.
+   *
+   * Estimates the deposit the node will demand before forwarding: the
+   * node sizes its gate from the request itself (messages, Responses
+   * input/instructions, serialized tools definitions, image content
+   * with detail levels), so the SDK must count the same payloads or
+   * every affected request bounces off a 402 into a topup round-trip.
+   *
+   * @param apiMessages chat-completions `messages` array (Responses
+   *   requests pass [])
+   * @param maxTokens max_tokens / max_output_tokens from the request
+   * @param requestBody the full request body, used to count Responses
+   *   input/instructions and tools definitions on both APIs
    */
   getRequiredSatsForModel(
     model: Model,
     apiMessages: any[],
-    maxTokens?: number
+    maxTokens?: number,
+    requestBody?: Record<string, unknown>
   ): number {
     try {
-      let imageTokens = 0;
-      if (apiMessages) {
-        for (const msg of apiMessages as any[]) {
-          const content = (msg as any)?.content;
-          if (Array.isArray(content)) {
-            for (const part of content) {
-              const isImage =
-                part && typeof part === "object" && part.type === "image_url";
-              const url: string | undefined = isImage
-                ? typeof part.image_url === "string"
-                  ? part.image_url
-                  : part.image_url?.url
-                : undefined;
+      const body = requestBody ?? {};
 
-              // Expecting a base64 data URL for local image inputs
-              if (url && typeof url === "string" && url.startsWith("data:")) {
-                const res = getImageResolutionFromDataUrl(url);
-                if (res) {
-                  const tokensFromImage = calculateImageTokens(
-                    res.width,
-                    res.height
-                  );
-                  // const patchSize = 32;
-                  // const patchesW = Math.floor((res.width + patchSize - 1) / patchSize);
-                  // const patchesH = Math.floor((res.height + patchSize - 1) / patchSize);
-                  // const tokensFromImage = patchesW * patchesH;
-                  imageTokens += tokensFromImage;
-                } else {
-                  // unknown image format
-                }
-              }
-            }
-          }
+      let imageTokens = 0;
+      let textChars = 0;
+      let sawPromptShape = false;
+      let textEstimateUnknown = false;
+
+      // Chat-completions shape: messages with content parts.
+      if (Array.isArray(apiMessages) && apiMessages.length > 0) {
+        sawPromptShape = true;
+        imageTokens += countImageTokensInMessages(apiMessages);
+        const stripped = safeStringify(
+          stripImagesFromMessages(apiMessages)
+        );
+        if (stripped === null) {
+          textEstimateUnknown = true;
+        } else {
+          textChars += stripped.length;
         }
       }
-      // Remove image_url parts from apiMessages when estimating text token count
-      const apiMessagesNoImages = apiMessages // SWITCH AFTER NODE UPDAATES
-        ? (apiMessages as any[]).map((m: any) => {
-            if (Array.isArray(m?.content)) {
-              const filtered = m.content.filter(
-                (p: any) =>
-                  !(p && typeof p === "object" && p.type === "image_url")
-              );
-              return { ...m, content: filtered };
-            }
-            return m;
-          })
-        : undefined;
 
-      const approximateTokens = apiMessagesNoImages // SWITCH AFTER NODE UPDAATES
-        ? Math.ceil(JSON.stringify(apiMessagesNoImages, null, 2).length / 2.84)
-        : 10000; // Assumed tokens for minimum balance calculation
+      // Responses shape: input list (or plain string) — only when there
+      // are no chat messages, matching the node's messages-first choice.
+      const responsesInput = body.input;
+      if (!sawPromptShape) {
+        if (Array.isArray(responsesInput)) {
+          sawPromptShape = true;
+          imageTokens += countImageTokensInResponsesInput(responsesInput);
+          const stripped = safeStringify(
+            stripImagesFromResponsesInput(responsesInput)
+          );
+          if (stripped === null) {
+            textEstimateUnknown = true;
+          } else {
+            textChars += stripped.length;
+          }
+        } else if (typeof responsesInput === "string") {
+          sawPromptShape = true;
+          textChars += responsesInput.length;
+        }
+      }
+
+      // Responses developer instructions count like prompt text.
+      const instructions = body.instructions;
+      if (typeof instructions === "string" && instructions) {
+        sawPromptShape = true;
+        textChars += instructions.length;
+      }
+
+      // Tool definitions are serialized into the prompt and billed as
+      // input tokens by the node, on both the chat and Responses APIs.
+      const tools = body.tools;
+      if (Array.isArray(tools) && tools.length > 0) {
+        sawPromptShape = true;
+        const serialized = safeStringify(tools);
+        if (serialized === null) {
+          textEstimateUnknown = true;
+        } else {
+          textChars += serialized.length;
+        }
+      }
+
+      // ~2.84 chars per token keeps the estimate at or above the node's
+      // ~3 chars/token heuristic while still counting the serialized
+      // structure (roles, JSON syntax) the node ignores.
+      const approximateTokens = textEstimateUnknown
+        ? 10_000 // serialization failed; assume a full prompt
+        : sawPromptShape
+          ? Math.ceil(textChars / 2.84)
+          : 10_000; // no recognizable prompt shape; minimum-balance assumption
 
       const totalInputTokens = approximateTokens + imageTokens;
 
@@ -731,11 +958,26 @@ export class ProviderManager {
         completionCost = sp.completion * maxTokens;
       }
       const totalEstimatedCosts = (promptCosts + completionCost + requestFee) * 1.05;
-      // return totalEstimatedCosts > sp.max_cost ? sp.max_cost : totalEstimatedCosts; // in some image input calculations, this cost balloons up. Now includes image tokens via 32px patches.
-      return totalEstimatedCosts; // Backend has a bug here.it's calculating image tokens wrong. gotta switch to different logic once its fixed
+
+      // Cap at the pricing envelope. The node's gate is always <= max_cost
+      // (it only discounts downward from the full envelope), so a capped
+      // deposit still clears it. The cap was disabled while the node
+      // mis-priced original-detail images with tile math; the node now uses
+      // patch-based pricing for original detail, so it is safe again.
+      if (
+        typeof sp.max_cost === "number" &&
+        totalEstimatedCosts > sp.max_cost
+      ) {
+        return sp.max_cost;
+      }
+      return totalEstimatedCosts;
     } catch (e) {
       this.logger.error("getRequiredSatsForModel error:", e);
-      return 0;
+      // Fall back to the model envelope rather than 0: a zero deposit is
+      // always rejected by the node's minimum-balance gate and forces a
+      // 402 topup round-trip.
+      const sp = (model as Model)?.sats_pricing as any;
+      return sp?.max_cost ?? 50;
     }
   }
 }
