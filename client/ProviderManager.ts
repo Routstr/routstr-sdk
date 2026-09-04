@@ -344,24 +344,66 @@ function safeStringify(value: unknown): string | null {
 }
 
 /**
- * Strip image parts (and their base64 payloads) from chat-completions
- * messages before serializing them for the text token estimate.
+ * Compact (canonical) JSON.stringify that never throws. Uses the same
+ * `JSON.stringify(value)` form the node uses for its billed-char counts
+ * (separators `,`/`:`), so object/array payloads contribute the same
+ * character count on both sides. Returns null on circular references so
+ * callers can fall back to a conservative token count.
  */
-function stripImagesFromMessages(apiMessages: any[]): any[] {
-  return (apiMessages as any[]).map((m: any) => {
-    if (Array.isArray(m?.content)) {
-      const filtered = m.content.filter(
-        (p: any) =>
-          !(
-            p &&
-            typeof p === "object" &&
-            (p.type === "image_url" || p.type === "input_image")
-          )
-      );
-      return { ...m, content: filtered };
+function safeStringifyCompact(value: unknown): string | null {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Conservative character length for a text/JSON payload, matching the
+ * node's `_text_length`: strings count their length; objects/arrays count
+ * their compact-serialized length; anything else counts as zero. Used so
+ * the SDK counts the same billed content the node does.
+ */
+function textLength(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (value !== null && typeof value === "object") {
+    return safeStringifyCompact(value)?.length ?? 0;
+  }
+  return 0;
+}
+
+/**
+ * Count the billed text characters across chat-completions messages,
+ * excluding the JSON envelope (keys, role fields, punctuation) that the
+ * node does not bill as prompt tokens. Counts string content, `text`
+ * parts, and assistant `tool_calls` function name + arguments. Image
+ * parts contribute zero here (they are priced separately as tokens).
+ */
+function countMessageTextChars(apiMessages: any[]): number {
+  let total = 0;
+  for (const msg of apiMessages ?? []) {
+    if (!msg || typeof msg !== "object") continue;
+    const content = (msg as any).content;
+    if (typeof content === "string") {
+      total += content.length;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part && typeof part === "object" && part.type === "text") {
+          total += textLength(part.text);
+        }
+      }
     }
-    return m;
-  });
+    const toolCalls = (msg as any).tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const call of toolCalls) {
+        const fn = call?.function;
+        if (!fn || typeof fn !== "object") continue;
+        total += textLength(fn.name);
+        total += textLength(fn.arguments);
+      }
+    }
+  }
+  return total;
 }
 
 /**
@@ -865,18 +907,17 @@ export class ProviderManager {
       let sawPromptShape = false;
       let textEstimateUnknown = false;
 
-      // Chat-completions shape: messages with content parts.
+      // Chat-completions shape: messages with content parts. Count only
+      // the billed text content (string content, text parts, tool_calls
+      // name+arguments) — not the serialized JSON envelope (keys, roles,
+      // punctuation), which the node does not bill as prompt tokens. This
+      // removes a ~3x envelope-inflation over-estimate on prose-heavy
+      // chats while no longer under-counting agentic chats with many
+      // tool_calls.
       if (Array.isArray(apiMessages) && apiMessages.length > 0) {
         sawPromptShape = true;
         imageTokens += countImageTokensInMessages(apiMessages);
-        const stripped = safeStringify(
-          stripImagesFromMessages(apiMessages)
-        );
-        if (stripped === null) {
-          textEstimateUnknown = true;
-        } else {
-          textChars += stripped.length;
-        }
+        textChars += countMessageTextChars(apiMessages);
       }
 
       // Responses shape: input list (or plain string) — only when there
@@ -912,7 +953,9 @@ export class ProviderManager {
       const tools = body.tools;
       if (Array.isArray(tools) && tools.length > 0) {
         sawPromptShape = true;
-        const serialized = safeStringify(tools);
+        // Canonical compact serialization, matching the node's billed
+        // tool-definition character count (indentation is not billed).
+        const serialized = safeStringifyCompact(tools);
         if (serialized === null) {
           textEstimateUnknown = true;
         } else {
@@ -920,9 +963,9 @@ export class ProviderManager {
         }
       }
 
-      // ~2.84 chars per token keeps the estimate at or above the node's
-      // ~3 chars/token heuristic while still counting the serialized
-      // structure (roles, JSON syntax) the node ignores.
+      // ~2.84 chars per token keeps the client estimate at or above the
+      // node's ~3 chars/token heuristic, so the client reserves a small
+      // conservative margin over the server's (authoritative) heuristic.
       const approximateTokens = textEstimateUnknown
         ? 10_000 // serialization failed; assume a full prompt
         : sawPromptShape
