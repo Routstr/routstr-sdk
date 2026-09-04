@@ -23,6 +23,21 @@
 export const USER_CACHE_SECRET_FIELD = "user_cache_secret";
 export const USER_CACHE_SECRET_ENV = "TINFOIL_USER_CACHE_SECRET";
 
+/** Options accepted by {@link resolveUserCacheSecret}. */
+export interface ResolveUserCacheSecretOptions {
+  /** Explicit secret value. The first non-empty value wins. */
+  explicit?: string;
+  /**
+   * Optional file path for the persisted default secret (analogous to
+   * `options.dbPath` on the sqlite storage driver). When omitted, the
+   * secret persists at `~/.tinfoil/user_cache_secret` — the same location
+   * Tinfoil's own SDKs use, so one machine shares one cache namespace
+   * across tools. Set this to keep an app's secret isolated (e.g. inside a
+   * routstrd data directory).
+   */
+  persistPath?: string;
+}
+
 /**
  * OpenAI-compatible endpoints whose bodies carry the field. Matched by path
  * suffix so `/v1/chat/completions`, `/chat/completions`, and custom
@@ -102,6 +117,7 @@ function getEphemeralUserCacheSecret(): string {
 }
 
 type NodeFs = typeof import("node:fs");
+type NodePath = typeof import("node:path");
 
 function readSecretFile(fs: NodeFs, file: string): string | undefined | null {
   try {
@@ -115,32 +131,53 @@ function readSecretFile(fs: NodeFs, file: string): string | undefined | null {
 }
 
 /**
- * Persist the secret at `~/.tinfoil/user_cache_secret` (the same location
- * Tinfoil's own SDKs use) so one machine gets one cache namespace across
- * Tinfoil SDKs. Falls back to null when the filesystem is unavailable or
- * unwritable, which lets the caller use an in-memory secret.
+ * Resolve the file used for the persisted default secret. A `persistPath`
+ * option wins; otherwise we use `~/.tinfoil/user_cache_secret` — the same
+ * location Tinfoil's own SDKs use, so one machine gets one cache namespace
+ * across Tinfoil SDKs. Returns null when no location is available.
+ */
+async function defaultPersistLocation(
+  path: NodePath,
+  persistPath?: string
+): Promise<{ dir: string; file: string } | null> {
+  if (persistPath !== undefined && persistPath !== "") {
+    return { dir: path.dirname(persistPath), file: persistPath };
+  }
+
+  const os = await import("node:os");
+  const home = os.homedir();
+  if (!home) {
+    return null;
+  }
+
+  const dir = path.join(home, USER_CACHE_SECRET_DIR_NAME);
+  return { dir, file: path.join(dir, USER_CACHE_SECRET_FILE_NAME) };
+}
+
+/**
+ * Persist the generated secret (see {@link defaultPersistLocation} for where).
+ * Falls back to null when the filesystem is unavailable or unwritable, which
+ * lets the caller use an in-memory secret.
  */
 async function loadOrPersistUserCacheSecret(
-  generate: () => string
+  generate: () => string,
+  persistPath?: string
 ): Promise<string | null> {
   if (!isNodeLikeRuntime()) {
     return null;
   }
 
   try {
-    const [fs, os, path] = await Promise.all([
+    const [fs, path] = await Promise.all([
       import("node:fs"),
-      import("node:os"),
       import("node:path"),
     ]);
 
-    const home = os.homedir();
-    if (!home) {
+    const location = await defaultPersistLocation(path, persistPath);
+    if (!location) {
       return null;
     }
-
-    const dir = path.join(home, USER_CACHE_SECRET_DIR_NAME);
-    const file = path.join(dir, USER_CACHE_SECRET_FILE_NAME);
+    const { dir, file } = location;
 
     const existing = readSecretFile(fs, file);
     if (existing !== undefined) {
@@ -175,18 +212,35 @@ async function loadOrPersistUserCacheSecret(
 }
 
 let defaultUserCacheSecretPromise: Promise<string> | undefined;
+const customPathSecretPromises = new Map<string, Promise<string>>();
+
+function generateThenPersist(persistPath?: string): Promise<string> {
+  return loadOrPersistUserCacheSecret(newUserCacheSecret, persistPath).then(
+    (secret) => {
+      if (secret === null || secret === "") {
+        return getEphemeralUserCacheSecret();
+      }
+      return secret;
+    }
+  );
+}
 
 /**
  * Resolve the client-level secret. The first non-empty value wins:
  *
  *  1. an explicit `userCacheSecret` option,
  *  2. the `TINFOIL_USER_CACHE_SECRET` environment variable,
- *  3. a generated secret persisted at `~/.tinfoil/user_cache_secret`,
- *     falling back to a process-lifetime in-memory secret.
+ *  3. a generated secret persisted at `options.persistPath` (or
+ *     `~/.tinfoil/user_cache_secret` when unset), falling back to a
+ *     process-lifetime in-memory secret.
  *
- * Never throws.
+ * Persisted results are memoized per path, so callers share one lookup (and
+ * one file) per location. Never throws.
  */
-export function resolveUserCacheSecret(explicit?: string): Promise<string> {
+export function resolveUserCacheSecret(
+  options?: ResolveUserCacheSecretOptions
+): Promise<string> {
+  const explicit = options?.explicit;
   if (explicit !== undefined && explicit !== "") {
     return Promise.resolve(explicit);
   }
@@ -196,15 +250,18 @@ export function resolveUserCacheSecret(explicit?: string): Promise<string> {
     return Promise.resolve(env);
   }
 
+  const persistPath = options?.persistPath;
+  if (persistPath !== undefined && persistPath !== "") {
+    let pending = customPathSecretPromises.get(persistPath);
+    if (!pending) {
+      pending = generateThenPersist(persistPath);
+      customPathSecretPromises.set(persistPath, pending);
+    }
+    return pending;
+  }
+
   if (!defaultUserCacheSecretPromise) {
-    defaultUserCacheSecretPromise = loadOrPersistUserCacheSecret(
-      newUserCacheSecret
-    ).then((secret) => {
-      if (secret === null || secret === "") {
-        return getEphemeralUserCacheSecret();
-      }
-      return secret;
-    });
+    defaultUserCacheSecretPromise = generateThenPersist();
   }
 
   return defaultUserCacheSecretPromise;

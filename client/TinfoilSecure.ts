@@ -44,6 +44,14 @@ export interface TinfoilClientOptions {
    * persisted at ~/.tinfoil/user_cache_secret.
    */
   userCacheSecret?: string;
+  /**
+   * Optional file path for the persisted default `userCacheSecret` (analogous
+   * to `options.dbPath` on the sqlite storage driver). When omitted, the
+   * secret persists at ~/.tinfoil/user_cache_secret, shared with Tinfoil's
+   * own SDKs. Set this to keep an app's secret isolated (e.g. inside a
+   * routstrd data directory).
+   */
+  tinfoilCacheSecretPath?: string;
 }
 
 const TINFOIL_MODEL_PREFIX = "tinfoil-";
@@ -325,7 +333,10 @@ export async function fetchTinfoilPreservingPlaintextErrors(
   const context = await prepareTinfoilClient(options);
   const ehbp = await import("ehbp");
   const normalized = normalizeFetchArgs(input, init);
-  const userCacheSecret = await resolveUserCacheSecret(options.userCacheSecret);
+  const userCacheSecret = await resolveUserCacheSecret({
+    explicit: options.userCacheSecret,
+    persistPath: options.tinfoilCacheSecretPath,
+  });
 
   try {
     return await fetchTinfoilEhbpOnce(

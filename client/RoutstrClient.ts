@@ -127,6 +127,14 @@ export interface RoutstrClientConfig {
    * `routeRequest` calls can override this with their own `userCacheSecret`.
    */
   userCacheSecret?: string;
+  /**
+   * Optional file path for the persisted default `userCacheSecret`
+   * (analogous to `options.dbPath` on the sqlite storage driver). When
+   * omitted, the secret persists at `~/.tinfoil/user_cache_secret`, shared
+   * with Tinfoil's own SDKs. Set this to keep the app's secret isolated
+   * (e.g. inside a routstrd data directory).
+   */
+  tinfoilCacheSecretPath?: string;
 }
 
 export class RoutstrClient {
@@ -141,6 +149,7 @@ export class RoutstrClient {
   private logger: SdkLogger;
   private requestResponseLogSink?: RequestResponseLogSink;
   private userCacheSecret?: string;
+  private tinfoilCacheSecretPath?: string;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -171,6 +180,7 @@ export class RoutstrClient {
     this.sdkStore = options.sdkStore;
     this.requestResponseLogSink = options.requestResponseLogSink;
     this.userCacheSecret = options.userCacheSecret;
+    this.tinfoilCacheSecretPath = options.tinfoilCacheSecretPath;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
@@ -457,6 +467,7 @@ export class RoutstrClient {
       maxTokens: requestMaxTokens,
       tinfoilEnabled,
       userCacheSecret,
+      tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
     });
 
@@ -591,6 +602,8 @@ export class RoutstrClient {
     tinfoilEnabled?: boolean;
     /** Secret scoping Tinfoil's prompt cache for this request. */
     userCacheSecret?: string;
+    /** File path for the persisted default secret (client-level). */
+    tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
   }): Promise<Response> {
@@ -619,7 +632,11 @@ export class RoutstrClient {
 
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
-            { baseUrl, userCacheSecret: params.userCacheSecret },
+            {
+              baseUrl,
+              userCacheSecret: params.userCacheSecret,
+              tinfoilCacheSecretPath: params.tinfoilCacheSecretPath,
+            },
             url,
             {
               method,

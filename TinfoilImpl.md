@@ -176,7 +176,11 @@ neither Routstr nor any network observer ever sees it. Resolution order:
 2. Client-level `RoutstrClientConfig.userCacheSecret`,
 3. `TINFOIL_USER_CACHE_SECRET` environment variable,
 4. A generated secret persisted at `~/.tinfoil/user_cache_secret` (Node/Bun),
-   falling back to a process-lifetime in-memory secret in browsers.
+   falling back to a process-lifetime in-memory secret in browsers. Set
+   `RoutstrClientConfig.tinfoilCacheSecretPath` to persist at a custom file
+   instead (analogous to `options.dbPath` on the sqlite storage driver) —
+   useful to keep an app's secret isolated inside its own data directory
+   rather than the location shared with Tinfoil's own SDKs.
 
 > **Multi-user deployments:** Routstr-core authenticates to Tinfoil with a single
 > API key shared by all of its users. Without a distinct per-user secret, those
