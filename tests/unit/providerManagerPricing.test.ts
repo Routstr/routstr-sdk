@@ -1290,6 +1290,53 @@ describe("ProviderManager", () => {
       expect(cost).toBe(300);
     });
 
+    it("counts Responses input text content, not the JSON envelope", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 1, // 1 sat/token so prompt cost == token count
+          completion: 0,
+          max_completion_cost: 1,
+        } as any,
+      };
+
+      // 300 chars of billed text across the Responses field set:
+      // input_text(100) + function_call.arguments(50) +
+      // function_call_output.output(50) + reasoning summary(50) +
+      // content part text(40) + refusal(10) = 300. The huge
+      // encrypted_content must NOT be counted.
+      const input = [
+        { type: "input_text", text: "x".repeat(100) },
+        { type: "function_call", arguments: "x".repeat(50) },
+        { type: "function_call_output", output: "x".repeat(50) },
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "x".repeat(50) }],
+          encrypted_content: "y".repeat(5000), // skipped
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: "x".repeat(40) },
+            { type: "refusal", refusal: "x".repeat(10) },
+          ],
+        },
+      ];
+
+      const expectedTokens = Math.ceil(300 / 2.84);
+      const cost = manager.getRequiredSatsForModel(
+        model,
+        [],
+        undefined,
+        { input }
+      );
+      // (tokens*1 + max_completion_cost 1) * 1.05; encrypted_content excluded
+      expect(cost).toBeCloseTo((expectedTokens + 1) * 1.05, 5);
+    });
+
     it("prices image detail levels, remote URLs, and file_id references", () => {
       const manager = new ProviderManager(createRegistry());
       const model: Model = {
