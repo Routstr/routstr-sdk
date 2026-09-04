@@ -1113,7 +1113,11 @@ describe("ProviderManager", () => {
         modelWithEnvelope,
         [circular]
       );
-      expect(costWithEnvelope).toBe((10000 * 0.5 + 200) * 1.05);
+      // Content-based counting never serializes the message envelope, so a
+      // circular content reference no longer trips the 10,000-token
+      // fallback: textLength counts it as 0 (un-stringifiable) and the
+      // estimate is the completion floor.
+      expect(costWithEnvelope).toBe((0 * 0.5 + 200) * 1.05);
     });
 
     it("counts Responses input and instructions instead of the 10k default", () => {
@@ -1212,6 +1216,59 @@ describe("ProviderManager", () => {
         { tools }
       );
       expect(toolsOnly).toBeGreaterThan(200 * 1.05);
+    });
+
+    it("matches the node's billed-char numerator on a real captured request", () => {
+      // Fixture derived from a real captured deepseek-v4-pro-0813 request
+      // (routstr-core fixtures: billedTotal=112793). The estimator must
+      // count ONLY billed content (string/text content + tool_calls
+      // name/args + compact tool defs), NOT the pretty-printed JSON
+      // envelope. The old indent=2 messages-only numerator was 209,678
+      // chars (73,830 tok); the corrected numerator is 112,793 chars.
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "deepseek-v4-pro-0813",
+        name: "test",
+        sats_pricing: {
+          prompt: 1, // 1 sat/token so prompt cost == token count
+          completion: 0,
+          max_completion_cost: 1, // non-zero so it's not treated as missing
+        } as any,
+      };
+
+      const s = (n: number) => "x".repeat(n);
+      const messages = [
+        { role: "system", content: s(71235) }, // messageContent
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              function: { name: s(124), arguments: s(21053) }, // toolCallsSubtotal
+            },
+          ],
+        },
+      ];
+      // tools def sized to the fixture's canonical (compact) total.
+      const toolDef = {
+        type: "function",
+        function: { name: "t", description: s(20381 - 60) },
+      };
+      const toolsPad = 20381 - JSON.stringify([toolDef]).length;
+      toolDef.function.description = s(20381 - 60 + toolsPad);
+      const tools = [toolDef];
+      expect(JSON.stringify(tools).length).toBe(20381);
+
+      // prompt = ceil((71235 + 124 + 21053 + 20381) / 2.84) = ceil(112793/2.84)
+      const expectedTokens = Math.ceil(112793 / 2.84);
+      const cost = manager.getRequiredSatsForModel(
+        model,
+        messages,
+        undefined,
+        { messages, tools }
+      );
+      // (prompt*1 sat * tokens + max_completion_cost 1 + request 0) * 1.05
+      expect(cost).toBeCloseTo((expectedTokens + 1) * 1.05, 5);
     });
 
     it("caps the estimate at the model's max_cost envelope", () => {
