@@ -332,18 +332,6 @@ function countImageTokensInResponsesInput(input: any): number {
 }
 
 /**
- * JSON.stringify that never throws (circular references etc. return null
- * so callers can fall back to a conservative token count).
- */
-function safeStringify(value: unknown): string | null {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Compact (canonical) JSON.stringify that never throws. Uses the same
  * `JSON.stringify(value)` form the node uses for its billed-char counts
  * (separators `,`/`:`), so object/array payloads contribute the same
@@ -407,35 +395,60 @@ function countMessageTextChars(apiMessages: any[]): number {
 }
 
 /**
- * Strip image items/parts and encrypted reasoning payloads from a
- * Responses API input list before serializing it for the text token
- * estimate: base64 image data and encrypted_content massively overstate
- * the prompt, and the node counts neither as prompt text.
+ * Count the billed text characters across a Responses API `input` list,
+ * excluding the JSON envelope. Mirrors the node's
+ * `estimate_tokens_from_input`: counts `input_text.text`,
+ * `function_call.arguments`, `function_call_output.output`, the visible
+ * `summary[].text` of `reasoning` items (NOT `encrypted_content`, whose
+ * base64 overstates the reasoning tokens), message `content` strings, and
+ * content-part `text` + `refusal`. Image parts contribute zero here (they
+ * are priced separately as tokens).
  */
-function stripImagesFromResponsesInput(input: any[]): any[] {
-  const result: any[] = [];
+function countResponsesInputTextChars(input: any[]): number {
+  if (!Array.isArray(input)) return 0;
+  let total = 0;
   for (const item of input) {
-    if (!item || typeof item !== "object") {
-      result.push(item);
+    if (!item || typeof item !== "object") continue;
+    const itemType = item.type;
+
+    if (itemType === "input_text") {
+      total += textLength(item.text);
       continue;
     }
-    if (item.type === "input_image") continue; // dropped entirely
-    if (item.type === "reasoning" && typeof item.encrypted_content === "string") {
-      const { encrypted_content, ...rest } = item;
-      result.push(rest);
+    if (itemType === "function_call") {
+      total += textLength(item.arguments);
       continue;
     }
-    if (Array.isArray(item.content)) {
-      const filtered = item.content.filter(
-        (p: any) =>
-          !(p && typeof p === "object" && p.type === "input_image")
-      );
-      result.push({ ...item, content: filtered });
+    if (itemType === "function_call_output") {
+      total += textLength(item.output);
       continue;
     }
-    result.push(item);
+    if (itemType === "reasoning") {
+      const summary = item.summary;
+      if (Array.isArray(summary)) {
+        for (const part of summary) {
+          if (part && typeof part === "object") {
+            total += textLength(part.text);
+          }
+        }
+      }
+      // fall through to also count content (below)
+    }
+
+    const content = item.content;
+    if (typeof content === "string") {
+      total += content.length;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        total += textLength(part.text);
+        if (typeof part.refusal === "string") {
+          total += part.refusal.length;
+        }
+      }
+    }
   }
-  return result;
+  return total;
 }
 
 /**
@@ -922,19 +935,13 @@ export class ProviderManager {
 
       // Responses shape: input list (or plain string) — only when there
       // are no chat messages, matching the node's messages-first choice.
+      // Count only billed text content, not the serialized envelope.
       const responsesInput = body.input;
       if (!sawPromptShape) {
         if (Array.isArray(responsesInput)) {
           sawPromptShape = true;
           imageTokens += countImageTokensInResponsesInput(responsesInput);
-          const stripped = safeStringify(
-            stripImagesFromResponsesInput(responsesInput)
-          );
-          if (stripped === null) {
-            textEstimateUnknown = true;
-          } else {
-            textChars += stripped.length;
-          }
+          textChars += countResponsesInputTextChars(responsesInput);
         } else if (typeof responsesInput === "string") {
           sawPromptShape = true;
           textChars += responsesInput.length;
