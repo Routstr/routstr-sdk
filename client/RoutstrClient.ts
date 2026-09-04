@@ -82,6 +82,14 @@ export interface RouteRequestParams {
   mintUrl: string;
   modelId?: string;
   clientApiKey?: string;
+  /**
+   * Optional per-request secret scoping Tinfoil's prompt cache. Prefer a
+   * stable, opaque, per-end-user value in multi-user deployments so users
+   * under the same Tinfoil API identity cannot observe each other's cache
+   * timing. Falls back to the client-level option, then the
+   * TINFOIL_USER_CACHE_SECRET environment variable, then a generated secret.
+   */
+  userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
 }
@@ -114,6 +122,19 @@ export interface RoutstrClientConfig {
   logger?: SdkLogger;
   /** Optional: raw request/response logging callbacks supplied by the runtime/app. */
   requestResponseLogSink?: RequestResponseLogSink;
+  /**
+   * Optional client-level secret scoping Tinfoil's prompt cache. Individual
+   * `routeRequest` calls can override this with their own `userCacheSecret`.
+   */
+  userCacheSecret?: string;
+  /**
+   * Optional file path for the persisted default `userCacheSecret`
+   * (analogous to `options.dbPath` on the sqlite storage driver). When
+   * omitted, the secret persists at `~/.tinfoil/user_cache_secret`, shared
+   * with Tinfoil's own SDKs. Set this to keep the app's secret isolated
+   * (e.g. inside a routstrd data directory).
+   */
+  tinfoilCacheSecretPath?: string;
 }
 
 export class RoutstrClient {
@@ -127,6 +148,8 @@ export class RoutstrClient {
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
   private requestResponseLogSink?: RequestResponseLogSink;
+  private userCacheSecret?: string;
+  private tinfoilCacheSecretPath?: string;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -156,6 +179,8 @@ export class RoutstrClient {
     this.usageTrackingDriver = options.usageTrackingDriver;
     this.sdkStore = options.sdkStore;
     this.requestResponseLogSink = options.requestResponseLogSink;
+    this.userCacheSecret = options.userCacheSecret;
+    this.tinfoilCacheSecretPath = options.tinfoilCacheSecretPath;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
@@ -311,7 +336,10 @@ export class RoutstrClient {
       mintUrl,
       modelId,
       clientApiKey: providedClientApiKey,
+      userCacheSecret: providedUserCacheSecret,
     } = params;
+
+    const userCacheSecret = providedUserCacheSecret ?? this.userCacheSecret;
 
     // Extract clientApiKey from incoming headers then discard them — they must
     // not be forwarded upstream (the client's Authorization Bearer key would
@@ -438,6 +466,8 @@ export class RoutstrClient {
       selectedMintUrl,
       maxTokens: requestMaxTokens,
       tinfoilEnabled,
+      userCacheSecret,
+      tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
     });
 
@@ -570,6 +600,10 @@ export class RoutstrClient {
     retryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /** Secret scoping Tinfoil's prompt cache for this request. */
+    userCacheSecret?: string;
+    /** File path for the persisted default secret (client-level). */
+    tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
   }): Promise<Response> {
@@ -598,7 +632,11 @@ export class RoutstrClient {
 
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
-            { baseUrl },
+            {
+              baseUrl,
+              userCacheSecret: params.userCacheSecret,
+              tinfoilCacheSecretPath: params.tinfoilCacheSecretPath,
+            },
             url,
             {
               method,

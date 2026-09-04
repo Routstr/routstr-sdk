@@ -19,6 +19,7 @@ routing without parsing the encrypted body.
 | File | Role |
 |---|---|
 | `client/TinfoilSecure.ts` | Tinfoil model detection, `SecureClient` creation/cache, attestation helpers, EHBP fetch wrapper that preserves plaintext proxy errors |
+| `client/TinfoilCacheSecret.ts` | `user_cache_secret` resolution (option → env → persisted default) and splice-injection into eligible request bodies before EHBP sealing |
 | `client/RoutstrClient.ts` | Detects `tinfoil-*`, attests before token spend, uses the Tinfoil EHBP fetch wrapper for the request |
 | `client/index.ts` | Re-exports Tinfoil helpers |
 
@@ -115,7 +116,7 @@ key-rotation behavior.
 ```txt
 SDK
   X-Routstr-Model: tinfoil-kimi-k2-6
-  encrypted body: { model: "kimi-k2-6", ... }
+  encrypted body: { model: "kimi-k2-6", user_cache_secret: "<secret>", ... }
     ↓
 Routstr proxy
   reads X-Routstr-Model for billing/routing
@@ -158,6 +159,34 @@ Optional environment overrides:
 | `ROUTSTR_TINFOIL_ATTESTATION_BUNDLE_URL` | Custom attestation bundle origin. `SecureClient` fetches `${url}/attestation`. |
 | `ROUTSTR_TINFOIL_ENCLAVE_URL` | Explicit enclave URL for custom deployments. |
 | `ROUTSTR_TINFOIL_CONFIG_REPO` | Repo used by Tinfoil verifier for custom enclave code verification. |
+| `TINFOIL_USER_CACHE_SECRET` | Optional stable secret scoping Tinfoil's prompt cache. Overrides the generated `~/.tinfoil/user_cache_secret` default. |
+
+## Prompt caching (`user_cache_secret`)
+
+Tinfoil salts its prompt cache so one tenant cannot time another tenant's cached
+prefixes. The cache namespace is derived from the authenticated Tinfoil API
+identity (the tenant) plus a client-held `user_cache_secret` carried inside the
+encrypted request body.
+
+The SDK injects this field for eligible POST requests (`/chat/completions`,
+`/completions`, `/responses`) **before** the EHBP transport seals the body, so
+neither Routstr nor any network observer ever sees it. Resolution order:
+
+1. Per-request `RouteRequestParams.userCacheSecret`,
+2. Client-level `RoutstrClientConfig.userCacheSecret`,
+3. `TINFOIL_USER_CACHE_SECRET` environment variable,
+4. A generated secret persisted at `~/.tinfoil/user_cache_secret` (Node/Bun),
+   falling back to a process-lifetime in-memory secret in browsers. Set
+   `RoutstrClientConfig.tinfoilCacheSecretPath` to persist at a custom file
+   instead (analogous to `options.dbPath` on the sqlite storage driver) —
+   useful to keep an app's secret isolated inside its own data directory
+   rather than the location shared with Tinfoil's own SDKs.
+
+> **Multi-user deployments:** Routstr-core authenticates to Tinfoil with a single
+> API key shared by all of its users. Without a distinct per-user secret, those
+> users share one Tinfoil cache namespace and can observe each other's cache
+> timing. Applications serving multiple users must set a stable, opaque,
+> per-user `userCacheSecret` on every request (or per-user client instance).
 
 ## Important notes
 
