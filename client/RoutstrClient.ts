@@ -395,7 +395,8 @@ export class RoutstrClient {
         requiredSats = this.providerManager.getRequiredSatsForModel(
           selectedModel,
           requestMessages,
-          requestMaxTokens
+          requestMaxTokens,
+          requestBodyForPricing
         );
       }
     }
@@ -1427,7 +1428,10 @@ export class RoutstrClient {
       const newRequiredSats = this.providerManager.getRequiredSatsForModel(
         newModel,
         messagesForPricing,
-        params.maxTokens
+        params.maxTokens,
+        body && typeof body === "object"
+          ? (body as Record<string, unknown>)
+          : undefined
       );
 
       if (params.tinfoilEnabled) {
