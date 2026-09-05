@@ -210,13 +210,29 @@ async function isEhbpKeyConfigMismatchResponse(
     return false;
   }
 
-  if (!isProblemJsonContentType(response.headers.get("content-type"))) {
-    return false;
+  // Primary path: the enclave (or a proxy that passes it through) returns
+  // 422 application/problem+json with the key-config URN.
+  if (isProblemJsonContentType(response.headers.get("content-type"))) {
+    try {
+      const problem = await response.clone().json();
+      if (problem?.type === protocol.KEY_CONFIG_PROBLEM_TYPE) {
+        return true;
+      }
+    } catch {
+      // Fall through to secondary check below.
+    }
   }
 
+  // Secondary path: a routstr proxy may have wrapped the upstream 422 into
+  // its own application/json error envelope (destroying the problem+json
+  // content type).  Detect the key-config URN or the enclave's canonical
+  // title anywhere in the body so the retry still fires.
   try {
-    const problem = await response.clone().json();
-    return problem?.type === protocol.KEY_CONFIG_PROBLEM_TYPE;
+    const body = await response.clone().text();
+    return (
+      body.includes(protocol.KEY_CONFIG_PROBLEM_TYPE) ||
+      body.includes("failed to read decrypted request body")
+    );
   } catch {
     return false;
   }
