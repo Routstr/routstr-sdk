@@ -365,12 +365,22 @@ export class RoutstrClient {
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
         const requestBodyForPricing = (body ?? {}) as Record<string, unknown>;
+        // Completion budget for pricing. max_completion_tokens (the
+        // OpenAI-standard chat field) wins when present: it's what
+        // reasoning-capable upstreams actually enforce, and routstrd now
+        // injects it as the default cap — so it reflects the real billing
+        // ceiling even when a legacy max_tokens rides alongside it.
+        // Precedence: max_completion_tokens → max_tokens (legacy chat) →
+        // max_output_tokens (Responses API). Undefined prices at the
+        // provider's worst-case max_completion_cost.
         requestMaxTokens =
-          typeof requestBodyForPricing.max_tokens === "number"
-            ? (requestBodyForPricing.max_tokens as number)
-            : typeof requestBodyForPricing.max_output_tokens === "number"
-              ? (requestBodyForPricing.max_output_tokens as number)
-              : undefined;
+          typeof requestBodyForPricing.max_completion_tokens === "number"
+            ? (requestBodyForPricing.max_completion_tokens as number)
+            : typeof requestBodyForPricing.max_tokens === "number"
+              ? (requestBodyForPricing.max_tokens as number)
+              : typeof requestBodyForPricing.max_output_tokens === "number"
+                ? (requestBodyForPricing.max_output_tokens as number)
+                : undefined;
 
         this._log(
           "DEBUG",
