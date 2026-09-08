@@ -71,12 +71,7 @@ export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
-const TOPUP_MARGIN = 1.2;
-
-/** Minimum time between proactive (pre-request) topup attempts for the
- *  same API key. Prevents tight background retry loops when topups keep
- *  failing while requests continue to stream in. */
-const PROACTIVE_TOPUP_COOLDOWN_MS = 30_000;
+const TOPUP_MARGIN = 1.4;
 
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
@@ -164,10 +159,6 @@ export class RoutstrClient {
    *  callers — proactive spin-offs and 402 handlers alike — share a single
    *  topUp call instead of stacking multiple deposits. */
   private _inflightTopups = new Map<string, Promise<TopUpResult>>();
-
-  /** Last time a proactive (pre-request) topup attempt was started, keyed
-   *  by `${baseUrl}:${apiKey}`. Cooldown backing store. */
-  private _lastProactiveTopupAt = new Map<string, number>();
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -1967,11 +1958,11 @@ export class RoutstrClient {
     if (snapshotSats >= snapshot.requiredSats) return;
 
     const key = `${snapshot.baseUrl}:${snapshot.token}`;
+    // A topup is already in flight for this key — join it instead of
+    // stacking another deposit. This in-flight guard is the only
+    // concurrency control needed under heavy parallel request load.
     if (this._inflightTopups.has(key)) return;
-    const lastAttempt = this._lastProactiveTopupAt.get(key) ?? 0;
-    if (Date.now() - lastAttempt < PROACTIVE_TOPUP_COOLDOWN_MS) return;
 
-    this._lastProactiveTopupAt.set(key, Date.now());
     this._log(
       "DEBUG",
       `[RoutstrClient] _spinOffTopupIfNeeded: snapshot balance=${snapshotSats} sat < required=${snapshot.requiredSats} sat for ${snapshot.baseUrl}; spinning off background topup`

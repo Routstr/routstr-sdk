@@ -142,7 +142,6 @@ function spinOff(
 describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -157,16 +156,16 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
     const topUp = vi
       .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 96, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 112, message: "ok" });
 
     spinOff(client);
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // shortfall = 100 - 20 = 80 → 80 * TOPUP_MARGIN(1.2)
+    // shortfall = 100 - 20 = 80 → 80 * TOPUP_MARGIN(1.4)
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 80 * 1.2,
+      amount: 80 * 1.4,
       token: API_KEY,
     });
     // After a successful topup the refreshed balance is persisted so the
@@ -187,16 +186,16 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
     const topUp = vi
       .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 108, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 126, message: "ok" });
 
     spinOff(client, { tokenBalance: 20 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // available = 20 - 10 = 10 → shortfall = 90 → 90 * 1.2
+    // available = 20 - 10 = 10 → shortfall = 90 → 90 * 1.4
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 90 * 1.2,
+      amount: 90 * 1.4,
       token: API_KEY,
     });
   });
@@ -217,11 +216,11 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     spinOff(client, { tokenBalance: 99 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // floor = 0.21 * 100 = 21 → 21 * 1.2
+    // floor = 0.21 * 100 = 21 → 21 * 1.4
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 21 * 1.2,
+      amount: 21 * 1.4,
       token: API_KEY,
     });
   });
@@ -297,8 +296,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     // rejection surfaced — vitest fails the run on those by default.
   });
 
-  it("applies a cooldown between proactive attempts so requests do not loop topups", async () => {
-    vi.useFakeTimers();
+  it("allows a new proactive attempt as soon as the previous one settles (no cooldown)", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
@@ -312,20 +310,13 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .mockResolvedValue({ success: true, message: "ok" });
 
     spinOff(client);
-    await vi.advanceTimersByTimeAsync(10);
-    expect(topUp).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
 
-    // Second request immediately after — blocked by the cooldown, not by
-    // the (already settled) in-flight guard.
+    // The first attempt settled, so a new low-balance snapshot may start
+    // another one immediately — the in-flight guard is the only
+    // concurrency control.
     spinOff(client);
-    await vi.advanceTimersByTimeAsync(10);
-    expect(topUp).toHaveBeenCalledTimes(1);
-
-    // After the cooldown window a new proactive attempt is allowed.
-    vi.advanceTimersByTime(30_001);
-    spinOff(client);
-    await vi.advanceTimersByTimeAsync(10);
-    expect(topUp).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledTimes(2));
   });
 
   it("shares one in-flight topup between concurrent spin-offs", async () => {
@@ -400,7 +391,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       0
     );
 
-    resolveTopUp({ success: true, toppedUpAmount: 96, message: "ok" });
+    resolveTopUp({ success: true, toppedUpAmount: 112, message: "ok" });
     const response = await handled;
 
     expect(response.status).toBe(200);
@@ -428,7 +419,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const topUp = vi.spyOn(balanceManager, "topUp").mockImplementation(
       async () => {
         topUpStarted = true;
-        return { success: true, toppedUpAmount: 96, message: "ok" };
+        return { success: true, toppedUpAmount: 112, message: "ok" };
       }
     );
 
