@@ -170,10 +170,10 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       amount: 120,
       token: API_KEY,
     });
-    // After a successful topup the refreshed balance is persisted so the
-    // stored snapshot does not stay stale-low.
+    // After a successful topup the new total is persisted from toppedUpAmount
+    // (snapshot 20 + added 120) so the stored snapshot isn't stale-low.
     await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 20, 0)
+      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 140, 0)
     );
   });
 
@@ -204,31 +204,6 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
   });
 
-  it("accounts for reserved funds in the fresh balance re-check", async () => {
-    const { client } = createClient();
-    const balanceManager = client.getBalanceManager();
-    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 20_000, // 20 sat total
-      reserved: 10_000, // 10 sat reserved → 10 sat available
-      unit: "msat",
-      apiKey: API_KEY,
-    });
-    const topUp = vi
-      .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 130, message: "ok" });
-
-    spinOff(client, { tokenBalance: 20 });
-
-    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // available = 20 - 10 = 10 → shortfall vs target = 140 - 10 = 130
-    expect(topUp).toHaveBeenCalledWith({
-      mintUrl: MINT_URL,
-      baseUrl: BASE_URL,
-      amount: 130,
-      token: API_KEY,
-    });
-  });
-
   it("applies the 0.21-floor when the shortfall is tiny", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
@@ -254,22 +229,34 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
   });
 
-  it("skips the topup when the fresh balance is already sufficient (stale snapshot)", async () => {
+  it("tops up from the snapshot without re-fetching the balance first", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
-    // Snapshot says 20 sat, but the fresh provider check says plenty.
-    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 150_000,
-      reserved: 10_000,
-      unit: "msat",
-      apiKey: API_KEY,
+    // A fresh call would say the key is plenty (150-10=140 sat), but the
+    // proactive path trusts the snapshot and does not consult the provider
+    // before topping up.
+    const getTokenBalance = vi
+      .spyOn(balanceManager, "getTokenBalance")
+      .mockResolvedValue({
+        amount: 150_000,
+        reserved: 10_000,
+        unit: "msat",
+        apiKey: API_KEY,
+      });
+    const topUp = vi
+      .spyOn(balanceManager, "topUp")
+      .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
+
+    spinOff(client); // snapshot: 20 sat available < target 140
+
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    expect(topUp).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      baseUrl: BASE_URL,
+      amount: 120, // shortfall vs target from the snapshot (140 - 20)
+      token: API_KEY,
     });
-    const topUp = vi.spyOn(balanceManager, "topUp");
-
-    spinOff(client);
-    await new Promise((r) => setTimeout(r, 10));
-
-    expect(topUp).not.toHaveBeenCalled();
+    expect(getTokenBalance).not.toHaveBeenCalled();
   });
 
   it("does not spin off when the snapshot balance is already sufficient", async () => {
@@ -326,7 +313,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
   });
 
   it("allows a new proactive attempt as soon as the previous one settles (no cooldown)", async () => {
-    const { client } = createClient();
+    const { client, updateApiKeyBalance } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
       amount: 20_000,
@@ -340,6 +327,9 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
 
     spinOff(client);
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    // Wait until the in-flight entry is fully cleared (the post-topup
+    // persist is the last step) before firing the next snapshot.
+    await vi.waitFor(() => expect(updateApiKeyBalance).toHaveBeenCalledOnce());
 
     // The first attempt settled, so a new low-balance snapshot may start
     // another one immediately — the in-flight guard is the only

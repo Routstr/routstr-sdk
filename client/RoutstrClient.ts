@@ -1946,9 +1946,9 @@ export class RoutstrClient {
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
   // Stored API-key snapshots contain both total and last-known reserved
-  // balance. They are not authoritative — parallel requests may change
-  // reservations immediately — so the background task re-validates against
-  // a fresh balance before moving funds.
+  // balance. The trigger and background task both trust this snapshot (no
+  // extra balance round-trip); the post-topup total is persisted from topUp's
+  // toppedUpAmount so the stored snapshot isn't stale-low and re-triggering.
 
   /**
    * Fire-and-forget topup spun off before a request when the API key's
@@ -2009,53 +2009,45 @@ export class RoutstrClient {
   }
 
   /**
-   * Re-validate against a fresh balance (including reserved funds) and top
-   * up only if the key is still short. Mirrors the 402 handler's amount
-   * heuristic (shortfall vs 0.21-floor, then TOPUP_MARGIN). Never throws.
+   * Top up the key based on the balance snapshot captured by _spendToken. The
+   * trigger already confirmed available < required x TOPUP_MARGIN, so we
+   * deposit exactly the shortfall to land at the margin. No extra balance
+   * round-trip: the post-topup total is persisted from topUp's
+   * toppedUpAmount so future snapshots aren't stale. Never throws.
    */
   private async _runProactiveTopup(snapshot: {
     token: string;
     baseUrl: string;
     mintUrl: string;
     requiredSats: number;
+    tokenBalance: number;
+    tokenReserved?: number;
+    tokenBalanceUnit: "sat" | "msat";
   }): Promise<TopUpResult> {
     try {
-      const info = await this.balanceManager.getTokenBalance(
-        snapshot.token,
-        snapshot.baseUrl
-      );
-      if (info.balanceUnknown) {
-        return {
-          success: false,
-          message: "proactive topup skipped: balance unknown",
-        };
-      }
-      if (info.isInvalidApiKey) {
-        return {
-          success: false,
-          message: "proactive topup skipped: API key invalid",
-        };
-      }
-      const currentSats =
-        info.unit === "msat" ? info.amount / 1000 : info.amount;
+      const tokenReserved = snapshot.tokenReserved ?? 0;
+      const snapshotSats =
+        snapshot.tokenBalanceUnit === "msat"
+          ? snapshot.tokenBalance / 1000
+          : snapshot.tokenBalance;
       const reservedSats =
-        info.unit === "msat" ? info.reserved / 1000 : info.reserved;
-      const availableSats = currentSats - reservedSats;
-      // Target the same margin the trigger uses: bring the key up to the
-      // margin (required x TOPUP_MARGIN), not merely above the request price.
-      // Otherwise a single topup makes no progress against an available balance
-      // in [required, required x margin) and oscillates with a "sufficient" no-op.
+        snapshot.tokenBalanceUnit === "msat"
+          ? tokenReserved / 1000
+          : tokenReserved;
+      const availableSats = snapshotSats - reservedSats;
+      // The trigger already guaranteed available < target, so the shortfall
+      // is exactly the amount needed to land the key at the margin.
       const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
       const shortfall = Math.max(0, targetSats - availableSats);
 
       if (shortfall <= 0) {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _runProactiveTopup: fresh balance for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat >= target=${targetSats} sat); no topup needed`
+          `[RoutstrClient] _runProactiveTopup: snapshot for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat >= target=${targetSats} sat); no topup needed`
         );
         return {
           success: true,
-          message: "proactive topup skipped: balance sufficient on fresh check",
+          message: "proactive topup skipped: balance sufficient on snapshot",
         };
       }
 
@@ -2066,8 +2058,7 @@ export class RoutstrClient {
       const result = await this.balanceManager.topUp({
         mintUrl: snapshot.mintUrl,
         baseUrl: snapshot.baseUrl,
-        // The target already includes TOPUP_MARGIN, so do not multiply again;
-        // top up exactly the shortfall to land at the margin.
+        // The target already includes TOPUP_MARGIN — deposit the shortfall.
         amount: topupAmount,
         token: snapshot.token,
       });
@@ -2076,32 +2067,17 @@ export class RoutstrClient {
         `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount}, message=${result.message}`
       );
 
-      // Persist the refreshed total and reserved snapshots: topUp never
-      // writes either value back to storage itself.
+      // Persist the new total so the stored snapshot does not stay stale-low
+      // and re-trigger a topup on every future request. topUp reports how
+      // much it added; combine it with the snapshot total instead of fetching
+      // the balance again.
       if (result.success) {
-        try {
-          const refreshed = await this.balanceManager.getTokenBalance(
-            snapshot.token,
-            snapshot.baseUrl
-          );
-          if (!refreshed.balanceUnknown) {
-            this.storageAdapter.updateApiKeyBalance(
-              snapshot.baseUrl,
-              refreshed.unit === "msat"
-                ? Math.floor(refreshed.amount / 1000)
-                : refreshed.amount,
-              refreshed.unit === "msat"
-                ? Math.floor(refreshed.reserved / 1000)
-                : refreshed.reserved
-            );
-          }
-        } catch (e) {
-          this._log(
-            "WARN",
-            `[RoutstrClient] _runProactiveTopup: could not persist refreshed balance for ${snapshot.baseUrl}`,
-            e
-          );
-        }
+        const added = result.toppedUpAmount ?? topupAmount;
+        this.storageAdapter.updateApiKeyBalance(
+          snapshot.baseUrl,
+          Math.floor(snapshotSats + added),
+          Math.floor(reservedSats)
+        );
       }
       return result;
     } catch (e) {
