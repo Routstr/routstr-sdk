@@ -19,6 +19,8 @@ export interface SdkStorageState {
     baseUrl: string;
     key: string;
     balance: number;
+    /** Last known reserved balance in sats. Optional for old persisted state. */
+    reserved?: number;
     lastUsed: number | null;
   }>;
   childKeys: Array<{

@@ -56,7 +56,10 @@ export interface WalletAdapter {
 export interface ApiKeyEntry {
   baseUrl: string;
   key: string;
-  balance: number; // tracked internally, updated via provider responses
+  balance: number; // total balance in sats, updated via provider responses
+  /** Last known reserved balance in sats. Optional for compatibility with
+   *  existing custom storage adapters and records created before this field. */
+  reserved?: number;
   lastUsed: number | null;
 }
 
@@ -91,10 +94,15 @@ export interface StorageAdapter {
   /** Store API key for a provider */
   setApiKey(baseUrl: string, key: string): void;
 
-  /** Update balance for an existing stored API key (based on provider response).
-   *  Does NOT touch `lastUsed` — call `touchApiKeyLastUsed()` separately when
-   *  the key was actually used for a request. */
-  updateApiKeyBalance(baseUrl: string, balance: number): void;
+  /** Update balance snapshots for an existing stored API key (based on a
+   *  provider response). When `reserved` is omitted, preserve the previous
+   *  reserved snapshot for backward compatibility. Does NOT touch `lastUsed`
+   *  — call `touchApiKeyLastUsed()` separately when the key was used. */
+  updateApiKeyBalance(
+    baseUrl: string,
+    balance: number,
+    reserved?: number
+  ): void;
 
   /** Mark an API key as recently used (sets `lastUsed = Date.now()`)
    *  without changing its balance.  Used for rate-limiting refund retries. */
@@ -106,8 +114,13 @@ export interface StorageAdapter {
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];
 
-  /** Get all stored API keys as distribution (baseUrl -> amount in sats) */
-  getApiKeyDistribution(): Array<{ baseUrl: string; amount: number }>;
+  /** Get stored API-key snapshots grouped by provider. `amount` is total
+   *  sats; `reserved` is the last known reserved sats and defaults to zero. */
+  getApiKeyDistribution(): Array<{
+    baseUrl: string;
+    amount: number;
+    reserved?: number;
+  }>;
 
   // ========== Child Keys (for apikeys mode) ==========
 

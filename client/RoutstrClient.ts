@@ -448,6 +448,7 @@ export class RoutstrClient {
     const {
       token,
       tokenBalance,
+      tokenReserved,
       tokenBalanceUnit,
       tokenBalanceUnknown,
       selectedMintUrl,
@@ -464,6 +465,7 @@ export class RoutstrClient {
       mintUrl,
       requiredSats,
       tokenBalance,
+      tokenReserved,
       tokenBalanceUnit,
       tokenBalanceUnknown,
     });
@@ -1195,6 +1197,11 @@ export class RoutstrClient {
             : latestBalanceInfo.unit === "msat"
               ? latestBalanceInfo.amount / 1000
               : latestBalanceInfo.amount;
+          const latestReservedBalance = latestBalanceInfo.balanceUnknown
+            ? undefined
+            : latestBalanceInfo.unit === "msat"
+              ? latestBalanceInfo.reserved / 1000
+              : latestBalanceInfo.reserved;
 
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
@@ -1210,7 +1217,8 @@ export class RoutstrClient {
           if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
             this.storageAdapter.updateApiKeyBalance(
               baseUrl,
-              latestTokenBalance
+              latestTokenBalance,
+              latestReservedBalance
             );
             this.storageAdapter.touchApiKeyLastUsed(baseUrl);
           }
@@ -1720,6 +1728,11 @@ export class RoutstrClient {
           : latestBalanceInfo.unit === "msat"
             ? latestBalanceInfo.amount / 1000
             : latestBalanceInfo.amount;
+        const latestReservedBalance = latestBalanceInfo.balanceUnknown
+          ? undefined
+          : latestBalanceInfo.unit === "msat"
+            ? latestBalanceInfo.reserved / 1000
+            : latestBalanceInfo.reserved;
 
         const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
         if (
@@ -1730,7 +1743,11 @@ export class RoutstrClient {
           this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
         if (latestTokenBalance !== undefined) {
-          this.storageAdapter.updateApiKeyBalance(baseUrl, latestTokenBalance);
+          this.storageAdapter.updateApiKeyBalance(
+            baseUrl,
+            latestTokenBalance,
+            latestReservedBalance
+          );
           this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
 
@@ -1928,11 +1945,10 @@ export class RoutstrClient {
   }
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
-  // Stored API-key balances are plain totals: they never subtract
-  // `reserved` and are not refreshed by topUp itself. A snapshot below
-  // requiredSats therefore means the key is *definitely* short (available
-  // ≤ total). The background task re-validates against a fresh balance
-  // before topping up, so a stale snapshot can never cause an over-topup.
+  // Stored API-key snapshots contain both total and last-known reserved
+  // balance. They are not authoritative — parallel requests may change
+  // reservations immediately — so the background task re-validates against
+  // a fresh balance before moving funds.
 
   /**
    * Fire-and-forget topup spun off before a request when the API key's
@@ -1945,6 +1961,7 @@ export class RoutstrClient {
     mintUrl: string;
     requiredSats: number;
     tokenBalance: number;
+    tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
   }): void {
@@ -1955,7 +1972,13 @@ export class RoutstrClient {
       snapshot.tokenBalanceUnit === "msat"
         ? snapshot.tokenBalance / 1000
         : snapshot.tokenBalance;
-    if (snapshotSats >= snapshot.requiredSats) return;
+    const tokenReserved = snapshot.tokenReserved ?? 0;
+    const snapshotReservedSats =
+      snapshot.tokenBalanceUnit === "msat"
+        ? tokenReserved / 1000
+        : tokenReserved;
+    const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
+    if (snapshotAvailableSats >= snapshot.requiredSats) return;
 
     const key = `${snapshot.baseUrl}:${snapshot.token}`;
     // A topup is already in flight for this key — join it instead of
@@ -1965,7 +1988,7 @@ export class RoutstrClient {
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot balance=${snapshotSats} sat < required=${snapshot.requiredSats} sat for ${snapshot.baseUrl}; spinning off background topup`
+      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < required=${snapshot.requiredSats} sat for ${snapshot.baseUrl}; spinning off background topup`
     );
 
     void this._topUpOnce(key, () => this._runProactiveTopup(snapshot)).catch(
@@ -2042,9 +2065,8 @@ export class RoutstrClient {
         `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount * TOPUP_MARGIN}, message=${result.message}`
       );
 
-      // Persist the refreshed balance: topUp never writes back to storage,
-      // so without this the pre-request snapshot stays stale-low and every
-      // cooldown window would retrigger a (no-op) background check.
+      // Persist the refreshed total and reserved snapshots: topUp never
+      // writes either value back to storage itself.
       if (result.success) {
         try {
           const refreshed = await this.balanceManager.getTokenBalance(
@@ -2056,7 +2078,10 @@ export class RoutstrClient {
               snapshot.baseUrl,
               refreshed.unit === "msat"
                 ? Math.floor(refreshed.amount / 1000)
-                : refreshed.amount
+                : refreshed.amount,
+              refreshed.unit === "msat"
+                ? Math.floor(refreshed.reserved / 1000)
+                : refreshed.reserved
             );
           }
         } catch (e) {
@@ -2110,6 +2135,7 @@ export class RoutstrClient {
   }): Promise<{
     token: string;
     tokenBalance: number;
+    tokenReserved: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
     selectedMintUrl?: string;
@@ -2238,6 +2264,7 @@ export class RoutstrClient {
       }
 
       let tokenBalance = 0;
+      let tokenReserved = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
       let tokenBalanceUnknown = false;
 
@@ -2247,6 +2274,7 @@ export class RoutstrClient {
       );
       if (distributionForBaseUrl) {
         tokenBalance = distributionForBaseUrl.amount;
+        tokenReserved = distributionForBaseUrl.reserved ?? 0;
       }
 
       if (tokenBalance === 0 && parentApiKey) {
@@ -2256,6 +2284,7 @@ export class RoutstrClient {
             baseUrl
           );
           tokenBalance = balanceInfo.amount;
+          tokenReserved = balanceInfo.reserved;
           tokenBalanceUnit = balanceInfo.unit;
           tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
         } catch (e) {
@@ -2265,12 +2294,13 @@ export class RoutstrClient {
 
       this._log(
         "DEBUG",
-        `[RoutstrClient] _spendToken: Returning token with balance=${tokenBalance} ${tokenBalanceUnit}`
+        `[RoutstrClient] _spendToken: Returning token with balance=${tokenBalance}, reserved=${tokenReserved} ${tokenBalanceUnit}`
       );
 
       return {
         token: parentApiKey?.key ?? "",
         tokenBalance,
+        tokenReserved,
         tokenBalanceUnit,
         tokenBalanceUnknown,
         selectedMintUrl,
@@ -2307,6 +2337,7 @@ export class RoutstrClient {
     return {
       token: spendResult.token!,
       tokenBalance: spendResult.balance,
+      tokenReserved: 0,
       tokenBalanceUnit: spendResult.unit ?? "sat",
       tokenBalanceUnknown: false,
       selectedMintUrl: spendResult.selectedMintUrl,

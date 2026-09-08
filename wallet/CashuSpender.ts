@@ -841,9 +841,13 @@ export class CashuSpender {
             const balanceSat = balanceResult.unit === "msat"
               ? Math.floor(balanceResult.amount / 1000)
               : balanceResult.amount;
+            const reservedSat = balanceResult.unit === "msat"
+              ? Math.floor(balanceResult.reserved / 1000)
+              : balanceResult.reserved;
             this.storageAdapter.updateApiKeyBalance(
               apiKeyEntry.baseUrl,
-              balanceSat
+              balanceSat,
+              reservedSat
             );
           } else {
             this.logger.warn(

@@ -29,6 +29,7 @@ export interface SdkStorageStore extends SdkStorageState {
           baseUrl: string;
           key: string;
           balance?: number;
+          reserved?: number;
           lastUsed?: number | null;
         }>
       | ((current: SdkStorageStore["apiKeys"]) => SdkStorageStore["apiKeys"])
@@ -193,6 +194,7 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
           ...entry,
           baseUrl: normalizeBaseUrl(entry.baseUrl),
           balance: entry.balance ?? 0,
+          reserved: entry.reserved ?? 0,
           lastUsed: entry.lastUsed ?? null,
         }));
         void driver.setItem(SDK_STORAGE_KEYS.API_KEYS, normalized);
@@ -421,6 +423,7 @@ const hydrateStoreFromDriver = async (
         baseUrl: string;
         key: string;
         balance?: number;
+        reserved?: number;
         lastUsed?: number | null;
       }>
     >(SDK_STORAGE_KEYS.API_KEYS, []),
@@ -521,6 +524,7 @@ const hydrateStoreFromDriver = async (
     ...entry,
     baseUrl: normalizeBaseUrl(entry.baseUrl),
     balance: entry.balance ?? 0,
+    reserved: entry.reserved ?? 0,
     lastUsed: entry.lastUsed ?? null,
   }));
 
@@ -667,16 +671,23 @@ export const createStorageAdapterFromStore = (
 ): StorageAdapter => ({
   getApiKeyDistribution: () => {
     const apiKeys = store.getState().apiKeys;
-    const distributionMap: Record<string, number> = {};
+    const distributionMap: Record<
+      string,
+      { amount: number; reserved: number }
+    > = {};
 
     for (const entry of apiKeys) {
-      const sum = entry.balance || 0;
-      distributionMap[entry.baseUrl] =
-        (distributionMap[entry.baseUrl] || 0) + sum;
+      const snapshot = distributionMap[entry.baseUrl] ?? {
+        amount: 0,
+        reserved: 0,
+      };
+      snapshot.amount += entry.balance || 0;
+      snapshot.reserved += entry.reserved || 0;
+      distributionMap[entry.baseUrl] = snapshot;
     }
 
     return Object.entries(distributionMap)
-      .map(([baseUrl, amt]) => ({ baseUrl, amount: amt }))
+      .map(([baseUrl, snapshot]) => ({ baseUrl, ...snapshot }))
       .sort((a, b) => b.amount - a.amount);
   },
   saveProviderInfo: (baseUrl, info) => {
@@ -715,17 +726,24 @@ export const createStorageAdapterFromStore = (
       baseUrl: normalized,
       key,
       balance: 0,
+      reserved: 0,
       lastUsed: Date.now(),
     });
     store.getState().setApiKeys(next);
   },
 
-  updateApiKeyBalance: (baseUrl, balance) => {
+  updateApiKeyBalance: (baseUrl, balance, reserved) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const keys = store.getState().apiKeys;
     const next = keys.map((entry) =>
       entry.baseUrl === normalized
-        ? { ...entry, balance }
+        ? {
+            ...entry,
+            balance,
+            // Old/custom callers that only know total balance must not erase
+            // a newer reserved snapshot.
+            reserved: reserved ?? entry.reserved ?? 0,
+          }
         : entry
     );
     store.getState().setApiKeys(next);
@@ -755,6 +773,7 @@ export const createStorageAdapterFromStore = (
       baseUrl: entry.baseUrl,
       key: entry.key,
       balance: entry.balance,
+      reserved: entry.reserved ?? 0,
       lastUsed: entry.lastUsed,
     }));
   },

@@ -123,6 +123,7 @@ function spinOff(
     mintUrl: string;
     requiredSats: number;
     tokenBalance: number;
+    tokenReserved: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
   }> = {}
@@ -133,6 +134,7 @@ function spinOff(
     mintUrl: MINT_URL,
     requiredSats: 100,
     tokenBalance: 20, // sat — below the 100-sat requirement
+    tokenReserved: 0,
     tokenBalanceUnit: "sat",
     tokenBalanceUnknown: false,
     ...snapshot,
@@ -171,8 +173,35 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     // After a successful topup the refreshed balance is persisted so the
     // stored snapshot does not stay stale-low.
     await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 20)
+      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 20, 0)
     );
+  });
+
+  it("triggers from stored reserved balance even when stored total covers the request", async () => {
+    const { client } = createClient();
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 120_000, // 120 sat total
+      reserved: 30_000, // 30 sat reserved → 90 sat available
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    const topUp = vi
+      .spyOn(balanceManager, "topUp")
+      .mockResolvedValue({ success: true, message: "ok" });
+
+    // Total alone covers 100 sats, but the stored reserved snapshot makes
+    // only 90 sats available and must trigger the proactive path.
+    spinOff(client, { tokenBalance: 120, tokenReserved: 30 });
+
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    expect(topUp).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      baseUrl: BASE_URL,
+      // Fresh shortfall is 10, so the 21-sat floor applies, then 1.4 margin.
+      amount: 21 * 1.4,
+      token: API_KEY,
+    });
   });
 
   it("accounts for reserved funds in the fresh balance re-check", async () => {
@@ -402,7 +431,11 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
 
   it("spins off the topup before the request goes out and does not block it", async () => {
     const { client } = createClient(
-      { getApiKeyDistribution: () => [{ baseUrl: BASE_URL, amount: 20 }] },
+      {
+        getApiKeyDistribution: () => [
+          { baseUrl: BASE_URL, amount: 120, reserved: 30 },
+        ],
+      },
       {
         getModelForProvider: async () => model,
         getRequiredSatsForModel: () => 100,
@@ -410,8 +443,8 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     );
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 20_000, // 20 sat — both the snapshot and the fresh check
-      reserved: 0,
+      amount: 120_000, // 120 sat total
+      reserved: 30_000, // 90 sat available — below the 100-sat request
       unit: "msat",
       apiKey: API_KEY,
     });
@@ -419,7 +452,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const topUp = vi.spyOn(balanceManager, "topUp").mockImplementation(
       async () => {
         topUpStarted = true;
-        return { success: true, toppedUpAmount: 112, message: "ok" };
+        return { success: true, toppedUpAmount: 21 * 1.4, message: "ok" };
       }
     );
 
