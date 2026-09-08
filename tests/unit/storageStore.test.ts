@@ -7,6 +7,74 @@ import {
 import { createStorageAdapterFromStore } from "../../storage/store";
 
 describe("sdk storage store", () => {
+  it("hydrates legacy API-key records with a zero reserved snapshot", async () => {
+    const seed = {
+      [SDK_STORAGE_KEYS.API_KEYS]: JSON.stringify([
+        {
+          baseUrl: "https://provider.example.com",
+          key: "sk-legacy",
+          balance: 42,
+          lastUsed: null,
+        },
+      ]),
+    };
+
+    const driver = createMemoryDriver(seed);
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
+    const storage = createStorageAdapterFromStore(store);
+
+    expect(storage.getApiKey("https://provider.example.com/")).toMatchObject({
+      balance: 42,
+      reserved: 0,
+    });
+    expect(storage.getApiKeyDistribution()).toEqual([
+      {
+        baseUrl: "https://provider.example.com/",
+        amount: 42,
+        reserved: 0,
+      },
+    ]);
+  });
+
+  it("stores reserved alongside total balance and preserves it for legacy two-argument updates", async () => {
+    const driver = createMemoryDriver();
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
+    const storage = createStorageAdapterFromStore(store);
+
+    storage.setApiKey("https://provider.example.com", "sk-test");
+    storage.updateApiKeyBalance("https://provider.example.com", 100, 30);
+
+    expect(storage.getApiKeyDistribution()).toEqual([
+      {
+        baseUrl: "https://provider.example.com/",
+        amount: 100,
+        reserved: 30,
+      },
+    ]);
+
+    // The JSON-backed drivers (including SQLite's key/value table) persist
+    // the new field without a schema migration.
+    const { store: rehydratedStore, hydrate: rehydrate } = createSdkStore({
+      driver,
+    });
+    await rehydrate;
+    expect(
+      createStorageAdapterFromStore(rehydratedStore).getApiKey(
+        "https://provider.example.com/"
+      )
+    ).toMatchObject({ balance: 100, reserved: 30 });
+
+    // Existing custom callers may still provide total balance only. They
+    // must not erase the last known reserved snapshot.
+    storage.updateApiKeyBalance("https://provider.example.com", 90);
+    expect(storage.getApiKey("https://provider.example.com/")).toMatchObject({
+      balance: 90,
+      reserved: 30,
+    });
+  });
+
   it("persists cached xcashu tokens through the store", async () => {
     const seed = {
       [SDK_STORAGE_KEYS.XCASHU_TOKENS]: JSON.stringify({
