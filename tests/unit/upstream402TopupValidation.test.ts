@@ -159,6 +159,7 @@ describe("RoutstrClient 402 top-up validation", () => {
       baseUrl: BASE_URL,
       amount: 80 * 1.4,
       token: API_KEY,
+      refundOtherProviders: true,
     });
     expect(retry).toHaveBeenCalledOnce();
   });

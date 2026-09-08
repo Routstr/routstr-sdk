@@ -32,17 +32,7 @@ export const localStorageDriver: StorageDriver = {
       }
     } catch (error) {
       console.error(`Error retrieving item with key "${key}":`, error);
-      if (canUseLocalStorage()) {
-        try {
-          window.localStorage.removeItem(key);
-        } catch (removeError) {
-          console.error(
-            `Error removing corrupted item with key "${key}":`,
-            removeError
-          );
-        }
-      }
-      return defaultValue;
+      throw error;
     }
   },
   async setItem<T>(key: string, value: T): Promise<void> {
@@ -68,10 +58,11 @@ export const localStorageDriver: StorageDriver = {
             `Storage quota exceeded; unable to persist key "${key}" after cleanup attempt.`,
             retryError
           );
-          return;
+          throw retryError;
         }
       }
       console.error(`Error storing item with key "${key}":`, error);
+      throw error;
     }
   },
   async removeItem(key: string): Promise<void> {
@@ -80,6 +71,7 @@ export const localStorageDriver: StorageDriver = {
       window.localStorage.removeItem(key);
     } catch (error) {
       console.error(`Error removing item with key "${key}":`, error);
+      throw error;
     }
   },
 };

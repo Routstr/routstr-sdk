@@ -39,6 +39,9 @@ export interface SpendOptions {
   /** Whether to reuse an existing token if available */
   reuseToken?: boolean;
 
+  /** Set false to never refund other providers' credit to fund this one */
+  refundOtherProviders?: boolean;
+
   /** Optional P2PK public key */
   p2pkPubkey?: string;
 
@@ -252,6 +255,7 @@ export class CashuSpender {
         p2pkPubkey,
         excludeMints,
         retryCount,
+        refundOtherProviders: options.refundOtherProviders,
       });
 
       if (result.status === "failed" || !result.token) {
@@ -384,6 +388,7 @@ export class CashuSpender {
         p2pkPubkey,
         excludeMints,
         retryCount,
+        refundOtherProviders: options.refundOtherProviders,
       });
 
       if (!tokenResult.success || !tokenResult.token) {

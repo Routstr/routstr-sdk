@@ -87,6 +87,9 @@ export interface TopUpOptions {
 
   /** Optional specific API key to top up (if not provided, uses stored token) */
   token?: string;
+
+  /** Set false to never refund other providers' credit to fund this top-up */
+  refundOtherProviders?: boolean;
 }
 
 export interface CreateProviderTokenOptions {
@@ -96,6 +99,8 @@ export interface CreateProviderTokenOptions {
   p2pkPubkey?: string;
   excludeMints?: string[];
   retryCount?: number;
+  /** Set false to never refund other providers' credit to fund this token */
+  refundOtherProviders?: boolean;
 }
 
 export interface ProviderTokenResult {
@@ -545,7 +550,7 @@ export class BalanceManager {
    * Top up API key balance with a cashu token
    */
   async topUp(options: TopUpOptions): Promise<TopUpResult> {
-    const { mintUrl, baseUrl, amount, token: providedToken } = options;
+    const { baseUrl } = options;
 
     const guard = this._canRunProviderWalletOperation(baseUrl, "topup");
     if (!guard.allowed) {
@@ -556,7 +561,7 @@ export class BalanceManager {
     this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
-      return await this._topUpImpl({ mintUrl, baseUrl, amount, token: providedToken });
+      return await this._topUpImpl(options);
     } finally {
       this._endProviderWalletOperation(baseUrl, "topup");
     }
@@ -590,6 +595,7 @@ export class BalanceManager {
         baseUrl,
         amount,
         excludeMints,
+        refundOtherProviders: options.refundOtherProviders,
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -600,6 +606,9 @@ export class BalanceManager {
       }
 
       cashuToken = tokenResult.token;
+
+      this.storageAdapter.addXcashuToken(baseUrl, cashuToken);
+      await this.storageAdapter.flush?.();
 
       const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
@@ -617,6 +626,11 @@ export class BalanceManager {
           this.logger.warn(
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
           );
+        }
+
+        if (recoveredToken || !canRecover) {
+          this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+          await this.storageAdapter.flush?.();
         }
 
         // A foreign-mint swap failure can be retried against the same provider
@@ -647,6 +661,8 @@ export class BalanceManager {
         };
       }
 
+      this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+      await this.storageAdapter.flush?.();
       return {
         success: true,
         toppedUpAmount: amount,
@@ -654,8 +670,10 @@ export class BalanceManager {
       };
     } catch (error) {
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
-      if (cashuToken) {
-        await this._recoverFailedTopUp(cashuToken);
+      if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
+        // Back in the wallet, so it is no longer recoverable credit.
+        this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+        await this.storageAdapter.flush?.().catch(() => {});
       }
 
       return this._handleTopUpError(error, mintUrl, requestId);
@@ -672,6 +690,7 @@ export class BalanceManager {
       retryCount = 0,
       excludeMints = [],
       p2pkPubkey,
+      refundOtherProviders = true,
     } = options;
 
     const adjustedAmount = Math.ceil(amount);
@@ -702,6 +721,7 @@ export class BalanceManager {
       .reduce((sum, [, value]) => sum + value, 0);
 
     if (
+      refundOtherProviders &&
       totalMintBalance + targetProviderBalance < adjustedAmount &&
       totalMintBalance + targetProviderBalance + refundableProviderBalance >=
         adjustedAmount &&
@@ -775,11 +795,16 @@ export class BalanceManager {
     let lastError: string | undefined;
     for (const candidateMint of candidates) {
       try {
+        await this.storageAdapter.flush?.();
         this.logger.log(`createProviderToken: attempting mint=${candidateMint} amount=${requiredAmount}`);
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
-          p2pkPubkey
+          p2pkPubkey,
+          async (token) => {
+            this.storageAdapter.addXcashuToken(baseUrl, token);
+            await this.storageAdapter.flush?.();
+          }
         );
         this.logger.log(`createProviderToken: success from mint=${candidateMint}`);
         return {
@@ -1154,11 +1179,15 @@ export class BalanceManager {
      *  this flag is set — it is 0, not a real balance. */
     balanceUnknown?: boolean;
   }> {
+    // Bounded like _postTopUp: settlement awaits this call and must not hang.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     try {
       const response = await fetch(`${baseUrl}v1/wallet/info`, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
+        signal: controller.signal,
       });
 
       if (response.ok) {
@@ -1207,6 +1236,8 @@ export class BalanceManager {
       }
     } catch (error) {
       this.logger.error("getTokenBalance error", error);
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     return {

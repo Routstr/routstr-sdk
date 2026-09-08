@@ -76,6 +76,8 @@ export interface FetchOptions {
   userCacheSecret?: string;
   /** Optional: abort signal to cancel the in-flight request + stream */
   abortSignal?: AbortSignal;
+  /** See RouteRequestParams.failover. Defaults to price-ranked failover. */
+  failover?: boolean;
 
   // ── Adapters (only needed for auto-discovery path) ────────────────
   /** Discovery adapter for model/mint discovery and provider data */
@@ -105,6 +107,7 @@ interface FetchAIResponseClient {
     modelId?: string;
     userCacheSecret?: string;
     signal?: AbortSignal;
+    failover?: boolean;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
 }
@@ -144,6 +147,10 @@ export async function fetchAIResponse(
     maxTokens,
     headers,
   } = options;
+
+  // SSE accounting runs on its own once the stream ends; never return to the
+  // caller before it settles or the caller's payment lock ends too early.
+  let settle: (() => Promise<number>) | undefined;
 
   try {
     // ── Resolve selectedModel / baseUrl / mintUrl / client ────────────
@@ -237,7 +244,10 @@ export async function fetchAIResponse(
       modelId: selectedModel.id,
       userCacheSecret: options.userCacheSecret,
       signal: options.abortSignal,
+      failover: options.failover,
     });
+    settle = (response as Response & { finalize?: () => Promise<number> })
+      .finalize;
 
     if (response.status !== 200) {
       // Parse the structured error envelope from routstr-core instead of
@@ -312,9 +322,10 @@ export async function fetchAIResponse(
         role: "system",
         content: "Generation stopped.",
       });
-      return;
+    } else {
+      handleError(error, callbacks, deps.alertLevel, deps.logger);
     }
-    handleError(error, callbacks, deps.alertLevel, deps.logger);
+    await settle?.();
   } finally {
     callbacks.onPaymentProcessing?.(false);
   }

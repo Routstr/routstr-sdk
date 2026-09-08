@@ -71,7 +71,7 @@ export const createIndexedDBDriver = (
     async getItem<T>(key: string, defaultValue: T): Promise<T> {
       try {
         const db = await getDb();
-        return new Promise<T>((resolve, reject) => {
+        return await new Promise<T>((resolve, reject) => {
           const tx = db.transaction(storeName, "readonly");
           const store = tx.objectStore(storeName);
           const request = store.get(key);
@@ -102,39 +102,43 @@ export const createIndexedDBDriver = (
         });
       } catch (error) {
         console.error(`IndexedDB getItem failed for key "${key}":`, error);
-        return defaultValue;
+        throw error;
       }
     },
 
     async setItem<T>(key: string, value: T): Promise<void> {
       try {
         const db = await getDb();
-        return new Promise<void>((resolve, reject) => {
+        return await new Promise<void>((resolve, reject) => {
           const tx = db.transaction(storeName, "readwrite");
           const store = tx.objectStore(storeName);
           store.put(JSON.stringify(value), key);
 
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
         });
       } catch (error) {
         console.error(`IndexedDB setItem failed for key "${key}":`, error);
+        throw error;
       }
     },
 
     async removeItem(key: string): Promise<void> {
       try {
         const db = await getDb();
-        return new Promise<void>((resolve, reject) => {
+        return await new Promise<void>((resolve, reject) => {
           const tx = db.transaction(storeName, "readwrite");
           const store = tx.objectStore(storeName);
           store.delete(key);
 
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error ?? new Error("IndexedDB delete aborted"));
         });
       } catch (error) {
         console.error(`IndexedDB removeItem failed for key "${key}":`, error);
+        throw error;
       }
     },
   };

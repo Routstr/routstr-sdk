@@ -13,6 +13,9 @@ export interface SdkStoreOptions {
 }
 
 export interface SdkStorageStore extends SdkStorageState {
+  flush: () => Promise<void>;
+  /** Re-read the driver and reopen a write barrier closed by a failed write. */
+  reload: () => Promise<void>;
   setModelsFromAllProviders: (value: Record<string, Model[]>) => void;
   setLastUsedModel: (value: string | null) => void;
   setBaseUrlsList: (value: string[]) => void;
@@ -96,8 +99,14 @@ export interface SdkStorageStore extends SdkStorageState {
 /** Store type returned after async initialization */
 export type SdkStore = StoreApi<SdkStorageStore>;
 
-const createEmptyStore = (driver: StorageDriver): SdkStore =>
+const createEmptyStore = (
+  driver: StorageDriver,
+  flush: () => Promise<void>,
+  reload: () => Promise<void>
+): SdkStore =>
   createStore<SdkStorageStore>((set, get) => ({
+    flush,
+    reload,
     modelsFromAllProviders: {},
     lastUsedModel: null,
     baseUrlsList: [],
@@ -603,13 +612,50 @@ const hydrateStoreFromDriver = async (
   });
 };
 
+// Money and credentials: writes serialize behind flush() and a failed read fails
+// hydration. Everything else is cache and degrades to its default.
+const strictKeys = new Set<string>([
+  SDK_STORAGE_KEYS.API_KEYS,
+  SDK_STORAGE_KEYS.CHILD_KEYS,
+  SDK_STORAGE_KEYS.XCASHU_TOKENS,
+  SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS,
+  SDK_STORAGE_KEYS.CLIENT_IDS,
+]);
+
 export const createSdkStore = ({
   driver,
 }: SdkStoreOptions): { store: SdkStore; hydrate: Promise<void> } => {
-  const store = createEmptyStore(driver);
+  let pending = Promise.resolve();
+  const durable: StorageDriver = {
+    ...driver,
+    getItem(key, defaultValue) {
+      if (strictKeys.has(key)) return driver.getItem(key, defaultValue);
+      return driver.getItem(key, defaultValue).catch((error) => {
+        console.warn(`[sdk store] using default for unreadable "${key}"`, error);
+        return defaultValue;
+      });
+    },
+    setItem(key, value) {
+      if (!strictKeys.has(key)) {
+        return driver.setItem(key, value).catch((error) => {
+          console.warn(`[sdk store] cache write failed for "${key}"`, error);
+        });
+      }
+      pending = pending.then(() => driver.setItem(key, value));
+      // Setters are synchronous; the payment boundary observes the rejection.
+      void pending.catch(() => {});
+      return pending;
+    },
+  };
+  const store = createEmptyStore(durable, () => pending, async () => {
+    // Let queued writes settle, take disk as truth, then reopen the barrier.
+    await pending.catch(() => {});
+    await hydrateStoreFromDriver(store, durable);
+    pending = Promise.resolve();
+  });
   return {
     store,
-    hydrate: hydrateStoreFromDriver(store, driver),
+    hydrate: hydrateStoreFromDriver(store, durable),
   };
 };
 
@@ -669,6 +715,14 @@ export const createDiscoveryAdapterFromStore = (
 export const createStorageAdapterFromStore = (
   store: SdkStore
 ): StorageAdapter => ({
+  flush: () => store.getState().flush(),
+  replaceApiKey: (baseUrl, key) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    store.getState().setApiKeys((keys) => [
+      ...keys.filter((entry) => entry.baseUrl !== normalized),
+      { baseUrl: normalized, key, balance: 0, lastUsed: Date.now() },
+    ]);
+  },
   getApiKeyDistribution: () => {
     const apiKeys = store.getState().apiKeys;
     const distributionMap: Record<
@@ -889,6 +943,7 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().xcashuTokens;
     const existing = tokens[normalized] || [];
+    if (existing.some((entry) => entry.token === token)) return;
     const next = { ...tokens };
     next[normalized] = [
       ...existing,

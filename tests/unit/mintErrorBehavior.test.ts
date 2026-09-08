@@ -339,6 +339,7 @@ describe("RoutstrClient._handleErrorResponse — mint_error (422)", () => {
       amount: 100,
       baseUrl: BASE_URL,
       excludeMints: [SECOND_MINT_URL],
+      refundOtherProviders: true,
     });
     expect(providerManager.markFailed).not.toHaveBeenCalled();
     expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
