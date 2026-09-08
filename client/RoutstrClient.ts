@@ -11,7 +11,7 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { SdkLogger } from "../core/types";
+import type { SdkLogger, TopUpResult } from "../core/types";
 import type { Model } from "../core/types";
 import { consoleLogger } from "../core/types";
 import type {
@@ -72,6 +72,15 @@ export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.2;
+
+/** Minimum time between proactive (pre-request) topup attempts for the
+ *  same API key. Prevents tight background retry loops when topups keep
+ *  failing while requests continue to stream in. */
+const PROACTIVE_TOPUP_COOLDOWN_MS = 30_000;
+
+/** Floor for proactive topup amounts as a fraction of the request price,
+ *  mirroring the 402 handler's heuristic. */
+const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
 
 export interface RouteRequestParams {
   path: string;
@@ -150,6 +159,15 @@ export class RoutstrClient {
   private requestResponseLogSink?: RequestResponseLogSink;
   private userCacheSecret?: string;
   private tinfoilCacheSecretPath?: string;
+
+  /** In-flight topup promises keyed by `${baseUrl}:${apiKey}`. Concurrent
+   *  callers — proactive spin-offs and 402 handlers alike — share a single
+   *  topUp call instead of stacking multiple deposits. */
+  private _inflightTopups = new Map<string, Promise<TopUpResult>>();
+
+  /** Last time a proactive (pre-request) topup attempt was started, keyed
+   *  by `${baseUrl}:${apiKey}`. Cooldown backing store. */
+  private _lastProactiveTopupAt = new Map<string, number>();
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -443,6 +461,21 @@ export class RoutstrClient {
       tokenBalanceUnknown,
       selectedMintUrl,
     } = spendResult;
+
+    // Proactive topup (apikeys mode): if the key we are about to use has a
+    // balance snapshot below the request price, spin off a background topup
+    // BEFORE the request goes out. Fire-and-forget — the request proceeds in
+    // parallel, and if it still 402s, _handleErrorResponse joins the
+    // in-flight topup instead of stacking a second deposit.
+    this._spinOffTopupIfNeeded({
+      token,
+      baseUrl,
+      mintUrl,
+      requiredSats,
+      tokenBalance,
+      tokenBalanceUnit,
+      tokenBalanceUnknown,
+    });
 
     // Build final request headers (auth + Tinfoil model hint)
     const finalHeaders = this._withAuthAndTinfoilHeaders(
@@ -1065,12 +1098,18 @@ export class RoutstrClient {
         if (!balanceValidated) {
           tryNextProvider = true;
         } else {
-          const topupResult = await this.balanceManager.topUp({
-            mintUrl,
-            baseUrl,
-            amount: topupAmount * TOPUP_MARGIN,
-            token: params.token,
-          });
+          // A proactive (pre-request) topup may already be in flight for
+          // this key — join it instead of stacking a second deposit.
+          const topupResult = await this._topUpOnce(
+            `${baseUrl}:${params.token}`,
+            () =>
+              this.balanceManager.topUp({
+                mintUrl,
+                baseUrl,
+                amount: topupAmount * TOPUP_MARGIN,
+                token: params.token,
+              })
+          );
           this._log(
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
@@ -1895,6 +1934,178 @@ export class RoutstrClient {
     if (totalBalance <= 0) {
       throw new InsufficientBalanceError(1, 0);
     }
+  }
+
+  // ── Proactive (pre-request) topup ─────────────────────────────────
+  // Stored API-key balances are plain totals: they never subtract
+  // `reserved` and are not refreshed by topUp itself. A snapshot below
+  // requiredSats therefore means the key is *definitely* short (available
+  // ≤ total). The background task re-validates against a fresh balance
+  // before topping up, so a stale snapshot can never cause an over-topup.
+
+  /**
+   * Fire-and-forget topup spun off before a request when the API key's
+   * balance snapshot is below the request price. Never blocks the request
+   * and never throws.
+   */
+  private _spinOffTopupIfNeeded(snapshot: {
+    token: string;
+    baseUrl: string;
+    mintUrl: string;
+    requiredSats: number;
+    tokenBalance: number;
+    tokenBalanceUnit: "sat" | "msat";
+    tokenBalanceUnknown: boolean;
+  }): void {
+    if (this.mode !== "apikeys" || !snapshot.token) return;
+    if (snapshot.tokenBalanceUnknown) return;
+
+    const snapshotSats =
+      snapshot.tokenBalanceUnit === "msat"
+        ? snapshot.tokenBalance / 1000
+        : snapshot.tokenBalance;
+    if (snapshotSats >= snapshot.requiredSats) return;
+
+    const key = `${snapshot.baseUrl}:${snapshot.token}`;
+    if (this._inflightTopups.has(key)) return;
+    const lastAttempt = this._lastProactiveTopupAt.get(key) ?? 0;
+    if (Date.now() - lastAttempt < PROACTIVE_TOPUP_COOLDOWN_MS) return;
+
+    this._lastProactiveTopupAt.set(key, Date.now());
+    this._log(
+      "DEBUG",
+      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot balance=${snapshotSats} sat < required=${snapshot.requiredSats} sat for ${snapshot.baseUrl}; spinning off background topup`
+    );
+
+    void this._topUpOnce(key, () => this._runProactiveTopup(snapshot)).catch(
+      (e: unknown) => {
+        // Unreachable in practice (_runProactiveTopup never throws), but a
+        // fire-and-forget promise must never surface an unhandled rejection.
+        this._log(
+          "WARN",
+          `[RoutstrClient] _spinOffTopupIfNeeded: background topup crashed for ${snapshot.baseUrl}`,
+          e
+        );
+      }
+    );
+  }
+
+  /**
+   * Re-validate against a fresh balance (including reserved funds) and top
+   * up only if the key is still short. Mirrors the 402 handler's amount
+   * heuristic (shortfall vs 0.21-floor, then TOPUP_MARGIN). Never throws.
+   */
+  private async _runProactiveTopup(snapshot: {
+    token: string;
+    baseUrl: string;
+    mintUrl: string;
+    requiredSats: number;
+  }): Promise<TopUpResult> {
+    try {
+      const info = await this.balanceManager.getTokenBalance(
+        snapshot.token,
+        snapshot.baseUrl
+      );
+      if (info.balanceUnknown) {
+        return {
+          success: false,
+          message: "proactive topup skipped: balance unknown",
+        };
+      }
+      if (info.isInvalidApiKey) {
+        return {
+          success: false,
+          message: "proactive topup skipped: API key invalid",
+        };
+      }
+      const currentSats =
+        info.unit === "msat" ? info.amount / 1000 : info.amount;
+      const reservedSats =
+        info.unit === "msat" ? info.reserved / 1000 : info.reserved;
+      const availableSats = currentSats - reservedSats;
+      const shortfall = Math.max(0, snapshot.requiredSats - availableSats);
+
+      if (shortfall <= 0) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _runProactiveTopup: fresh balance for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat); no topup needed`
+        );
+        return {
+          success: true,
+          message: "proactive topup skipped: balance sufficient on fresh check",
+        };
+      }
+
+      const topupAmount = Math.max(
+        shortfall,
+        PROACTIVE_TOPUP_MIN_FRACTION * snapshot.requiredSats
+      );
+      const result = await this.balanceManager.topUp({
+        mintUrl: snapshot.mintUrl,
+        baseUrl: snapshot.baseUrl,
+        amount: topupAmount * TOPUP_MARGIN,
+        token: snapshot.token,
+      });
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount * TOPUP_MARGIN}, message=${result.message}`
+      );
+
+      // Persist the refreshed balance: topUp never writes back to storage,
+      // so without this the pre-request snapshot stays stale-low and every
+      // cooldown window would retrigger a (no-op) background check.
+      if (result.success) {
+        try {
+          const refreshed = await this.balanceManager.getTokenBalance(
+            snapshot.token,
+            snapshot.baseUrl
+          );
+          if (!refreshed.balanceUnknown) {
+            this.storageAdapter.updateApiKeyBalance(
+              snapshot.baseUrl,
+              refreshed.unit === "msat"
+                ? Math.floor(refreshed.amount / 1000)
+                : refreshed.amount
+            );
+          }
+        } catch (e) {
+          this._log(
+            "WARN",
+            `[RoutstrClient] _runProactiveTopup: could not persist refreshed balance for ${snapshot.baseUrl}`,
+            e
+          );
+        }
+      }
+      return result;
+    } catch (e) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _runProactiveTopup: failed for ${snapshot.baseUrl}`,
+        e
+      );
+      return {
+        success: false,
+        message: `proactive topup failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+  }
+
+  /**
+   * Run (or join) the single in-flight topup for an API key. Concurrent
+   * callers — proactive spin-offs and 402 handlers alike — share one topUp
+   * call instead of stacking multiple deposits.
+   */
+  private _topUpOnce(
+    key: string,
+    start: () => Promise<TopUpResult>
+  ): Promise<TopUpResult> {
+    const existing = this._inflightTopups.get(key);
+    if (existing) return existing;
+    const promise = start().finally(() => {
+      this._inflightTopups.delete(key);
+    });
+    this._inflightTopups.set(key, promise);
+    return promise;
   }
 
   /**
