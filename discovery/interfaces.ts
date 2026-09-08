@@ -11,6 +11,10 @@ export { ProviderInfo };
  * Abstracts localStorage operations so discovery logic is testable and reusable
  */
 export interface DiscoveryAdapter {
+  /** Last refresh that returned evidence for each Nostr filter. */
+  getNostrQueryLastUpdate?(): Record<string, number>;
+  setNostrQueryLastUpdate?(timestamps: Record<string, number>): void;
+
   /**
    * Get cached models from all providers
    * @returns Record mapping baseUrl -> array of models

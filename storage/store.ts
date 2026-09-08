@@ -13,6 +13,7 @@ export interface SdkStoreOptions {
 }
 
 export interface SdkStorageStore extends SdkStorageState {
+  setNostrQueryLastUpdate: (value: Record<string, number>) => void;
   setModelsFromAllProviders: (value: Record<string, Model[]>) => void;
   setLastUsedModel: (value: string | null) => void;
   setBaseUrlsList: (value: string[]) => void;
@@ -97,6 +98,11 @@ export type SdkStore = StoreApi<SdkStorageStore>;
 
 const createEmptyStore = (driver: StorageDriver): SdkStore =>
   createStore<SdkStorageStore>((set, get) => ({
+    nostrQueryLastUpdate: {},
+    setNostrQueryLastUpdate: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, value);
+      set({ nostrQueryLastUpdate: value });
+    },
     modelsFromAllProviders: {},
     lastUsedModel: null,
     baseUrlsList: [],
@@ -373,6 +379,7 @@ const hydrateStoreFromDriver = async (
   driver: StorageDriver
 ): Promise<void> => {
   const [
+    nostrQueryLastUpdate,
     rawModels,
     lastUsedModel,
     rawBaseUrls,
@@ -394,6 +401,7 @@ const hydrateStoreFromDriver = async (
     rawLastFailed,
     rawProvidersOnCooldown,
   ] = await Promise.all([
+    driver.getItem<Record<string, number>>(SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, {}),
     driver.getItem<Record<string, Model[]>>(
       SDK_STORAGE_KEYS.MODELS_FROM_ALL_PROVIDERS,
       {}
@@ -576,6 +584,7 @@ const hydrateStoreFromDriver = async (
   }));
 
   store.setState({
+    nostrQueryLastUpdate,
     modelsFromAllProviders,
     lastUsedModel,
     baseUrlsList,
@@ -612,6 +621,8 @@ export const createSdkStore = ({
 export const createDiscoveryAdapterFromStore = (
   store: SdkStore
 ): DiscoveryAdapter => ({
+  getNostrQueryLastUpdate: () => store.getState().nostrQueryLastUpdate,
+  setNostrQueryLastUpdate: (timestamps) => store.getState().setNostrQueryLastUpdate(timestamps),
   getCachedModels: () => store.getState().modelsFromAllProviders,
   setCachedModels: (models) =>
     store.getState().setModelsFromAllProviders(models),
