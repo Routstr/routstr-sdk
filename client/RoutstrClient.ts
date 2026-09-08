@@ -1978,7 +1978,11 @@ export class RoutstrClient {
         ? tokenReserved / 1000
         : tokenReserved;
     const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
-    if (snapshotAvailableSats >= snapshot.requiredSats) return;
+    // Maintain the margin up front: proactively top up whenever the available
+    // balance is at or below the request price scaled by TOPUP_MARGIN, so the
+    // key stays covered at the margin instead of reacting only after a 402.
+    const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
+    if (snapshotAvailableSats >= targetSats) return;
 
     const key = `${snapshot.baseUrl}:${snapshot.token}`;
     // A topup is already in flight for this key — join it instead of
@@ -1988,7 +1992,7 @@ export class RoutstrClient {
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < required=${snapshot.requiredSats} sat for ${snapshot.baseUrl}; spinning off background topup`
+      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; spinning off background topup`
     );
 
     void this._topUpOnce(key, () => this._runProactiveTopup(snapshot)).catch(
@@ -2037,12 +2041,17 @@ export class RoutstrClient {
       const reservedSats =
         info.unit === "msat" ? info.reserved / 1000 : info.reserved;
       const availableSats = currentSats - reservedSats;
-      const shortfall = Math.max(0, snapshot.requiredSats - availableSats);
+      // Target the same margin the trigger uses: bring the key up to the
+      // margin (required x TOPUP_MARGIN), not merely above the request price.
+      // Otherwise a single topup makes no progress against an available balance
+      // in [required, required x margin) and oscillates with a "sufficient" no-op.
+      const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
+      const shortfall = Math.max(0, targetSats - availableSats);
 
       if (shortfall <= 0) {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _runProactiveTopup: fresh balance for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat); no topup needed`
+          `[RoutstrClient] _runProactiveTopup: fresh balance for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat >= target=${targetSats} sat); no topup needed`
         );
         return {
           success: true,
@@ -2057,12 +2066,14 @@ export class RoutstrClient {
       const result = await this.balanceManager.topUp({
         mintUrl: snapshot.mintUrl,
         baseUrl: snapshot.baseUrl,
-        amount: topupAmount * TOPUP_MARGIN,
+        // The target already includes TOPUP_MARGIN, so do not multiply again;
+        // top up exactly the shortfall to land at the margin.
+        amount: topupAmount,
         token: snapshot.token,
       });
       this._log(
         "DEBUG",
-        `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount * TOPUP_MARGIN}, message=${result.message}`
+        `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount}, message=${result.message}`
       );
 
       // Persist the refreshed total and reserved snapshots: topUp never

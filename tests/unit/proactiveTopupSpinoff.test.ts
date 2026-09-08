@@ -158,16 +158,16 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
     const topUp = vi
       .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 112, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
 
     spinOff(client);
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // shortfall = 100 - 20 = 80 → 80 * TOPUP_MARGIN(1.4)
+    // target = 100 * 1.4 = 140; shortfall = 140 - 20 = 120 (floor 21)
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 80 * 1.4,
+      amount: 120,
       token: API_KEY,
     });
     // After a successful topup the refreshed balance is persisted so the
@@ -191,15 +191,15 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .mockResolvedValue({ success: true, message: "ok" });
 
     // Total alone covers 100 sats, but the stored reserved snapshot makes
-    // only 90 sats available and must trigger the proactive path.
+    // only 90 sats available (below the 140-sat margin) so it must trigger.
     spinOff(client, { tokenBalance: 120, tokenReserved: 30 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      // Fresh shortfall is 10, so the 21-sat floor applies, then 1.4 margin.
-      amount: 21 * 1.4,
+      // target = 140; shortfall = 140 - 90 = 50 (floor 21)
+      amount: 50,
       token: API_KEY,
     });
   });
@@ -215,16 +215,16 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     });
     const topUp = vi
       .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 126, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 130, message: "ok" });
 
     spinOff(client, { tokenBalance: 20 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // available = 20 - 10 = 10 → shortfall = 90 → 90 * 1.4
+    // available = 20 - 10 = 10 → shortfall vs target = 140 - 10 = 130
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 90 * 1.4,
+      amount: 130,
       token: API_KEY,
     });
   });
@@ -233,7 +233,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 99_000, // 99 sat → shortfall = 1 sat < 0.21 * 100
+      amount: 125_000, // 125 sat → shortfall vs target = 15 < 0.21 * 100
       reserved: 0,
       unit: "msat",
       apiKey: API_KEY,
@@ -242,14 +242,14 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    spinOff(client, { tokenBalance: 99 });
+    spinOff(client, { tokenBalance: 125 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // floor = 0.21 * 100 = 21 → 21 * 1.4
+    // floor = 0.21 * 100 = 21
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 21 * 1.4,
+      amount: 21,
       token: API_KEY,
     });
   });
@@ -276,7 +276,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const { client } = createClient();
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    spinOff(client, { tokenBalance: 200 }); // ≥ required
+    spinOff(client, { tokenBalance: 200 }); // ≥ required * 1.4 (margin)
     await new Promise((r) => setTimeout(r, 10));
 
     expect(topUp).not.toHaveBeenCalled();
@@ -452,7 +452,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const topUp = vi.spyOn(balanceManager, "topUp").mockImplementation(
       async () => {
         topUpStarted = true;
-        return { success: true, toppedUpAmount: 21 * 1.4, message: "ok" };
+        return { success: true, toppedUpAmount: 50, message: "ok" };
       }
     );
 
