@@ -557,11 +557,7 @@ export class ProviderManager {
   ): ModelProviderPrice[] {
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
-    const disabledProviderList = this.discoveryAdapter.getDisabledProviders();
-    const disabledProviders = new Set(disabledProviderList);
-    if (disabledProviderList.length > 0) {
-      this.logger.log(`getProviderPriceRankingForModel: disabled providers (${disabledProviderList.length}): ${disabledProviderList.join(", ")}`);
-    }
+    const disabledProviders = new Set(this.discoveryAdapter.getDisabledProviders());
     const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
 
