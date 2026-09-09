@@ -27,7 +27,7 @@ export interface WalletAdapter {
    * @param mintUrl The mint URL to send from
    * @param amount Amount in sats
    * @param p2pkPubkey Optional P2PK public key
-   * @param persistToken Await before deleting the wallet's recovery backup
+   * @param persistToken Call with the encoded token and await before discarding the wallet's copy of those proofs
    * @returns Encoded cashu token string
    */
   sendToken(

@@ -648,7 +648,6 @@ export const createSdkStore = ({
     },
   };
   const store = createEmptyStore(durable, () => pending, async () => {
-    // Let queued writes settle, take disk as truth, then reopen the barrier.
     await pending.catch(() => {});
     await hydrateStoreFromDriver(store, durable);
     pending = Promise.resolve();

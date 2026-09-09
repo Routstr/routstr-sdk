@@ -1959,7 +1959,7 @@ export class RoutstrClient {
       this.mode === "apikeys" &&
       (this.storageAdapter.getApiKey(baseUrl) ||
         this.storageAdapter.getXcashuTokensForBaseUrl(baseUrl)
-          .some((entry) => entry.token.startsWith("cashu")))
+          .some((entry) => entry.token.startsWith("cashu") && !this.balanceManager.isTokenRecovering(entry.token)))
     ) {
       return;
     }
@@ -2175,6 +2175,9 @@ export class RoutstrClient {
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       let selectedMintUrl: string | undefined;
+      if (parentApiKey && this.balanceManager.isTokenRecovering(parentApiKey.key)) {
+        throw new Error("API key recovery is in progress; retry after it finishes");
+      }
 
       // A bootstrap token whose key record never got written is still this
       // provider's credential: adopt it, the validation below drops it if dead.
@@ -2182,7 +2185,7 @@ export class RoutstrClient {
         ? undefined
         : this.storageAdapter
             .getXcashuTokensForBaseUrl(baseUrl)
-            .find((entry) => entry.token.startsWith("cashu"));
+            .find((entry) => entry.token.startsWith("cashu") && !this.balanceManager.isTokenRecovering(entry.token));
       if (pendingBootstrap) {
         this.storageAdapter.setApiKey(baseUrl, pendingBootstrap.token);
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
@@ -2206,9 +2209,7 @@ export class RoutstrClient {
               `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
             );
             this.storageAdapter.removeApiKey(baseUrl);
-            if (pendingBootstrap) {
-              this.storageAdapter.removeXcashuToken(baseUrl, pendingBootstrap.token);
-            }
+            this.storageAdapter.removeXcashuToken(baseUrl, parentApiKey.key);
             parentApiKey = null;
           }
         } catch (e) {

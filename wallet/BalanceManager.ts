@@ -133,7 +133,7 @@ export class BalanceManager {
   private _refundTimedOutProviders: Set<string> = new Set();
   private readonly logger: SdkLogger;
   private activeTokenUses = 0;
-  private tokenRecovery?: Promise<void>;
+  private recoveringToken?: string;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -156,9 +156,8 @@ export class BalanceManager {
     }
   }
 
-  /** Keep concurrent payments from adopting tokens that are being recovered. */
+  /** Defer recovery while payments may still be using saved tokens. */
   async withTokenUse<T>(operation: () => Promise<T>): Promise<T> {
-    while (this.tokenRecovery) await this.tokenRecovery;
     this.activeTokenUses++;
     try {
       return await operation();
@@ -167,16 +166,18 @@ export class BalanceManager {
     }
   }
 
+  isTokenRecovering(token: string): boolean {
+    return this.recoveringToken === token;
+  }
+
   /** Recovery owns the original until receipt and removal from storage finish. */
-  async withTokenRecovery<T>(operation: () => Promise<T>): Promise<T | undefined> {
-    if (this.activeTokenUses || this.tokenRecovery) return undefined;
-    let release!: () => void;
-    this.tokenRecovery = new Promise<void>((resolve) => { release = resolve; });
+  async withTokenRecovery<T>(token: string, operation: () => Promise<T>): Promise<T | undefined> {
+    if (this.activeTokenUses || this.recoveringToken) return undefined;
+    this.recoveringToken = token;
     try {
       return await operation();
     } finally {
-      this.tokenRecovery = undefined;
-      release();
+      this.recoveringToken = undefined;
     }
   }
 
@@ -611,6 +612,9 @@ export class BalanceManager {
     if (!apiKey) {
       return { success: false, message: "No API key available for top up" };
     }
+    if (this.isTokenRecovering(apiKey)) {
+      return { success: false, message: "API key recovery is in progress; retry after it finishes" };
+    }
 
     let cashuToken: string | null = null;
     let requestId: string | undefined;
@@ -656,7 +660,7 @@ export class BalanceManager {
 
         if (recoveredToken || !canRecover) {
           this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
-          await this.storageAdapter.flush?.();
+          await this.storageAdapter.flush?.().catch(() => {});
         }
 
         // A foreign-mint swap failure can be retried against the same provider
@@ -688,7 +692,7 @@ export class BalanceManager {
       }
 
       this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
-      await this.storageAdapter.flush?.();
+      await this.storageAdapter.flush?.().catch(() => {});
       return {
         success: true,
         toppedUpAmount: amount,
@@ -697,7 +701,6 @@ export class BalanceManager {
     } catch (error) {
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
       if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
-        // Back in the wallet, so it is no longer recoverable credit.
         this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
         await this.storageAdapter.flush?.().catch(() => {});
       }
@@ -737,6 +740,8 @@ export class BalanceManager {
     // fresh chance.
     if (retryCount === 0) this._refundTimedOutProviders.clear();
 
+    // Do not refund provider credit when its key removal cannot be persisted.
+    await this.storageAdapter.flush?.();
     const balanceState = await this.getBalanceState();
     const balances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();

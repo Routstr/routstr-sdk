@@ -471,6 +471,9 @@ export class CashuSpender {
   ): Promise<SpendResult | null> {
     const apiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
     if (!apiKeyEntry) return null;
+    if (this.balanceManager?.isTokenRecovering(apiKeyEntry.key)) {
+      throw new Error("API key recovery is in progress; retry after it finishes");
+    }
 
     // Get pending distribution to check balance
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
@@ -638,7 +641,7 @@ export class CashuSpender {
               (fetchResult.parsedError &&
                 isHandledRedemptionError(fetchResult.parsedError)))
           ) {
-            const directReceive = await this.balanceManager.withTokenRecovery(async () => {
+            const directReceive = await this.balanceManager.withTokenRecovery(xcashuToken.token, async () => {
               const received = await this.receiveToken(xcashuToken.token);
               if (received.success) {
                 this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
@@ -647,6 +650,7 @@ export class CashuSpender {
             });
             if (!directReceive) {
               results.push({ baseUrl, token: xcashuToken.token, success: false, error: "Token is in use" });
+              if (refundNotFound) this._startRefundRetryInterval(mintUrl);
               continue;
             }
             if (directReceive.success) {

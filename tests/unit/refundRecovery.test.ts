@@ -210,7 +210,7 @@ describe("Cashu refund recovery", () => {
     expect(pending).toMatchObject([{ token: TOKEN, tryCount: 0 }]);
   });
 
-  it("waits for original-token recovery before starting a new bootstrap request", async () => {
+  it("uses fresh funds without adopting a bootstrap token being recovered", async () => {
     const f = await fixture();
     const receiveStarted = deferred();
     const finishReceive = deferred();
@@ -231,17 +231,136 @@ describe("Cashu refund recovery", () => {
     vi.useFakeTimers();
     const sweep = f.spender.refundXcashuTokens(MINT_URL);
     await receiveStarted.promise;
-    const payment = f.client.routeRequest(request);
+    let settled = false;
+    const payment = f.client.routeRequest(request).finally(() => { settled = true; });
     await vi.advanceTimersByTimeAsync(0);
-    const queriesDuringRecovery = f.balanceQuery.mock.calls.length;
+    const completedDuringRecovery = settled;
+    const pendingDuringRecovery = f.storage.getXcashuTokensForBaseUrl(BASE_URL);
+    const queriedOriginal = f.balanceQuery.mock.calls.some(([token]) => token === TOKEN);
     finishReceive.resolve();
     await sweep;
     await expect(payment).resolves.toMatchObject({ status: 200 });
-    expect(queriesDuringRecovery).toBe(0);
+    expect(completedDuringRecovery).toBe(true);
+    expect(queriedOriginal).toBe(false);
+    expect(pendingDuringRecovery).toMatchObject([{ token: TOKEN }]);
     expect(sendToken).toHaveBeenCalledTimes(1);
     expect(f.fetchMock).toHaveBeenCalledWith(`${BASE_URL}v1/chat/completions`, expect.objectContaining({
       headers: expect.objectContaining({ Authorization: "Bearer cashu-fresh" }),
     }));
     expect(f.storage.getXcashuTokensForBaseUrl(BASE_URL)).toEqual([]);
+  });
+
+  it.each(["request", "topup", "create-token"])("allows an unrelated %s while recovery is pending", async (operation) => {
+    const f = await fixture();
+    const receiveStarted = deferred();
+    const finishReceive = deferred();
+    f.storage.setApiKey(BASE_URL, "sk-funded");
+    f.storage.updateApiKeyBalance(BASE_URL, 100);
+    f.storage.addXcashuToken(BASE_URL, TOKEN);
+    f.wallet.getBalances = async () => ({ [MINT_URL]: operation === "request" ? 0 : 100 });
+    f.wallet.sendToken = async (_mint, _amount, _pubkey, persist) => {
+      await persist?.("cashu-fresh");
+      return "cashu-fresh";
+    };
+    f.receiveToken.mockImplementation(async () => {
+      receiveStarted.resolve();
+      await finishReceive.promise;
+      return { success: true, amount: 7, unit: "sat" };
+    });
+    f.fetchMock.mockImplementation(async (url) => url.endsWith("/refund")
+      ? Response.json({ error: { type: "token_consumed", code: "cashu_token_consumed", message: "Token consumed" } }, { status: 500 })
+      : Response.json({ choices: [] }));
+    vi.useFakeTimers();
+    const sweep = f.spender.refundXcashuTokens(MINT_URL);
+    await receiveStarted.promise;
+    const options = { baseUrl: BASE_URL, mintUrl: MINT_URL, amount: 7 };
+    let settled = false;
+    const payment = (operation === "request" ? f.client.routeRequest(request)
+      : operation === "topup" ? f.manager.topUp(options)
+      : f.manager.createProviderToken(options)).finally(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    const completedDuringRecovery = settled;
+    finishReceive.resolve();
+    await sweep;
+    expect(await payment).toMatchObject(operation === "request" ? { status: 200 } : { success: true });
+    expect(completedDuringRecovery).toBe(true);
+    expect(f.storage.getApiKey(BASE_URL)?.key).toBe("sk-funded");
+    expect(f.receiveToken).toHaveBeenCalledExactlyOnceWith(TOKEN);
+  });
+
+  it.each(["request", "topup", "reuse"])("does not use a saved recovering key for %s", async (operation) => {
+    const f = await fixture();
+    const receiveStarted = deferred();
+    const finishReceive = deferred();
+    f.storage.setApiKey(BASE_URL, TOKEN);
+    f.storage.updateApiKeyBalance(BASE_URL, 100);
+    f.storage.addXcashuToken(BASE_URL, TOKEN);
+    f.wallet.getBalances = async () => ({ [MINT_URL]: 0 });
+    f.receiveToken.mockImplementation(async () => {
+      receiveStarted.resolve();
+      await finishReceive.promise;
+      return { success: false, amount: 0, unit: "sat", message: "Mint unavailable" };
+    });
+    f.fetchMock.mockImplementation(async (url) => url.endsWith("/refund")
+      ? Response.json({ detail: "Refund not found" }, { status: 404 })
+      : Response.json({ choices: [] }));
+    vi.useFakeTimers();
+    const sweep = f.spender.refundXcashuTokens(MINT_URL);
+    await receiveStarted.promise;
+    const options = { baseUrl: BASE_URL, mintUrl: MINT_URL, amount: 7, reuseToken: true };
+    let result: unknown;
+    const payment = (operation === "request" ? f.client.routeRequest(request)
+      : operation === "topup" ? f.manager.topUp(options) : f.spender.spend(options))
+      .then((value) => { result = value; }, (error) => { result = error; });
+    await vi.advanceTimersByTimeAsync(0);
+    const resultDuringRecovery = result;
+    const queriesDuringRecovery = f.balanceQuery.mock.calls.length;
+    const requestsDuringRecovery = f.fetchMock.mock.calls.filter(([url]) => !url.endsWith("/refund"));
+    finishReceive.resolve();
+    await sweep;
+    await payment;
+    if (operation === "topup") {
+      expect(resultDuringRecovery).toMatchObject({ success: false, message: expect.stringContaining("recovery is in progress") });
+    } else {
+      expect(resultDuringRecovery).toBeInstanceOf(Error);
+      expect((resultDuringRecovery as Error).message).toContain("recovery is in progress");
+    }
+    expect(queriesDuringRecovery).toBe(0);
+    expect(requestsDuringRecovery).toEqual([]);
+    expect(f.storage.getApiKey(BASE_URL)?.key).toBe(TOKEN);
+    expect(f.storage.getXcashuTokensForBaseUrl(BASE_URL)).toMatchObject([{ token: TOKEN }]);
+    f.balanceQuery.mockClear();
+    await expect(f.client.routeRequest(request)).resolves.toMatchObject({ status: 200 });
+    expect(f.balanceQuery).toHaveBeenCalledWith(TOKEN, BASE_URL);
+  });
+
+  it("retries a deferred orphan after the active payment finishes", async () => {
+    const f = await fixture();
+    const requestStarted = deferred();
+    const finishRequest = deferred();
+    f.storage.setApiKey(BASE_URL, "sk-funded");
+    f.storage.updateApiKeyBalance(BASE_URL, 100);
+    f.storage.addXcashuToken(BASE_URL, TOKEN);
+    f.receiveToken.mockResolvedValue({ success: true, amount: 7, unit: "sat" });
+    f.fetchMock.mockImplementation(async (url) => {
+      if (url.endsWith("/refund")) return Response.json({ detail: "Refund not found" }, { status: 404 });
+      requestStarted.resolve();
+      await finishRequest.promise;
+      return Response.json({ choices: [] });
+    });
+    vi.useFakeTimers();
+    const payment = f.client.routeRequest(request);
+    await requestStarted.promise;
+    await f.spender.refundXcashuTokens(MINT_URL);
+    expect(f.storage.getXcashuTokensForBaseUrl(BASE_URL)).toMatchObject([{ token: TOKEN, tryCount: 0 }]);
+    expect(f.receiveToken).not.toHaveBeenCalled();
+    finishRequest.resolve();
+    await expect(payment).resolves.toMatchObject({ status: 200 });
+    await vi.advanceTimersByTimeAsync(RETRY_INTERVAL_MS);
+    expect(f.fetchMock.mock.calls.filter(([url]) => url.endsWith("/refund"))).toHaveLength(2);
+    expect(f.receiveToken).toHaveBeenCalledExactlyOnceWith(TOKEN);
+    expect(f.storage.getXcashuTokensForBaseUrl(BASE_URL)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(RETRY_INTERVAL_MS);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

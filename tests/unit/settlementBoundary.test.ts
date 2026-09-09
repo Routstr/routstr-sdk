@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { fetchAIResponse } from "../../client/fetchAIResponse";
 import { inspectSSEWebStream } from "../../client/sse";
+import { noopLogger as logger } from "../../core/types";
 import { createMemoryDriver, createSdkStore, createStorageAdapterFromStore, createDiscoveryAdapterFromStore } from "../../storage";
 
 const base = "https://provider.example/";
-const logger = { log: () => {}, debug: () => {}, warn: () => {}, error: () => {}, child: () => logger };
 
 describe("settlement boundary", () => {
   afterEach(() => { vi.restoreAllMocks(); });

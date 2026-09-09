@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { ProviderError } from "../../core/errors";
+import { noopLogger as logger } from "../../core/types";
 import { createMemoryDriver, createSdkStore, createStorageAdapterFromStore, createDiscoveryAdapterFromStore } from "../../storage";
 import type { WalletAdapter } from "../../wallet/interfaces";
 
@@ -8,7 +9,6 @@ const A = "https://a.example/";
 const B = "https://b.example/";
 const mint = "https://mint.example";
 const model = { id: "gpt-4o-mini", name: "GPT-4o Mini", sats_pricing: { prompt: 1, completion: 1, max_cost: 100 } } as any;
-const logger = { log: () => {}, debug: () => {}, warn: () => {}, error: () => {}, child: () => logger };
 const request = { path: "/v1/chat/completions", method: "POST", body: { messages: [] }, baseUrl: A, mintUrl: mint, modelId: model.id };
 
 async function fixture(mode: "apikeys" | "xcashu" = "apikeys") {
