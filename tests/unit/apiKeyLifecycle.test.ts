@@ -161,15 +161,77 @@ describe("direct provider key lifecycle", () => {
     expect(balanceAtDispatch).toEqual([{ balance: 7, reserved: 1.5 }]);
   });
 
-  it("adopts a persisted bootstrap token instead of funding a second one", async () => {
+  it("adopts a persisted bootstrap token after reload with an empty wallet", async () => {
     const f = await fixture();
     f.storage.addXcashuToken(base, "cashu-orphan");
     await f.storage.flush?.();
+    const reloaded = createSdkStore({ driver: f.driver });
+    await reloaded.hydrate;
+    const storage = createStorageAdapterFromStore(reloaded.store);
+    f.wallet.getBalances = async () => ({});
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ choices: [] })));
-    await f.makeClient().routeRequest(request);
+    await f.makeClient(storage).routeRequest(request);
     expect(f.send).not.toHaveBeenCalled();
-    expect(f.storage.getApiKey(base)?.key).toBe("canonical-fixture");
-    expect(f.storage.getXcashuTokensForBaseUrl(base)).toEqual([]);
+    expect(storage.getApiKey(base)?.key).toBe("canonical-fixture");
+    expect(storage.getXcashuTokensForBaseUrl(base)).toEqual([]);
+  });
+
+  it("reuses a bootstrap adopted while the first wallet send is finishing", async () => {
+    const f = await fixture();
+    let tokenReady!: () => void;
+    const persisted = new Promise<void>((resolve) => { tokenReady = resolve; });
+    let resumeSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => { resumeSend = resolve; });
+    let infoReady!: () => void;
+    const validating = new Promise<void>((resolve) => { infoReady = resolve; });
+    let resumeInfo!: () => void;
+    const infoGate = new Promise<void>((resolve) => { resumeInfo = resolve; });
+    let sends = 0;
+    f.send.mockImplementation(async (_mint, _amount, _pubkey, persist) => {
+      const token = `cashu-race-${++sends}`;
+      await persist?.(token);
+      tokenReady();
+      await sendGate;
+      return token;
+    });
+    const recovered = new Set<string>();
+    const deposited = new Set<string>();
+    f.wallet.receiveToken = vi.fn(async (token) => {
+      if (deposited.has(token)) return { success: false, amount: 0, unit: "sat" };
+      recovered.add(token);
+      return { success: true, amount: 7, unit: "sat" };
+    });
+    const client = f.makeClient();
+    vi.mocked(client.getBalanceManager().getTokenBalance).mockRestore();
+    let infoCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const token = new Headers(init.headers).get("authorization")!.slice(7).replace(/^sk-/, "");
+      if (url.endsWith("/wallet/info")) {
+        infoCalls++;
+        infoReady();
+        await infoGate;
+      }
+      if (recovered.has(token) && !deposited.has(token)) {
+        return Response.json({ detail: { error: { code: "invalid_api_key", message: "proofs already spent" } } }, { status: 401 });
+      }
+      deposited.add(token);
+      return url.endsWith("/wallet/info")
+        ? Response.json({ balance: 7000, reserved: 0, api_key: `sk-${token}` })
+        : Response.json({ choices: [] });
+    }));
+
+    const first = client.routeRequest({ ...request, failover: false }).catch((error) => error);
+    await persisted;
+    const second = client.routeRequest({ ...request, failover: false }).catch((error) => error);
+    await validating;
+    resumeSend();
+    await vi.waitFor(() => expect(infoCalls).toBe(2));
+    resumeInfo();
+    const results = await Promise.all([first, second]);
+
+    expect(results.map((result) => result.status ?? result.message)).toEqual([200, 200]);
+    expect(f.wallet.receiveToken).not.toHaveBeenCalled();
+    expect(f.send).toHaveBeenCalledOnce();
   });
 
   it("drops a dead orphan token before funding again", async () => {

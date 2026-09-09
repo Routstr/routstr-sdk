@@ -474,17 +474,16 @@ describe("CashuSpender background redemption recovery", () => {
     store.getXcashuTokens = () => ({
       [BASE_URL]: [{ token, tryCount: 0 }],
     });
-    const balanceManager = {
-      fetchRefundToken: vi.fn().mockResolvedValue({
-        success: false,
-        status: 500,
-        error: "consumed",
-        parsedError: parseCoreError(
-          body(CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED),
-          500
-        ),
-      }),
-    } as any;
+    const balanceManager = new BalanceManager(wallet(), store);
+    vi.spyOn(balanceManager, "fetchRefundToken").mockResolvedValue({
+      success: false,
+      status: 500,
+      error: "consumed",
+      parsedError: parseCoreError(
+        body(CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED),
+        500
+      ),
+    });
     const spender = new CashuSpender(wallet(), store, discovery(), balanceManager);
     const receive = vi.spyOn(spender, "receiveToken").mockResolvedValue({
       success: true,

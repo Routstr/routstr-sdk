@@ -11,7 +11,7 @@ const model = { id: "gpt-4o-mini", name: "GPT-4o Mini", sats_pricing: { prompt: 
 const logger = { log: () => {}, debug: () => {}, warn: () => {}, error: () => {}, child: () => logger };
 const request = { path: "/v1/chat/completions", method: "POST", body: { messages: [] }, baseUrl: A, mintUrl: mint, modelId: model.id };
 
-async function fixture() {
+async function fixture(mode: "apikeys" | "xcashu" = "apikeys") {
   const { store, hydrate } = createSdkStore({ driver: createMemoryDriver() });
   await hydrate;
   const storage = createStorageAdapterFromStore(store);
@@ -32,7 +32,7 @@ async function fixture() {
     sendToken: send,
     receiveToken: async () => ({ success: true, amount: 7, unit: "sat" }),
   };
-  const client = new RoutstrClient(wallet, storage, discovery, "min", "apikeys", { logger });
+  const client = new RoutstrClient(wallet, storage, discovery, "min", mode, { logger });
   const manager = client.getBalanceManager();
   vi.spyOn(manager, "getTokenBalance").mockResolvedValue({ amount: 200000, reserved: 0, unit: "msat", apiKey: "sk-credit-on-a" });
   const refund = vi.spyOn(manager, "refundApiKey").mockResolvedValue({ success: true, refundedAmount: 50000 } as any);
@@ -97,5 +97,19 @@ describe("selected provider policy", () => {
     expect(f.refund).not.toHaveBeenCalled();
     await f.manager.createProviderToken({ mintUrl: mint, baseUrl: A, amount: 7 });
     expect(f.refund).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: B }));
+  });
+
+  it.each(["apikeys", "xcashu"] as const)("failover: false never funds a %s request from another provider", async (mode) => {
+    const f = await fixture(mode);
+    f.wallet.getBalances = async () => ({ [mint]: 1 });
+    f.storage.removeApiKey(A);
+    f.storage.setApiKey(B, "sk-credit-on-b");
+    f.storage.updateApiKeyBalance(B, 1000);
+
+    await expect(f.client.routeRequest({ ...request, failover: false })).rejects.toThrow("Insufficient balance");
+
+    expect(f.refund).not.toHaveBeenCalled();
+    expect(f.send).not.toHaveBeenCalled();
+    expect(f.storage.getApiKey(B)).toMatchObject({ key: "sk-credit-on-b", balance: 1000 });
   });
 });

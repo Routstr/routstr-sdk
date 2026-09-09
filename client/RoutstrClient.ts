@@ -274,7 +274,9 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
-    const prepared = await this._prepareRoutedRequest(params);
+    const prepared = await this.balanceManager.withTokenUse(
+      () => this._prepareRoutedRequest(params)
+    );
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
@@ -1951,9 +1953,14 @@ export class RoutstrClient {
    * Check wallet balance and throw if insufficient
    */
   private async _checkBalance(baseUrl: string): Promise<void> {
-    // In apikeys mode, if a funded API key already exists in storage its
-    // balance lives on the provider — skip the local wallet check.
-    if (this.mode === "apikeys" && this.storageAdapter.getApiKey(baseUrl)) {
+    // Stored credit or a pending bootstrap token can fund the request
+    // even when the local wallet is empty.
+    if (
+      this.mode === "apikeys" &&
+      (this.storageAdapter.getApiKey(baseUrl) ||
+        this.storageAdapter.getXcashuTokensForBaseUrl(baseUrl)
+          .some((entry) => entry.token.startsWith("cashu")))
+    ) {
       return;
     }
 
@@ -2267,20 +2274,22 @@ export class RoutstrClient {
             error instanceof Error &&
             error.message.includes("ApiKey already exists")
           ) {
-            const receiveResult = await this.cashuSpender.receiveToken(
-              spendResult.token
-            );
-            if (receiveResult.success) {
-              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
+            if (this.storageAdapter.getApiKey(baseUrl)?.key !== spendResult.token) {
+              const receiveResult = await this.cashuSpender.receiveToken(
+                spendResult.token
               );
-            } else {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restore failed: ${receiveResult.message}`
-              );
+              if (receiveResult.success) {
+                this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+                this._log(
+                  "DEBUG",
+                  `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
+                );
+              } else {
+                this._log(
+                  "DEBUG",
+                  `[RoutstrClient] _handleErrorResponse: Token restore failed: ${receiveResult.message}`
+                );
+              }
             }
             this._log(
               "DEBUG",
@@ -2366,6 +2375,7 @@ export class RoutstrClient {
       baseUrl,
       reuseToken: false,
       excludeMints,
+      refundOtherProviders,
     });
 
     if (!spendResult.token) {

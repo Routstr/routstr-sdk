@@ -132,6 +132,8 @@ export class BalanceManager {
   /** Providers that have timed out during the current refund cascade. */
   private _refundTimedOutProviders: Set<string> = new Set();
   private readonly logger: SdkLogger;
+  private activeTokenUses = 0;
+  private tokenRecovery?: Promise<void>;
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -151,6 +153,30 @@ export class BalanceManager {
         this,
         this.logger
       );
+    }
+  }
+
+  /** Keep concurrent payments from adopting tokens that are being recovered. */
+  async withTokenUse<T>(operation: () => Promise<T>): Promise<T> {
+    while (this.tokenRecovery) await this.tokenRecovery;
+    this.activeTokenUses++;
+    try {
+      return await operation();
+    } finally {
+      this.activeTokenUses--;
+    }
+  }
+
+  /** Recovery owns the original until receipt and removal from storage finish. */
+  async withTokenRecovery<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    if (this.activeTokenUses || this.tokenRecovery) return undefined;
+    let release!: () => void;
+    this.tokenRecovery = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      return await operation();
+    } finally {
+      this.tokenRecovery = undefined;
+      release();
     }
   }
 
@@ -561,7 +587,7 @@ export class BalanceManager {
     this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
-      return await this._topUpImpl(options);
+      return await this.withTokenUse(() => this._topUpImpl(options));
     } finally {
       this._endProviderWalletOperation(baseUrl, "topup");
     }
@@ -681,6 +707,12 @@ export class BalanceManager {
   }
 
   async createProviderToken(
+    options: CreateProviderTokenOptions
+  ): Promise<ProviderTokenResult> {
+    return this.withTokenUse(() => this._createProviderToken(options));
+  }
+
+  private async _createProviderToken(
     options: CreateProviderTokenOptions
   ): Promise<ProviderTokenResult> {
     const {
