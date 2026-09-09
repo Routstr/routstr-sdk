@@ -15,7 +15,7 @@ import {
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
-import { getDecodedToken } from "@cashu/cashu-ts";
+import { getTokenMetadata } from "@cashu/cashu-ts";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { FileRequestResponseLogSink } from "./requestResponseLogSink";
@@ -344,13 +344,12 @@ async function main(): Promise<void> {
     }> {
       try {
         await runWalletCommand(["receive", "cashu", token]);
-        const decoded = getDecodedToken(token);
-        const amount = decoded?.proofs?.reduce(
-          (sum, proof) => sum + proof.amount,
-          0
-        );
-        const unit = decoded?.unit === "msat" ? "msat" : "sat";
-        return { success: true, amount: amount ?? 0, unit };
+        const { amount, unit } = getTokenMetadata(token);
+        return {
+          success: true,
+          amount,
+          unit: unit === "msat" ? "msat" : "sat",
+        };
       } catch (error) {
         console.log("Eerro in receive", error);
         const errorMessage =

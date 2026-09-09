@@ -1,3 +1,4 @@
+import { getEncodedTokenV4 } from "@cashu/cashu-ts";
 import { describe, expect, it } from "vitest";
 import { CashuSpender } from "../../wallet/CashuSpender";
 import { InsufficientBalanceError } from "../../core";
@@ -41,6 +42,49 @@ const createStorage = (
 });
 
 describe("CashuSpender", () => {
+  it("caches the real amount when a short-keyset token fails on an unreachable mint", async () => {
+    const shortKeysetId = `01${"11".repeat(32)}`;
+    const token = getEncodedTokenV4({
+      mint: "https://mint.example.com",
+      unit: "msat",
+      proofs: [
+        {
+          id: shortKeysetId,
+          amount: 2,
+          secret: "synthetic-secret-1",
+          C: `02${"22".repeat(32)}`,
+        },
+        {
+          id: shortKeysetId,
+          amount: 5,
+          secret: "synthetic-secret-2",
+          C: `03${"33".repeat(32)}`,
+        },
+      ],
+    });
+
+    const cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
+    const spender = new CashuSpender(
+      createWallet({
+        receiveToken: async () => {
+          throw new Error("Failed to fetch mint https://mint.example.com");
+        },
+      }),
+      createStorage({
+        getCachedReceiveTokens: () => cached,
+        setCachedReceiveTokens: (tokens) => {
+          cached.splice(0, cached.length, ...tokens);
+        },
+      })
+    );
+
+    const result = await spender.receiveToken(token);
+
+    expect(cached).toHaveLength(1);
+    expect(cached[0]).toMatchObject({ token, amount: 7, unit: "msat" });
+    expect(result).toMatchObject({ success: false, amount: 7, unit: "msat" });
+  });
+
   it("reuses stored API key when pending balance is sufficient", async () => {
     const spender = new CashuSpender(
       createWallet({
