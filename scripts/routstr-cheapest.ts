@@ -7,7 +7,7 @@ import {
   fetchAIResponse,
   consoleLogger,
 } from "@routstr/sdk";
-import { getDecodedToken } from "@cashu/cashu-ts";
+import { getTokenMetadata } from "@cashu/cashu-ts";
 import { createSdkStore } from "@routstr/sdk/storage";
 import { createSqliteDriver } from "@routstr/sdk/storage/node";
 import {
@@ -259,13 +259,8 @@ async function main(): Promise<void> {
       token: string
     ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }> {
       await runWalletCommand(["receive", "cashu", token]);
-      const decoded = getDecodedToken(token);
-      const amount = decoded?.proofs?.reduce(
-        (sum, proof) => sum + proof.amount,
-        0
-      );
-      const unit = decoded?.unit === "msat" ? "msat" : "sat";
-      return { success: true, amount: amount ?? 0, unit };
+      const { amount, unit } = getTokenMetadata(token);
+      return { success: true, amount, unit: unit === "msat" ? "msat" : "sat" };
     },
     isUsingNip60(): boolean {
       return false;

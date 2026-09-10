@@ -7,7 +7,7 @@ import {
   createStorageAdapterFromStore,
 } from "@routstr/sdk/storage";
 import { spawn } from "child_process";
-import { getDecodedToken } from "@cashu/cashu-ts";
+import { getTokenMetadata } from "@cashu/cashu-ts";
 
 async function runWalletCommand(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -183,13 +183,8 @@ async function main(): Promise<void> {
       token: string
     ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }> {
       await runWalletCommand(["receive", "cashu", token]);
-      const decoded = getDecodedToken(token);
-      const amount = decoded?.proofs?.reduce(
-        (sum, proof) => sum + proof.amount,
-        0
-      );
-      const unit = decoded?.unit === "msat" ? "msat" : "sat";
-      return { success: true, amount: amount ?? 0, unit };
+      const { amount, unit } = getTokenMetadata(token);
+      return { success: true, amount, unit: unit === "msat" ? "msat" : "sat" };
     },
   };
 

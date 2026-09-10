@@ -21,7 +21,7 @@ import {
 import { BalanceManager } from "./BalanceManager";
 import { auditLogger } from "./AuditLogger";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
-import { getDecodedToken } from "@cashu/cashu-ts";
+import { getTokenMetadata } from "@cashu/cashu-ts";
 
 /**
  * Options for spending cashu tokens
@@ -122,13 +122,9 @@ export class CashuSpender {
     unit: "sat" | "msat";
   } {
     try {
-      const decoded = getDecodedToken(token);
-      const amount = decoded.proofs.reduce(
-        (acc, proof) => acc + proof.amount,
-        0
-      );
-      const unit = (decoded.unit as "sat" | "msat") || "sat";
-      return { amount, unit };
+      const metadata = getTokenMetadata(token);
+      const unit = (metadata.unit as "sat" | "msat") || "sat";
+      return { amount: metadata.amount, unit };
     } catch {
       return { amount: 0, unit: "sat" };
     }
