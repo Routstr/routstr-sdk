@@ -224,14 +224,19 @@ export class ModelManager {
     this.eventStoreInitPromise = null;
   }
 
+  /**
+   * Query Nostr events for a filter from the event store (persistent or
+   * memory fallback), live-fetching from relays only when forced, the store is
+   * empty for the filter, or the last successful fetch for the filter is
+   * older than cacheTTL. Every returned event passes the trust gate exactly
+   * once per call; `onEvent` fires once per returned event.
+   */
   private async getNostrEvents(
     filter: Filter,
     forceRefresh: boolean = false,
     onEvent?: (event: NostrEvent) => void
   ): Promise<NostrEvent[]> {
     const eventStore = (await this.ensureEventStore()) ?? this.memoryEventStore;
-    const cached = eventStore.getTimeline(filter)
-      .filter((event) => this.isNostrEventTrustworthy(event));
     const query = JSON.stringify(filter);
     const lastUpdate = this.queryLastUpdate.get(query) ??
       this.adapter.getNostrQueryLastUpdate?.()?.[query];
@@ -239,6 +244,11 @@ export class ModelManager {
     const cacheValid = typeof lastUpdate === "number" &&
       lastUpdate <= now && now - lastUpdate <= this.cacheTTL;
     const received = new Set<string>();
+
+    // forceRefresh decides the fetch branch on its own; the verified store
+    // read would be discarded, so skip it entirely.
+    const cached = forceRefresh ? [] : eventStore.getTimeline(filter)
+      .filter((event) => this.isNostrEventTrustworthy(event));
 
     if (forceRefresh || cached.length === 0 || !cacheValid) {
       await this.collectNostrEvents(
@@ -259,15 +269,24 @@ export class ModelManager {
           ...Object.fromEntries(this.queryLastUpdate),
         });
       }
+
+      // Refresh timing does not expire saved announcements or reviews; the
+      // re-read picks up both newly stored and previously saved events.
+      const events = eventStore.getTimeline(filter)
+        .filter((event) => this.isNostrEventTrustworthy(event));
+      for (const event of events) {
+        if (!received.has(event.id)) onEvent?.(event);
+      }
+      return events;
     }
 
-    // Refresh timing does not expire saved announcements or reviews.
-    const events = eventStore.getTimeline(filter)
-      .filter((event) => this.isNostrEventTrustworthy(event));
-    for (const event of events) {
-      if (!received.has(event.id)) onEvent?.(event);
+    // Cache hit: `cached` was verified moments ago and nothing has touched
+    // the store since, so reuse it instead of re-reading the timeline. No
+    // fetch ran, so `received` is empty and every event fires exactly once.
+    for (const event of cached) {
+      onEvent?.(event);
     }
-    return events;
+    return cached;
   }
 
   /**
