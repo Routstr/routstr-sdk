@@ -104,6 +104,7 @@ export const createShardedDiscoveryAdapter = async (
   // ---- Hydrate non-model fields once ----
 
   const [
+    rawNostrQueryLastUpdate,
     rawMints,
     rawInfo,
     lastUsedModel,
@@ -115,6 +116,9 @@ export const createShardedDiscoveryAdapter = async (
     rawRoutstr21Models,
     lastRoutstr21ModelsUpdate,
   ] = await Promise.all([
+    driver.getItem<Record<string, number>>(
+      SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, {}
+    ).catch(() => ({})),
     driver.getItem<Record<string, string[]>>(
       SDK_STORAGE_KEYS.MINTS_FROM_ALL_PROVIDERS,
       {},
@@ -213,6 +217,7 @@ export const createShardedDiscoveryAdapter = async (
   );
 
   let _lastUsedModel: string | null = lastUsedModel;
+  let nostrQueryLastUpdate = rawNostrQueryLastUpdate;
   let _disabledProviders: string[] = rawDisabled.map(normalizeBaseUrl);
   let _manuallyDisabledProviders: string[] = rawManuallyDisabled.map(normalizeBaseUrl);
   let _manuallyEnabledProviders: string[] = rawManuallyEnabled.map(normalizeBaseUrl);
@@ -228,6 +233,12 @@ export const createShardedDiscoveryAdapter = async (
   // ---- Build the adapter ----
 
   return {
+    getNostrQueryLastUpdate: () => nostrQueryLastUpdate,
+    setNostrQueryLastUpdate: (timestamps) => {
+      nostrQueryLastUpdate = timestamps;
+      void driver.setItem(SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, timestamps)
+        .catch((error) => console.warn("Failed to persist discovery query times", error));
+    },
     // -- Models (sharded kv) --
 
     getCachedModels: (): Record<string, Model[]> => {

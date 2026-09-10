@@ -1,4 +1,5 @@
 export const SDK_STORAGE_KEYS = {
+  NOSTR_QUERY_LAST_UPDATE: "nostr_query_last_update",
   MODELS_FROM_ALL_PROVIDERS: "modelsFromAllProviders",
   LAST_USED_MODEL: "lastUsedModel",
   BASE_URLS_LIST: "base_urls_list",

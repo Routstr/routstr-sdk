@@ -5,6 +5,7 @@ export interface StorageDriver {
 }
 
 export interface SdkStorageState {
+  nostrQueryLastUpdate: Record<string, number>;
   modelsFromAllProviders: Record<string, import("../core").Model[]>;
   lastUsedModel: string | null;
   baseUrlsList: string[];

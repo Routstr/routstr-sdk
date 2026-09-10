@@ -15,7 +15,7 @@ import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
 import { verifyEvent } from "applesauce-core/helpers";
-import type { NostrEvent } from "applesauce-core/helpers";
+import type { Filter, NostrEvent } from "applesauce-core/helpers";
 
 type SqliteStatement = {
   run?: (...params: any[]) => unknown;
@@ -64,6 +64,8 @@ const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
  * Configuration for ModelManager
  */
 export interface ModelManagerConfig {
+  /** Existing event store. Its database must be hydrated before discovery starts. */
+  eventStore?: EventStore;
   /** URL to fetch provider directory from */
   providerDirectoryUrl?: string;
   /** Additional provider base URLs to include */
@@ -125,6 +127,8 @@ export class ModelManager {
   private relayPool: RelayPool | null = null;
   /** Persistent event store for relay-fetched events (null if not configured/initialized) */
   private eventStore: EventStore | null = null;
+  private readonly memoryEventStore = new EventStore({ verifyEvent });
+  private readonly queryLastUpdate = new Map<string, number>();
   private eventStoreDb: PersistentEventDatabase | null = null;
   private eventStoreInitPromise: Promise<EventStore | null> | null = null;
   private readonly eventStoreDbPath?: string;
@@ -151,6 +155,7 @@ export class ModelManager {
 
     this.eventStoreDbPath = config.eventStoreDbPath;
     this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
+    this.eventStore = config.eventStore ?? null;
   }
 
   /**
@@ -163,11 +168,11 @@ export class ModelManager {
 
   /**
    * Lazily initialize the persistent event store.
-   * Returns null if no eventStoreDbPath was provided.
+   * Returns null if neither eventStore nor eventStoreDbPath was provided.
    */
   private async ensureEventStore(): Promise<EventStore | null> {
-    if (!this.eventStoreDbPath) return null;
     if (this.eventStore) return this.eventStore;
+    if (!this.eventStoreDbPath) return null;
 
     if (!this.eventStoreInitPromise) {
       this.eventStoreInitPromise = (async () => {
@@ -175,7 +180,6 @@ export class ModelManager {
           const db = await this.createPersistentEventDatabase();
           this.eventStoreDb = db;
           this.eventStore = new EventStore({ database: db });
-          this.initializeEventStoreMetadata();
           this.logger.log(
             `Persistent event store initialized at ${this.eventStoreDbPath}`
           );
@@ -194,7 +198,7 @@ export class ModelManager {
 
   /**
    * Get the persistent event store, initializing it if configured.
-   * Returns null if no eventStoreDbPath was provided.
+   * Returns null if neither eventStore nor eventStoreDbPath was provided.
    */
   async getEventStore(): Promise<EventStore | null> {
     return this.ensureEventStore();
@@ -220,55 +224,69 @@ export class ModelManager {
     this.eventStoreInitPromise = null;
   }
 
-  private initializeEventStoreMetadata(): void {
-    this.eventStoreDb?.db?.exec(
-      `CREATE TABLE IF NOT EXISTS routstr_event_cache_metadata (
-        event_id TEXT PRIMARY KEY,
-        fetched_at INTEGER NOT NULL
-      )`
-    );
-  }
-
-  private markEventFetched(event: NostrEvent, fetchedAt: number = Date.now()): void {
-    const db = this.eventStoreDb?.db;
-    if (!db) return;
-
-    db.prepare(
-      `INSERT INTO routstr_event_cache_metadata (event_id, fetched_at)
-       VALUES (?, ?)
-       ON CONFLICT(event_id) DO UPDATE SET fetched_at = excluded.fetched_at`
-    ).run?.(event.id, fetchedAt);
-  }
-
-  private getEventFetchedAt(event: NostrEvent): number | undefined {
-    const db = this.eventStoreDb?.db;
-    if (!db) return undefined;
-
-    const row = db
-      .prepare(
-        `SELECT fetched_at FROM routstr_event_cache_metadata WHERE event_id = ?`
-      )
-      .get?.(event.id);
-    return typeof row?.fetched_at === "number" ? row.fetched_at : undefined;
-  }
-
   /**
-   * Return all matching events from the persistent event store.
-   * The store accumulates events over time — it is the source of truth,
-   * not a temporary cache. Old events remain valid.
+   * Query Nostr events for a filter from the event store (persistent or
+   * memory fallback), live-fetching from relays only when forced, the store is
+   * empty for the filter, or the last successful fetch for the filter is
+   * older than cacheTTL. Every returned event passes the trust gate exactly
+   * once per call; `onEvent` fires once per returned event.
    */
-  private async getCachedNostrEvents(
-    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[] },
-    forceRefresh: boolean = false
+  private async getNostrEvents(
+    filter: Filter,
+    forceRefresh: boolean = false,
+    onEvent?: (event: NostrEvent) => void
   ): Promise<NostrEvent[]> {
-    const eventStore = await this.ensureEventStore();
-    if (forceRefresh) return [];
-    if (!eventStore) return [];
+    const eventStore = (await this.ensureEventStore()) ?? this.memoryEventStore;
+    const query = JSON.stringify(filter);
+    const lastUpdate = this.queryLastUpdate.get(query) ??
+      this.adapter.getNostrQueryLastUpdate?.()?.[query];
+    const now = Date.now();
+    const cacheValid = typeof lastUpdate === "number" &&
+      lastUpdate <= now && now - lastUpdate <= this.cacheTTL;
+    const received = new Set<string>();
 
-    return eventStore
-      .getTimeline(filter)
-      // Drop far-future state persisted before this fix.
-      .filter((event) => !this.isFutureDated(event));
+    // forceRefresh decides the fetch branch on its own; the verified store
+    // read would be discarded, so skip it entirely.
+    const cached = forceRefresh ? [] : eventStore.getTimeline(filter)
+      .filter((event) => this.isNostrEventTrustworthy(event));
+
+    if (forceRefresh || cached.length === 0 || !cacheValid) {
+      await this.collectNostrEvents(
+        filter, this.getNostrRelays(), NOSTR_QUERY_TIMEOUT_MS,
+        (event) => {
+          const stored = eventStore.add(event);
+          if (!stored || stored.id !== event.id) return;
+          received.add(event.id);
+          onEvent?.(event);
+        }
+      );
+
+      // Relay errors can complete an empty stream. Only returned evidence renews the query cache.
+      if (received.size > 0) {
+        this.queryLastUpdate.set(query, Date.now());
+        this.adapter.setNostrQueryLastUpdate?.({
+          ...this.adapter.getNostrQueryLastUpdate?.(),
+          ...Object.fromEntries(this.queryLastUpdate),
+        });
+      }
+
+      // Refresh timing does not expire saved announcements or reviews; the
+      // re-read picks up both newly stored and previously saved events.
+      const events = eventStore.getTimeline(filter)
+        .filter((event) => this.isNostrEventTrustworthy(event));
+      for (const event of events) {
+        if (!received.has(event.id)) onEvent?.(event);
+      }
+      return events;
+    }
+
+    // Cache hit: `cached` was verified moments ago and nothing has touched
+    // the store since, so reuse it instead of re-reading the timeline. No
+    // fetch ran, so `received` is empty and every event fires exactly once.
+    for (const event of cached) {
+      onEvent?.(event);
+    }
+    return cached;
   }
 
   /**
@@ -285,28 +303,23 @@ export class ModelManager {
       return;
     }
 
-    const relays = this.getNostrRelays();
-    const timeoutMs = 5000;
-
     // Kind 38421 — provider discovery
-    await this.fetchLiveIntoStore({ kinds: [38421], limit: 100 }, relays, timeoutMs);
+    await this.getNostrEvents({ kinds: [38421], limit: 100 }, true);
 
     // Kind 38425 — provider review/audit events (lgtm, avoid, ...). Fetch all
     // labels so a provider that was later re-reviewed as `avoid` is discovered;
     // querying only `#t:["lgtm"]` here would silently keep stale approvals.
-    await this.fetchLiveIntoStore(
+    await this.getNostrEvents(
       { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
-      relays,
-      timeoutMs
+      true
     );
 
     // Kind 38423 — routstr21 curated model list. Fetch every published
     // version so the latest one can be selected from the persistent store;
     // limiting to 1 here could persist a stale event.
-    await this.fetchLiveIntoStore(
+    await this.getNostrEvents(
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
-      relays,
-      timeoutMs
+      true
     );
 
     this.logger.log("refreshNostrEvents: live fetch complete");
@@ -315,23 +328,6 @@ export class ModelManager {
     // store. A newly published `avoid` review (or an lgtm→avoid reversal) must
     // take effect now, not on the next bootstrap/manual refresh.
     await this.syncReviewedProvidersFromNostr();
-  }
-
-  /**
-   * Fetch events from live relays and persist them into the event store.
-   */
-  private async fetchLiveIntoStore(
-    filter: { kinds?: number[]; authors?: string[]; "#t"?: string[]; "#d"?: string[]; limit?: number },
-    relays: string[],
-    timeoutMs: number
-  ): Promise<void> {
-    const eventStore = await this.ensureEventStore();
-    if (!eventStore) return;
-
-    await this.collectNostrEvents(filter, relays, timeoutMs, (event) => {
-      eventStore.add(event);
-      this.markEventFetched(event);
-    });
   }
 
   static async init(
@@ -374,11 +370,7 @@ export class ModelManager {
           );
           await Promise.all([
             this.fetchRoutstr21Models(forceRefresh),
-            this.syncReviewedProvidersFromNostr(
-              filteredCachedUrls,
-              this.providerNodePubkeysByUrl,
-              forceRefresh
-            ),
+            this.syncReviewedProvidersFromNostr(filteredCachedUrls),
           ]);
           return filteredCachedUrls;
         }
@@ -442,12 +434,7 @@ export class ModelManager {
     return event.created_at > max;
   }
 
-  /**
-   * Gate every relay-delivered event before use: verify the signature and
-   * reject far-future timestamps. Verification must run here, not only on
-   * EventStore.add(), since that path is optional (no persistent store in
-   * the browser default) and its result is otherwise ignored.
-   */
+  // getTimeline does not verify hydrated records; use the same trust gate for reads and relay events.
   private isNostrEventTrustworthy(event: NostrEvent): boolean {
     let valid = false;
     try {
@@ -532,8 +519,6 @@ export class ModelManager {
     forceRefresh: boolean = false,
     options: BootstrapOptions = {}
   ): Promise<string[]> {
-    const relays = this.getNostrRelays();
-
     const bases = new Set<string>();
     this.providerNodePubkeysByUrl = new Map();
     const excluded = new Set(
@@ -611,30 +596,7 @@ export class ModelManager {
       }
     };
 
-    // Check persistent store first
-    const cached = await this.getCachedNostrEvents(
-      { kinds: [kind] },
-      forceRefresh
-    );
-
-    if (cached.length > 0) {
-      this.logger.log(`Using ${cached.length} cached kind ${kind} events from persistent store`);
-      for (const event of cached) {
-        collectFromEvent(event);
-      }
-    } else {
-      await this.collectNostrEvents(
-        { kinds: [kind], limit: 100 },
-        relays,
-        NOSTR_QUERY_TIMEOUT_MS,
-        (event) => {
-          // Persist to durable store if configured
-          this.eventStore?.add(event);
-          this.markEventFetched(event);
-          collectFromEvent(event);
-        }
-      );
-    }
+    await this.getNostrEvents({ kinds: [kind], limit: 100 }, forceRefresh, collectFromEvent);
 
     // Add additional configured providers
     for (const url of this.includeProviderUrls) {
@@ -733,7 +695,7 @@ export class ModelManager {
    */
   async syncReviewedProvidersFromNostr(
     baseUrls: string[] = this.adapter.getBaseUrlsList(),
-    providerNodes: Map<string, Set<string>> = this.providerNodePubkeysByUrl,
+    providerNodes?: Map<string, Set<string>>,
     forceRefresh: boolean = false
   ): Promise<string[] | null> {
     if (baseUrls.length === 0) return null;
@@ -745,12 +707,14 @@ export class ModelManager {
       return null;
     }
 
-    // On a warm bootstrap the base URL list is served from the adapter cache
-    // and the Nostr discovery pass (which builds providerNodePubkeysByUrl) is
-    // skipped, leaving the node map empty. Rebuild it from the persisted 38421
-    // events so review-based disabling still works across restarts.
-    if (providerNodes.size === 0) {
-      providerNodes = await this.rebuildProviderNodesFromStore();
+    if (!providerNodes || providerNodes.size === 0) {
+      providerNodes = await this.rebuildProviderNodesFromStore(forceRefresh);
+      if (
+        !forceRefresh && providerNodes.size > 0 &&
+        baseUrls.some((url) => !providerNodes!.has(this.normalizeUrl(url)))
+      ) {
+        providerNodes = await this.rebuildProviderNodesFromStore(true);
+      }
       this.providerNodePubkeysByUrl = providerNodes;
     }
 
@@ -758,17 +722,11 @@ export class ModelManager {
     return this.applyReviewDisables(baseUrls, providerNodes, reviewLabels);
   }
 
-  /**
-   * Rebuild the url → node-pubkeys map from persisted kind 38421 events.
-   * Used when a warm bootstrap skipped the live Nostr discovery pass.
-   */
-  private async rebuildProviderNodesFromStore(): Promise<
+  // Restore provider identities even when a warm URL cache skipped discovery.
+  private async rebuildProviderNodesFromStore(forceRefresh: boolean): Promise<
     Map<string, Set<string>>
   > {
     const map = new Map<string, Set<string>>();
-    const eventStore = await this.ensureEventStore();
-    if (!eventStore) return map;
-
     const addNode = (url: string, pubkey?: string) => {
       if (!pubkey) return;
       const normalized = this.normalizeUrl(url);
@@ -777,7 +735,9 @@ export class ModelManager {
       map.set(normalized, existing);
     };
 
-    const events = eventStore.getTimeline({ kinds: [38421] });
+    const events = await this.getNostrEvents(
+      { kinds: [38421], limit: 100 }, forceRefresh
+    );
     for (const event of events) {
       const eventUrls: string[] = [];
       for (const tag of event.tags) {
@@ -799,7 +759,10 @@ export class ModelManager {
           ? content
           : content.providers || [];
         for (const p of providers) {
-          const endpoints = this.getProviderEndpoints(p, false);
+          const endpoints = [
+            ...this.getProviderEndpoints(p, false),
+            ...this.getProviderEndpoints(p, true),
+          ];
           for (const endpoint of endpoints) {
             addNode(endpoint, p?.pubkey || event.pubkey);
           }
@@ -844,35 +807,11 @@ export class ModelManager {
       }
     };
 
-    // Check persistent store first
-    const cached = await this.getCachedNostrEvents(
-      { kinds: [38425], authors: [this.routstrPubkey] },
+    const events = await this.getNostrEvents(
+      { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
       forceRefresh
     );
-
-    if (cached.length > 0) {
-      this.logger.log(
-        `Using ${cached.length} cached kind 38425 review events from persistent store`
-      );
-      for (const event of cached) {
-        collectFromEvent(event);
-      }
-    } else {
-      await this.collectNostrEvents(
-        {
-          kinds: [38425],
-          limit: 500,
-          authors: [this.routstrPubkey],
-        },
-        this.getNostrRelays(),
-        NOSTR_QUERY_TIMEOUT_MS,
-        (event) => {
-          this.eventStore?.add(event);
-          this.markEventFetched(event);
-          collectFromEvent(event);
-        }
-      );
-    }
+    for (const event of events) collectFromEvent(event);
 
     const labels = new Map<string, string>();
     for (const [node, event] of latestByNode) {
@@ -1248,41 +1187,14 @@ export class ModelManager {
       }
     }
 
-    const relays = this.getNostrRelays();
-
-    // Check persistent store first
-    const cached = await this.getCachedNostrEvents(
+    const events = await this.getNostrEvents(
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
       forceRefresh
     );
-    let event: NostrEvent | null = null;
-
-    if (cached.length === 0) {
-      await this.collectNostrEvents(
-        {
-          kinds: [38423],
-          "#d": ["routstr-21-models"],
-          authors: [this.routstrModelsPubkey],
-        },
-        relays,
-        NOSTR_QUERY_TIMEOUT_MS,
-        (e) => {
-          // Persist to durable store if configured
-          this.eventStore?.add(e);
-          this.markEventFetched(e);
-          // Relay arrival order is not guaranteed to be chronological, so
-          // keep the most recently published event rather than the first one.
-          if (!event || e.created_at > event.created_at) event = e;
-        }
-      );
-    } else {
-      this.logger.log(`Using ${cached.length} cached kind 38423 events from persistent store`);
-      // The store accumulates events over time; always act on the latest one.
-      event = cached.reduce((latest, e) =>
-        e.created_at > latest.created_at ? e : latest,
-        cached[0]!
-      );
-    }
+    const event = events.reduce<NostrEvent | null>(
+      (latest, event) => !latest || event.created_at > latest.created_at ? event : latest,
+      null
+    );
 
     if (!event) {
       return cachedModels.length > 0 ? cachedModels : [];
