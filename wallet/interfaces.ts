@@ -27,12 +27,14 @@ export interface WalletAdapter {
    * @param mintUrl The mint URL to send from
    * @param amount Amount in sats
    * @param p2pkPubkey Optional P2PK public key
+   * @param persistToken Call with the encoded token and await before discarding the wallet's copy of those proofs
    * @returns Encoded cashu token string
    */
   sendToken(
     mintUrl: string,
     amount: number,
-    p2pkPubkey?: string
+    p2pkPubkey?: string,
+    persistToken?: (token: string) => Promise<void>
   ): Promise<string>;
 
   /**
@@ -80,6 +82,12 @@ export interface XCashuTokenEntry {
 }
 
 export interface StorageAdapter {
+  /** Wait for queued credential/token writes. A failed write must reject. */
+  flush?(): Promise<void>;
+
+  /** Replace a bootstrap credential without deleting it in a separate write. */
+  replaceApiKey?(baseUrl: string, key: string): void;
+
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
 

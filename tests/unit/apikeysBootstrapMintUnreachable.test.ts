@@ -229,6 +229,7 @@ describe("RoutstrClient._handleErrorResponse — apikeys bootstrap, 503 mint_unr
       amount: 100,
       baseUrl: BASE_URL,
       excludeMints: [MINT_URL],
+      refundOtherProviders: true,
     });
     expect(providerManager.markFailed).not.toHaveBeenCalled();
     expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();

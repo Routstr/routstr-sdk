@@ -12,6 +12,8 @@ const storage = {
   getApiKey: () => null,
   getApiKeyDistribution: () => [],
   getXcashuTokens: () => ({}),
+  addXcashuToken: () => {},
+  removeXcashuToken: () => {},
   getAllApiKeys: () => [],
 } as unknown as StorageAdapter;
 
@@ -52,7 +54,7 @@ describe("BalanceManager request-scoped mint selection", () => {
       selectedMintUrl: MINT_B,
       token: `token:${MINT_B}`,
     });
-    expect(sendToken).toHaveBeenCalledWith(MINT_B, 10, undefined);
+    expect(sendToken).toHaveBeenCalledWith(MINT_B, 10, undefined, expect.any(Function));
   });
 
   it("never falls back to a funded mint the provider does not advertise", async () => {

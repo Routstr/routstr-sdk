@@ -56,6 +56,7 @@ describe("sdk storage store", () => {
 
     // The JSON-backed drivers (including SQLite's key/value table) persist
     // the new field without a schema migration.
+    await storage.flush!();
     const { store: rehydratedStore, hydrate: rehydrate } = createSdkStore({
       driver,
     });

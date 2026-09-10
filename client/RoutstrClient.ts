@@ -37,6 +37,7 @@ import {
 } from "../core/errors";
 import {
   parseCoreError,
+  summarizeCoreError,
   CoreErrorCode,
   CoreErrorType,
   isInvalidTokenError,
@@ -96,6 +97,9 @@ export interface RouteRequestParams {
   userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
+  /** False keeps requests and credit on `baseUrl`, including transient errors.
+   * Defaults to price-ranked failover and pooling other providers' credit. */
+  failover?: boolean;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -270,7 +274,9 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
-    const prepared = await this._prepareRoutedRequest(params);
+    const prepared = await this.balanceManager.withTokenUse(
+      () => this._prepareRoutedRequest(params)
+    );
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
@@ -356,6 +362,7 @@ export class RoutstrClient {
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
+    await this.storageAdapter.flush?.();
     await this._checkBalance(baseUrl);
 
     let requiredSats = 1;
@@ -443,6 +450,7 @@ export class RoutstrClient {
       mintUrl,
       amount: requiredSats,
       baseUrl,
+      refundOtherProviders: params.failover !== false,
     });
 
     const {
@@ -468,6 +476,7 @@ export class RoutstrClient {
       tokenReserved,
       tokenBalanceUnit,
       tokenBalanceUnknown,
+      refundOtherProviders: params.failover !== false,
     });
 
     // Build final request headers (auth + Tinfoil model hint)
@@ -495,6 +504,7 @@ export class RoutstrClient {
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
+      failover: params.failover,
     });
 
     let tokenBalanceInSats =
@@ -632,6 +642,7 @@ export class RoutstrClient {
     tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
+    failover?: boolean;
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -656,6 +667,7 @@ export class RoutstrClient {
 
       if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
 
+      await this.storageAdapter.flush?.();
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
             {
@@ -774,6 +786,7 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
+      failover?: boolean;
     },
     token: string,
     status: number,
@@ -937,6 +950,7 @@ export class RoutstrClient {
           amount: params.requiredSats,
           baseUrl,
           excludeMints,
+          refundOtherProviders: params.failover !== false,
         });
       } catch (error) {
         this._log(
@@ -1101,6 +1115,7 @@ export class RoutstrClient {
                 baseUrl,
                 amount: topupAmount * TOPUP_MARGIN,
                 token: params.token,
+                refundOtherProviders: params.failover !== false,
               })
           );
           this._log(
@@ -1206,10 +1221,7 @@ export class RoutstrClient {
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
             if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-              if (storedApiKeyEntry) {
-                this.storageAdapter.removeApiKey(baseUrl);
-              }
-              this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+              await this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
             }
             retryToken = latestBalanceInfo.apiKey;
           }
@@ -1283,7 +1295,10 @@ export class RoutstrClient {
         status === 503 ||
         status === 504 ||
         status === 521) &&
-      !tryNextProvider
+      !tryNextProvider &&
+      // A selected provider keeps its credential and credit through a
+      // transient error; the refund below only makes sense before failover.
+      params.failover !== false
     ) {
       this._log(
         "DEBUG",
@@ -1429,10 +1444,10 @@ export class RoutstrClient {
       );
     }
 
-    const nextProvider = this.providerManager.findNextBestProvider(
-      selectedModel.id,
-      baseUrl
-    );
+    const nextProvider =
+      params.failover === false
+        ? null
+        : this.providerManager.findNextBestProvider(selectedModel.id, baseUrl);
 
     if (nextProvider) {
       this._log(
@@ -1570,6 +1585,15 @@ export class RoutstrClient {
         recoveryAttempted,
         recoverySucceeded,
       });
+    }
+
+    if (params.failover === false) {
+      throw new ProviderError(
+        baseUrl,
+        status,
+        summarizeCoreError(parsedError),
+        resolvedRequestId
+      );
     }
 
     throw new FailoverError(
@@ -1739,8 +1763,7 @@ export class RoutstrClient {
           storedApiKeyEntry?.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
-          this.storageAdapter.removeApiKey(baseUrl);
-          this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+          await this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(
@@ -1930,9 +1953,14 @@ export class RoutstrClient {
    * Check wallet balance and throw if insufficient
    */
   private async _checkBalance(baseUrl: string): Promise<void> {
-    // In apikeys mode, if a funded API key already exists in storage its
-    // balance lives on the provider — skip the local wallet check.
-    if (this.mode === "apikeys" && this.storageAdapter.getApiKey(baseUrl)) {
+    // Stored credit or a pending bootstrap token can fund the request
+    // even when the local wallet is empty.
+    if (
+      this.mode === "apikeys" &&
+      (this.storageAdapter.getApiKey(baseUrl) ||
+        this.storageAdapter.getXcashuTokensForBaseUrl(baseUrl)
+          .some((entry) => entry.token.startsWith("cashu") && !this.balanceManager.isTokenRecovering(entry.token)))
+    ) {
       return;
     }
 
@@ -1964,6 +1992,7 @@ export class RoutstrClient {
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
+    refundOtherProviders?: boolean;
   }): void {
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
@@ -2023,6 +2052,7 @@ export class RoutstrClient {
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
+    refundOtherProviders?: boolean;
   }): Promise<TopUpResult> {
     try {
       const tokenReserved = snapshot.tokenReserved ?? 0;
@@ -2061,6 +2091,7 @@ export class RoutstrClient {
         // The target already includes TOPUP_MARGIN — deposit the shortfall.
         amount: topupAmount,
         token: snapshot.token,
+        refundOtherProviders: snapshot.refundOtherProviders,
       });
       this._log(
         "DEBUG",
@@ -2119,6 +2150,7 @@ export class RoutstrClient {
     amount: number;
     baseUrl: string;
     excludeMints?: string[];
+    refundOtherProviders?: boolean;
   }): Promise<{
     token: string;
     tokenBalance: number;
@@ -2127,7 +2159,13 @@ export class RoutstrClient {
     tokenBalanceUnknown: boolean;
     selectedMintUrl?: string;
   }> {
-    const { mintUrl, amount, baseUrl, excludeMints = [] } = params;
+    const {
+      mintUrl,
+      amount,
+      baseUrl,
+      excludeMints = [],
+      refundOtherProviders,
+    } = params;
 
     this._log(
       "DEBUG",
@@ -2137,6 +2175,21 @@ export class RoutstrClient {
     if (this.mode === "apikeys") {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       let selectedMintUrl: string | undefined;
+      if (parentApiKey && this.balanceManager.isTokenRecovering(parentApiKey.key)) {
+        throw new Error("API key recovery is in progress; retry after it finishes");
+      }
+
+      // A bootstrap token whose key record never got written is still this
+      // provider's credential: adopt it, the validation below drops it if dead.
+      const pendingBootstrap = parentApiKey
+        ? undefined
+        : this.storageAdapter
+            .getXcashuTokensForBaseUrl(baseUrl)
+            .find((entry) => entry.token.startsWith("cashu") && !this.balanceManager.isTokenRecovering(entry.token));
+      if (pendingBootstrap) {
+        this.storageAdapter.setApiKey(baseUrl, pendingBootstrap.token);
+        parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+      }
 
       // A stored key that is still a bootstrap Cashu token (i.e. the
       // provider's canonical key was never swapped in) may be a zombie: if the
@@ -2156,6 +2209,7 @@ export class RoutstrClient {
               `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
             );
             this.storageAdapter.removeApiKey(baseUrl);
+            this.storageAdapter.removeXcashuToken(baseUrl, parentApiKey.key);
             parentApiKey = null;
           }
         } catch (e) {
@@ -2188,6 +2242,7 @@ export class RoutstrClient {
           baseUrl,
           reuseToken: false,
           excludeMints,
+          refundOtherProviders,
         });
 
         selectedMintUrl = spendResult.selectedMintUrl;
@@ -2220,19 +2275,22 @@ export class RoutstrClient {
             error instanceof Error &&
             error.message.includes("ApiKey already exists")
           ) {
-            const receiveResult = await this.cashuSpender.receiveToken(
-              spendResult.token
-            );
-            if (receiveResult.success) {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
+            if (this.storageAdapter.getApiKey(baseUrl)?.key !== spendResult.token) {
+              const receiveResult = await this.cashuSpender.receiveToken(
+                spendResult.token
               );
-            } else {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Token restore failed: ${receiveResult.message}`
-              );
+              if (receiveResult.success) {
+                this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+                this._log(
+                  "DEBUG",
+                  `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
+                );
+              } else {
+                this._log(
+                  "DEBUG",
+                  `[RoutstrClient] _handleErrorResponse: Token restore failed: ${receiveResult.message}`
+                );
+              }
             }
             this._log(
               "DEBUG",
@@ -2250,6 +2308,11 @@ export class RoutstrClient {
         );
       }
 
+      await this.storageAdapter.flush?.();
+      if (parentApiKey?.key.startsWith("cashu")) {
+        this.storageAdapter.removeXcashuToken(baseUrl, parentApiKey.key);
+        await this.storageAdapter.flush?.();
+      }
       let tokenBalance = 0;
       let tokenReserved = 0;
       let tokenBalanceUnit: "sat" | "msat" = "sat";
@@ -2274,6 +2337,15 @@ export class RoutstrClient {
           tokenReserved = balanceInfo.reserved;
           tokenBalanceUnit = balanceInfo.unit;
           tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
+          // Record the provider-confirmed credit so a request that never
+          // finalizes does not leave the key showing zero.
+          if (!tokenBalanceUnknown) {
+            this.storageAdapter.updateApiKeyBalance(
+              baseUrl,
+              tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance,
+              tokenBalanceUnit === "msat" ? tokenReserved / 1000 : tokenReserved
+            );
+          }
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
@@ -2304,6 +2376,7 @@ export class RoutstrClient {
       baseUrl,
       reuseToken: false,
       excludeMints,
+      refundOtherProviders,
     });
 
     if (!spendResult.token) {
@@ -2344,6 +2417,16 @@ export class RoutstrClient {
     };
 
     return headers;
+  }
+
+  private async _replaceApiKey(baseUrl: string, key: string): Promise<void> {
+    if (this.storageAdapter.replaceApiKey) {
+      this.storageAdapter.replaceApiKey(baseUrl, key);
+    } else {
+      this.storageAdapter.removeApiKey(baseUrl);
+      this.storageAdapter.setApiKey(baseUrl, key);
+    }
+    await this.storageAdapter.flush?.();
   }
 
   /**
