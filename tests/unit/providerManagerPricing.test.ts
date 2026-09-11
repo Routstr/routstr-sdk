@@ -1397,6 +1397,166 @@ describe("ProviderManager", () => {
     });
   });
 
+  // ---- node gate (minimum-balance reserve) ----
+  //
+  // `getRequiredSatsForModel` prices what a request should *cost*. The node
+  // gates on a discounted envelope instead, and the two come apart whenever
+  // the node cannot discount a budget it holds in reserve — most notably for
+  // any request carrying an inline image, because the node's prompt-token
+  // count covers the whole body and counts base64 image data as text.
+  //
+  // The `core:` figure in each comment is what routstr-core's
+  // `calculate_discounted_max_cost` returns (default settings) for the exact
+  // same body. The reserve must never fall below it.
+  describe("node gate reserve", () => {
+    // 1x1 PNG: image token math is exact and the body stays small.
+    const PNG_1X1 =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    const gateModel = (overrides: Record<string, unknown> = {}): Model =>
+      ({
+        id: "test-model",
+        name: "Test Model",
+        context_length: 1000,
+        top_provider: { context_length: 1000, max_completion_tokens: 900 },
+        sats_pricing: {
+          prompt: 0.001,
+          completion: 0.01,
+          request: 0,
+          max_prompt_cost: 10,
+          max_completion_cost: 50,
+          max_cost: 60,
+        },
+        ...overrides,
+      }) as unknown as Model;
+
+    const imageBody = (model: Model, maxTokens?: number) => ({
+      model: model.id,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hi" },
+            { type: "image_url", image_url: { url: PNG_1X1 } },
+          ],
+        },
+      ],
+      ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+    });
+
+    it("reserves the node's gate when an inline image blocks the prompt discount", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = imageBody(model, 4096);
+
+      // core: 50.860 (envelope 59.400 less the unused completion budget).
+      // Pricing only the components gave 43.277 and under-deposited.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.403, 3);
+    });
+
+    it("caps at the envelope without dropping below the gate", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = imageBody(model);
+
+      // core: 59.400. Without max_tokens the node discounts nothing, so the
+      // reserve pins to max_cost (60) rather than the old 52.769.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, undefined, body)
+      ).toBe(60);
+    });
+
+    it("does not discount a Responses max_output_tokens budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "hi" },
+              { type: "input_image", image_url: PNG_1X1 },
+            ],
+          },
+        ],
+        max_output_tokens: 4096,
+      };
+
+      // The call site forwards max_output_tokens as maxTokens, but the node
+      // only discounts `max_tokens`, so the gate stays at the envelope.
+      // core: 59.372 — the old estimate was 43.277.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages ?? [], 4096, body)
+      ).toBe(60);
+    });
+
+    it("applies the node's prompt discount to small text requests", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 10,
+      };
+
+      // A tiny body stays inside the prompt budget, so the node discounts
+      // hard and the gate drops well below the envelope. core: 9.917.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 10, body)
+      ).toBeCloseTo(10.413, 3);
+    });
+
+    it("tracks the gate for a large completion budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 4096,
+      };
+
+      // core: 50.777.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.316, 3);
+    });
+
+    it("falls back to max_prompt_cost when the model exposes no token budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel({
+        id: "test-model-noctx",
+        context_length: undefined,
+        top_provider: undefined,
+      });
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 10,
+      };
+
+      // core: 0.118 (prompt allowance falls back to max_prompt_cost).
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 10, body)
+      ).toBeCloseTo(0.1239, 3);
+    });
+
+    it("never discounts a sealed EHBP/Tinfoil body", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel({ id: "tinfoil-test-model" });
+      const body = imageBody(model, 4096);
+
+      // The enclave encrypts the body, so the node cannot read max_tokens and
+      // holds the whole envelope. Same body as the discounted chat case
+      // above, which reserved 53.403.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBe(60);
+    });
+  });
+
   // ---- store hydration ----
 
   describe("store hydration", () => {
