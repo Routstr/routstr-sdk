@@ -452,6 +452,181 @@ function countResponsesInputTextChars(input: any[]): number {
 }
 
 /**
+ * Node tolerance assumption for the gate calculation.
+ *
+ * Mirrors the default of routstr-core's `tolerance_percentage` setting, the
+ * only value the SDK can assume: the node's configured tolerance is not
+ * advertised anywhere in `/v1/models`. The reserve keeps a further margin on
+ * top of the resulting gate, so a node running a slightly different tolerance
+ * still ends up funded.
+ */
+const NODE_TOLERANCE_PERCENT = 1;
+
+/**
+ * Sum the length of every string in a value tree, keys included.
+ *
+ * Port of routstr-core `_sum_string_chars`. Nothing is excluded, because the
+ * node excludes nothing: inline image data counts as text too, which is the
+ * whole reason a request carrying a base64 image can no longer have its
+ * prompt budget discounted (and therefore reserves its full prompt
+ * allowance).
+ */
+function sumStringChars(node: unknown): number {
+  if (typeof node === "string") return node.length;
+  if (Array.isArray(node)) {
+    return node.reduce<number>((total, item) => total + sumStringChars(item), 0);
+  }
+  if (node && typeof node === "object") {
+    let total = 0;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      total += key.length + sumStringChars(value);
+    }
+    return total;
+  }
+  return 0;
+}
+
+/**
+ * Count integer entries in a legacy completions `prompt` array.
+ *
+ * Port of routstr-core `_count_prompt_token_ids` (booleans are not token IDs).
+ */
+function countPromptTokenIds(node: unknown): number {
+  if (typeof node === "number" && Number.isInteger(node)) return 1;
+  if (Array.isArray(node)) {
+    return node.reduce<number>((total, item) => total + countPromptTokenIds(item), 0);
+  }
+  return 0;
+}
+
+/**
+ * Port of routstr-core `estimate_prompt_tokens`: every string in the
+ * provider-bound body counts, summed over the whole tree and integer-divided
+ * by three.
+ *
+ * JS `.length` counts UTF-16 code units where Python `len()` counts code
+ * points, so astral characters (emoji) are counted slightly higher here. That
+ * direction is safe: a larger prompt count means a smaller prompt discount,
+ * hence a larger gate.
+ */
+function estimateNodePromptTokens(body: Record<string, unknown>): number {
+  return Math.floor(sumStringChars(body) / 3) + countPromptTokenIds(body?.prompt);
+}
+
+/**
+ * Port of the node's minimum-balance gate
+ * (`routstr/payment/helpers.py:calculate_discounted_max_cost`), in sats.
+ *
+ * The node does not price a request by summing components; it gates on a
+ * discounted envelope:
+ *
+ *     gate = max_cost * tolerance
+ *          - max(0, prompt_allowance - prompt_tokens * prompt_price)
+ *          - max(0, max_completion_cost * tolerance - max_tokens * completion_price)
+ *
+ * Two details of that formula are easy to miss on the client, and both of
+ * them caused under-reserved deposits:
+ *
+ *  - The prompt side is only discounted while the node's prompt-token count
+ *    fits inside the allowed prompt budget. That count covers the entire
+ *    body, and inline base64 image data is counted as text, so *any* request
+ *    carrying an image blows past the budget and the node keeps its whole
+ *    prompt allowance reserved. Pricing the prompt from a stripped local text
+ *    estimate reserves far less than the gate.
+ *  - The completion discount comes only from `body.max_tokens`. The node
+ *    ignores Responses `max_output_tokens`, so honoring it here would reserve
+ *    less than the gate for every Responses request that sets it.
+ */
+function nodeGateSats(
+  model: Model,
+  satsPricing: any,
+  requestBody: Record<string, unknown>,
+  imageTokens: number
+): number {
+  const maxCost = satsPricing?.max_cost;
+  if (typeof maxCost !== "number" || !Number.isFinite(maxCost)) return 0;
+
+  const toleranceFactor = 1 - NODE_TOLERANCE_PERCENT / 100;
+  const promptPrice =
+    typeof satsPricing.prompt === "number" ? satsPricing.prompt : 0;
+  const completionPrice =
+    typeof satsPricing.completion === "number" ? satsPricing.completion : 0;
+
+  // `get_max_cost_for_model` truncates the envelope to whole millisats and
+  // floors it at `min_request_msat` (1).
+  let gateMsats = Math.max(1, Math.floor(maxCost * 1000 * toleranceFactor));
+
+  // Prompt allowance: the node starts from `max_prompt_cost` and replaces it
+  // with the model's *token* budget x price whenever it can derive one.
+  let promptAllowanceSats =
+    typeof satsPricing.max_prompt_cost === "number"
+      ? satsPricing.max_prompt_cost * toleranceFactor
+      : 0;
+
+  const topProvider: any = (model as any)?.top_provider;
+  const providerContextLength = topProvider?.context_length;
+  const providerMaxCompletion = topProvider?.max_completion_tokens;
+  let promptTokenLimit: number | undefined;
+
+  if (topProvider && (providerContextLength || providerMaxCompletion)) {
+    if (providerContextLength && providerMaxCompletion) {
+      promptTokenLimit = Math.max(0, providerContextLength - providerMaxCompletion);
+    } else if (providerContextLength) {
+      promptTokenLimit = providerContextLength;
+    } else {
+      promptTokenLimit = 0;
+    }
+  } else if ((model as any)?.context_length) {
+    promptTokenLimit = (model as any).context_length;
+  }
+
+  if (promptTokenLimit !== undefined) {
+    promptAllowanceSats = promptTokenLimit * promptPrice * toleranceFactor;
+  }
+
+  // Images are added as a separate term by the node, and only for chat
+  // `messages` (Responses input images are already inside the body count).
+  const promptTokens =
+    estimateNodePromptTokens(requestBody) +
+    (Array.isArray((requestBody as any)?.messages) ? imageTokens : 0);
+
+  if (promptTokens > 0) {
+    const unusedPromptBudget = promptAllowanceSats - promptTokens * promptPrice;
+    if (unusedPromptBudget > 0) {
+      gateMsats -= Math.floor(unusedPromptBudget * 1000);
+    }
+  }
+
+  // Completion budget: only from `max_tokens`, never Responses
+  // `max_output_tokens`. EHBP/Tinfoil bodies are sealed, so the node cannot
+  // read a budget out of them at all.
+  const rawMaxTokens = (requestBody as any)?.max_tokens;
+  const parsedMaxTokens =
+    typeof rawMaxTokens === "number"
+      ? rawMaxTokens
+      : typeof rawMaxTokens === "string" && rawMaxTokens.trim() !== ""
+        ? Number(rawMaxTokens)
+        : NaN;
+
+  if (
+    Number.isFinite(parsedMaxTokens) &&
+    parsedMaxTokens > 0 &&
+    typeof satsPricing?.max_completion_cost === "number" &&
+    completionPrice > 0 &&
+    !isTinfoilModel(model.id)
+  ) {
+    const unusedCompletionBudget =
+      satsPricing.max_completion_cost * toleranceFactor -
+      parsedMaxTokens * completionPrice;
+    if (unusedCompletionBudget > 0) {
+      gateMsats -= Math.floor(unusedCompletionBudget * 1000);
+    }
+  }
+
+  return Math.max(gateMsats, 1) / 1000;
+}
+
+/**
  * Candidate provider for failover
  */
 interface CandidateProvider {
@@ -1007,7 +1182,17 @@ export class ProviderManager {
       if (maxTokens !== undefined && sp.completion && !isTinfoilModel(model.id)) {
         completionCost = sp.completion * maxTokens;
       }
-      const totalEstimatedCosts = (promptCosts + completionCost + requestFee) * 1.05;
+      const componentEstimate = (promptCosts + completionCost + requestFee) * 1.05;
+
+      // The component estimate above prices what the request is expected to
+      // *cost*. The gate is what the node actually *demands* up front, and the
+      // two diverge whenever the node cannot discount a budget it holds in
+      // reserve — which is the normal case for any request carrying an inline
+      // image (see nodeGateSats). Reserve the larger of the two, keeping the
+      // same 5% margin the component estimate uses so the node's configured
+      // tolerance (which the SDK cannot read) cannot eat the whole reserve.
+      const gateEstimate = nodeGateSats(model, sp, body, imageTokens) * 1.05;
+      let totalEstimatedCosts = Math.max(componentEstimate, gateEstimate);
 
       // Cap at the pricing envelope. The node's gate is always <= max_cost
       // (it only discounts downward from the full envelope), so a capped
