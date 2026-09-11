@@ -14,7 +14,11 @@ import {
 import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
-import { verifyEvent } from "applesauce-core/helpers";
+import {
+  getReplaceableIdentifier,
+  isReplaceable,
+  verifyEvent,
+} from "applesauce-core/helpers";
 import type { Filter, NostrEvent } from "applesauce-core/helpers";
 
 type SqliteStatement = {
@@ -59,6 +63,13 @@ const NOSTR_QUERY_TIMEOUT_MS = 5000;
 
 // Drop events with a forged far-future created_at so they can't win "latest".
 const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
+
+/** Kinds whose persisted events are discovery evidence. */
+const DISCOVERY_KINDS = [38421, 38423, 38425];
+
+// Deletes are chunked so one pruning pass never builds an unbounded SQL
+// statement; the store read itself is never limited.
+const PRUNE_CHUNK_SIZE = 500;
 
 /**
  * Configuration for ModelManager
@@ -225,16 +236,117 @@ export class ModelManager {
   }
 
   /**
+   * True when a kind-38421 event can yield routstr provider URLs, i.e. it
+   * carries a `u` endpoint tag or directory-style JSON content.
+   *
+   * Kind 38421 is not exclusive to routstr — unrelated projects publish their
+   * own addressable events on it (e.g. `lnproxy-v1` advertisement updates,
+   * which have neither field). Without this gate those events are stored,
+   * verified, and counted as discovery evidence.
+   */
+  private isProviderAnnouncement(event: NostrEvent): boolean {
+    for (const tag of event.tags) {
+      if (tag[0] === "u" && typeof tag[1] === "string" && tag[1]) return true;
+    }
+    // Directory-style announcements hold the URLs in JSON content instead.
+    // Check the raw string first so rejected events are never JSON-parsed.
+    const content = event.content;
+    if (!content.includes("endpoint_url") && !content.includes("providers")) {
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(content);
+      const providers = Array.isArray(parsed)
+        ? parsed
+        : parsed?.providers ?? [];
+      return Array.isArray(providers) && providers.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Read discovery evidence from the event store.
+   *
+   * `filter` belongs to the relay subscription and may carry a `limit`; that
+   * limit must not reach the store read. The store is the accumulated history
+   * and applying a row limit to it truncates the evidence to the newest N
+   * rows — which a high-volume unrelated publisher on the same kind can
+   * monopolize, silently evicting providers (and reviews) from discovery.
+   * Superseded versions are collapsed instead, so the newest event per
+   * address is what costs a signature verification.
+   */
+  private readStoredEvents(
+    eventStore: EventStore,
+    filter: Filter,
+    accept?: (event: NostrEvent) => boolean
+  ): NostrEvent[] {
+    const { limit: _relayOnlyLimit, ...storeFilter } = filter;
+    return this.newestTrustworthyPerAddress(
+      this.groupByAddress(
+        eventStore
+          .getTimeline(storeFilter)
+          .filter((event) => !accept || accept(event))
+      )
+    );
+  }
+
+  /**
+   * Group stored rows by replaceable address, newest first.
+   */
+  private groupByAddress(rows: NostrEvent[]): NostrEvent[][] {
+    const byAddress = new Map<string, NostrEvent[]>();
+
+    for (const event of rows) {
+      // Regular events have no history to collapse.
+      const address = isReplaceable(event.kind)
+        ? `${event.kind}:${event.pubkey}:${getReplaceableIdentifier(event)}`
+        : `event:${event.id}`;
+      const group = byAddress.get(address);
+      if (group) group.push(event);
+      else byAddress.set(address, [event]);
+    }
+
+    return Array.from(byAddress.values(), (group) =>
+      group.sort(
+        (a, b) =>
+          b.created_at - a.created_at ||
+          (a.id === b.id ? 0 : a.id < b.id ? 1 : -1)
+      )
+    );
+  }
+
+  /**
+   * Collapse the persisted versions of every address to the newest
+   * trustworthy one, verifying candidates newest-first so a forged newer
+   * version cannot evict a genuine older one and honest addresses pay one
+   * verification.
+   */
+  private newestTrustworthyPerAddress(groups: NostrEvent[][]): NostrEvent[] {
+    const latest: NostrEvent[] = [];
+    for (const group of groups) {
+      const winner = group.find((candidate) =>
+        this.isNostrEventTrustworthy(candidate)
+      );
+      if (winner) latest.push(winner);
+    }
+    return latest;
+  }
+
+  /**
    * Query Nostr events for a filter from the event store (persistent or
    * memory fallback), live-fetching from relays only when forced, the store is
    * empty for the filter, or the last successful fetch for the filter is
    * older than cacheTTL. Every returned event passes the trust gate exactly
-   * once per call; `onEvent` fires once per returned event.
+   * once per call; `onEvent` fires once per returned event. `accept` scopes a
+   * query to the events it can actually use, so unrelated publishers sharing
+   * the kind are never stored, verified, or counted as evidence.
    */
   private async getNostrEvents(
     filter: Filter,
     forceRefresh: boolean = false,
-    onEvent?: (event: NostrEvent) => void
+    onEvent?: (event: NostrEvent) => void,
+    accept?: (event: NostrEvent) => boolean
   ): Promise<NostrEvent[]> {
     const eventStore = (await this.ensureEventStore()) ?? this.memoryEventStore;
     const query = JSON.stringify(filter);
@@ -247,13 +359,17 @@ export class ModelManager {
 
     // forceRefresh decides the fetch branch on its own; the verified store
     // read would be discarded, so skip it entirely.
-    const cached = forceRefresh ? [] : eventStore.getTimeline(filter)
-      .filter((event) => this.isNostrEventTrustworthy(event));
+    const cached = forceRefresh
+      ? []
+      : this.readStoredEvents(eventStore, filter, accept);
 
     if (forceRefresh || cached.length === 0 || !cacheValid) {
       await this.collectNostrEvents(
         filter, this.getNostrRelays(), NOSTR_QUERY_TIMEOUT_MS,
         (event) => {
+          // Relay noise that this query cannot use is not evidence, so it is
+          // not persisted and does not renew the query cache.
+          if (accept && !accept(event)) return;
           const stored = eventStore.add(event);
           if (!stored || stored.id !== event.id) return;
           received.add(event.id);
@@ -272,8 +388,7 @@ export class ModelManager {
 
       // Refresh timing does not expire saved announcements or reviews; the
       // re-read picks up both newly stored and previously saved events.
-      const events = eventStore.getTimeline(filter)
-        .filter((event) => this.isNostrEventTrustworthy(event));
+      const events = this.readStoredEvents(eventStore, filter, accept);
       for (const event of events) {
         if (!received.has(event.id)) onEvent?.(event);
       }
@@ -287,6 +402,59 @@ export class ModelManager {
       onEvent?.(event);
     }
     return cached;
+  }
+
+  /**
+   * Drop persisted discovery events that can never win a read: superseded
+   * versions of replaceable events, and kind-38421 events that are not
+   * provider announcements. Discovery evidence is append-only, so without
+   * this the store grows forever and a single unrelated publisher on the
+   * same kind slows every read (and every bootstrap) down.
+   *
+   * In-memory query caches still point at events removed here only when they
+   * were superseded, so reads are unaffected. Best effort: never throws.
+   *
+   * @returns Number of events removed
+   */
+  async pruneSupersededDiscoveryEvents(): Promise<number> {
+    const eventStore = await this.ensureEventStore();
+    if (!eventStore) return 0;
+
+    let removed = 0;
+    try {
+      for (const kind of DISCOVERY_KINDS) {
+        const accept = kind === 38421
+          ? (event: NostrEvent) => this.isProviderAnnouncement(event)
+          : undefined;
+        const rows = eventStore.getTimeline({ kinds: [kind] });
+        // Rows the read dropped are either superseded versions or events the
+        // query rejects outright; neither can ever be returned again. An
+        // address with no trustworthy version keeps its newest row, so a
+        // future-dated event is not destroyed while the clock catches up.
+        const keep = new Set<string>();
+        for (const group of this.groupByAddress(
+          rows.filter((event) => !accept || accept(event))
+        )) {
+          const winner = group.find((candidate) =>
+            this.isNostrEventTrustworthy(candidate)
+          );
+          keep.add((winner ?? group[0]!).id);
+        }
+        const staleIds = rows
+          .filter((event) => !keep.has(event.id))
+          .map((event) => event.id);
+
+        for (let i = 0; i < staleIds.length; i += PRUNE_CHUNK_SIZE) {
+          removed += eventStore.removeByFilters({
+            ids: staleIds.slice(i, i + PRUNE_CHUNK_SIZE),
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.warn("pruneSupersededDiscoveryEvents failed:", error);
+    }
+
+    return removed;
   }
 
   /**
@@ -304,7 +472,12 @@ export class ModelManager {
     }
 
     // Kind 38421 — provider discovery
-    await this.getNostrEvents({ kinds: [38421], limit: 100 }, true);
+    await this.getNostrEvents(
+      { kinds: [38421], limit: 100 },
+      true,
+      undefined,
+      (event) => this.isProviderAnnouncement(event)
+    );
 
     // Kind 38425 — provider review/audit events (lgtm, avoid, ...). Fetch all
     // labels so a provider that was later re-reviewed as `avoid` is discovered;
@@ -323,6 +496,13 @@ export class ModelManager {
     );
 
     this.logger.log("refreshNostrEvents: live fetch complete");
+
+    const pruned = await this.pruneSupersededDiscoveryEvents();
+    if (pruned > 0) {
+      this.logger.log(
+        `refreshNostrEvents: pruned ${pruned} superseded discovery event(s)`
+      );
+    }
 
     // Re-apply review-based provider disables against the freshly-updated
     // store. A newly published `avoid` review (or an lgtm→avoid reversal) must
@@ -596,7 +776,14 @@ export class ModelManager {
       }
     };
 
-    await this.getNostrEvents({ kinds: [kind], limit: 100 }, forceRefresh, collectFromEvent);
+    await this.getNostrEvents(
+      { kinds: [kind], limit: 100 },
+      forceRefresh,
+      collectFromEvent,
+      kind === 38421
+        ? (event) => this.isProviderAnnouncement(event)
+        : undefined
+    );
 
     // Add additional configured providers
     for (const url of this.includeProviderUrls) {
@@ -736,7 +923,10 @@ export class ModelManager {
     };
 
     const events = await this.getNostrEvents(
-      { kinds: [38421], limit: 100 }, forceRefresh
+      { kinds: [38421], limit: 100 },
+      forceRefresh,
+      undefined,
+      (event) => this.isProviderAnnouncement(event)
     );
     for (const event of events) {
       const eventUrls: string[] = [];
