@@ -134,11 +134,11 @@ describe("getNostrEvents verification cost", () => {
 
     // Forced queries skip the verified pre-read: each stored event costs
     // one relay-gate verification plus one post-fetch re-read (2 events x 2
-    // = 4). refreshNostrEvents then re-applies the review sync, whose two
-    // cache-hit queries re-verify both events once each (+2). The old code's
-    // wasted pre-read would push this to 10.
+    // = 4). refreshNostrEvents then prunes superseded versions, whose one
+    // read verifies both events again (+2), and re-applies the review sync,
+    // whose two cache-hit queries re-verify both events once each (+2).
     verify.calls = 0;
     await manager.refreshNostrEvents();
-    expect(verify.calls).toBe(6);
+    expect(verify.calls).toBe(8);
   });
 });
