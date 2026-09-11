@@ -10,6 +10,11 @@ UnhandledSchemeError: Reading from "bun:sqlite" is not handled by plugins
 
 The SDK now has browser-safe default exports and explicit runtime-specific entrypoints for Node and Bun.
 
+The browser build is regression-tested as a complete dependency bundle. The
+Web SSE inspector is isolated from the Node `Transform` parser, and file-backed
+audit logging is configured only by the Node/Bun entrypoints. Tinfoil's
+capability-gated `zlib` fallback can be mapped to `@routstr/sdk/browser/zlib`.
+
 ## Root Cause
 
 Before this change, the default SDK entrypoint eventually included code paths with dynamic imports such as:

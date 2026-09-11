@@ -1,0 +1,26 @@
+name: Browser bundle
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  browser-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check:browser
+      - run: pnpm exec vitest run tests/unit/sse.test.ts tests/unit/auditLogger.test.ts
+      - run: pnpm run build

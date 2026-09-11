@@ -6,6 +6,34 @@ This SDK lives under `sdk/` and exposes a framework-agnostic surface for Routstr
 
 - `sdk/index.ts` exports core types, discovery, wallet interfaces, client, storage, utils.
 
+### Browser bundling
+
+Use `@routstr/sdk/browser` for browser applications. Its SDK dependency graph
+uses Web Streams and does not import Node `stream`, `string_decoder`, `fs`, or
+`path` modules. Node's `createSSEParserTransform` and file-backed audit logger
+are available from `@routstr/sdk/node` (and the Bun entrypoint).
+
+Node consumers that previously imported `createSSEParserTransform` from the
+default or `client` entrypoint should import it from `@routstr/sdk/node`
+instead.
+
+Tinfoil's verifier retains a dynamic `zlib` fallback for runtimes without the
+Web `DecompressionStream` API. Bundlers that resolve optional dynamic imports
+can map that fallback to the SDK's browser shim:
+
+```ts
+// Vite / Rolldown-style resolve config
+resolve: {
+  alias: {
+    zlib: "@routstr/sdk/browser/zlib",
+  },
+}
+```
+
+The package's `check:browser` script performs a complete browser-platform
+bundle and fails if any Node builtin other than that mapped fallback enters the
+browser dependency graph.
+
 ## Core Modules
 
 - Discovery: `ModelManager`, `MintDiscovery` in `sdk/discovery/`
