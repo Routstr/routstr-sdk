@@ -350,9 +350,8 @@ export class RoutstrClient {
 
     const userCacheSecret = providedUserCacheSecret ?? this.userCacheSecret;
 
-    // Extract clientApiKey from incoming headers then discard them — they must
-    // not be forwarded upstream (the client's Authorization Bearer key would
-    // overwrite the Cashu/API-key auth we attach ourselves).
+    // Extract clientApiKey for tracking. Only explicitly allowed routing headers
+    // may be forwarded; client credentials must never replace SDK payment auth.
     const clientApiKey =
       providedClientApiKey ?? this._extractClientApiKey(headers);
 
@@ -407,8 +406,15 @@ export class RoutstrClient {
       }
     }
 
-    // Build clean outgoing headers — do NOT pass the incoming client headers here
+    // Keep the opaque selector in baseHeaders so request retries preserve it.
+    // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
+    // to the caller, not the upstream payment connection.
     const baseHeaders = this._buildBaseHeaders();
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() === "x-routstr-model-path") {
+        baseHeaders["x-routstr-model-path"] = value;
+      }
+    }
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
     const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
