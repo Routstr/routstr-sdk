@@ -11,3 +11,11 @@ export {
   filterBaseUrlsForTor,
   type ProviderDirectoryEntry,
 } from "./torUtils";
+export {
+  MODEL_PATH_HEADER,
+  DEEPSEEK_MODEL_PATH_WHITELIST,
+  deepSeekModelPath,
+  deepSeekModelPathHeaders,
+  isWhitelistedDeepSeekModelPath,
+  type DeepSeekModelRoute,
+} from "./modelPaths";
