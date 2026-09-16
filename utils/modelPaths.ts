@@ -17,6 +17,8 @@
  * invalid_model_path).
  */
 
+import { normalizeProviderUrl } from "./torUtils";
+
 /** The only request header the SDK forwards upstream on routed requests. */
 export const MODEL_PATH_HEADER = "x-routstr-model-path";
 
@@ -41,6 +43,87 @@ export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly DeepSeekModelRoute[] = [
   { url: "https://api.deepseek.com" },
   { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
 ];
+
+/**
+ * The model whose requests get automatic x-routstr-model-path selection.
+ * Only this model is auto-pinned for now; everything else routes normally.
+ */
+export const DEEPSEEK_AUTO_MODEL_ID = "deepseek-v4.1-flash";
+
+/**
+ * The node the automatic selection resolves provider ids from. provider ids
+ * are node-internal, so the pinned node must be the node we asked for paths.
+ */
+export const DEEPSEEK_AUTO_NODE_URL = "https://ai.redsh1ft.com";
+
+/** The subset of GET /v1/models/paths the SDK consumes. */
+export interface NodeModelPaths {
+  data: Array<{ id: string; paths: string[] }>;
+  updatedAt: number | null;
+}
+
+/**
+ * Fetch one node's GET /v1/models/paths and keep the fields the SDK needs:
+ * the model id and, per path, the advertised selector string used verbatim as
+ * the x-routstr-model-path header value. Returns null on any failure
+ * (network, non-200, malformed payload).
+ */
+export async function fetchModelPaths(
+  baseUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<NodeModelPaths | null> {
+  const normalized = normalizeProviderUrl(baseUrl);
+  if (!normalized) return null;
+  let url: URL;
+  try {
+    url = new URL("v1/models/paths", normalized);
+  } catch {
+    return null;
+  }
+  let payload: unknown;
+  try {
+    const response = await fetchImpl(url.toString(), {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) return null;
+    payload = await response.json();
+  } catch {
+    return null;
+  }
+  return parseModelPathsPayload(payload);
+}
+
+/** Defensive parse of a /v1/models/paths payload; null when malformed. */
+export function parseModelPathsPayload(payload: unknown): NodeModelPaths | null {
+  if (!payload || typeof payload !== "object") return null;
+  const data = (payload as Record<string, unknown>).data;
+  if (!Array.isArray(data)) return null;
+  const models: Array<{ id: string; paths: string[] }> = [];
+  for (const entry of data) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const id = record.id;
+    const rawPaths = record.paths;
+    if (typeof id !== "string" || !Array.isArray(rawPaths)) continue;
+    // Each advertised path is an object; the selector string lives in .path.
+    const paths: string[] = [];
+    for (const raw of rawPaths) {
+      if (!raw || typeof raw !== "object") continue;
+      const path = (raw as Record<string, unknown>).path;
+      if (typeof path === "string" && path.length > 0) {
+        paths.push(path);
+      }
+    }
+    models.push({ id, paths });
+  }
+  if (models.length === 0) return null;
+  const updatedAt = (payload as Record<string, unknown>).updated_at;
+  return {
+    data: models,
+    updatedAt: typeof updatedAt === "number" ? updatedAt : null,
+  };
+}
 
 /**
  * Percent-encode exactly like the node's urlencode (quote_plus) so built
@@ -103,21 +186,75 @@ export function deepSeekModelPath(
 }
 
 /**
+ * The whitelisted route a selector identifies, or null when the selector is
+ * malformed or routes through a non-whitelisted upstream. Only the stable
+ * identity (url + endpoint tag) is matched; the node-specific provider-id is
+ * ignored (the node enforces that it matches the pinned url) but must still
+ * be a well-formed positive integer.
+ */
+export function whitelistedDeepSeekRoute(
+  selector: string
+): DeepSeekModelRoute | null {
+  const params = parseSelector(selector);
+  if (!params) return null;
+  const providerId = Number(params["provider-id"]);
+  if (!Number.isInteger(providerId) || providerId <= 0) return null;
+  return (
+    DEEPSEEK_MODEL_PATH_WHITELIST.find(
+      (route) =>
+        route.url === params.url &&
+        (route.endpoint ?? null) === (params.endpoint ?? null)
+    ) ?? null
+  );
+}
+
+/**
  * True when an x-routstr-model-path selector routes through one of the two
- * whitelisted DeepSeek upstream identities. Matches url and endpoint tag
- * only; the node-specific provider-id is ignored (the node enforces that it
- * matches the pinned url) but must still be a well-formed positive integer.
+ * whitelisted DeepSeek upstream identities. Only url and endpoint tag are
+ * matched; provider-id is node-specific plumbing, not identity.
  */
 export function isWhitelistedDeepSeekModelPath(selector: string): boolean {
-  const params = parseSelector(selector);
-  if (!params) return false;
-  const providerId = Number(params["provider-id"]);
-  if (!Number.isInteger(providerId) || providerId <= 0) return false;
-  return DEEPSEEK_MODEL_PATH_WHITELIST.some(
-    (route) =>
-      route.url === params.url &&
-      (route.endpoint ?? null) === (params.endpoint ?? null)
+  return whitelistedDeepSeekRoute(selector) !== null;
+}
+
+/** Whitelisted DeepSeek selectors resolved from one node's advertised paths. */
+export interface DeepSeekModelPathSelectors {
+  /** Advertised selector for the official DeepSeek API, if the node has one. */
+  officialApi: string | null;
+  /** Advertised selector for OpenRouter's deepseek subprovider, if any. */
+  openrouter: string | null;
+}
+
+/**
+ * Resolve the whitelisted DeepSeek selectors from a node's /v1/models/paths
+ * payload. Advertised path strings are used verbatim: they already carry the
+ * node's provider-id and the exact model id, so the node is guaranteed to
+ * accept them. Returns null when the node does not list the model.
+ */
+export function resolveDeepSeekModelPathSelectors(
+  nodePaths: NodeModelPaths,
+  modelId: string
+): DeepSeekModelPathSelectors | null {
+  const entry = nodePaths.data.find(
+    (m) => m.id.toLowerCase() === modelId.toLowerCase()
   );
+  if (!entry) return null;
+  const selectors: DeepSeekModelPathSelectors = {
+    officialApi: null,
+    openrouter: null,
+  };
+  for (const path of entry.paths) {
+    const route = whitelistedDeepSeekRoute(path);
+    if (route === DEEPSEEK_MODEL_PATH_WHITELIST[0] && !selectors.officialApi) {
+      selectors.officialApi = path;
+    } else if (
+      route === DEEPSEEK_MODEL_PATH_WHITELIST[1] &&
+      !selectors.openrouter
+    ) {
+      selectors.openrouter = path;
+    }
+  }
+  return selectors;
 }
 
 /**
