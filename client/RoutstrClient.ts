@@ -782,6 +782,28 @@ export class RoutstrClient {
    * Store request details to a file in the reqs/ folder before fetch.
    */
   /**
+   * Decide the cooldown scope for a failure.
+   *
+   * Returns the model id when the failure is specific to the selected model
+   * (only that model is cooled down on the provider), or undefined when the
+   * failure is model-independent and the whole provider should be cooled
+   * down:
+   * - network errors (status -1): the provider host itself is unreachable
+   * - `mint_unreachable`: the provider's mint/wallet infrastructure is down
+   * - no selected model: the failure cannot be attributed to a model
+   */
+  private _getCooldownScopeModelId(
+    status: number,
+    parsedError: ParsedCoreError,
+    selectedModel?: Model
+  ): string | undefined {
+    if (!selectedModel) return undefined;
+    if (status === -1) return undefined;
+    if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return undefined;
+    return selectedModel.id;
+  }
+
+  /**
    * Handle error responses with failover
    */
   private async _handleErrorResponse(
@@ -1431,10 +1453,23 @@ export class RoutstrClient {
     ]
       .filter(Boolean)
       .join(" ");
-    this.providerManager.markFailed(baseUrl, failReason);
+    // Scope the cooldown: when a model-specific request failed on a healthy
+    // provider, only that model is put on cooldown so the provider's other
+    // models remain usable. Network failures and mint/wallet infrastructure
+    // errors are model-independent and cool down the whole provider.
+    const cooldownModelId = this._getCooldownScopeModelId(
+      status,
+      parsedError,
+      selectedModel
+    );
+    this.providerManager.markFailed(baseUrl, failReason, cooldownModelId);
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed (${failReason})`
+      `[RoutstrClient] _handleErrorResponse: Marked ${
+        cooldownModelId
+          ? `model ${cooldownModelId} on provider ${baseUrl}`
+          : `provider ${baseUrl}`
+      } as failed (${failReason})`
     );
 
     if (!selectedModel) {
