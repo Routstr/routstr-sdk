@@ -129,6 +129,30 @@ describe("autoModelPathFor", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("does nothing when the caller forced a different node", async () => {
+    const fetchMock = stubNodeFetch();
+    for (const other of [
+      "https://routstr.otrta.me/",
+      "https://routstr.otrta.me",
+      "https://api.routstr.com/",
+    ]) {
+      await expect(
+        autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, undefined, other)
+      ).resolves.toEqual({});
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still pins when the caller forces the auto node itself", async () => {
+    stubNodeFetch();
+    await expect(
+      autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, undefined, "https://ai.redsh1ft.com/")
+    ).resolves.toEqual({
+      forcedProvider: DEEPSEEK_AUTO_NODE_URL,
+      headers: { [MODEL_PATH_HEADER]: OFFICIAL_API_SELECTOR },
+    });
+  });
+
   it("does nothing when the node lists no whitelisted route", async () => {
     stubNodeFetch({
       data: [
@@ -200,5 +224,32 @@ describe("routeRequests deepseek-v4.1-flash pinning", () => {
     const call = (resolved as { client: ReturnType<typeof makeClient> }).client
       .routeRequest.mock.calls[0][0];
     expect(call.headers[MODEL_PATH_HEADER]).toBe(PPQ_SELECTOR);
+  });
+
+  it("does not attach a selector when the caller forced a different node", async () => {
+    // Live failure this guards: the node-scoped selector (provider-id 5 belongs
+    // to ai.redsh1ft.com) was sent to routstr.otrta.me -> 404 invalid_model_path.
+    const fetchMock = stubNodeFetch();
+    mockedResolve.mockResolvedValue({
+      client: makeClient(),
+      baseUrl: "https://routstr.otrta.me/",
+      mintUrl: "https://mint.example/",
+      selectedModel: { id: DEEPSEEK_AUTO_MODEL_ID },
+    } as never);
+
+    await routeRequests(
+      routeOptions(DEEPSEEK_AUTO_MODEL_ID, {
+        forcedProvider: "https://routstr.otrta.me/",
+      })
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockedResolve.mock.calls[0][0].forcedProvider).toBe(
+      "https://routstr.otrta.me/"
+    );
+    const resolved = await mockedResolve.mock.results[0].value;
+    const call = (resolved as { client: ReturnType<typeof makeClient> }).client
+      .routeRequest.mock.calls[0][0];
+    expect(call.headers?.[MODEL_PATH_HEADER]).toBeUndefined();
   });
 });

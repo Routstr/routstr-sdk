@@ -24,6 +24,7 @@ import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
+import { MODEL_PATH_HEADER } from "../utils/modelPaths";
 import {
   ProviderError,
   FailoverError,
@@ -425,13 +426,15 @@ export class RoutstrClient {
     }
 
     // Keep the opaque selector in baseHeaders so request retries preserve it.
+    // It is never forwarded to a different provider: cross-provider failover
+    // is disabled for pinned requests in _handleErrorResponse, because the
+    // selector's provider id is node-internal.
     // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
     // to the caller, not the upstream payment connection.
     const baseHeaders = this._buildBaseHeaders();
-    for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() === "x-routstr-model-path") {
-        baseHeaders["x-routstr-model-path"] = value;
-      }
+    const modelPathSelector = this._findModelPathHeader(headers);
+    if (modelPathSelector) {
+      baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
     }
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
@@ -1453,10 +1456,22 @@ export class RoutstrClient {
       );
     }
 
-    const nextProvider = this.providerManager.findNextBestProvider(
-      selectedModel.id,
-      baseUrl
-    );
+    // A pinned x-routstr-model-path selector encodes a node-internal provider
+    // id, so it is only meaningful on the node it was resolved from. A pinned
+    // request must never fail over to a different node: the selector would be
+    // rejected there (404 invalid_model_path) and the caller explicitly asked
+    // for that one upstream. Failures surface to the caller instead.
+    const pinnedModelPath = this._findModelPathHeader(params.baseHeaders);
+    if (pinnedModelPath) {
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: not failing over, request is pinned to a model path (${pinnedModelPath})`
+      );
+    }
+
+    const nextProvider = pinnedModelPath
+      ? null
+      : this.providerManager.findNextBestProvider(selectedModel.id, baseUrl);
 
     if (nextProvider) {
       this._log(
@@ -2397,6 +2412,16 @@ export class RoutstrClient {
     }
 
     return nextHeaders;
+  }
+
+  /** The x-routstr-model-path selector on these headers, if any. */
+  private _findModelPathHeader(
+    headers: Record<string, string>
+  ): string | undefined {
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() === MODEL_PATH_HEADER) return value;
+    }
+    return undefined;
   }
 
   /**

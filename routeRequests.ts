@@ -26,7 +26,11 @@ import {
   type ResolvedContext,
 } from "./client/resolveRequestContext";
 import { InsufficientBalanceError } from "./core/errors";
-import { autoModelPathFor } from "./utils/modelPaths";
+import {
+  autoModelPathFor,
+  sameNode,
+  DEEPSEEK_AUTO_NODE_URL,
+} from "./utils/modelPaths";
 
 // Re-export for consumers that want access to the shared resolver
 export { resolveRequestContext };
@@ -144,10 +148,10 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     requestResponseLogSink,
   } = options;
 
-  // Automatic DeepSeek pinning: deepseek-v4.1-flash always routes through the
-  // official DeepSeek API on the pinned node unless the caller pinned a path.
-  const autoModelPath = await autoModelPathFor(modelId, headers);
-  const effectiveHeaders = { ...headers, ...autoModelPath.headers };
+  // Automatic DeepSeek pinning: deepseek-v4.1-flash routes through the
+  // official DeepSeek API on the pinned node unless the caller pinned a path
+  // or forced a different node (then autoModelPathFor returns {}).
+  const autoModelPath = await autoModelPathFor(modelId, headers, forcedProvider);
   const effectiveForcedProvider = forcedProvider ?? autoModelPath.forcedProvider;
 
   // Delegate to shared context resolution
@@ -175,6 +179,13 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     });
 
   const client = resolvedClient;
+
+  // The selector encodes a node-internal provider id, so it is only valid on
+  // the node it was resolved from. Never send it anywhere else.
+  const effectiveHeaders =
+    autoModelPath.headers && sameNode(baseUrl, DEEPSEEK_AUTO_NODE_URL)
+      ? { ...headers, ...autoModelPath.headers }
+      : headers;
 
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);

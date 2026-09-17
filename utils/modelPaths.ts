@@ -303,6 +303,17 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
   );
 }
 
+/** True when two base URLs point at the same node. */
+export function sameNode(
+  a?: string | null,
+  b?: string | null
+): boolean {
+  const left = normalizeProviderUrl(a);
+  const right = normalizeProviderUrl(b);
+  if (!left || !right) return false;
+  return left.toLowerCase() === right.toLowerCase();
+}
+
 /**
  * Automatic DeepSeek path pinning, applied by routeRequests() for
  * deepseek-v4.1-flash only: force the node and return the
@@ -310,17 +321,26 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
  * (prefer-official, falling back to OpenRouter's deepseek subprovider).
  *
  * Returns {} for every other model, when the caller already supplied its own
- * x-routstr-model-path header, or when the node advertises neither route.
+ * x-routstr-model-path header, when the caller forced a different node (the
+ * selector's provider id belongs to the pinned node only), or when the node
+ * advertises neither route.
  */
 export async function autoModelPathFor(
   modelId: string,
-  headers?: Record<string, string>
+  headers?: Record<string, string>,
+  forcedProvider?: string
 ): Promise<{ forcedProvider?: string; headers?: Record<string, string> }> {
-  if (typeof modelId !== "string" || modelId.trim().toLowerCase() !== DEEPSEEK_AUTO_MODEL_ID) {
+  if (
+    typeof modelId !== "string" ||
+    modelId.trim().toLowerCase() !== DEEPSEEK_AUTO_MODEL_ID
+  ) {
     return {};
   }
   if (hasModelPathHeader(headers)) {
     return {}; // caller pinned a path explicitly
+  }
+  if (forcedProvider && !sameNode(forcedProvider, DEEPSEEK_AUTO_NODE_URL)) {
+    return {}; // a different node would reject this node's provider id
   }
   const nodePaths = await getNodeModelPaths(DEEPSEEK_AUTO_NODE_URL);
   const selectors = nodePaths
