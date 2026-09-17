@@ -636,14 +636,32 @@ interface CandidateProvider {
 }
 
 /**
+ * A cooldown entry. When `modelId` is present, only that model is cooled
+ * down on the provider; other models on the same provider stay selectable.
+ * When `modelId` is undefined, the whole provider is on cooldown.
+ */
+export interface CooldownEntry {
+  baseUrl: string;
+  modelId?: string;
+  timestamp: number;
+}
+
+/**
+ * Map key for a cooldown entry: `baseUrl` for provider-scoped entries,
+ * `baseUrl::modelId` for model-scoped entries.
+ */
+const cooldownKey = (baseUrl: string, modelId?: string): string =>
+  modelId ? `${baseUrl}::${modelId}` : baseUrl;
+
+/**
  * ProviderManager handles provider selection and failover
  */
 export class ProviderManager {
   private failedProviders = new Set<string>();
-  /** Track when each provider last failed (provider URL -> timestamp) */
+  /** Track when each scope (provider URL or baseUrl::modelId) last failed */
   private lastFailed = new Map<string, number>();
-  /** Providers on cooldown: [provider_url, cooldown_started_timestamp][] */
-  private providersOnCoolDown: [string, number][] = [];
+  /** Cooldown entries keyed by cooldownKey(baseUrl, modelId) */
+  private providersOnCoolDown = new Map<string, CooldownEntry>();
   /** Cooldown duration in milliseconds (210 seconds) */
   private static readonly COOLDOWN_DURATION_MS = 210 * 1000;
   /** Optional persistent store for failure tracking */
@@ -680,12 +698,23 @@ export class ProviderManager {
 
     // Hydrate providersOnCooldown (filter out expired)
     const now = Date.now();
-    this.providersOnCoolDown = state.providersOnCooldown
-      .filter(
-        (entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS
-      )
-      .map((entry) => [entry.baseUrl, entry.timestamp] as [string, number]);
-
+    this.providersOnCoolDown = new Map(
+      state.providersOnCooldown
+        .filter(
+          (entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS
+        )
+        .map(
+          (entry) =>
+            [
+              cooldownKey(entry.baseUrl, entry.modelId),
+              {
+                baseUrl: entry.baseUrl,
+                modelId: entry.modelId,
+                timestamp: entry.timestamp,
+              },
+            ] as const
+        )
+    );
   }
 
   /**
@@ -697,25 +726,38 @@ export class ProviderManager {
 
   /**
    * Clean up expired cooldown entries
-   * Also removes the provider from failedProviders so it can be retried
+   * Also removes the provider from failedProviders (once none of its
+   * cooldown entries remain) so it can be retried
    */
   private cleanupExpiredCooldowns(): void {
     const now = Date.now();
-    this.providersOnCoolDown = this.providersOnCoolDown.filter(
-      ([url, timestamp]) => {
-        const age = now - timestamp;
-        const isExpired = age >= ProviderManager.COOLDOWN_DURATION_MS;
-        if (isExpired) {
-          // Also remove from failedProviders so the provider can be retried
-          this.failedProviders.delete(url);
-          // Persist to store
-          if (this.store) {
-            this.store.getState().removeFailedProvider(url);
-          }
+    const expiredProviders = new Set<string>();
+    for (const [key, entry] of this.providersOnCoolDown) {
+      if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
+        this.providersOnCoolDown.delete(key);
+        expiredProviders.add(entry.baseUrl);
+        // Persist the removal of this exact entry
+        if (this.store) {
+          this.store
+            .getState()
+            .removeProviderFromCooldown(entry.baseUrl, entry.modelId);
         }
-        return !isExpired;
       }
-    );
+    }
+
+    // Remove providers from failedProviders once they have no active
+    // cooldown entries left, so they can be retried
+    for (const baseUrl of expiredProviders) {
+      const stillCooled = [...this.providersOnCoolDown.values()].some(
+        (entry) => entry.baseUrl === baseUrl
+      );
+      if (!stillCooled) {
+        this.failedProviders.delete(baseUrl);
+        if (this.store) {
+          this.store.getState().removeFailedProvider(baseUrl);
+        }
+      }
+    }
   }
 
   /**
@@ -727,20 +769,35 @@ export class ProviderManager {
 
   /**
    * Check if a provider is currently on cooldown
+   *
+   * A provider-scoped cooldown entry blocks every model on the provider.
+   * A model-scoped entry only blocks the given `modelId`; pass `modelId`
+   * to check a specific model, or omit it to check whether the provider as
+   * a whole is unavailable.
    */
-  isOnCooldown(baseUrl: string): boolean {
+  isOnCooldown(baseUrl: string, modelId?: string): boolean {
     this.cleanupExpiredCooldowns();
 
-    const result = this.providersOnCoolDown.some(([url]) => url === baseUrl);
-    return result;
+    // Provider-wide cooldown blocks all models
+    if (this.providersOnCoolDown.has(cooldownKey(baseUrl))) {
+      return true;
+    }
+    // Model-scoped cooldown blocks only that model
+    if (
+      modelId !== undefined &&
+      this.providersOnCoolDown.has(cooldownKey(baseUrl, modelId))
+    ) {
+      return true;
+    }
+    return false;
   }
 
   /**
-   * Get all providers currently on cooldown
+   * Get all cooldown entries currently active (provider- and model-scoped)
    */
-  getProvidersOnCooldown(): [string, number][] {
+  getProvidersOnCooldown(): CooldownEntry[] {
     this.cleanupExpiredCooldowns();
-    return [...this.providersOnCoolDown];
+    return [...this.providersOnCoolDown.values()];
   }
 
   /**
@@ -769,20 +826,32 @@ export class ProviderManager {
   }
 
   /**
-   * Mark a provider as failed
-   * If a provider fails twice within 5 minutes, it's added to cooldown
+   * Mark a provider (optionally a specific model on it) as failed
+   *
+   * If the same scope fails twice within the cooldown window, that scope is
+   * added to cooldown:
+   * - With `modelId`: only that model is cooled down on the provider.
+   * - Without `modelId`: the whole provider is cooled down (legacy behavior).
    */
-  markFailed(baseUrl: string, reason?: string): void {
+  markFailed(baseUrl: string, reason?: string, modelId?: string): void {
+    // Drop expired entries first so a stale entry can't suppress a fresh
+    // second-strike cooldown for the same scope
+    this.cleanupExpiredCooldowns();
     const now = Date.now();
-    const lastFailure = this.lastFailed.get(baseUrl);
+    const key = cooldownKey(baseUrl, modelId);
+    const lastFailure = this.lastFailed.get(key);
 
     // Track this failure in memory
-    this.lastFailed.set(baseUrl, now);
+    this.lastFailed.set(key, now);
     this.failedProviders.add(baseUrl);
 
-    // Persist to store
+    // Persist to store. Model-scoped strike counts stay in-memory only; the
+    // cooldown entries themselves are persisted, so cross-restart behavior
+    // is preserved once a cooldown actually triggers.
     if (this.store) {
-      this.store.getState().setLastFailedTimestamp(baseUrl, now);
+      if (modelId === undefined) {
+        this.store.getState().setLastFailedTimestamp(baseUrl, now);
+      }
       this.store.getState().addFailedProvider(baseUrl);
     }
 
@@ -791,12 +860,18 @@ export class ProviderManager {
       lastFailure !== undefined &&
       now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
     ) {
-      // Second failure within 5 minutes - add to cooldown
-      if (!this.isOnCooldown(baseUrl)) {
-        this.providersOnCoolDown.push([baseUrl, now]);
+      // Second failure within the window - add this scope to cooldown
+      if (!this.providersOnCoolDown.has(key)) {
+        this.providersOnCoolDown.set(key, {
+          baseUrl,
+          modelId,
+          timestamp: now,
+        });
         // Persist to store
         if (this.store) {
-          this.store.getState().addProviderOnCooldown(baseUrl, now);
+          this.store
+            .getState()
+            .addProviderOnCooldown(baseUrl, now, modelId);
         }
       }
     }
@@ -804,14 +879,23 @@ export class ProviderManager {
 
   /**
    * Remove a provider from cooldown (e.g., after successful request)
+   *
+   * With `modelId`, only that model's cooldown entry is removed; without it,
+   * every cooldown entry for the provider is removed.
    */
-  removeFromCooldown(baseUrl: string): void {
-    this.providersOnCoolDown = this.providersOnCoolDown.filter(
-      ([url]) => url !== baseUrl
-    );
+  removeFromCooldown(baseUrl: string, modelId?: string): void {
+    if (modelId === undefined) {
+      for (const [key, entry] of [...this.providersOnCoolDown]) {
+        if (entry.baseUrl === baseUrl) {
+          this.providersOnCoolDown.delete(key);
+        }
+      }
+    } else {
+      this.providersOnCoolDown.delete(cooldownKey(baseUrl, modelId));
+    }
     // Persist to store
     if (this.store) {
-      this.store.getState().removeProviderFromCooldown(baseUrl);
+      this.store.getState().removeProviderFromCooldown(baseUrl, modelId);
     }
   }
 
@@ -819,7 +903,7 @@ export class ProviderManager {
    * Clear all cooldown tracking
    */
   clearCooldowns(): void {
-    this.providersOnCoolDown = [];
+    this.providersOnCoolDown.clear();
     // Persist to store
     if (this.store) {
       this.store.getState().clearProvidersOnCooldown();
@@ -883,7 +967,7 @@ export class ProviderManager {
         if (disabledProviders.has(baseUrl)) {
           continue;
         }
-        if (this.isOnCooldown(baseUrl)) {
+        if (this.isOnCooldown(baseUrl, modelId)) {
           continue;
         }
 
@@ -961,7 +1045,7 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allProviders)) {
       if (disabledProviders.has(baseUrl)) continue;
-      if (this.isOnCooldown(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl, modelId)) continue;
       if (!torMode && isOnionUrl(baseUrl))
         continue;
 
@@ -990,7 +1074,7 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allModels)) {
       if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
-      if (this.isOnCooldown(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl, modelId)) continue;
       if (torMode && !baseUrl.includes(".onion")) continue;
       if (
         !torMode &&
