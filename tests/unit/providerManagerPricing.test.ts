@@ -1079,7 +1079,7 @@ describe("ProviderManager", () => {
       expect(cost).toBeGreaterThanOrEqual(1.05);
     });
 
-    it("returns 0 when an error occurs during calculation", () => {
+    it("handles un-serializable messages conservatively instead of returning 0", () => {
       const manager = new ProviderManager(createRegistry());
       const model: Model = {
         id: "gpt-4o-mini",
@@ -1087,12 +1087,473 @@ describe("ProviderManager", () => {
         sats_pricing: {} as any, // this will cause issues
       };
 
-      // Force an error by passing a circular reference
+      // Circular references must not throw (safeStringify contains the
+      // failure) and must not under-deposit: the estimator falls back to
+      // a conservative 10,000-token assumption for the un-serializable
+      // messages, and this model ({} pricing) falls through to the
+      // max_cost ?? 50 default.
       const circular: any = { role: "user" };
       circular.content = circular;
 
       const cost = manager.getRequiredSatsForModel(model, [circular]);
-      expect(cost).toBe(0);
+      expect(cost).toBe(50);
+
+      // With a real envelope, the unknown-text fallback prices at the
+      // 10,000-token assumption instead of crashing to 0.
+      const modelWithEnvelope: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+        } as any,
+      };
+      const costWithEnvelope = manager.getRequiredSatsForModel(
+        modelWithEnvelope,
+        [circular]
+      );
+      // Content-based counting never serializes the message envelope, so a
+      // circular content reference no longer trips the 10,000-token
+      // fallback: textLength counts it as 0 (un-stringifiable) and the
+      // estimate is the completion floor.
+      expect(costWithEnvelope).toBe((0 * 0.5 + 200) * 1.05);
+    });
+
+    it("counts Responses input and instructions instead of the 10k default", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+        } as any,
+      };
+
+      // No messages, no input, no instructions: the 10,000-token
+      // minimum-balance assumption applies.
+      const bare = manager.getRequiredSatsForModel(model, [], undefined, {});
+      expect(bare).toBe((10000 * 0.5 + 200) * 1.05);
+
+      // A small Responses input prices far below the 10k assumption...
+      const withInput = manager.getRequiredSatsForModel(model, [], undefined, {
+        input: [{ type: "message", role: "user", content: "hello" }],
+        instructions: "be brief",
+      });
+      expect(withInput).toBeGreaterThan(200 * 1.05);
+      expect(withInput).toBeLessThan(bare);
+
+      // ...and grows with the input size.
+      const withBigInput = manager.getRequiredSatsForModel(
+        model,
+        [],
+        undefined,
+        {
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: "a".repeat(20_000),
+            },
+          ],
+        }
+      );
+      expect(withBigInput).toBeGreaterThan(withInput);
+    });
+
+    it("counts serialized tools definitions on both API shapes", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+        } as any,
+      };
+
+      const messages = [{ role: "user", content: "hi" }];
+      const tools = [
+        {
+          type: "function",
+          name: "get_weather",
+          description: "Get the current weather in a given location",
+          parameters: {
+            type: "object",
+            properties: {
+              location: {
+                type: "string",
+                description: "The city and state",
+              },
+            },
+          },
+        },
+      ];
+
+      const withoutTools = manager.getRequiredSatsForModel(
+        model,
+        messages,
+        undefined,
+        { messages }
+      );
+      const withTools = manager.getRequiredSatsForModel(
+        model,
+        messages,
+        undefined,
+        { messages, tools }
+      );
+      expect(withTools).toBeGreaterThan(withoutTools);
+
+      // Tools alone (Responses-style request without messages) also
+      // raise the estimate above the completion-only floor.
+      const toolsOnly = manager.getRequiredSatsForModel(
+        model,
+        [],
+        undefined,
+        { tools }
+      );
+      expect(toolsOnly).toBeGreaterThan(200 * 1.05);
+    });
+
+    it("matches the node's billed-char numerator on a real captured request", () => {
+      // Fixture derived from a real captured deepseek-v4-pro-0813 request
+      // (routstr-core fixtures: billedTotal=112793). The estimator must
+      // count ONLY billed content (string/text content + tool_calls
+      // name/args + compact tool defs), NOT the pretty-printed JSON
+      // envelope. The old indent=2 messages-only numerator was 209,678
+      // chars (73,830 tok); the corrected numerator is 112,793 chars.
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "deepseek-v4-pro-0813",
+        name: "test",
+        sats_pricing: {
+          prompt: 1, // 1 sat/token so prompt cost == token count
+          completion: 0,
+          max_completion_cost: 1, // non-zero so it's not treated as missing
+        } as any,
+      };
+
+      const s = (n: number) => "x".repeat(n);
+      const messages = [
+        { role: "system", content: s(71235) }, // messageContent
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              function: { name: s(124), arguments: s(21053) }, // toolCallsSubtotal
+            },
+          ],
+        },
+      ];
+      // tools def sized to the fixture's canonical (compact) total.
+      const toolDef = {
+        type: "function",
+        function: { name: "t", description: s(20381 - 60) },
+      };
+      const toolsPad = 20381 - JSON.stringify([toolDef]).length;
+      toolDef.function.description = s(20381 - 60 + toolsPad);
+      const tools = [toolDef];
+      expect(JSON.stringify(tools).length).toBe(20381);
+
+      // prompt = ceil((71235 + 124 + 21053 + 20381) / 2.84) = ceil(112793/2.84)
+      const expectedTokens = Math.ceil(112793 / 2.84);
+      const cost = manager.getRequiredSatsForModel(
+        model,
+        messages,
+        undefined,
+        { messages, tools }
+      );
+      // (prompt*1 sat * tokens + max_completion_cost 1 + request 0) * 1.05
+      expect(cost).toBeCloseTo((expectedTokens + 1) * 1.05, 5);
+    });
+
+    it("caps the estimate at the model's max_cost envelope", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+          max_cost: 300,
+        } as any,
+      };
+
+      // 10,000-token assumption * 0.5 = 5,000 sats of prompt alone; the
+      // envelope caps the deposit at max_cost.
+      const cost = manager.getRequiredSatsForModel(model, [], undefined, {});
+      expect(cost).toBe(300);
+    });
+
+    it("counts Responses input text content, not the JSON envelope", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 1, // 1 sat/token so prompt cost == token count
+          completion: 0,
+          max_completion_cost: 1,
+        } as any,
+      };
+
+      // 300 chars of billed text across the Responses field set:
+      // input_text(100) + function_call.arguments(50) +
+      // function_call_output.output(50) + reasoning summary(50) +
+      // content part text(40) + refusal(10) = 300. The huge
+      // encrypted_content must NOT be counted.
+      const input = [
+        { type: "input_text", text: "x".repeat(100) },
+        { type: "function_call", arguments: "x".repeat(50) },
+        { type: "function_call_output", output: "x".repeat(50) },
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "x".repeat(50) }],
+          encrypted_content: "y".repeat(5000), // skipped
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: "x".repeat(40) },
+            { type: "refusal", refusal: "x".repeat(10) },
+          ],
+        },
+      ];
+
+      const expectedTokens = Math.ceil(300 / 2.84);
+      const cost = manager.getRequiredSatsForModel(
+        model,
+        [],
+        undefined,
+        { input }
+      );
+      // (tokens*1 + max_completion_cost 1) * 1.05; encrypted_content excluded
+      expect(cost).toBeCloseTo((expectedTokens + 1) * 1.05, 5);
+    });
+
+    it("prices image detail levels, remote URLs, and file_id references", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model: Model = {
+        id: "gpt-4o-mini",
+        name: "test",
+        sats_pricing: {
+          prompt: 0.5,
+          completion: 0.6,
+          max_completion_cost: 200,
+        } as any,
+      };
+
+      const costOf = (messages: any[]): number =>
+        manager.getRequiredSatsForModel(model, messages, undefined, {
+          messages,
+        });
+
+      const messageWith = (part: any): any[] => [
+        { role: "user", content: [{ type: "text", text: "hi" }, part] },
+      ];
+
+      // Remote URLs: the node fetches and measures them, so assume the
+      // worst case for the detail level (765 tokens at auto).
+      const remoteLow = costOf(
+        messageWith({
+          type: "image_url",
+          image_url: { url: "https://example.com/cat.jpg", detail: "low" },
+        })
+      );
+      const remoteAuto = costOf(
+        messageWith({
+          type: "image_url",
+          image_url: { url: "https://example.com/cat.jpg" },
+        })
+      );
+      // 85 tokens for low, 765 for auto: a 680-token difference at
+      // 0.5 sats/token, all through the 1.05 safety multiplier.
+      expect(remoteAuto - remoteLow).toBeCloseTo(680 * 0.5 * 1.05, 5);
+
+      // Responses input_image with original detail and a file_id has
+      // unknown dimensions: the 36,000-token worst case applies.
+      const responsesCost = manager.getRequiredSatsForModel(
+        model,
+        [],
+        undefined,
+        {
+          input: [
+            { type: "input_text", text: "describe" },
+            {
+              type: "input_image",
+              file_id: "file-1",
+              detail: "original",
+            },
+          ],
+        }
+      );
+      expect(responsesCost).toBeGreaterThan(36000 * 0.5 * 1.05);
+    });
+  });
+
+  // ---- node gate (minimum-balance reserve) ----
+  //
+  // `getRequiredSatsForModel` prices what a request should *cost*. The node
+  // gates on a discounted envelope instead, and the two come apart whenever
+  // the node cannot discount a budget it holds in reserve — most notably for
+  // any request carrying an inline image, because the node's prompt-token
+  // count covers the whole body and counts base64 image data as text.
+  //
+  // The `core:` figure in each comment is what routstr-core's
+  // `calculate_discounted_max_cost` returns (default settings) for the exact
+  // same body. The reserve must never fall below it.
+  describe("node gate reserve", () => {
+    // 1x1 PNG: image token math is exact and the body stays small.
+    const PNG_1X1 =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    const gateModel = (overrides: Record<string, unknown> = {}): Model =>
+      ({
+        id: "test-model",
+        name: "Test Model",
+        context_length: 1000,
+        top_provider: { context_length: 1000, max_completion_tokens: 900 },
+        sats_pricing: {
+          prompt: 0.001,
+          completion: 0.01,
+          request: 0,
+          max_prompt_cost: 10,
+          max_completion_cost: 50,
+          max_cost: 60,
+        },
+        ...overrides,
+      }) as unknown as Model;
+
+    const imageBody = (model: Model, maxTokens?: number) => ({
+      model: model.id,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hi" },
+            { type: "image_url", image_url: { url: PNG_1X1 } },
+          ],
+        },
+      ],
+      ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+    });
+
+    it("reserves the node's gate when an inline image blocks the prompt discount", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = imageBody(model, 4096);
+
+      // core: 50.860 (envelope 59.400 less the unused completion budget).
+      // Pricing only the components gave 43.277 and under-deposited.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.403, 3);
+    });
+
+    it("caps at the envelope without dropping below the gate", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = imageBody(model);
+
+      // core: 59.400. Without max_tokens the node discounts nothing, so the
+      // reserve pins to max_cost (60) rather than the old 52.769.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, undefined, body)
+      ).toBe(60);
+    });
+
+    it("does not discount a Responses max_output_tokens budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "hi" },
+              { type: "input_image", image_url: PNG_1X1 },
+            ],
+          },
+        ],
+        max_output_tokens: 4096,
+      };
+
+      // The call site forwards max_output_tokens as maxTokens, but the node
+      // only discounts `max_tokens`, so the gate stays at the envelope.
+      // core: 59.372 — the old estimate was 43.277.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages ?? [], 4096, body)
+      ).toBe(60);
+    });
+
+    it("applies the node's prompt discount to small text requests", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 10,
+      };
+
+      // A tiny body stays inside the prompt budget, so the node discounts
+      // hard and the gate drops well below the envelope. core: 9.917.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 10, body)
+      ).toBeCloseTo(10.413, 3);
+    });
+
+    it("tracks the gate for a large completion budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 4096,
+      };
+
+      // core: 50.777.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.316, 3);
+    });
+
+    it("falls back to max_prompt_cost when the model exposes no token budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel({
+        id: "test-model-noctx",
+        context_length: undefined,
+        top_provider: undefined,
+      });
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 10,
+      };
+
+      // core: 0.118 (prompt allowance falls back to max_prompt_cost).
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 10, body)
+      ).toBeCloseTo(0.1239, 3);
+    });
+
+    it("never discounts a sealed EHBP/Tinfoil body", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel({ id: "tinfoil-test-model" });
+      const body = imageBody(model, 4096);
+
+      // The enclave encrypts the body, so the node cannot read max_tokens and
+      // holds the whole envelope. Same body as the discounted chat case
+      // above, which reserved 53.403.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBe(60);
     });
   });
 

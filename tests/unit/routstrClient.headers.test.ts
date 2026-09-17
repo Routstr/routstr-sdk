@@ -13,6 +13,10 @@ async function prepare(headers: Record<string, string>, mode = "xcashu") {
   client._spendToken = vi.fn().mockResolvedValue({
     token: "sdk-payment", tokenBalance: 1, tokenBalanceUnit: "sat",
   });
+  // The proactive API-key topup (apikeys mode) is a wallet-spend side effect
+  // that is out of scope for header assertions — and this fake client has none
+  // of the state a real topup needs. Neutralize it and assert headers only.
+  client._spinOffTopupIfNeeded = vi.fn();
   const stop = new Error("transport boundary reached");
   client._makeRequest = vi.fn().mockRejectedValue(stop);
   await expect(client.routeRequest({
