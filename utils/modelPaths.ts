@@ -269,3 +269,67 @@ export function deepSeekModelPathHeaders(
 ): { [MODEL_PATH_HEADER]: string } {
   return { [MODEL_PATH_HEADER]: deepSeekModelPath(modelId, providerId, route) };
 }
+
+/** Cached /v1/models/paths payloads, keyed by node base URL. */
+const MODEL_PATHS_TTL_MS = 10 * 60 * 1000;
+const modelPathsCache = new Map<string, { paths: NodeModelPaths; at: number }>();
+
+/** Drop cached /v1/models/paths payloads (tests, manual refresh). */
+export function clearModelPathsCache(): void {
+  modelPathsCache.clear();
+}
+
+async function getNodeModelPaths(
+  baseUrl: string
+): Promise<NodeModelPaths | null> {
+  const cached = modelPathsCache.get(baseUrl);
+  if (cached && Date.now() - cached.at < MODEL_PATHS_TTL_MS) {
+    return cached.paths;
+  }
+  const fetched = await fetchModelPaths(baseUrl);
+  if (fetched) {
+    modelPathsCache.set(baseUrl, { paths: fetched, at: Date.now() });
+    return fetched;
+  }
+  return cached?.paths ?? null;
+}
+
+function hasModelPathHeader(headers?: Record<string, string>): boolean {
+  return (
+    !!headers &&
+    Object.keys(headers).some(
+      (name) => name.toLowerCase() === MODEL_PATH_HEADER
+    )
+  );
+}
+
+/**
+ * Automatic DeepSeek path pinning, applied by routeRequests() for
+ * deepseek-v4.1-flash only: force the node and return the
+ * x-routstr-model-path header for the official DeepSeek API route
+ * (prefer-official, falling back to OpenRouter's deepseek subprovider).
+ *
+ * Returns {} for every other model, when the caller already supplied its own
+ * x-routstr-model-path header, or when the node advertises neither route.
+ */
+export async function autoModelPathFor(
+  modelId: string,
+  headers?: Record<string, string>
+): Promise<{ forcedProvider?: string; headers?: Record<string, string> }> {
+  if (typeof modelId !== "string" || modelId.trim().toLowerCase() !== DEEPSEEK_AUTO_MODEL_ID) {
+    return {};
+  }
+  if (hasModelPathHeader(headers)) {
+    return {}; // caller pinned a path explicitly
+  }
+  const nodePaths = await getNodeModelPaths(DEEPSEEK_AUTO_NODE_URL);
+  const selectors = nodePaths
+    ? resolveDeepSeekModelPathSelectors(nodePaths, DEEPSEEK_AUTO_MODEL_ID)
+    : null;
+  const selector = selectors?.officialApi ?? selectors?.openrouter;
+  if (!selector) return {};
+  return {
+    forcedProvider: DEEPSEEK_AUTO_NODE_URL,
+    headers: { [MODEL_PATH_HEADER]: selector },
+  };
+}

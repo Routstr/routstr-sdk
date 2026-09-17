@@ -26,6 +26,7 @@ import {
   type ResolvedContext,
 } from "./client/resolveRequestContext";
 import { InsufficientBalanceError } from "./core/errors";
+import { autoModelPathFor } from "./utils/modelPaths";
 
 // Re-export for consumers that want access to the shared resolver
 export { resolveRequestContext };
@@ -143,11 +144,17 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     requestResponseLogSink,
   } = options;
 
+  // Automatic DeepSeek pinning: deepseek-v4.1-flash always routes through the
+  // official DeepSeek API on the pinned node unless the caller pinned a path.
+  const autoModelPath = await autoModelPathFor(modelId, headers);
+  const effectiveHeaders = { ...headers, ...autoModelPath.headers };
+  const effectiveForcedProvider = forcedProvider ?? autoModelPath.forcedProvider;
+
   // Delegate to shared context resolution
   const { client: resolvedClient, baseUrl, mintUrl, selectedModel } =
     await resolveRequestContext({
       modelId,
-      forcedProvider,
+      forcedProvider: effectiveForcedProvider,
       walletAdapter,
       storageAdapter,
       discoveryAdapter,
@@ -192,7 +199,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     baseUrl,
     mintUrl,
     path,
-    headers,
+    headers: effectiveHeaders,
     modelId,
     proxiedBody,
   };

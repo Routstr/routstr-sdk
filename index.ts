@@ -30,6 +30,3 @@ export * from "./storage";
 
 // Routing helper
 export * from "./routeRequests";
-
-// Automatic model-path routing (DeepSeek whitelist)
-export * from "./modelPathRouting";

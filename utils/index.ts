@@ -18,6 +18,8 @@ export {
   DEEPSEEK_AUTO_NODE_URL,
   deepSeekModelPath,
   deepSeekModelPathHeaders,
+  autoModelPathFor,
+  clearModelPathsCache,
   isWhitelistedDeepSeekModelPath,
   whitelistedDeepSeekRoute,
   fetchModelPaths,
