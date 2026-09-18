@@ -7,6 +7,9 @@ const selector = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=2&model
 async function prepare(headers: Record<string, string>, mode = "xcashu") {
   const client = Object.create(RoutstrClient.prototype) as any;
   client.mode = mode;
+  // Object.create skips the constructor, so instance fields are missing;
+  // the proactive-topup path reads this map unconditionally.
+  client._inflightTopups = new Map();
   client._checkBalance = vi.fn().mockResolvedValue(undefined);
   client._log = vi.fn();
   client.providerManager = { getModelForProvider: vi.fn().mockResolvedValue(null) };

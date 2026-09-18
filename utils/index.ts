@@ -26,6 +26,7 @@ export {
   fetchModelPaths,
   parseModelPathsPayload,
   resolveDeepSeekModelPathSelectors,
+  preferredDeepSeekSelector,
   type DeepSeekModelRoute,
   type DeepSeekModelPathSelectors,
   type NodeModelPaths,

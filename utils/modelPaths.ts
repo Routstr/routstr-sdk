@@ -27,21 +27,22 @@ export interface DeepSeekModelRoute {
   /** Upstream base URL, exactly as the node advertises it in the selector. */
   url: string;
   /**
-   * OpenRouter subprovider endpoint tag. Required on the OpenRouter entry:
+   * OpenRouter subprovider endpoint tag. Required on every whitelisted route:
    * a bare OpenRouter selector would let OpenRouter pick any subprovider
-   * (deepinfra, fireworks, ...), not necessarily DeepSeek.
+   * (deepinfra, together, ...), not necessarily a whitelisted one.
    */
   endpoint?: string;
 }
 
 /**
- * The only two upstream routes DeepSeek requests may take, for now:
- * 1. the official DeepSeek API
- * 2. DeepSeek through OpenRouter's `deepseek` subprovider
+ * The only two upstream routes DeepSeek requests may take, for now, in
+ * preference order — both pinned OpenRouter subproviders:
+ * 1. DeepSeek's own subprovider on OpenRouter
+ * 2. Fireworks' subprovider on OpenRouter
  */
 export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly DeepSeekModelRoute[] = [
-  { url: "https://api.deepseek.com" },
   { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
 ];
 
 /**
@@ -167,7 +168,8 @@ function parseSelector(selector: string): Record<string, string> | null {
  * Build the x-routstr-model-path selector pinning a DeepSeek model to one of
  * the whitelisted routes. The provider id is node-specific: take it from the
  * node's GET /v1/models/paths entry whose url (and endpoint tag) match the
- * route. Defaults to the official DeepSeek API route.
+ * route. Defaults to the first (preferred) whitelisted route — OpenRouter's
+ * deepseek subprovider.
  */
 export function deepSeekModelPath(
   modelId: string,
@@ -219,17 +221,19 @@ export function isWhitelistedDeepSeekModelPath(selector: string): boolean {
 
 /** Whitelisted DeepSeek selectors resolved from one node's advertised paths. */
 export interface DeepSeekModelPathSelectors {
-  /** Advertised selector for the official DeepSeek API, if the node has one. */
-  officialApi: string | null;
-  /** Advertised selector for OpenRouter's deepseek subprovider, if any. */
-  openrouter: string | null;
+  /**
+   * selectors[i] is the node's advertised selector for
+   * DEEPSEEK_MODEL_PATH_WHITELIST[i], or null when the node has no such route.
+   */
+  selectors: Array<string | null>;
 }
 
 /**
  * Resolve the whitelisted DeepSeek selectors from a node's /v1/models/paths
- * payload. Advertised path strings are used verbatim: they already carry the
- * node's provider-id and the exact model id, so the node is guaranteed to
- * accept them. Returns null when the node does not list the model.
+ * payload, in whitelist preference order. Advertised path strings are used
+ * verbatim: they already carry the node's provider-id and the exact model id,
+ * so the node is guaranteed to accept them. Returns null when the node does
+ * not list the model.
  */
 export function resolveDeepSeekModelPathSelectors(
   nodePaths: NodeModelPaths,
@@ -239,22 +243,28 @@ export function resolveDeepSeekModelPathSelectors(
     (m) => m.id.toLowerCase() === modelId.toLowerCase()
   );
   if (!entry) return null;
-  const selectors: DeepSeekModelPathSelectors = {
-    officialApi: null,
-    openrouter: null,
-  };
+  const selectors: Array<string | null> = DEEPSEEK_MODEL_PATH_WHITELIST.map(
+    () => null
+  );
   for (const path of entry.paths) {
     const route = whitelistedDeepSeekRoute(path);
-    if (route === DEEPSEEK_MODEL_PATH_WHITELIST[0] && !selectors.officialApi) {
-      selectors.officialApi = path;
-    } else if (
-      route === DEEPSEEK_MODEL_PATH_WHITELIST[1] &&
-      !selectors.openrouter
-    ) {
-      selectors.openrouter = path;
+    if (!route) continue;
+    const index = DEEPSEEK_MODEL_PATH_WHITELIST.indexOf(route);
+    if (index >= 0 && selectors[index] === null) {
+      selectors[index] = path;
     }
   }
-  return selectors;
+  return { selectors };
+}
+
+/**
+ * The first whitelisted selector the node advertises, in whitelist preference
+ * order; null when the node advertises none.
+ */
+export function preferredDeepSeekSelector(
+  selectors: DeepSeekModelPathSelectors | null
+): string | null {
+  return selectors?.selectors.find((s): s is string => s !== null) ?? null;
 }
 
 /**
@@ -318,7 +328,7 @@ export function sameNode(
  * Automatic DeepSeek path pinning, applied by routeRequests() for
  * deepseek-v4.1-flash only: force the node and return the
  * x-routstr-model-path header for the official DeepSeek API route
- * (prefer-official, falling back to OpenRouter's deepseek subprovider).
+ * (prefer OpenRouter's deepseek subprovider, falling back to fireworks).
  *
  * Returns {} for every other model, when the caller already supplied its own
  * x-routstr-model-path header, when the caller forced a different node (the
@@ -343,10 +353,11 @@ export async function autoModelPathFor(
     return {}; // a different node would reject this node's provider id
   }
   const nodePaths = await getNodeModelPaths(DEEPSEEK_AUTO_NODE_URL);
-  const selectors = nodePaths
-    ? resolveDeepSeekModelPathSelectors(nodePaths, DEEPSEEK_AUTO_MODEL_ID)
-    : null;
-  const selector = selectors?.officialApi ?? selectors?.openrouter;
+  const selector = preferredDeepSeekSelector(
+    nodePaths
+      ? resolveDeepSeekModelPathSelectors(nodePaths, DEEPSEEK_AUTO_MODEL_ID)
+      : null
+  );
   if (!selector) return {};
   return {
     forcedProvider: DEEPSEEK_AUTO_NODE_URL,

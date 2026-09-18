@@ -19,12 +19,15 @@ import { routeRequests } from "../../routeRequests";
 const mockedResolve = vi.mocked(resolveRequestContext);
 
 // Byte-exact advertised selectors from ai.redsh1ft.com /v1/models/paths.
-const OFFICIAL_API_SELECTOR =
-  "url=https%3A%2F%2Fapi.deepseek.com&provider-id=5&model-id=deepseek-v4.1-flash";
 const OPENROUTER_DEEPSEEK_SELECTOR =
   "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=8&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+const OPENROUTER_FIREWORKS_SELECTOR =
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=8&model-id=deepseek-v4.1-flash&endpoint=fireworks";
 const PPQ_SELECTOR =
   "url=https%3A%2F%2Fapi.ppq.ai&provider-id=6&model-id=deepseek-v4.1-flash";
+// No longer whitelisted: the official DeepSeek API route.
+const OFFICIAL_API_SELECTOR =
+  "url=https%3A%2F%2Fapi.deepseek.com&provider-id=5&model-id=deepseek-v4.1-flash";
 
 function makeNodePayload() {
   return {
@@ -34,6 +37,13 @@ function makeNodePayload() {
         paths: [
           { path: PPQ_SELECTOR, provider: { id: 6 }, endpoint: null },
           { path: OFFICIAL_API_SELECTOR, provider: { id: 5 }, endpoint: null },
+          {
+            // Fireworks is listed before deepseek on purpose: the node's
+            // order must not matter, the whitelist preference does.
+            path: OPENROUTER_FIREWORKS_SELECTOR,
+            provider: { id: 8 },
+            endpoint: { tag: "fireworks", name: "Fireworks" },
+          },
           {
             path: OPENROUTER_DEEPSEEK_SELECTOR,
             provider: { id: 8 },
@@ -84,24 +94,24 @@ function routeOptions(modelId: string, extra: Record<string, unknown> = {}) {
 }
 
 describe("autoModelPathFor", () => {
-  it("pins the official DeepSeek route for deepseek-v4.1-flash", async () => {
+  it("pins the preferred whitelisted route (OpenRouter deepseek) for deepseek-v4.1-flash", async () => {
     stubNodeFetch();
     await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({
       forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OFFICIAL_API_SELECTOR },
+      headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
     });
   });
 
-  it("uses the OpenRouter route when the node has no official path", async () => {
+  it("falls back to OpenRouter fireworks when the node has no deepseek route", async () => {
     stubNodeFetch({
       data: [
         {
           id: DEEPSEEK_AUTO_MODEL_ID,
           paths: [
             {
-              path: OPENROUTER_DEEPSEEK_SELECTOR,
+              path: OPENROUTER_FIREWORKS_SELECTOR,
               provider: { id: 8 },
-              endpoint: { tag: "deepseek", name: "DeepSeek" },
+              endpoint: { tag: "fireworks", name: "Fireworks" },
             },
           ],
         },
@@ -109,7 +119,7 @@ describe("autoModelPathFor", () => {
     });
     await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({
       forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
+      headers: { [MODEL_PATH_HEADER]: OPENROUTER_FIREWORKS_SELECTOR },
     });
   });
 
@@ -149,7 +159,7 @@ describe("autoModelPathFor", () => {
       autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, undefined, "https://ai.redsh1ft.com/")
     ).resolves.toEqual({
       forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OFFICIAL_API_SELECTOR },
+      headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
     });
   });
 
@@ -179,7 +189,7 @@ describe("autoModelPathFor", () => {
 });
 
 describe("routeRequests deepseek-v4.1-flash pinning", () => {
-  it("pins the node and sends the official-API selector for that model", async () => {
+  it("pins the node and sends the OpenRouter deepseek selector for that model", async () => {
     stubNodeFetch();
     await routeRequests(routeOptions(DEEPSEEK_AUTO_MODEL_ID));
 
@@ -191,7 +201,7 @@ describe("routeRequests deepseek-v4.1-flash pinning", () => {
       (client as { client: ReturnType<typeof makeClient> }).client.routeRequest
     ).toHaveBeenCalledWith(
       expect.objectContaining({
-        headers: { [MODEL_PATH_HEADER]: OFFICIAL_API_SELECTOR },
+        headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
       })
     );
   });
