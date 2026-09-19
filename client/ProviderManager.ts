@@ -737,12 +737,22 @@ export class ProviderManager {
       if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
         this.providersOnCoolDown.delete(key);
         expiredProviders.add(entry.baseUrl);
-        // Persist the removal of this exact entry
+        // Persist the removal of this exact entry (other entries for the
+        // same provider, e.g. still-live model-scoped ones, are kept)
         if (this.store) {
           this.store
             .getState()
             .removeProviderFromCooldown(entry.baseUrl, entry.modelId);
         }
+      }
+    }
+
+    // Prune strike timestamps older than the cooldown window: they can no
+    // longer combine with a fresh failure into a two-strike cooldown, and
+    // pruning keeps the per-scope map bounded.
+    for (const [key, ts] of this.lastFailed) {
+      if (now - ts >= ProviderManager.COOLDOWN_DURATION_MS) {
+        this.lastFailed.delete(key);
       }
     }
 
@@ -896,7 +906,11 @@ export class ProviderManager {
     }
     // Persist to store
     if (this.store) {
-      this.store.getState().removeProviderFromCooldown(baseUrl, modelId);
+      if (modelId === undefined) {
+        this.store.getState().removeAllProviderCooldowns(baseUrl);
+      } else {
+        this.store.getState().removeProviderFromCooldown(baseUrl, modelId);
+      }
     }
   }
 

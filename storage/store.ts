@@ -94,7 +94,11 @@ export interface SdkStorageStore extends SdkStorageState {
     timestamp: number,
     modelId?: string
   ) => void;
+  /** Remove exactly one cooldown entry: the one matching both baseUrl and
+   * `modelId` (an undefined `modelId` matches only the provider-wide entry). */
   removeProviderFromCooldown: (baseUrl: string, modelId?: string) => void;
+  /** Remove every cooldown entry for the provider (provider-wide release). */
+  removeAllProviderCooldowns: (baseUrl: string) => void;
   clearProvidersOnCooldown: () => void;
 }
 
@@ -379,14 +383,21 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     removeProviderFromCooldown: (baseUrl, modelId) => {
       const normalized = normalizeBaseUrl(baseUrl);
       const current = get().providersOnCooldown;
-      // Without modelId, remove every entry for the provider (provider-wide
-      // release); with modelId, remove only that model's entry.
+      // Exact-entry removal: matches both baseUrl and modelId, so an
+      // undefined modelId removes only the provider-wide entry and leaves
+      // model-scoped entries untouched.
       const updated = current.filter(
         (entry) =>
-          !(
-            entry.baseUrl === normalized &&
-            (modelId === undefined || entry.modelId === modelId)
-          )
+          !(entry.baseUrl === normalized && entry.modelId === modelId)
+      );
+      void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
+      set({ providersOnCooldown: updated });
+    },
+    removeAllProviderCooldowns: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().providersOnCooldown;
+      const updated = current.filter(
+        (entry) => entry.baseUrl !== normalized
       );
       void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
       set({ providersOnCooldown: updated });
