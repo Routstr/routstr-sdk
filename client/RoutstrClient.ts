@@ -762,9 +762,6 @@ export class RoutstrClient {
   }
 
   /**
-   * Store request details to a file in the reqs/ folder before fetch.
-   */
-  /**
    * Decide the cooldown scope for a failure.
    *
    * Returns the model id when the failure is specific to the selected model

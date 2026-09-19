@@ -983,6 +983,93 @@ describe("ProviderManager", () => {
 
       vi.useRealTimers();
     });
+
+    it("expiry of a provider-wide entry keeps live model-scoped entries in the store", () => {
+      // Stateful store stub mirroring storage/store.ts semantics
+      const state: {
+        failedProviders: string[];
+        lastFailed: Record<string, number>;
+        providersOnCooldown: Array<{
+          baseUrl: string;
+          modelId?: string;
+          timestamp: number;
+        }>;
+      } = { failedProviders: [], lastFailed: {}, providersOnCooldown: [] };
+      const store = {
+        getState: () => ({
+          ...state,
+          setLastFailedTimestamp: (b: string, ts: number) => {
+            state.lastFailed[b] = ts;
+          },
+          addFailedProvider: (b: string) => {
+            if (!state.failedProviders.includes(b)) state.failedProviders.push(b);
+          },
+          removeFailedProvider: (b: string) => {
+            state.failedProviders = state.failedProviders.filter((x) => x !== b);
+          },
+          addProviderOnCooldown: (b: string, ts: number, m?: string) => {
+            if (
+              !state.providersOnCooldown.some(
+                (e) => e.baseUrl === b && e.modelId === m
+              )
+            ) {
+              state.providersOnCooldown.push({
+                baseUrl: b,
+                modelId: m,
+                timestamp: ts,
+              });
+            }
+          },
+          removeProviderFromCooldown: (b: string, m?: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) => !(e.baseUrl === b && e.modelId === m)
+            );
+          },
+          removeAllProviderCooldowns: (b: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) => e.baseUrl !== b
+            );
+          },
+          clearProvidersOnCooldown: () => {
+            state.providersOnCooldown = [];
+          },
+          setLastFailed: vi.fn(),
+          setFailedProviders: vi.fn(),
+        }),
+      } as any;
+
+      const manager = new ProviderManager(registry(), store);
+      const P = "https://alpha.example.com/";
+      const t0 = Date.now();
+
+      // Provider-wide cooldown created at t0+1s (expires at t0+211s)
+      vi.setSystemTime(t0);
+      manager.markFailed(P);
+      vi.setSystemTime(t0 + 1_000);
+      manager.markFailed(P);
+
+      // Model-scoped cooldown for gpt-4o-mini created at t0+101s (expires t0+311s)
+      vi.setSystemTime(t0 + 100_000);
+      manager.markFailed(P, undefined, "gpt-4o-mini");
+      vi.setSystemTime(t0 + 101_000);
+      manager.markFailed(P, undefined, "gpt-4o-mini");
+
+      expect(state.providersOnCooldown).toHaveLength(2);
+
+      // At t0+212s the provider-wide entry has expired while the model-scoped
+      // entry is still live: memory and store must agree on that.
+      vi.setSystemTime(t0 + 212_000);
+      expect(manager.isOnCooldown(P, "gpt-4o-mini")).toBe(true);
+      expect(manager.isOnCooldown(P)).toBe(false);
+      expect(state.providersOnCooldown).toHaveLength(1);
+      expect(state.providersOnCooldown[0].modelId).toBe("gpt-4o-mini");
+
+      // Provider-wide release clears the remaining model-scoped entry too
+      manager.removeFromCooldown(P);
+      expect(state.providersOnCooldown).toHaveLength(0);
+
+      vi.useRealTimers();
+    });
   });
 
   // ---- failure tracking ----
@@ -1789,6 +1876,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
@@ -1813,6 +1901,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
@@ -1847,6 +1936,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
