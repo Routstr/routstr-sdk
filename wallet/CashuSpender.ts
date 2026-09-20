@@ -19,7 +19,6 @@ import {
   isHandledRedemptionError,
 } from "../core/errorTypes";
 import { BalanceManager } from "./BalanceManager";
-import { auditLogger } from "./AuditLogger";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
 import { getTokenMetadata } from "@cashu/cashu-ts";
 
@@ -169,20 +168,6 @@ export class CashuSpender {
       providerBalances,
       mintBalances: normalizedMintBalances,
     };
-  }
-
-  private async _logTransaction(
-    action: "spend" | "topup" | "refund" | "receive" | "balance_check",
-    options?: {
-      amount?: number;
-      mintUrl?: string;
-      baseUrl?: string;
-      status?: "success" | "failed";
-      details?: string;
-    }
-  ): Promise<void> {
-    const balanceState = await this._getBalanceState();
-    await auditLogger.logBalanceSnapshot(action, balanceState, options);
   }
 
   /**
@@ -429,13 +414,6 @@ export class CashuSpender {
       );
     }
 
-    this._logTransaction("spend", {
-      amount: spentAmount,
-      mintUrl: selectedMintUrl || mintUrl,
-      baseUrl,
-      status: "success",
-    });
-
     this._log(
       "DEBUG",
       `[CashuSpender] _spendInternal: Successfully spent ${spentAmount}, returning token with balance=${spentAmount}`
@@ -497,13 +475,6 @@ export class CashuSpender {
         const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
         const units = this.walletAdapter.getMintUnits();
         const unit = units[mintUrl] || "sat";
-
-        this._logTransaction("topup", {
-          amount: topUpResult.toppedUpAmount,
-          mintUrl,
-          baseUrl,
-          status: "success",
-        });
 
         return {
           token: apiKeyEntry.key,
