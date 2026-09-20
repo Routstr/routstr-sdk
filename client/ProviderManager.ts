@@ -651,7 +651,7 @@ export interface CooldownEntry {
  * `baseUrl::modelId` for model-scoped entries.
  */
 const cooldownKey = (baseUrl: string, modelId?: string): string =>
-  modelId ? `${baseUrl}::${modelId}` : baseUrl;
+  modelId != null ? `${baseUrl}::${modelId}` : baseUrl;
 
 /**
  * ProviderManager handles provider selection and failover
