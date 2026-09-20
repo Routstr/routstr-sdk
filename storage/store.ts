@@ -87,10 +87,18 @@ export interface SdkStorageStore extends SdkStorageState {
   setLastFailed: (value: Record<string, number>) => void;
   setLastFailedTimestamp: (baseUrl: string, timestamp: number) => void;
   setProvidersOnCooldown: (
-    value: Array<{ baseUrl: string; timestamp: number }>
+    value: Array<{ baseUrl: string; modelId?: string; timestamp: number }>
   ) => void;
-  addProviderOnCooldown: (baseUrl: string, timestamp: number) => void;
-  removeProviderFromCooldown: (baseUrl: string) => void;
+  addProviderOnCooldown: (
+    baseUrl: string,
+    timestamp: number,
+    modelId?: string
+  ) => void;
+  /** Remove exactly one cooldown entry: the one matching both baseUrl and
+   * `modelId` (an undefined `modelId` matches only the provider-wide entry). */
+  removeProviderFromCooldown: (baseUrl: string, modelId?: string) => void;
+  /** Remove every cooldown entry for the provider (provider-wide release). */
+  removeAllProviderCooldowns: (baseUrl: string) => void;
   clearProvidersOnCooldown: () => void;
 }
 
@@ -349,24 +357,48 @@ const createEmptyStore = (driver: StorageDriver): SdkStore =>
     setProvidersOnCooldown: (value) => {
       const normalized = value.map((entry) => ({
         baseUrl: normalizeBaseUrl(entry.baseUrl),
+        modelId: entry.modelId,
         timestamp: entry.timestamp,
       }));
       void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, normalized);
       set({ providersOnCooldown: normalized });
     },
-    addProviderOnCooldown: (baseUrl, timestamp) => {
+    addProviderOnCooldown: (baseUrl, timestamp, modelId) => {
       const normalized = normalizeBaseUrl(baseUrl);
       const current = get().providersOnCooldown;
-      if (!current.some((entry) => entry.baseUrl === normalized)) {
-        const updated = [...current, { baseUrl: normalized, timestamp }];
+      if (
+        !current.some(
+          (entry) =>
+            entry.baseUrl === normalized && entry.modelId === modelId
+        )
+      ) {
+        const updated = [
+          ...current,
+          { baseUrl: normalized, modelId, timestamp },
+        ];
         void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
         set({ providersOnCooldown: updated });
       }
     },
-    removeProviderFromCooldown: (baseUrl) => {
+    removeProviderFromCooldown: (baseUrl, modelId) => {
       const normalized = normalizeBaseUrl(baseUrl);
       const current = get().providersOnCooldown;
-      const updated = current.filter((entry) => entry.baseUrl !== normalized);
+      // Exact-entry removal: matches both baseUrl and modelId, so an
+      // undefined modelId removes only the provider-wide entry and leaves
+      // model-scoped entries untouched.
+      const updated = current.filter(
+        (entry) =>
+          !(entry.baseUrl === normalized && entry.modelId === modelId)
+      );
+      void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
+      set({ providersOnCooldown: updated });
+    },
+    removeAllProviderCooldowns: (baseUrl) => {
+      const normalized = normalizeBaseUrl(baseUrl);
+      const current = get().providersOnCooldown;
+      const updated = current.filter(
+        (entry) => entry.baseUrl !== normalized
+      );
       void driver.setItem(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, updated);
       set({ providersOnCooldown: updated });
     },
@@ -480,10 +512,11 @@ const hydrateStoreFromDriver = async (
     >(SDK_STORAGE_KEYS.CLIENT_IDS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.FAILED_PROVIDERS, []),
     driver.getItem<Record<string, number>>(SDK_STORAGE_KEYS.LAST_FAILED, {}),
-    driver.getItem<Array<{ baseUrl: string; timestamp: number }>>(
-      SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN,
-      []
-    ),
+    driver.getItem<Array<{
+      baseUrl: string;
+      modelId?: string;
+      timestamp: number;
+    }>>(SDK_STORAGE_KEYS.PROVIDERS_ON_COOLDOWN, []),
   ]);
 
   const modelsFromAllProviders = Object.fromEntries(
@@ -584,6 +617,7 @@ const hydrateStoreFromDriver = async (
   );
   const providersOnCooldown = rawProvidersOnCooldown.map((entry) => ({
     baseUrl: normalizeBaseUrl(entry.baseUrl),
+    modelId: entry.modelId,
     timestamp: entry.timestamp,
   }));
 

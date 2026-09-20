@@ -201,7 +201,9 @@ describe("RoutstrClient redemption recovery and provider failover", () => {
       expect(receive).toHaveBeenCalledTimes(1);
       expect(providerManager.markFailed).toHaveBeenCalledWith(
         BASE_URL,
-        expect.stringContaining(`code=${code}`)
+        expect.stringContaining(`code=${code}`),
+        // model-scoped cooldown: only this model is cooled down on the provider
+        "gpt-4o-mini"
       );
     }
   );

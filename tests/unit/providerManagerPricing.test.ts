@@ -749,8 +749,10 @@ describe("ProviderManager", () => {
 
       const cooldowns = manager.getProvidersOnCooldown();
       expect(cooldowns).toHaveLength(1);
-      expect(cooldowns[0][0]).toBe("https://alpha.example.com/");
-      expect(cooldowns[0][1]).toBe(t0 + 1_000); // timestamp of second failure
+      expect(cooldowns[0].baseUrl).toBe("https://alpha.example.com/");
+      expect(cooldowns[0].timestamp).toBe(t0 + 1_000); // timestamp of second failure
+      // provider-scoped: no modelId on the entry
+      expect(cooldowns[0].modelId).toBeUndefined();
 
       vi.useRealTimers();
     });
@@ -765,6 +767,308 @@ describe("ProviderManager", () => {
       expect(manager.getLastFailed("https://alpha.example.com/")).toBeUndefined();
       // But it's still in failedProviders unless we also reset
       expect(manager.hasFailed("https://alpha.example.com/")).toBe(true);
+    });
+  });
+
+  // ---- model-scoped cooldown ----
+
+  describe("model-scoped cooldown", () => {
+    const registry = () =>
+      createRegistry({
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [
+            {
+              id: "gpt-4o-mini",
+              sats_pricing: { prompt: 1, completion: 1 },
+            } as any,
+            {
+              id: "claude-3",
+              sats_pricing: { prompt: 2, completion: 2 },
+            } as any,
+          ],
+          "https://beta.example.com/": [
+            {
+              id: "gpt-4o-mini",
+              sats_pricing: { prompt: 5, completion: 5 },
+            } as any,
+            {
+              id: "claude-3",
+              sats_pricing: { prompt: 5, completion: 5 },
+            } as any,
+          ],
+        }),
+      });
+
+    it("cools down only the failed model on a provider, not the whole provider", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+
+      // Second strike: only gpt-4o-mini on alpha is cooled down
+      expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
+        true
+      );
+      // Other models on the same provider are still selectable
+      expect(manager.isOnCooldown("https://alpha.example.com/", "claude-3")).toBe(
+        false
+      );
+      // Without a model, the provider as a whole is NOT considered down
+      expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(false);
+
+      // The provider stays in ranking/selection for its other model
+      const providers = manager.getAllProvidersForModel("claude-3");
+      expect(providers.map((p) => p.baseUrl)).toEqual([
+        "https://alpha.example.com/",
+        "https://beta.example.com/",
+      ]);
+      // But is excluded for the cooled model
+      const cooled = manager.getAllProvidersForModel("gpt-4o-mini");
+      expect(cooled.map((p) => p.baseUrl)).toEqual(["https://beta.example.com/"]);
+
+      vi.useRealTimers();
+    });
+
+    it("model-scoped strikes do not cross-contaminate: one failure per model does not trigger cooldown", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
+
+      // Two failures on the same provider but different models: no cooldown
+      expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
+        false
+      );
+      expect(manager.isOnCooldown("https://alpha.example.com/", "claude-3")).toBe(
+        false
+      );
+      expect(manager.getProvidersOnCooldown()).toHaveLength(0);
+
+      vi.useRealTimers();
+    });
+
+    it("a provider-scoped failure (no modelId) cools down every model on the provider", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/");
+
+      expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(true);
+      expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
+        true
+      );
+      expect(manager.isOnCooldown("https://alpha.example.com/", "claude-3")).toBe(
+        true
+      );
+      // Other providers are unaffected
+      expect(manager.isOnCooldown("https://beta.example.com/")).toBe(false);
+
+      vi.useRealTimers();
+    });
+
+    it("findNextBestProvider skips a provider only for the cooled model", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+
+      // For gpt-4o-mini, alpha is skipped
+      expect(
+        manager.findNextBestProvider("gpt-4o-mini", "https://other.example.com/")
+      ).toBe("https://beta.example.com/");
+      // For claude-3, alpha is still a candidate (cheapest)
+      expect(
+        manager.findNextBestProvider("claude-3", "https://other.example.com/")
+      ).toBe("https://alpha.example.com/");
+
+      vi.useRealTimers();
+    });
+
+    it("getProviderPriceRankingForModel excludes a provider only for the cooled model", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+
+      expect(
+        manager
+          .getProviderPriceRankingForModel("gpt-4o-mini")
+          .map((e) => e.baseUrl)
+      ).toEqual(["https://beta.example.com/"]);
+      expect(
+        manager
+          .getProviderPriceRankingForModel("claude-3")
+          .map((e) => e.baseUrl)
+      ).toEqual(["https://alpha.example.com/", "https://beta.example.com/"]);
+
+      vi.useRealTimers();
+    });
+
+    it("removeFromCooldown with modelId releases only that model", () => {
+      const manager = new ProviderManager(registry());
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(now + 2_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
+      vi.setSystemTime(now + 3_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
+
+      expect(manager.getProvidersOnCooldown()).toHaveLength(2);
+
+      manager.removeFromCooldown("https://alpha.example.com/", "gpt-4o-mini");
+      const remaining = manager.getProvidersOnCooldown();
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].modelId).toBe("claude-3");
+      expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
+        false
+      );
+      expect(manager.isOnCooldown("https://alpha.example.com/", "claude-3")).toBe(
+        true
+      );
+
+      // Without modelId, every entry for the provider is released
+      manager.removeFromCooldown("https://alpha.example.com/");
+      expect(manager.getProvidersOnCooldown()).toHaveLength(0);
+
+      vi.useRealTimers();
+    });
+
+    it("cooldown entries carry modelId and expire independently", () => {
+      const manager = new ProviderManager(registry());
+
+      const t0 = Date.now();
+      vi.setSystemTime(t0);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      vi.setSystemTime(t0 + 1_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "gpt-4o-mini");
+      // claude-3 goes on cooldown slightly later
+      vi.setSystemTime(t0 + 10_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
+      vi.setSystemTime(t0 + 11_000);
+      manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
+
+      const entries = manager.getProvidersOnCooldown();
+      expect(entries).toHaveLength(2);
+      expect(entries.filter((e) => e.modelId === "gpt-4o-mini")).toHaveLength(1);
+      expect(entries.filter((e) => e.modelId === "claude-3")).toHaveLength(1);
+      expect(entries.every((e) => e.baseUrl === "https://alpha.example.com/")).toBe(
+        true
+      );
+
+      // After the full cooldown window, both entries expire
+      vi.setSystemTime(t0 + 11_000 + manager.getCooldownDurationMs() + 1);
+      expect(manager.getProvidersOnCooldown()).toHaveLength(0);
+      expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
+        false
+      );
+
+      vi.useRealTimers();
+    });
+
+    it("expiry of a provider-wide entry keeps live model-scoped entries in the store", () => {
+      // Stateful store stub mirroring storage/store.ts semantics
+      const state: {
+        failedProviders: string[];
+        lastFailed: Record<string, number>;
+        providersOnCooldown: Array<{
+          baseUrl: string;
+          modelId?: string;
+          timestamp: number;
+        }>;
+      } = { failedProviders: [], lastFailed: {}, providersOnCooldown: [] };
+      const store = {
+        getState: () => ({
+          ...state,
+          setLastFailedTimestamp: (b: string, ts: number) => {
+            state.lastFailed[b] = ts;
+          },
+          addFailedProvider: (b: string) => {
+            if (!state.failedProviders.includes(b)) state.failedProviders.push(b);
+          },
+          removeFailedProvider: (b: string) => {
+            state.failedProviders = state.failedProviders.filter((x) => x !== b);
+          },
+          addProviderOnCooldown: (b: string, ts: number, m?: string) => {
+            if (
+              !state.providersOnCooldown.some(
+                (e) => e.baseUrl === b && e.modelId === m
+              )
+            ) {
+              state.providersOnCooldown.push({
+                baseUrl: b,
+                modelId: m,
+                timestamp: ts,
+              });
+            }
+          },
+          removeProviderFromCooldown: (b: string, m?: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) => !(e.baseUrl === b && e.modelId === m)
+            );
+          },
+          removeAllProviderCooldowns: (b: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) => e.baseUrl !== b
+            );
+          },
+          clearProvidersOnCooldown: () => {
+            state.providersOnCooldown = [];
+          },
+          setLastFailed: vi.fn(),
+          setFailedProviders: vi.fn(),
+        }),
+      } as any;
+
+      const manager = new ProviderManager(registry(), store);
+      const P = "https://alpha.example.com/";
+      const t0 = Date.now();
+
+      // Provider-wide cooldown created at t0+1s (expires at t0+211s)
+      vi.setSystemTime(t0);
+      manager.markFailed(P);
+      vi.setSystemTime(t0 + 1_000);
+      manager.markFailed(P);
+
+      // Model-scoped cooldown for gpt-4o-mini created at t0+101s (expires t0+311s)
+      vi.setSystemTime(t0 + 100_000);
+      manager.markFailed(P, undefined, "gpt-4o-mini");
+      vi.setSystemTime(t0 + 101_000);
+      manager.markFailed(P, undefined, "gpt-4o-mini");
+
+      expect(state.providersOnCooldown).toHaveLength(2);
+
+      // At t0+212s the provider-wide entry has expired while the model-scoped
+      // entry is still live: memory and store must agree on that.
+      vi.setSystemTime(t0 + 212_000);
+      expect(manager.isOnCooldown(P, "gpt-4o-mini")).toBe(true);
+      expect(manager.isOnCooldown(P)).toBe(false);
+      expect(state.providersOnCooldown).toHaveLength(1);
+      expect(state.providersOnCooldown[0].modelId).toBe("gpt-4o-mini");
+
+      // Provider-wide release clears the remaining model-scoped entry too
+      manager.removeFromCooldown(P);
+      expect(state.providersOnCooldown).toHaveLength(0);
+
+      vi.useRealTimers();
     });
   });
 
@@ -1572,6 +1876,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
@@ -1596,6 +1901,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
@@ -1617,6 +1923,12 @@ describe("ProviderManager", () => {
             { baseUrl: "https://fresh.example.com/", timestamp: now - 5_000 },
             // Expired cooldown — older than COOLDOWN_DURATION_MS (210s), should be filtered out
             { baseUrl: "https://stale.example.com/", timestamp: now - 220_000 },
+            // Fresh model-scoped cooldown — should be kept with its modelId
+            {
+              baseUrl: "https://modelcooled.example.com/",
+              modelId: "gpt-4o-mini",
+              timestamp: now - 5_000,
+            },
           ],
           removeFailedProvider: vi.fn(),
           setFailedProviders: vi.fn(),
@@ -1624,6 +1936,7 @@ describe("ProviderManager", () => {
           setLastFailedTimestamp: vi.fn(),
           addProviderOnCooldown: vi.fn(),
           removeProviderFromCooldown: vi.fn(),
+          removeAllProviderCooldowns: vi.fn(),
           clearProvidersOnCooldown: vi.fn(),
           setLastFailed: vi.fn(),
         }),
@@ -1632,8 +1945,26 @@ describe("ProviderManager", () => {
       const manager = new ProviderManager(createRegistry(), store);
 
       const cooldowns = manager.getProvidersOnCooldown();
-      expect(cooldowns).toHaveLength(1);
-      expect(cooldowns[0][0]).toBe("https://fresh.example.com/");
+      expect(cooldowns).toHaveLength(2);
+      expect(
+        cooldowns.some(
+          (e) => e.baseUrl === "https://fresh.example.com/" && !e.modelId
+        )
+      ).toBe(true);
+      expect(
+        cooldowns.some(
+          (e) =>
+            e.baseUrl === "https://modelcooled.example.com/" &&
+            e.modelId === "gpt-4o-mini"
+        )
+      ).toBe(true);
+      // The hydrated model-scoped entry only blocks that model
+      expect(
+        manager.isOnCooldown("https://modelcooled.example.com/", "gpt-4o-mini")
+      ).toBe(true);
+      expect(
+        manager.isOnCooldown("https://modelcooled.example.com/", "claude-3")
+      ).toBe(false);
     });
 
     it("does nothing when no store is provided", () => {
