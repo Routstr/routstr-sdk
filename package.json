@@ -16,6 +16,11 @@
       "import": "./dist/browser.mjs",
       "require": "./dist/browser.js"
     },
+    "./browser/zlib": {
+      "types": "./dist/browser-zlib.d.mts",
+      "import": "./dist/browser-zlib.mjs",
+      "require": "./dist/browser-zlib.js"
+    },
     "./node": {
       "types": "./dist/node.d.mts",
       "import": "./dist/node.mjs",
@@ -66,7 +71,8 @@
     "typecheck": "tsc --noEmit",
     "test:sdk": "vitest run tests/unit",
     "test:sdk:unit": "vitest run tests/unit",
-    "test:sdk:integration": "vitest run tests/integration"
+    "test:sdk:integration": "vitest run tests/integration",
+    "check:browser": "node scripts/check-browser-bundle.mjs"
   },
   "dependencies": {
     "@cashu/cashu-ts": "^3.1.1",
@@ -84,6 +90,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
+    "esbuild": "0.27.7",
     "joycon": "^3.1.1",
     "tsup": "^8.5.1",
     "typescript": "^5.0.0",

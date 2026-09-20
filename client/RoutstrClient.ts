@@ -56,7 +56,7 @@ import {
   extractUsageFromResponseHeaders,
   type UsageTrackingData,
 } from "./usage";
-import { inspectSSEWebStream } from "./sse";
+import { inspectSSEWebStream } from "./sseWeb";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -2393,4 +2393,3 @@ export class RoutstrClient {
   }
 
 }
-

@@ -3,6 +3,8 @@
 // browser-safe default and @routstr/sdk/browser entrypoints.
 
 export * from "./index";
+export { createSSEParserTransform } from "./client/sse";
+export { configureNodeAuditLogger } from "./wallet/AuditLoggerNode";
 export { createBunSqliteDriver } from "./storage/drivers/bunSqlite";
 export {
   createBunSqliteUsageTrackingDriver as createBunSqliteUsageTrackingDriverWithDatabase,
@@ -16,11 +18,14 @@ import {
 import type { DiscoveryAdapter } from "./discovery/interfaces";
 import type { StorageDriver } from "./storage/types";
 import type { SdkLogger } from "./core/types";
+import { configureNodeAuditLogger } from "./wallet/AuditLoggerNode";
 import { createBunSqliteDriver as createBunSqliteDriverInternal } from "./storage/drivers/bunSqlite";
 import {
   createBunSqliteUsageTrackingDriver as createBunSqliteUsageTrackingDriverInternal,
   type BunSqliteUsageTrackingDriverOptions,
 } from "./storage/usageTracking/bunSqlite";
+
+configureNodeAuditLogger();
 
 const createBunPersistentEventDatabase = async (dbPath: string) => {
   const { BunSqliteEventDatabase } = await import("applesauce-sqlite/bun");

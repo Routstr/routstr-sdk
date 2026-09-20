@@ -4,8 +4,10 @@ import { promisify } from "util";
 import { pipeline as pipelineCallback } from "stream";
 import {
   createSSEParserTransform,
-  inspectSSEWebStream,
 } from "../../client/sse";
+import {
+  inspectSSEWebStream,
+} from "../../client/sseWeb";
 
 const pipeline = promisify(pipelineCallback);
 
