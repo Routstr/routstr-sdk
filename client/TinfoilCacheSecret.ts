@@ -20,6 +20,8 @@
  * logging it.
  */
 
+import { OPENAI_JSON_BODY_PATHS } from "../utils/openAiEndpoints";
+
 export const USER_CACHE_SECRET_FIELD = "user_cache_secret";
 export const USER_CACHE_SECRET_ENV = "TINFOIL_USER_CACHE_SECRET";
 
@@ -44,11 +46,7 @@ export interface ResolveUserCacheSecretOptions {
  * path-prefixed proxies all qualify. Embeddings, audio, files, and other
  * endpoints do not prefix-cache and may reject unknown fields.
  */
-const USER_CACHE_SECRET_PATHS = [
-  "/chat/completions",
-  "/completions",
-  "/responses",
-];
+const USER_CACHE_SECRET_PATHS = OPENAI_JSON_BODY_PATHS;
 
 const USER_CACHE_SECRET_DIR_NAME = ".tinfoil";
 const USER_CACHE_SECRET_FILE_NAME = "user_cache_secret";
