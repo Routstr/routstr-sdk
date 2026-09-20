@@ -673,9 +673,9 @@ const cooldownKey = (
   modelId?: string,
   modelPath?: string
 ): string =>
-  modelPath
+  modelPath != null
     ? `${baseUrl}::path::${modelPath}`
-    : modelId
+    : modelId != null
       ? `${baseUrl}::${modelId}`
       : baseUrl;
 
