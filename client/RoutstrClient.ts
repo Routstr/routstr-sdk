@@ -63,6 +63,7 @@ import {
   prepareTinfoilClient,
   fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
+import { isOpenAiJsonBodyPath } from "../utils/openAiEndpoints";
 
 /**
  * RoutstrClient is the main SDK entry point
@@ -401,7 +402,10 @@ export class RoutstrClient {
     let requestBody = body;
     if (body && typeof body === "object") {
       const bodyObj = body as Record<string, unknown>;
-      if (!bodyObj.stream) {
+      // `stream` is OpenAI request vocabulary. Only normalize it on endpoints
+      // that define it: strict non-chat endpoints (e.g. /v1/systemone) reject
+      // unknown fields with a 400, so adding it there breaks the request.
+      if (isOpenAiJsonBodyPath(requestPath) && !bodyObj.stream) {
         requestBody = { ...bodyObj, stream: false };
       }
     }
