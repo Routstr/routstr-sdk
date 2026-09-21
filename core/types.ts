@@ -48,6 +48,7 @@ export interface MessageContentType {
   hidden?: boolean;
   thinking?: string;
   citations?: string[];
+  annotations?: AnnotationData[];
 }
 
 export interface Message {
