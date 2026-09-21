@@ -15,7 +15,13 @@ import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { findModelForId } from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
-import { isOnionUrl, isTorContext } from "../utils/torUtils";
+import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
+import {
+  canonicalModelPath,
+  DEEPSEEK_AUTO_NODE_URLS,
+  getNodeModelPaths,
+  resolveDeepSeekModelPathSelectors,
+} from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
@@ -1083,6 +1089,93 @@ export class ProviderManager {
     }
 
     return null;
+  }
+
+  /**
+   * Ranked DeepSeek model-path candidates for automatic pinning
+   * ("get baseUrl for model path").
+   *
+   * One entry per whitelisted node that (a) is enabled and not cooled down
+   * for the model, and (b) advertises at least one whitelisted route for it
+   * on GET /v1/models/paths. Entries are sorted by the per-route completion
+   * price of the node's best available route; within an entry, `selectors`
+   * and `satsPricing` are in whitelist preference order with cooled-down
+   * routes removed — the failover chain is node-major: every route of the
+   * cheapest node before the next node.
+   */
+  async getModelPathProviderRanking(
+    modelId: string,
+    options: { torMode?: boolean; excludeBaseUrl?: string } = {}
+  ): Promise<
+    Array<{
+      baseUrl: string;
+      selectors: string[];
+      satsPricing: Array<{
+        prompt?: number;
+        completion?: number;
+        max_cost?: number;
+      } | null>;
+      model: Model;
+    }>
+  > {
+    const torMode = options.torMode ?? isTorContext();
+    const disabledProviders = new Set(
+      this.discoveryAdapter.getDisabledProviders()
+    );
+    const allModels = this.discoveryAdapter.getCachedModels();
+
+    const candidates = await Promise.all(
+      DEEPSEEK_AUTO_NODE_URLS.map(async (nodeUrl) => {
+        const baseUrl = normalizeProviderUrl(nodeUrl);
+        if (!baseUrl) return null;
+        if (options.excludeBaseUrl && baseUrl === options.excludeBaseUrl) {
+          return null;
+        }
+        if (disabledProviders.has(baseUrl)) return null;
+        if (!torMode && isOnionUrl(baseUrl)) return null;
+        if (this.isOnCooldown(baseUrl, modelId)) return null;
+
+        const model = (allModels[baseUrl] || []).find(
+          (m: Model) => m.id === modelId
+        );
+        if (!model) return null;
+
+        const nodePaths = await getNodeModelPaths(baseUrl);
+        if (!nodePaths) return null;
+        const resolved = resolveDeepSeekModelPathSelectors(nodePaths, modelId);
+        if (!resolved) return null;
+
+        // Whitelist order, dropping routes this node has on path-scoped
+        // cooldown (or does not advertise at all).
+        const selectors: string[] = [];
+        const satsPricing: Array<{
+          prompt?: number;
+          completion?: number;
+          max_cost?: number;
+        } | null> = [];
+        for (let i = 0; i < resolved.selectors.length; i++) {
+          const selector = resolved.selectors[i];
+          if (!selector) continue;
+          const pathId = canonicalModelPath(selector);
+          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
+          selectors.push(selector);
+          satsPricing.push(resolved.satsPricing[i] ?? null);
+        }
+        if (selectors.length === 0) return null;
+
+        const price = satsPricing.find((p) => p != null);
+        const cost =
+          price?.completion ?? model.sats_pricing?.completion ?? Infinity;
+        return { baseUrl, selectors, satsPricing, model, cost };
+      })
+    );
+
+    return candidates
+      .filter(
+        (c): c is NonNullable<typeof c> => c !== null
+      )
+      .sort((a, b) => a.cost - b.cost)
+      .map(({ cost: _cost, ...candidate }) => candidate);
   }
 
   /**

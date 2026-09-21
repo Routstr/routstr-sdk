@@ -51,11 +51,19 @@ export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly DeepSeekModelRoute[] = [
 export const DEEPSEEK_AUTO_MODEL_ID = "deepseek-v4.1-flash";
 
 /**
- * The node the automatic selection resolves advertised paths from. A
+ * The nodes the automatic selection may pin, in preference order. A
  * selector is only guaranteed valid on the node that advertised it, so the
- * pinned node must be the node we asked for paths.
+ * pinned node must be the node we asked for paths. Hardcoded for now; the
+ * intent is to discover eligible nodes by their advertised routstr-core
+ * version once model paths are widely deployed.
  */
-export const DEEPSEEK_AUTO_NODE_URL = "https://ai.redsh1ft.com";
+export const DEEPSEEK_AUTO_NODE_URLS: readonly string[] = [
+  "https://ai.redsh1ft.com",
+  "https://routstr.otrta.me",
+];
+
+/** The preferred automatic-selection node (first of DEEPSEEK_AUTO_NODE_URLS). */
+export const DEEPSEEK_AUTO_NODE_URL = DEEPSEEK_AUTO_NODE_URLS[0];
 
 /**
  * Per-route metadata advertised alongside a path (routstr-core model-path
@@ -361,7 +369,11 @@ export function clearModelPathsCache(): void {
   modelPathsCache.clear();
 }
 
-async function getNodeModelPaths(
+/**
+ * A node's GET /v1/models/paths payload, cached for MODEL_PATHS_TTL_MS.
+ * On fetch failure the stale cache entry (if any) is kept.
+ */
+export async function getNodeModelPaths(
   baseUrl: string
 ): Promise<NodeModelPaths | null> {
   const cached = modelPathsCache.get(baseUrl);

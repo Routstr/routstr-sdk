@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderManager } from "../../client/ProviderManager";
+import {
+  clearModelPathsCache,
+  DEEPSEEK_AUTO_NODE_URLS,
+} from "../../utils/modelPaths";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 
@@ -1269,6 +1273,186 @@ describe("ProviderManager", () => {
       ).toBe(false);
 
       vi.useRealTimers();
+    });
+  });
+
+  // ---- model-path ranking ----
+
+  describe("getModelPathProviderRanking", () => {
+    const MODEL_ID = "deepseek-v4.1-flash";
+    const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
+    const DEEPSEEK_SELECTOR =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+    const FIREWORKS_SELECTOR =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
+
+    const pathsPayload = (
+      paths: Array<{ path: string; completion?: number }>
+    ) => ({
+      data: [
+        {
+          id: MODEL_ID,
+          paths: paths.map(({ path, completion }) => ({
+            path,
+            provider: { slug: "openrouter", type: "openrouter" },
+            endpoint: null,
+            model:
+              completion === undefined
+                ? undefined
+                : { sats_pricing: { prompt: 0, completion, max_cost: 0 } },
+          })),
+        },
+      ],
+      updated_at: null,
+    });
+
+    const stubPathsFetch = (byNode: Record<string, unknown | Error>) =>
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: unknown) => {
+          const url = String(input);
+          for (const [node, payload] of Object.entries(byNode)) {
+            if (url.startsWith(node)) {
+              if (payload instanceof Error) throw payload;
+              return { ok: true, json: async () => payload };
+            }
+          }
+          throw new Error(`unexpected fetch: ${url}`);
+        })
+      );
+
+    const pathRegistry = () =>
+      createRegistry({
+        getCachedModels: () => ({
+          [`${NODE_A}/`]: [
+            {
+              id: MODEL_ID,
+              sats_pricing: { prompt: 1, completion: 1 },
+            } as any,
+          ],
+          [`${NODE_B}/`]: [
+            {
+              id: MODEL_ID,
+              sats_pricing: { prompt: 1, completion: 1 },
+            } as any,
+          ],
+        }),
+      });
+
+    beforeEach(() => {
+      stubClearnetWindow();
+      clearModelPathsCache();
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("ranks whitelisted nodes by per-route completion price", async () => {
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
+          { path: FIREWORKS_SELECTOR, completion: 0.0007 },
+        ]),
+        [NODE_B]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0004 },
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_B}/`,
+        `${NODE_A}/`,
+      ]);
+      // Selectors stay in whitelist preference order within the node, even
+      // where the second route is cheaper than the first.
+      expect(ranking[1].selectors).toEqual([
+        DEEPSEEK_SELECTOR,
+        FIREWORKS_SELECTOR,
+      ]);
+      // Per-route pricing rides along with the selectors.
+      expect(ranking[1].satsPricing[0]?.completion).toBe(0.0013);
+      expect(ranking[1].satsPricing[1]?.completion).toBe(0.0007);
+    });
+
+    it("skips a node whose model-scoped cooldown is live, keeps a path-scoped one", async () => {
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
+          { path: FIREWORKS_SELECTOR, completion: 0.0007 },
+        ]),
+        [NODE_B]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0004 },
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      // Path-scoped cooldown on A's deepseek route: A stays, deepseek drops
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed(`${NODE_A}/`, undefined, MODEL_ID, DEEPSEEK_SELECTOR);
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed(`${NODE_A}/`, undefined, MODEL_ID, DEEPSEEK_SELECTOR);
+
+      let ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_B}/`,
+        `${NODE_A}/`,
+      ]);
+      expect(
+        ranking.find((c) => c.baseUrl === `${NODE_A}/`)?.selectors
+      ).toEqual([FIREWORKS_SELECTOR]);
+
+      // Model-scoped cooldown on B: B drops entirely
+      vi.setSystemTime(now + 2_000);
+      manager.markFailed(`${NODE_B}/`, undefined, MODEL_ID);
+      vi.setSystemTime(now + 3_000);
+      manager.markFailed(`${NODE_B}/`, undefined, MODEL_ID);
+
+      ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+      expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_A}/`]);
+
+      vi.useRealTimers();
+    });
+
+    it("excludes the failed node when excludeBaseUrl is given", async () => {
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
+        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID, {
+        excludeBaseUrl: `${NODE_A}/`,
+      });
+      expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
+    });
+
+    it("skips nodes that do not offer the model or advertise no whitelisted path", async () => {
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash" },
+        ]),
+        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+      expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
+    });
+
+    it("returns an empty ranking when no node is usable", async () => {
+      stubPathsFetch({
+        [NODE_A]: new Error("offline"),
+        [NODE_B]: new Error("offline"),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      await expect(
+        manager.getModelPathProviderRanking(MODEL_ID)
+      ).resolves.toEqual([]);
     });
   });
 
