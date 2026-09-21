@@ -79,6 +79,21 @@ const TOPUP_MARGIN = 1.4;
  *  mirroring the 402 handler's heuristic. */
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
 
+/**
+ * An SDK-pinned x-routstr-model-path selector and the per-route pricing the
+ * node advertised for it. Marks the request as auto-pinned (failover may
+ * re-resolve a selector on the next model-path node); caller-supplied
+ * selectors never fail over.
+ */
+export interface ModelPathPin {
+  selector: string;
+  satsPricing?: {
+    prompt?: number;
+    completion?: number;
+    max_cost?: number;
+  };
+}
+
 export interface RouteRequestParams {
   path: string;
   method: string;
@@ -98,6 +113,10 @@ export interface RouteRequestParams {
   userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
+  /**
+   * Set by the SDK's automatic model-path pinning (see resolveRequestContext).
+   */
+  autoModelPath?: ModelPathPin;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -395,7 +414,8 @@ export class RoutstrClient {
           selectedModel,
           requestMessages,
           requestMaxTokens,
-          requestBodyForPricing
+          requestBodyForPricing,
+          params.autoModelPath?.satsPricing
         );
       }
     }
@@ -659,6 +679,8 @@ export class RoutstrClient {
     tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
+    /** SDK-pinned model path for this request, if any. */
+    autoModelPath?: ModelPathPin;
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -825,6 +847,8 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
+      /** SDK-pinned model path for this request, if any. */
+      autoModelPath?: ModelPathPin;
     },
     token: string,
     status: number,
@@ -1505,20 +1529,47 @@ export class RoutstrClient {
     }
 
     // A pinned x-routstr-model-path selector is only guaranteed valid on
-    // the node that advertised it. A pinned request must never fail over to
-    // a different node: the selector may be rejected there (404
+    // the node that advertised it. A caller-pinned request must never fail
+    // over to a different node: the selector may be rejected there (404
     // invalid_model_path) and the caller explicitly asked for that one
-    // upstream. Failures surface to the caller instead.
+    // upstream. An SDK auto-pinned request may fail over to the next ranked
+    // model-path node, with a fresh selector resolved from that node's own
+    // advertised paths.
+    let nextProvider: string | null;
+    let nextModelPathSelector: string | undefined;
+    let nextModelPathPricing:
+      | { prompt?: number; completion?: number; max_cost?: number }
+      | undefined;
     if (pinnedModelPath) {
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: not failing over, request is pinned to a model path (${pinnedModelPath})`
+      if (!params.autoModelPath) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: not failing over, request is pinned to a model path (${pinnedModelPath})`
+        );
+        nextProvider = null;
+      } else {
+        const ranking =
+          await this.providerManager.getModelPathProviderRanking(
+            selectedModel.id,
+            { excludeBaseUrl: baseUrl }
+          );
+        const next = ranking[0];
+        nextProvider = next?.baseUrl ?? null;
+        nextModelPathSelector = next?.selectors[0];
+        nextModelPathPricing = next?.satsPricing[0] ?? undefined;
+        if (nextProvider) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: auto-pinned request failing over to next model-path node: ${nextProvider}`
+          );
+        }
+      }
+    } else {
+      nextProvider = this.providerManager.findNextBestProvider(
+        selectedModel.id,
+        baseUrl
       );
     }
-
-    const nextProvider = pinnedModelPath
-      ? null
-      : this.providerManager.findNextBestProvider(selectedModel.id, baseUrl);
 
     if (nextProvider) {
       this._log(
@@ -1538,14 +1589,16 @@ export class RoutstrClient {
         ? ((body as { messages?: unknown }).messages as any[])
         : [];
 
-      const newRequiredSats = this.providerManager.getRequiredSatsForModel(
-        newModel,
-        messagesForPricing,
-        params.maxTokens,
-        body && typeof body === "object"
-          ? (body as Record<string, unknown>)
-          : undefined
-      );
+      const newRequiredSats =
+        this.providerManager.getRequiredSatsForModel(
+          newModel,
+          messagesForPricing,
+          params.maxTokens,
+          body && typeof body === "object"
+            ? (body as Record<string, unknown>)
+            : undefined,
+          nextModelPathPricing
+        );
 
       if (params.tinfoilEnabled) {
         this._log(
@@ -1607,19 +1660,33 @@ export class RoutstrClient {
         bodyObj && typeof bodyObj.model === "string"
           ? { ...bodyObj, model: newModel.id }
           : body;
+      // An auto-pinned request swaps its selector for one the new node
+      // advertised; the failed node's selector is never forwarded.
+      const retryBaseHeaders = { ...params.baseHeaders };
+      if (nextModelPathSelector !== undefined) {
+        retryBaseHeaders[MODEL_PATH_HEADER] = nextModelPathSelector;
+      }
       const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
         body: retryBody,
         baseUrl: nextProvider,
+        baseHeaders: retryBaseHeaders,
         selectedModel: newModel,
         token: spendResult.token!,
         selectedMintUrl: spendResult.selectedMintUrl,
         excludeMints: undefined,
         requiredSats: newRequiredSats,
+        autoModelPath:
+          nextModelPathSelector !== undefined
+            ? {
+                selector: nextModelPathSelector,
+                satsPricing: nextModelPathPricing,
+              }
+            : undefined,
         headers: this._withAuthAndTinfoilHeaders(
-          params.baseHeaders,
+          retryBaseHeaders,
           spendResult.token!,
           params.tinfoilEnabled,
           newModel.id

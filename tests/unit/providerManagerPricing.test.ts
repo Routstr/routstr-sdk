@@ -1306,20 +1306,20 @@ describe("ProviderManager", () => {
       updated_at: null,
     });
 
-    const stubPathsFetch = (byNode: Record<string, unknown | Error>) =>
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (input: unknown) => {
-          const url = String(input);
-          for (const [node, payload] of Object.entries(byNode)) {
-            if (url.startsWith(node)) {
-              if (payload instanceof Error) throw payload;
-              return { ok: true, json: async () => payload };
-            }
+    const stubPathsFetch = (byNode: Record<string, unknown | Error>) => {
+      const fn = vi.fn(async (input: unknown) => {
+        const url = String(input);
+        for (const [node, payload] of Object.entries(byNode)) {
+          if (url.startsWith(node)) {
+            if (payload instanceof Error) throw payload;
+            return { ok: true, json: async () => payload };
           }
-          throw new Error(`unexpected fetch: ${url}`);
-        })
-      );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      vi.stubGlobal("fetch", fn);
+      return fn;
+    };
 
     const pathRegistry = () =>
       createRegistry({

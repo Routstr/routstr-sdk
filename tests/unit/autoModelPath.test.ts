@@ -1,265 +1,300 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEEPSEEK_AUTO_MODEL_ID,
-  DEEPSEEK_AUTO_NODE_URL,
+  DEEPSEEK_AUTO_NODE_URLS,
   MODEL_PATH_HEADER,
-  autoModelPathFor,
   clearModelPathsCache,
 } from "../../utils/modelPaths";
-
-// routeRequests() resolves its provider context through this module; mock it
-// so the integration tests exercise the model-path wiring without discovery,
-// wallet, or transport.
-vi.mock("../../client/resolveRequestContext", () => ({
-  resolveRequestContext: vi.fn(),
-}));
 import { resolveRequestContext } from "../../client/resolveRequestContext";
+import type { DiscoveryAdapter } from "../../discovery/interfaces";
+import type { Model } from "../../core/types";
+
+// routeRequests() resolves its provider context through resolveRequestContext;
+// mock it for the passthrough tests at the bottom.
+vi.mock("../../client/resolveRequestContext", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("../../client/resolveRequestContext")>();
+  return { ...original, resolveRequestContext: vi.fn(original.resolveRequestContext) };
+});
 import { routeRequests } from "../../routeRequests";
 
-const mockedResolve = vi.mocked(resolveRequestContext);
+const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
 
 // Byte-exact advertised selectors from a node's /v1/models/paths.
-const OPENROUTER_DEEPSEEK_SELECTOR =
+const DEEPSEEK_SELECTOR =
   "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
-const OPENROUTER_FIREWORKS_SELECTOR =
+const FIREWORKS_SELECTOR =
   "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
 const PPQ_SELECTOR =
   "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash";
-// No longer whitelisted: the official DeepSeek API route.
-const OFFICIAL_API_SELECTOR =
-  "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash";
 
-function makeNodePayload() {
-  return {
-    data: [
-      {
-        id: DEEPSEEK_AUTO_MODEL_ID,
-        paths: [
-          { path: PPQ_SELECTOR, provider: { slug: "ppq", type: "generic" }, endpoint: null },
-          { path: OFFICIAL_API_SELECTOR, provider: { slug: "deepseek", type: "generic" }, endpoint: null },
-          {
-            // Fireworks is listed before deepseek on purpose: the node's
-            // order must not matter, the whitelist preference does.
-            path: OPENROUTER_FIREWORKS_SELECTOR,
-            provider: { slug: "openrouter", type: "openrouter" },
-            endpoint: { tag: "fireworks", name: "Fireworks" },
-          },
-          {
-            path: OPENROUTER_DEEPSEEK_SELECTOR,
-            provider: { slug: "openrouter", type: "openrouter" },
-            endpoint: { tag: "deepseek", name: "DeepSeek" },
-          },
-        ],
-      },
-    ],
-    updated_at: 1789466999,
-  };
-}
+const pathsPayload = (
+  paths: Array<{ path: string; completion?: number }>
+) => ({
+  data: [
+    {
+      id: DEEPSEEK_AUTO_MODEL_ID,
+      paths: paths.map(({ path, completion }) => ({
+        path,
+        provider: { slug: "openrouter", type: "openrouter" },
+        endpoint: null,
+        model:
+          completion === undefined
+            ? undefined
+            : { sats_pricing: { prompt: 0.001, completion, max_cost: 700 } },
+      })),
+    },
+  ],
+  updated_at: null,
+});
 
-function stubNodeFetch(payload: unknown = makeNodePayload()) {
-  const fetchMock = vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => payload,
+const stubPathsFetch = (byNode: Record<string, unknown | Error>) => {
+  const fn = vi.fn(async (input: unknown) => {
+    const url = String(input);
+    for (const [node, payload] of Object.entries(byNode)) {
+      if (url.startsWith(node)) {
+        if (payload instanceof Error) throw payload;
+        return { ok: true, json: async () => payload };
+      }
+    }
+    throw new Error(`unexpected fetch: ${url}`);
   });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
-}
+  vi.stubGlobal("fetch", fn);
+  return fn;
+};
 
-function makeClient() {
-  return { routeRequest: vi.fn().mockResolvedValue(new Response("ok")) };
+const makeModel = (completion = 1): Model =>
+  ({
+    id: DEEPSEEK_AUTO_MODEL_ID,
+    sats_pricing: { prompt: 1, completion, max_cost: 100 },
+  }) as Model;
+
+function makeDeps(modelsByNode: Record<string, Model[]>) {
+  const discoveryAdapter = {
+    getCachedModels: () => modelsByNode,
+    setCachedModels: () => {},
+    getCachedMints: () => ({}),
+    setCachedMints: () => {},
+    getCachedProviderInfo: () => ({}),
+    setCachedProviderInfo: () => {},
+    getProviderLastUpdate: () => null,
+    setProviderLastUpdate: () => {},
+    getLastUsedModel: () => null,
+    setLastUsedModel: () => {},
+    getDisabledProviders: () => [],
+    setDisabledProviders: () => {},
+    getBaseUrlsList: () => [],
+    getBaseUrlsLastUpdate: () => null,
+    setBaseUrlsList: () => {},
+    setBaseUrlsLastUpdate: () => {},
+    getRoutstr21Models: () => [],
+    setRoutstr21Models: () => {},
+    getRoutstr21ModelsLastUpdate: () => null,
+    setRoutstr21ModelsLastUpdate: () => {},
+  } as DiscoveryAdapter;
+  return {
+    discoveryAdapter,
+    walletAdapter: {
+      getActiveMintUrl: () => "https://mint.example/",
+      getBalances: async () => ({}),
+    } as never,
+    storageAdapter: {} as never,
+    modelManager: {
+      getBaseUrls: () => Object.keys(modelsByNode),
+      getAllCachedModels: () => modelsByNode,
+    } as never,
+  };
 }
 
 beforeEach(() => {
+  vi.stubGlobal("window", { location: { hostname: "example.com" } });
   clearModelPathsCache();
-  mockedResolve.mockReset();
-  const client = makeClient();
-  const selectedModel = { id: DEEPSEEK_AUTO_MODEL_ID };
-  mockedResolve.mockResolvedValue({
-    client,
-    baseUrl: "https://ai.redsh1ft.com/",
-    mintUrl: "https://mint.example/",
-    selectedModel,
-  } as never);
 });
 
-function routeOptions(modelId: string, extra: Record<string, unknown> = {}) {
-  return {
-    modelId,
-    requestBody: { messages: [] },
-    walletAdapter: {} as never,
-    storageAdapter: {} as never,
-    discoveryAdapter: {} as never,
-    ...extra,
-  };
-}
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
-describe("autoModelPathFor", () => {
-  it("pins the preferred whitelisted route (OpenRouter deepseek) for deepseek-v4.1-flash", async () => {
-    stubNodeFetch();
-    await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({
-      forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
+describe("resolveRequestContext model-path selection", () => {
+  it("pins the cheapest whitelisted node's preferred route for deepseek-v4.1-flash", async () => {
+    stubPathsFetch({
+      [NODE_A]: pathsPayload([
+        { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
+        { path: FIREWORKS_SELECTOR, completion: 0.0007 },
+      ]),
+      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
+    });
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel()],
+      [`${NODE_B}/`]: [makeModel()],
+    });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      ...deps,
+    });
+
+    expect(ctx.baseUrl).toBe(`${NODE_B}/`);
+    expect(ctx.modelPath).toEqual({
+      selector: DEEPSEEK_SELECTOR,
+      satsPricing: { prompt: 0.001, completion: 0.0004, max_cost: 700 },
+      autoPinned: true,
     });
   });
 
-  it("falls back to OpenRouter fireworks when the node has no deepseek route", async () => {
-    stubNodeFetch({
-      data: [
-        {
-          id: DEEPSEEK_AUTO_MODEL_ID,
-          paths: [
-            {
-              path: OPENROUTER_FIREWORKS_SELECTOR,
-              provider: { slug: "openrouter", type: "openrouter" },
-              endpoint: { tag: "fireworks", name: "Fireworks" },
-            },
-          ],
-        },
-      ],
+  it("pins the forced node's own selector when the caller forces a whitelisted node", async () => {
+    const fetchMock = stubPathsFetch({
+      [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0013 }]),
+      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
     });
-    await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({
-      forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OPENROUTER_FIREWORKS_SELECTOR },
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel()],
+      [`${NODE_B}/`]: [makeModel()],
     });
-  });
 
-  it("does nothing for other models", async () => {
-    const fetchMock = stubNodeFetch();
-    await expect(autoModelPathFor("glm-5.2")).resolves.toEqual({});
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("leaves a caller-supplied selector alone", async () => {
-    const fetchMock = stubNodeFetch();
-    await expect(
-      autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, {
-        "X-Routstr-Model-Path": PPQ_SELECTOR,
-      })
-    ).resolves.toEqual({});
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when the caller forced a different node", async () => {
-    const fetchMock = stubNodeFetch();
-    for (const other of [
-      "https://routstr.otrta.me/",
-      "https://routstr.otrta.me",
-      "https://api.routstr.com/",
-    ]) {
-      await expect(
-        autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, undefined, other)
-      ).resolves.toEqual({});
-    }
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("still pins when the caller forces the auto node itself", async () => {
-    stubNodeFetch();
-    await expect(
-      autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID, undefined, "https://ai.redsh1ft.com/")
-    ).resolves.toEqual({
-      forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-      headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A,
+      ...deps,
     });
-  });
 
-  it("does nothing when the node lists no whitelisted route", async () => {
-    stubNodeFetch({
-      data: [
-        { id: DEEPSEEK_AUTO_MODEL_ID, paths: [{ path: PPQ_SELECTOR, provider: { slug: "ppq", type: "generic" }, endpoint: null }] },
-      ],
-    });
-    await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({});
-  });
-
-  it("does nothing when the paths fetch fails", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
-    await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({});
-  });
-
-  it("caches the node's paths", async () => {
-    const fetchMock = stubNodeFetch();
-    await autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID);
-    await autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID);
+    // NODE_A is pricier, but the caller forced it: pin NODE_A's own paths.
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath?.selector).toBe(DEEPSEEK_SELECTOR);
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      `${DEEPSEEK_AUTO_NODE_URL}/v1/models/paths`
-    );
+    expect(String(fetchMock.mock.calls[0][0])).toContain(NODE_A);
+  });
+
+  it("does not pin when the caller forced a non-whitelisted node", async () => {
+    const fetchMock = stubPathsFetch({});
+    const deps = makeDeps({
+      "https://other.example/": [makeModel()],
+    });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: "https://other.example/",
+      ...deps,
+    });
+
+    expect(ctx.baseUrl).toBe("https://other.example/");
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a caller-pinned request unpinned", async () => {
+    const fetchMock = stubPathsFetch({});
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel()],
+    });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      inputHeaders: { "X-Routstr-Model-Path": PPQ_SELECTOR },
+      ...deps,
+    });
+
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("degrades to the normal price ranking when no model-path node is usable", async () => {
+    stubPathsFetch({
+      [NODE_A]: new Error("offline"),
+      [NODE_B]: new Error("offline"),
+    });
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel()],
+      [`${NODE_B}/`]: [makeModel()],
+      "https://cheap.example/": [makeModel(0.5)],
+    });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      ...deps,
+    });
+
+    expect(ctx.baseUrl).toBe("https://cheap.example/");
+    expect(ctx.modelPath).toBeUndefined();
+  });
+
+  it("routes other models through the normal price ranking", async () => {
+    const fetchMock = stubPathsFetch({});
+    const otherModel = { ...makeModel(), id: "glm-5.2" } as Model;
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [otherModel],
+    });
+
+    const ctx = await resolveRequestContext({ modelId: "glm-5.2", ...deps });
+
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
-describe("routeRequests deepseek-v4.1-flash pinning", () => {
-  it("pins the node and sends the OpenRouter deepseek selector for that model", async () => {
-    stubNodeFetch();
-    await routeRequests(routeOptions(DEEPSEEK_AUTO_MODEL_ID));
-
-    expect(mockedResolve.mock.calls[0][0].forcedProvider).toBe(
-      DEEPSEEK_AUTO_NODE_URL
+describe("routeRequests model-path passthrough", () => {
+  it("sends the pinned selector and marks the request as auto-pinned", async () => {
+    const { resolveRequestContext: mockedResolve } = await import(
+      "../../client/resolveRequestContext"
     );
-    const client = await mockedResolve.mock.results[0].value;
-    expect(
-      (client as { client: ReturnType<typeof makeClient> }).client.routeRequest
-    ).toHaveBeenCalledWith(
-      expect.objectContaining({
-        headers: { [MODEL_PATH_HEADER]: OPENROUTER_DEEPSEEK_SELECTOR },
-      })
-    );
-  });
-
-  it("leaves other models untouched", async () => {
-    const fetchMock = stubNodeFetch();
-    await routeRequests(routeOptions("glm-5.2"));
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(mockedResolve.mock.calls[0][0].forcedProvider).toBeUndefined();
-    const resolved = await mockedResolve.mock.results[0].value;
-    const call = (resolved as { client: ReturnType<typeof makeClient> }).client
-      .routeRequest.mock.calls[0][0];
-    expect(call.headers?.[MODEL_PATH_HEADER]).toBeUndefined();
-  });
-
-  it("keeps a caller-supplied provider and path", async () => {
-    stubNodeFetch();
-    await routeRequests(
-      routeOptions(DEEPSEEK_AUTO_MODEL_ID, {
-        forcedProvider: "https://other.example/",
-        headers: { "x-routstr-model-path": PPQ_SELECTOR },
-      })
-    );
-
-    expect(mockedResolve.mock.calls[0][0].forcedProvider).toBe(
-      "https://other.example/"
-    );
-    const resolved = await mockedResolve.mock.results[0].value;
-    const call = (resolved as { client: ReturnType<typeof makeClient> }).client
-      .routeRequest.mock.calls[0][0];
-    expect(call.headers[MODEL_PATH_HEADER]).toBe(PPQ_SELECTOR);
-  });
-
-  it("does not attach a selector when the caller forced a different node", async () => {
-    // Live failure this guards: a selector resolved from ai.redsh1ft.com was
-    // sent to routstr.otrta.me -> 404 invalid_model_path.
-    const fetchMock = stubNodeFetch();
-    mockedResolve.mockResolvedValue({
-      client: makeClient(),
-      baseUrl: "https://routstr.otrta.me/",
+    const client = { routeRequest: vi.fn().mockResolvedValue(new Response("ok")) };
+    vi.mocked(mockedResolve).mockResolvedValueOnce({
+      client,
+      baseUrl: `${NODE_A}/`,
       mintUrl: "https://mint.example/",
-      selectedModel: { id: DEEPSEEK_AUTO_MODEL_ID },
+      selectedModel: makeModel(),
+      modelPath: {
+        selector: DEEPSEEK_SELECTOR,
+        satsPricing: { prompt: 0.001, completion: 0.0013, max_cost: 700 },
+        autoPinned: true,
+      },
     } as never);
 
-    await routeRequests(
-      routeOptions(DEEPSEEK_AUTO_MODEL_ID, {
-        forcedProvider: "https://routstr.otrta.me/",
+    await routeRequests({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      requestBody: { messages: [] },
+      walletAdapter: {} as never,
+      storageAdapter: {} as never,
+      discoveryAdapter: {} as never,
+    });
+
+    expect(client.routeRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: { [MODEL_PATH_HEADER]: DEEPSEEK_SELECTOR },
+        autoModelPath: {
+          selector: DEEPSEEK_SELECTOR,
+          satsPricing: { prompt: 0.001, completion: 0.0013, max_cost: 700 },
+        },
       })
     );
+  });
 
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(mockedResolve.mock.calls[0][0].forcedProvider).toBe(
-      "https://routstr.otrta.me/"
+  it("keeps a caller-supplied provider and path untouched", async () => {
+    const { resolveRequestContext: mockedResolve } = await import(
+      "../../client/resolveRequestContext"
     );
-    const resolved = await mockedResolve.mock.results[0].value;
-    const call = (resolved as { client: ReturnType<typeof makeClient> }).client
-      .routeRequest.mock.calls[0][0];
-    expect(call.headers?.[MODEL_PATH_HEADER]).toBeUndefined();
+    const client = { routeRequest: vi.fn().mockResolvedValue(new Response("ok")) };
+    vi.mocked(mockedResolve).mockResolvedValueOnce({
+      client,
+      baseUrl: "https://other.example/",
+      mintUrl: "https://mint.example/",
+      selectedModel: makeModel(),
+    } as never);
+
+    await routeRequests({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      requestBody: { messages: [] },
+      forcedProvider: "https://other.example/",
+      headers: { "x-routstr-model-path": PPQ_SELECTOR },
+      walletAdapter: {} as never,
+      storageAdapter: {} as never,
+      discoveryAdapter: {} as never,
+    });
+
+    const call = client.routeRequest.mock.calls[0][0];
+    expect(call.headers[MODEL_PATH_HEADER]).toBe(PPQ_SELECTOR);
+    expect(call.autoModelPath).toBeUndefined();
   });
 });

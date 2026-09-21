@@ -26,11 +26,7 @@ import {
   type ResolvedContext,
 } from "./client/resolveRequestContext";
 import { InsufficientBalanceError } from "./core/errors";
-import {
-  autoModelPathFor,
-  sameNode,
-  DEEPSEEK_AUTO_NODE_URL,
-} from "./utils/modelPaths";
+import { MODEL_PATH_HEADER } from "./utils/modelPaths";
 
 // Re-export for consumers that want access to the shared resolver
 export { resolveRequestContext };
@@ -125,6 +121,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
   headers: Record<string, string>;
   modelId: string;
   proxiedBody: Record<string, unknown>;
+  modelPath?: ResolvedContext["modelPath"];
 }> {
   const {
     modelId,
@@ -148,17 +145,15 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     requestResponseLogSink,
   } = options;
 
-  // Automatic DeepSeek pinning: deepseek-v4.1-flash routes through the
-  // official DeepSeek API on the pinned node unless the caller pinned a path
-  // or forced a different node (then autoModelPathFor returns {}).
-  const autoModelPath = await autoModelPathFor(modelId, headers, forcedProvider);
-  const effectiveForcedProvider = forcedProvider ?? autoModelPath.forcedProvider;
-
-  // Delegate to shared context resolution
-  const { client: resolvedClient, baseUrl, mintUrl, selectedModel } =
+  // Delegate to shared context resolution. For the auto-pinned DeepSeek
+  // model it ranks the whitelisted model-path nodes ("get baseUrl for model
+  // path") and returns the selector to pin; every other model — and every
+  // request whose caller pinned its own path — resolves exactly as before.
+  const { client: resolvedClient, baseUrl, mintUrl, selectedModel, modelPath } =
     await resolveRequestContext({
       modelId,
-      forcedProvider: effectiveForcedProvider,
+      forcedProvider,
+      inputHeaders: headers,
       walletAdapter,
       storageAdapter,
       discoveryAdapter,
@@ -180,12 +175,11 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 
   const client = resolvedClient;
 
-  // The selector encodes a node-internal provider id, so it is only valid on
-  // the node it was resolved from. Never send it anywhere else.
-  const effectiveHeaders =
-    autoModelPath.headers && sameNode(baseUrl, DEEPSEEK_AUTO_NODE_URL)
-      ? { ...headers, ...autoModelPath.headers }
-      : headers;
+  // The selector was resolved from this node's own advertised paths, so
+  // the node is guaranteed to accept it.
+  const effectiveHeaders = modelPath
+    ? { ...headers, [MODEL_PATH_HEADER]: modelPath.selector }
+    : headers;
 
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
@@ -213,6 +207,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     headers: effectiveHeaders,
     modelId,
     proxiedBody,
+    modelPath,
   };
 }
 
@@ -222,7 +217,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<Response> {
-  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody } =
+  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody, modelPath } =
     await resolveRouteRequestContext(options);
 
 
@@ -236,6 +231,12 @@ export async function routeRequests(
       mintUrl,
       modelId,
       userCacheSecret: options.userCacheSecret,
+      autoModelPath: modelPath?.autoPinned
+        ? {
+            selector: modelPath.selector,
+            satsPricing: modelPath.satsPricing,
+          }
+        : undefined,
     });
 
     if (!response.ok) {

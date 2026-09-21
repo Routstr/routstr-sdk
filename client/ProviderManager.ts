@@ -1316,9 +1316,30 @@ export class ProviderManager {
     model: Model,
     apiMessages: any[],
     maxTokens?: number,
-    requestBody?: Record<string, unknown>
+    requestBody?: Record<string, unknown>,
+    pathPricing?: { prompt?: number; completion?: number; max_cost?: number }
   ): number {
     try {
+      // A pinned model path prices itself: the node advertises per-route
+      // sats pricing alongside the path, which replaces the model's
+      // aggregate prompt/completion rates (max_cost stays the envelope cap).
+      if (pathPricing) {
+        model = {
+          ...model,
+          sats_pricing: {
+            ...((model.sats_pricing ?? {}) as unknown as Record<
+              string,
+              unknown
+            >),
+            ...(pathPricing.prompt !== undefined
+              ? { prompt: pathPricing.prompt }
+              : {}),
+            ...(pathPricing.completion !== undefined
+              ? { completion: pathPricing.completion }
+              : {}),
+          },
+        } as unknown as Model;
+      }
       const body = requestBody ?? {};
 
       let imageTokens = 0;

@@ -339,15 +339,6 @@ export function resolveDeepSeekModelPathSelectors(
   return { selectors, satsPricing };
 }
 
-/**
- * The first whitelisted selector the node advertises, in whitelist preference
- * order; null when the node advertises none.
- */
-export function preferredDeepSeekSelector(
-  selectors: DeepSeekModelPathSelectors | null
-): string | null {
-  return selectors?.selectors.find((s): s is string => s !== null) ?? null;
-}
 
 /**
  * Headers object for routeRequests({ headers }) pinning a DeepSeek model to a
@@ -388,14 +379,6 @@ export async function getNodeModelPaths(
   return cached?.paths ?? null;
 }
 
-function hasModelPathHeader(headers?: Record<string, string>): boolean {
-  return (
-    !!headers &&
-    Object.keys(headers).some(
-      (name) => name.toLowerCase() === MODEL_PATH_HEADER
-    )
-  );
-}
 
 /** True when two base URLs point at the same node. */
 export function sameNode(
@@ -408,43 +391,3 @@ export function sameNode(
   return left.toLowerCase() === right.toLowerCase();
 }
 
-/**
- * Automatic DeepSeek path pinning, applied by routeRequests() for
- * deepseek-v4.1-flash only: force the node and return the
- * x-routstr-model-path header for the official DeepSeek API route
- * (prefer OpenRouter's deepseek subprovider, falling back to fireworks).
- *
- * Returns {} for every other model, when the caller already supplied its own
- * x-routstr-model-path header, when the caller forced a different node (the
- * selector is only guaranteed valid on the node that advertised it), or when
- * the node advertises neither route.
- */
-export async function autoModelPathFor(
-  modelId: string,
-  headers?: Record<string, string>,
-  forcedProvider?: string
-): Promise<{ forcedProvider?: string; headers?: Record<string, string> }> {
-  if (
-    typeof modelId !== "string" ||
-    modelId.trim().toLowerCase() !== DEEPSEEK_AUTO_MODEL_ID
-  ) {
-    return {};
-  }
-  if (hasModelPathHeader(headers)) {
-    return {}; // caller pinned a path explicitly
-  }
-  if (forcedProvider && !sameNode(forcedProvider, DEEPSEEK_AUTO_NODE_URL)) {
-    return {}; // a different node may not accept this node's selector
-  }
-  const nodePaths = await getNodeModelPaths(DEEPSEEK_AUTO_NODE_URL);
-  const selector = preferredDeepSeekSelector(
-    nodePaths
-      ? resolveDeepSeekModelPathSelectors(nodePaths, DEEPSEEK_AUTO_MODEL_ID)
-      : null
-  );
-  if (!selector) return {};
-  return {
-    forcedProvider: DEEPSEEK_AUTO_NODE_URL,
-    headers: { [MODEL_PATH_HEADER]: selector },
-  };
-}
