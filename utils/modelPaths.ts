@@ -238,6 +238,26 @@ export function deepSeekModelPath(
 }
 
 /**
+ * Canonical identity of an x-routstr-model-path selector: the stable parts
+ * (url, model-id, endpoint tag) re-encoded in fixed order. Two selectors
+ * naming the same route — e.g. legacy ones carrying different provider-id
+ * values — share one identity, so it is the right key for path-scoped
+ * cooldowns. Null when the selector is malformed.
+ */
+export function canonicalModelPath(selector: string): string | null {
+  const params = parseSelector(selector);
+  if (!params) return null;
+  const components = [
+    `url=${encodeFormValue(params.url)}`,
+    `model-id=${encodeFormValue(params["model-id"])}`,
+  ];
+  if (params.endpoint) {
+    components.push(`endpoint=${encodeFormValue(params.endpoint)}`);
+  }
+  return components.join("&");
+}
+
+/**
  * The whitelisted route a selector identifies, or null when the selector is
  * malformed or routes through a non-whitelisted upstream. Only the stable
  * identity (url + endpoint tag) is matched.

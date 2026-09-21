@@ -1072,6 +1072,206 @@ describe("ProviderManager", () => {
     });
   });
 
+  describe("path-scoped cooldown", () => {
+    const DEEPSEEK_PATH =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+    const FIREWORKS_PATH =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
+
+    const registry = () =>
+      createRegistry({
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [
+            {
+              id: "deepseek-v4.1-flash",
+              sats_pricing: { prompt: 1, completion: 1 },
+            } as any,
+          ],
+          "https://beta.example.com/": [
+            {
+              id: "deepseek-v4.1-flash",
+              sats_pricing: { prompt: 2, completion: 2 },
+            } as any,
+          ],
+        }),
+      });
+
+    it("cools down only the failed path, not the model or the provider", () => {
+      const manager = new ProviderManager(registry());
+      const P = "https://alpha.example.com/";
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+
+      // Second strike: only this path on alpha is cooled down
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
+      ).toBe(true);
+      // The other route on the same node is still usable
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", FIREWORKS_PATH)
+      ).toBe(false);
+      // Neither the model nor the provider as a whole is cooled
+      expect(manager.isOnCooldown(P, "deepseek-v4.1-flash")).toBe(false);
+      expect(manager.isOnCooldown(P)).toBe(false);
+
+      // Unpinned model ranking is unaffected by path-scoped entries
+      const providers = manager.getAllProvidersForModel("deepseek-v4.1-flash");
+      expect(providers.map((p) => p.baseUrl)).toEqual([
+        "https://alpha.example.com/",
+        "https://beta.example.com/",
+      ]);
+
+      vi.useRealTimers();
+    });
+    
+    it("model- and path-scoped failures on the same model track separate strikes", () => {
+      const manager = new ProviderManager(registry());
+      const P = "https://alpha.example.com/";
+
+      const now = Date.now();
+      // One model-scoped failure + one path-scoped failure: no cooldown yet,
+      // because strikes are counted per scope.
+      vi.setSystemTime(now);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash");
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+
+      expect(manager.isOnCooldown(P, "deepseek-v4.1-flash")).toBe(false);
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
+      ).toBe(false);
+
+      // A second path-scoped failure completes the path's two-strike cooldown
+      vi.setSystemTime(now + 2_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
+      ).toBe(true);
+      expect(manager.isOnCooldown(P, "deepseek-v4.1-flash")).toBe(false);
+
+      vi.useRealTimers();
+    });
+
+    it("removeFromCooldown with modelPath releases only that path", () => {
+      const manager = new ProviderManager(registry());
+      const P = "https://alpha.example.com/";
+
+      const now = Date.now();
+      vi.setSystemTime(now);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      vi.setSystemTime(now + 1_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      vi.setSystemTime(now + 2_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", FIREWORKS_PATH);
+      vi.setSystemTime(now + 3_000);
+      manager.markFailed(P, undefined, "deepseek-v4.1-flash", FIREWORKS_PATH);
+
+      expect(manager.getProvidersOnCooldown()).toHaveLength(2);
+
+      manager.removeFromCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      const remaining = manager.getProvidersOnCooldown();
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].modelPath).toBe(FIREWORKS_PATH);
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
+      ).toBe(false);
+      expect(
+        manager.isOnCooldown(P, "deepseek-v4.1-flash", FIREWORKS_PATH)
+      ).toBe(true);
+
+      vi.useRealTimers();
+    });
+
+    it("persists and rehydrates path-scoped entries", () => {
+      const state: {
+        providersOnCooldown: Array<{
+          baseUrl: string;
+          modelId?: string;
+          modelPath?: string;
+          timestamp: number;
+        }>;
+      } = { providersOnCooldown: [] };
+      const store = {
+        getState: () => ({
+          failedProviders: [],
+          lastFailed: {},
+          ...state,
+          setLastFailedTimestamp: vi.fn(),
+          addFailedProvider: vi.fn(),
+          removeFailedProvider: vi.fn(),
+          addProviderOnCooldown: (
+            b: string,
+            ts: number,
+            m?: string,
+            p?: string
+          ) => {
+            if (
+              !state.providersOnCooldown.some(
+                (e) =>
+                  e.baseUrl === b && e.modelId === m && e.modelPath === p
+              )
+            ) {
+              state.providersOnCooldown.push({
+                baseUrl: b,
+                modelId: m,
+                modelPath: p,
+                timestamp: ts,
+              });
+            }
+          },
+          removeProviderFromCooldown: (b: string, m?: string, p?: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) =>
+                !(e.baseUrl === b && e.modelId === m && e.modelPath === p)
+            );
+          },
+          removeAllProviderCooldowns: (b: string) => {
+            state.providersOnCooldown = state.providersOnCooldown.filter(
+              (e) => e.baseUrl !== b
+            );
+          },
+          clearProvidersOnCooldown: () => {
+            state.providersOnCooldown = [];
+          },
+          setLastFailed: vi.fn(),
+          setFailedProviders: vi.fn(),
+        }),
+      } as any;
+
+      const P = "https://alpha.example.com/";
+      const now = Date.now();
+      vi.setSystemTime(now);
+      const first = new ProviderManager(registry(), store);
+      first.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+      vi.setSystemTime(now + 1_000);
+      first.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+
+      expect(state.providersOnCooldown).toEqual([
+        {
+          baseUrl: P,
+          modelId: "deepseek-v4.1-flash",
+          modelPath: DEEPSEEK_PATH,
+          timestamp: now + 1_000,
+        },
+      ]);
+
+      // A fresh manager hydrating from the same store sees the path cooldown
+      const second = new ProviderManager(registry(), store);
+      expect(
+        second.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
+      ).toBe(true);
+      expect(
+        second.isOnCooldown(P, "deepseek-v4.1-flash", FIREWORKS_PATH)
+      ).toBe(false);
+
+      vi.useRealTimers();
+    });
+  });
+
   // ---- failure tracking ----
 
   describe("failure tracking", () => {

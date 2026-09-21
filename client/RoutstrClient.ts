@@ -24,7 +24,7 @@ import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
-import { MODEL_PATH_HEADER } from "../utils/modelPaths";
+import { MODEL_PATH_HEADER, canonicalModelPath } from "../utils/modelPaths";
 import {
   ProviderError,
   FailoverError,
@@ -781,23 +781,28 @@ export class RoutstrClient {
   /**
    * Decide the cooldown scope for a failure.
    *
-   * Returns the model id when the failure is specific to the selected model
-   * (only that model is cooled down on the provider), or undefined when the
-   * failure is model-independent and the whole provider should be cooled
-   * down:
-   * - network errors (status -1): the provider host itself is unreachable
-   * - `mint_unreachable`: the provider's mint/wallet infrastructure is down
-   * - no selected model: the failure cannot be attributed to a model
+   * - Network errors (status -1) and `mint_unreachable` are model-independent:
+   *   the provider host or its mint/wallet infrastructure is down, so the
+   *   whole provider is cooled down (empty scope).
+   * - A pinned x-routstr-model-path request attributes the failure to that
+   *   upstream route: only the canonical path is cooled on the provider, so
+   *   the provider's other routes for the same model stay usable.
+   * - Otherwise the failure is attributed to the selected model only.
    */
-  private _getCooldownScopeModelId(
+  private _getCooldownScope(
     status: number,
     parsedError: ParsedCoreError,
-    selectedModel?: Model
-  ): string | undefined {
-    if (!selectedModel) return undefined;
-    if (status === -1) return undefined;
-    if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return undefined;
-    return selectedModel.id;
+    selectedModel?: Model,
+    pinnedModelPath?: string
+  ): { modelId?: string; modelPath?: string } {
+    if (!selectedModel) return {};
+    if (status === -1) return {};
+    if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return {};
+    if (pinnedModelPath) {
+      const modelPath = canonicalModelPath(pinnedModelPath);
+      if (modelPath) return { modelId: selectedModel.id, modelPath };
+    }
+    return { modelId: selectedModel.id };
   }
 
   /**
@@ -1450,22 +1455,33 @@ export class RoutstrClient {
     ]
       .filter(Boolean)
       .join(" ");
-    // Scope the cooldown: when a model-specific request failed on a healthy
-    // provider, only that model is put on cooldown so the provider's other
-    // models remain usable. Network failures and mint/wallet infrastructure
-    // errors are model-independent and cool down the whole provider.
-    const cooldownModelId = this._getCooldownScopeModelId(
+    // The pinned model-path selector (if any) decides both the cooldown
+    // scope below and the failover behavior further down.
+    const pinnedModelPath = this._findModelPathHeader(params.baseHeaders);
+
+    // Scope the cooldown: a pinned request cools only its upstream route on
+    // the provider, an unpinned model-specific failure cools only that
+    // model, and network/mint failures cool the whole provider.
+    const cooldownScope = this._getCooldownScope(
       status,
       parsedError,
-      selectedModel
+      selectedModel,
+      pinnedModelPath
     );
-    this.providerManager.markFailed(baseUrl, failReason, cooldownModelId);
+    this.providerManager.markFailed(
+      baseUrl,
+      failReason,
+      cooldownScope.modelId,
+      cooldownScope.modelPath
+    );
     this._log(
       "DEBUG",
       `[RoutstrClient] _handleErrorResponse: Marked ${
-        cooldownModelId
-          ? `model ${cooldownModelId} on provider ${baseUrl}`
-          : `provider ${baseUrl}`
+        cooldownScope.modelPath
+          ? `path ${cooldownScope.modelPath} on provider ${baseUrl}`
+          : cooldownScope.modelId
+            ? `model ${cooldownScope.modelId} on provider ${baseUrl}`
+            : `provider ${baseUrl}`
       } as failed (${failReason})`
     );
 
@@ -1488,12 +1504,11 @@ export class RoutstrClient {
       );
     }
 
-    // A pinned x-routstr-model-path selector encodes a node-internal provider
-    // id, so it is only meaningful on the node it was resolved from. A pinned
-    // request must never fail over to a different node: the selector would be
-    // rejected there (404 invalid_model_path) and the caller explicitly asked
-    // for that one upstream. Failures surface to the caller instead.
-    const pinnedModelPath = this._findModelPathHeader(params.baseHeaders);
+    // A pinned x-routstr-model-path selector is only guaranteed valid on
+    // the node that advertised it. A pinned request must never fail over to
+    // a different node: the selector may be rejected there (404
+    // invalid_model_path) and the caller explicitly asked for that one
+    // upstream. Failures surface to the caller instead.
     if (pinnedModelPath) {
       this._log(
         "DEBUG",

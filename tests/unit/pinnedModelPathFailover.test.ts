@@ -143,6 +143,33 @@ describe("RoutstrClient pinned model-path failover", () => {
     expect(findNext).not.toHaveBeenCalled();
   });
 
+  it("cools down the pinned path on the provider, not the model or provider", async () => {
+    const client = makeClient();
+    const markFailed = vi.spyOn(
+      (client as any).providerManager,
+      "markFailed"
+    );
+
+    await expect(
+      (client as any)._handleErrorResponse(
+        errorParams({ "x-routstr-model-path": SELECTOR }),
+        TOKEN,
+        404,
+        "req-1",
+        undefined,
+        INVALID_MODEL_PATH_BODY
+      )
+    ).rejects.toThrow();
+
+    expect(markFailed).toHaveBeenCalledWith(
+      BASE_URL,
+      expect.stringContaining("type=invalid_model_path"),
+      "deepseek-v4.1-flash",
+      // canonical path identity of SELECTOR
+      "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash"
+    );
+  });
+
   it("still fails over when no path is pinned", async () => {
     const client = makeClient();
     const findNext = vi.spyOn(

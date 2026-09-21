@@ -183,7 +183,9 @@ describe("RoutstrClient 402 top-up validation", () => {
       BASE_URL,
       expect.stringContaining("type=upstream_error"),
       // model-scoped cooldown: the 402 belongs to this model's request
-      "gpt-test"
+      "gpt-test",
+      // no pinned model path: no path-scoped cooldown
+      undefined
     );
   });
 

@@ -306,7 +306,9 @@ describe("RoutstrClient._handleErrorResponse — token_already_spent", () => {
     expect(providerManager.markFailed).toHaveBeenCalledWith(
       BASE_URL,
       expect.stringContaining("type=token_already_spent"),
-      "gpt-4o-mini"
+      "gpt-4o-mini",
+      // no pinned model path: no path-scoped cooldown
+      undefined
     );
     expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     // Retry went to the failover provider with a fresh token, not the spent one.

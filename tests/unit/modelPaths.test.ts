@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MODEL_PATH_HEADER,
   DEEPSEEK_MODEL_PATH_WHITELIST,
+  canonicalModelPath,
   deepSeekModelPath,
   deepSeekModelPathHeaders,
   isWhitelistedDeepSeekModelPath,
@@ -106,6 +107,25 @@ describe("DeepSeek model path whitelist", () => {
         "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=%zz&endpoint=deepseek"
       )
     ).toBe(false);
+  });
+
+  it("canonicalModelPath gives selectors of the same route one identity", () => {
+    // New-format selector and a legacy provider-id selector of the same
+    // route share the canonical identity used for path-scoped cooldowns.
+    expect(canonicalModelPath(OPENROUTER_DEEPSEEK_SELECTOR)).toBe(
+      OPENROUTER_DEEPSEEK_SELECTOR
+    );
+    expect(
+      canonicalModelPath(
+        "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=8&model-id=deepseek-v4.1-flash&endpoint=deepseek"
+      )
+    ).toBe(OPENROUTER_DEEPSEEK_SELECTOR);
+    // Different routes have different identities.
+    expect(canonicalModelPath(OPENROUTER_FIREWORKS_SELECTOR)).not.toBe(
+      canonicalModelPath(OPENROUTER_DEEPSEEK_SELECTOR)
+    );
+    // Malformed selectors have no identity.
+    expect(canonicalModelPath("not-a-selector")).toBeNull();
   });
 
   it("builds the headers object for routeRequests", () => {

@@ -203,7 +203,9 @@ describe("RoutstrClient redemption recovery and provider failover", () => {
         BASE_URL,
         expect.stringContaining(`code=${code}`),
         // model-scoped cooldown: only this model is cooled down on the provider
-        "gpt-4o-mini"
+        "gpt-4o-mini",
+        // no pinned model path: no path-scoped cooldown
+        undefined
       );
     }
   );

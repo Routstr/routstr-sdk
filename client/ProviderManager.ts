@@ -644,15 +644,32 @@ interface CandidateProvider {
 export interface CooldownEntry {
   baseUrl: string;
   modelId?: string;
+  /**
+   * Canonical x-routstr-model-path identity (see canonicalModelPath) for
+   * path-scoped entries: only that upstream route is cooled on the provider,
+   * the provider's other routes for the same model stay selectable.
+   */
+  modelPath?: string;
   timestamp: number;
 }
 
 /**
  * Map key for a cooldown entry: `baseUrl` for provider-scoped entries,
- * `baseUrl::modelId` for model-scoped entries.
+ * `baseUrl::modelId` for model-scoped entries,
+ * `baseUrl::path::<canonical path>` for path-scoped entries. (A fourth
+ * scope — a path cooled across every node for upstream-wide outages — is a
+ * deliberate future extension, not implemented.)
  */
-const cooldownKey = (baseUrl: string, modelId?: string): string =>
-  modelId ? `${baseUrl}::${modelId}` : baseUrl;
+const cooldownKey = (
+  baseUrl: string,
+  modelId?: string,
+  modelPath?: string
+): string =>
+  modelPath
+    ? `${baseUrl}::path::${modelPath}`
+    : modelId
+      ? `${baseUrl}::${modelId}`
+      : baseUrl;
 
 /**
  * ProviderManager handles provider selection and failover
@@ -707,10 +724,11 @@ export class ProviderManager {
         .map(
           (entry) =>
             [
-              cooldownKey(entry.baseUrl, entry.modelId),
+              cooldownKey(entry.baseUrl, entry.modelId, entry.modelPath),
               {
                 baseUrl: entry.baseUrl,
                 modelId: entry.modelId,
+                modelPath: entry.modelPath,
                 timestamp: entry.timestamp,
               },
             ] as const
@@ -742,7 +760,11 @@ export class ProviderManager {
         if (this.store) {
           this.store
             .getState()
-            .removeProviderFromCooldown(entry.baseUrl, entry.modelId);
+            .removeProviderFromCooldown(
+              entry.baseUrl,
+              entry.modelId,
+              entry.modelPath
+            );
         }
       }
     }
@@ -782,11 +804,12 @@ export class ProviderManager {
    * Check if a provider is currently on cooldown
    *
    * A provider-scoped cooldown entry blocks every model on the provider.
-   * A model-scoped entry only blocks the given `modelId`; pass `modelId`
-   * to check a specific model, or omit it to check whether the provider as
-   * a whole is unavailable.
+   * A model-scoped entry only blocks the given `modelId`; a path-scoped
+   * entry only blocks the given canonical `modelPath`. Pass `modelId` and/or
+   * `modelPath` to check a specific scope, or omit both to check whether the
+   * provider as a whole is unavailable.
    */
-  isOnCooldown(baseUrl: string, modelId?: string): boolean {
+  isOnCooldown(baseUrl: string, modelId?: string, modelPath?: string): boolean {
     this.cleanupExpiredCooldowns();
 
     // Provider-wide cooldown blocks all models
@@ -797,6 +820,13 @@ export class ProviderManager {
     if (
       modelId !== undefined &&
       this.providersOnCoolDown.has(cooldownKey(baseUrl, modelId))
+    ) {
+      return true;
+    }
+    // Path-scoped cooldown blocks only that upstream route
+    if (
+      modelPath !== undefined &&
+      this.providersOnCoolDown.has(cooldownKey(baseUrl, undefined, modelPath))
     ) {
       return true;
     }
@@ -837,30 +867,38 @@ export class ProviderManager {
   }
 
   /**
-   * Mark a provider (optionally a specific model on it) as failed
+   * Mark a provider (optionally a specific model or model path on it) as
+   * failed
    *
    * If the same scope fails twice within the cooldown window, that scope is
    * added to cooldown:
-   * - With `modelId`: only that model is cooled down on the provider.
-   * - Without `modelId`: the whole provider is cooled down (legacy behavior).
+   * - With `modelPath`: only that upstream route is cooled down on the
+   *   provider (the canonical path identity, see canonicalModelPath).
+   * - With `modelId` only: only that model is cooled down on the provider.
+   * - Without either: the whole provider is cooled down (legacy behavior).
    */
-  markFailed(baseUrl: string, reason?: string, modelId?: string): void {
+  markFailed(
+    baseUrl: string,
+    reason?: string,
+    modelId?: string,
+    modelPath?: string
+  ): void {
     // Drop expired entries first so a stale entry can't suppress a fresh
     // second-strike cooldown for the same scope
     this.cleanupExpiredCooldowns();
     const now = Date.now();
-    const key = cooldownKey(baseUrl, modelId);
+    const key = cooldownKey(baseUrl, modelId, modelPath);
     const lastFailure = this.lastFailed.get(key);
 
     // Track this failure in memory
     this.lastFailed.set(key, now);
     this.failedProviders.add(baseUrl);
 
-    // Persist to store. Model-scoped strike counts stay in-memory only; the
-    // cooldown entries themselves are persisted, so cross-restart behavior
-    // is preserved once a cooldown actually triggers.
+    // Persist to store. Model- and path-scoped strike counts stay in-memory
+    // only; the cooldown entries themselves are persisted, so cross-restart
+    // behavior is preserved once a cooldown actually triggers.
     if (this.store) {
-      if (modelId === undefined) {
+      if (modelId === undefined && modelPath === undefined) {
         this.store.getState().setLastFailedTimestamp(baseUrl, now);
       }
       this.store.getState().addFailedProvider(baseUrl);
@@ -876,13 +914,14 @@ export class ProviderManager {
         this.providersOnCoolDown.set(key, {
           baseUrl,
           modelId,
+          modelPath,
           timestamp: now,
         });
         // Persist to store
         if (this.store) {
           this.store
             .getState()
-            .addProviderOnCooldown(baseUrl, now, modelId);
+            .addProviderOnCooldown(baseUrl, now, modelId, modelPath);
         }
       }
     }
@@ -891,25 +930,28 @@ export class ProviderManager {
   /**
    * Remove a provider from cooldown (e.g., after successful request)
    *
-   * With `modelId`, only that model's cooldown entry is removed; without it,
-   * every cooldown entry for the provider is removed.
+   * With `modelPath`, only that path's cooldown entry is removed; with
+   * `modelId` only, only that model's entry; without either, every cooldown
+   * entry for the provider is removed.
    */
-  removeFromCooldown(baseUrl: string, modelId?: string): void {
-    if (modelId === undefined) {
+  removeFromCooldown(baseUrl: string, modelId?: string, modelPath?: string): void {
+    if (modelId === undefined && modelPath === undefined) {
       for (const [key, entry] of [...this.providersOnCoolDown]) {
         if (entry.baseUrl === baseUrl) {
           this.providersOnCoolDown.delete(key);
         }
       }
     } else {
-      this.providersOnCoolDown.delete(cooldownKey(baseUrl, modelId));
+      this.providersOnCoolDown.delete(cooldownKey(baseUrl, modelId, modelPath));
     }
     // Persist to store
     if (this.store) {
-      if (modelId === undefined) {
+      if (modelId === undefined && modelPath === undefined) {
         this.store.getState().removeAllProviderCooldowns(baseUrl);
       } else {
-        this.store.getState().removeProviderFromCooldown(baseUrl, modelId);
+        this.store
+          .getState()
+          .removeProviderFromCooldown(baseUrl, modelId, modelPath);
       }
     }
   }

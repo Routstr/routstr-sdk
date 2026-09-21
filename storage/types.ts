@@ -57,11 +57,13 @@ export interface SdkStorageState {
   failedProviders: string[];
   /** Map of provider URL -> timestamp of last failure */
   lastFailed: Record<string, number>;
-  /** Providers currently on cooldown. Entries with `modelId` cool down only
-   * that model on the provider; entries without it cool down the whole provider. */
+  /** Providers currently on cooldown. Entries with `modelPath` cool down only
+   * that upstream route on the provider; entries with `modelId` only cool down
+   * that model; entries with neither cool down the whole provider. */
   providersOnCooldown: Array<{
     baseUrl: string;
     modelId?: string;
+    modelPath?: string;
     timestamp: number;
   }>;
 }
