@@ -1,8 +1,8 @@
 /**
- * A pinned x-routstr-model-path selector is only meaningful on the node it
- * was resolved from: it carries a node-internal provider id, so failing a
- * pinned request over to a different provider would send an unusable selector
- * and get 404 invalid_model_path back (observed against a live node:
+ * A pinned x-routstr-model-path selector is only guaranteed valid on the node
+ * that advertised it, so failing a pinned request over to a different
+ * provider would send a selector the new node may not accept and get 404
+ * invalid_model_path back (observed against a live node:
  * "Model 'deepseek-v4.1-flash' is not routable through provider 5").
  *
  * These tests pin that behavior on RoutstrClient._handleErrorResponse.
@@ -18,7 +18,7 @@ const BASE_URL = "https://ai.redsh1ft.com/";
 const MINT_URL = "https://mint.example.com";
 const TOKEN = "cashu_token_123";
 const SELECTOR =
-  "url=https%3A%2F%2Fapi.deepseek.com&provider-id=5&model-id=deepseek-v4.1-flash";
+  "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash";
 const INVALID_MODEL_PATH_BODY = JSON.stringify({
   error: {
     message: "Model 'deepseek-v4.1-flash' is not routable through provider 5",

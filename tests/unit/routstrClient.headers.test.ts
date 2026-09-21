@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 
-const selector = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=2&model-id=glm-5.3-flash&endpoint=z-ai%2Ffp8";
+const selector = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=glm-5.3-flash&endpoint=z-ai%2Ffp8";
 
 // Run real request preparation up to the transport boundary, without wallet spend.
 async function prepare(headers: Record<string, string>, mode = "xcashu") {

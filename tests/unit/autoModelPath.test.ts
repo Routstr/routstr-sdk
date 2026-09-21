@@ -18,16 +18,16 @@ import { routeRequests } from "../../routeRequests";
 
 const mockedResolve = vi.mocked(resolveRequestContext);
 
-// Byte-exact advertised selectors from ai.redsh1ft.com /v1/models/paths.
+// Byte-exact advertised selectors from a node's /v1/models/paths.
 const OPENROUTER_DEEPSEEK_SELECTOR =
-  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=8&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
 const OPENROUTER_FIREWORKS_SELECTOR =
-  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=8&model-id=deepseek-v4.1-flash&endpoint=fireworks";
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
 const PPQ_SELECTOR =
-  "url=https%3A%2F%2Fapi.ppq.ai&provider-id=6&model-id=deepseek-v4.1-flash";
+  "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash";
 // No longer whitelisted: the official DeepSeek API route.
 const OFFICIAL_API_SELECTOR =
-  "url=https%3A%2F%2Fapi.deepseek.com&provider-id=5&model-id=deepseek-v4.1-flash";
+  "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash";
 
 function makeNodePayload() {
   return {
@@ -35,18 +35,18 @@ function makeNodePayload() {
       {
         id: DEEPSEEK_AUTO_MODEL_ID,
         paths: [
-          { path: PPQ_SELECTOR, provider: { id: 6 }, endpoint: null },
-          { path: OFFICIAL_API_SELECTOR, provider: { id: 5 }, endpoint: null },
+          { path: PPQ_SELECTOR, provider: { slug: "ppq", type: "generic" }, endpoint: null },
+          { path: OFFICIAL_API_SELECTOR, provider: { slug: "deepseek", type: "generic" }, endpoint: null },
           {
             // Fireworks is listed before deepseek on purpose: the node's
             // order must not matter, the whitelist preference does.
             path: OPENROUTER_FIREWORKS_SELECTOR,
-            provider: { id: 8 },
+            provider: { slug: "openrouter", type: "openrouter" },
             endpoint: { tag: "fireworks", name: "Fireworks" },
           },
           {
             path: OPENROUTER_DEEPSEEK_SELECTOR,
-            provider: { id: 8 },
+            provider: { slug: "openrouter", type: "openrouter" },
             endpoint: { tag: "deepseek", name: "DeepSeek" },
           },
         ],
@@ -110,7 +110,7 @@ describe("autoModelPathFor", () => {
           paths: [
             {
               path: OPENROUTER_FIREWORKS_SELECTOR,
-              provider: { id: 8 },
+              provider: { slug: "openrouter", type: "openrouter" },
               endpoint: { tag: "fireworks", name: "Fireworks" },
             },
           ],
@@ -166,7 +166,7 @@ describe("autoModelPathFor", () => {
   it("does nothing when the node lists no whitelisted route", async () => {
     stubNodeFetch({
       data: [
-        { id: DEEPSEEK_AUTO_MODEL_ID, paths: [{ path: PPQ_SELECTOR, provider: { id: 6 }, endpoint: null }] },
+        { id: DEEPSEEK_AUTO_MODEL_ID, paths: [{ path: PPQ_SELECTOR, provider: { slug: "ppq", type: "generic" }, endpoint: null }] },
       ],
     });
     await expect(autoModelPathFor(DEEPSEEK_AUTO_MODEL_ID)).resolves.toEqual({});
@@ -237,8 +237,8 @@ describe("routeRequests deepseek-v4.1-flash pinning", () => {
   });
 
   it("does not attach a selector when the caller forced a different node", async () => {
-    // Live failure this guards: the node-scoped selector (provider-id 5 belongs
-    // to ai.redsh1ft.com) was sent to routstr.otrta.me -> 404 invalid_model_path.
+    // Live failure this guards: a selector resolved from ai.redsh1ft.com was
+    // sent to routstr.otrta.me -> 404 invalid_model_path.
     const fetchMock = stubNodeFetch();
     mockedResolve.mockResolvedValue({
       client: makeClient(),
