@@ -13,6 +13,7 @@
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
+import { findModelForId } from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext } from "../utils/torUtils";
 import { isTinfoilModel } from "./TinfoilSecure";
@@ -892,8 +893,9 @@ export class ProviderManager {
           continue;
         }
 
-        // Find the model in this provider's list
-        const model = models.find((m: Model) => m.id === modelId);
+        // Find the model in this provider's list (by native id or a
+        // statically mapped variant/alias of it)
+        const model = findModelForId(models, modelId);
         if (!model) {
           continue;
         }
@@ -928,9 +930,9 @@ export class ProviderManager {
     // Get models for this provider
     const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
-    // First try exact match
-    const exactMatch = models.find((m) => m.id === modelId);
-    if (exactMatch) return exactMatch;
+    // First try exact or statically mapped (variant/alias) match
+    const mappedMatch = findModelForId(models, modelId);
+    if (mappedMatch) return mappedMatch;
 
     // Try matching by ID suffix (for backward compatibility with v0.1.x providers)
     const providerInfo = await fetchProviderInfo(this.discoveryAdapter, baseUrl, this.logger);
@@ -965,7 +967,7 @@ export class ProviderManager {
       if (!torMode && isOnionUrl(baseUrl))
         continue;
 
-      const model = models.find((m: Model) => m.id === modelId);
+      const model = findModelForId(models, modelId);
       if (!model) continue;
 
       const cost = model.sats_pricing?.completion ?? 0;
@@ -998,7 +1000,7 @@ export class ProviderManager {
       )
         continue;
 
-      const match = models.find((model) => model.id === modelId);
+      const match = findModelForId(models, modelId);
       if (!match?.sats_pricing) continue;
 
       const prompt = match.sats_pricing.prompt;
