@@ -14,6 +14,7 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
+import { findModelForId } from "../core/modelMappings";
 import {
   RoutstrClient,
   type DebugLevel,
@@ -152,7 +153,9 @@ export async function resolveRequestContext(
 
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
-    const match = models.find((m) => m.id === modelId);
+    // Match by native id or a statically mapped variant/alias of it, so a
+    // forced provider also serves requests using the canonical id.
+    const match = findModelForId(models, modelId);
     if (!match) {
       throw new Error(
         `Provider ${normalizedProvider} does not offer model: ${modelId}`

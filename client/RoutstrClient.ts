@@ -410,6 +410,20 @@ export class RoutstrClient {
       }
     }
 
+    // Forward the provider-native model id when selection resolved through a
+    // static mapping: mapped providers only know their own id, so the
+    // caller-facing canonical id would 400/404 upstream. Only touches JSON
+    // bodies that already carry a string `model` field.
+    if (selectedModel && requestBody && typeof requestBody === "object") {
+      const bodyObj = requestBody as Record<string, unknown>;
+      if (
+        typeof bodyObj.model === "string" &&
+        bodyObj.model !== selectedModel.id
+      ) {
+        requestBody = { ...bodyObj, model: selectedModel.id };
+      }
+    }
+
     // Keep the opaque selector in baseHeaders so request retries preserve it.
     // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
     // to the caller, not the upstream payment connection.
@@ -1521,11 +1535,21 @@ export class RoutstrClient {
       // Retry with new provider (reset retry count). Attach the balance that
       // was observed before the retry request so callers do not have to query
       // after the provider may already have charged the request.
+      // The failover target may serve the model under a different native id
+      // (static mapping), so forward newModel.id, not the original body model.
+      const bodyObj =
+        body && typeof body === "object"
+          ? (body as Record<string, unknown>)
+          : undefined;
+      const retryBody =
+        bodyObj && typeof bodyObj.model === "string"
+          ? { ...bodyObj, model: newModel.id }
+          : body;
       const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
-        body,
+        body: retryBody,
         baseUrl: nextProvider,
         selectedModel: newModel,
         token: spendResult.token!,
