@@ -1328,7 +1328,10 @@ export class ProviderManager {
     try {
       // A pinned model path prices itself: the node advertises per-route
       // sats pricing alongside the path, which replaces the model's
-      // aggregate prompt/completion rates (max_cost stays the envelope cap).
+      // aggregate pricing — prompt/completion rates AND the max_cost
+      // envelope. Routes of one model can differ sharply (e.g. 348 vs 682
+      // sats of envelope on one live node), so keeping the model-level
+      // aggregate here would under- or over-reserve the deposit.
       if (pathPricing) {
         model = {
           ...model,
@@ -1342,6 +1345,9 @@ export class ProviderManager {
               : {}),
             ...(pathPricing.completion !== undefined
               ? { completion: pathPricing.completion }
+              : {}),
+            ...(pathPricing.max_cost !== undefined
+              ? { max_cost: pathPricing.max_cost }
               : {}),
           },
         } as unknown as Model;
