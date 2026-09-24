@@ -446,9 +446,10 @@ export class RoutstrClient {
     }
 
     // Keep the opaque selector in baseHeaders so request retries preserve it.
-    // It is never forwarded to a different provider: cross-provider failover
-    // is disabled for pinned requests in _handleErrorResponse, because the
-    // selector's provider id is node-internal.
+    // A caller-supplied selector is never forwarded to a different provider:
+    // failover is disabled for caller-pinned requests in _handleErrorResponse.
+    // An SDK auto-pin (params.autoModelPath) may fail over, with the selector
+    // swapped for one the next node advertised.
     // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
     // to the caller, not the upstream payment connection.
     const baseHeaders = this._buildBaseHeaders();
@@ -542,6 +543,12 @@ export class RoutstrClient {
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
+      // The SDK auto-pin marker must reach _handleErrorResponse to
+      // distinguish an SDK-pinned selector (may fail over) from a
+      // caller-pinned one (never does). Retry call sites inside
+      // _handleErrorResponse spread ...params, so this is the single place
+      // it can get lost.
+      autoModelPath: params.autoModelPath,
     });
 
     let tokenBalanceInSats =

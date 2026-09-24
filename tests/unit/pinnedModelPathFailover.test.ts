@@ -119,6 +119,7 @@ function makeClient() {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("RoutstrClient pinned model-path failover", () => {
@@ -246,6 +247,140 @@ describe("RoutstrClient pinned model-path failover", () => {
         INVALID_MODEL_PATH_BODY
       )
     ).rejects.toThrow();
+  });
+
+  it("keeps the auto-pin marker through routeRequest so failover is reachable", async () => {
+    // Regression: routeRequest() used to drop autoModelPath before the initial
+    // _makeRequest, so _handleErrorResponse mistook every SDK auto-pin for a
+    // caller pin and never failed over. Drive the real
+    // routeRequest -> _makeRequest -> _handleErrorResponse seam; only the
+    // payment/accounting boundaries and transport are stubbed.
+    const NEXT_SELECTOR =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+    const NEXT_BASE_URL = "https://routstr.otrta.me/";
+    const client = makeClient();
+    // _checkBalance needs a funded wallet to get past the request preamble.
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    // The xcashu recovery preamble only reclaims tokens with a `cashu`
+    // prefix (RoutstrClient._handleErrorResponse), so the mocked spend must
+    // return one — like the real _spendToken does.
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(
+      0
+    );
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+    const ranking = vi
+      .spyOn((client as any).providerManager, "getModelPathProviderRanking")
+      .mockResolvedValue([
+        {
+          baseUrl: NEXT_BASE_URL,
+          selectors: [NEXT_SELECTOR],
+          satsPricing: [null],
+          model: makeModel(),
+        },
+      ]);
+    const findNext = vi.spyOn(
+      (client as any).providerManager,
+      "findNextBestProvider"
+    );
+
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith(BASE_URL)) {
+        return new Response(INVALID_MODEL_PATH_BODY, {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("ok");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [] },
+      headers: { "x-routstr-model-path": SELECTOR },
+      baseUrl: BASE_URL,
+      mintUrl: MINT_URL,
+      modelId: "deepseek-v4.1-flash",
+      autoModelPath: { selector: SELECTOR },
+    });
+
+    expect(response.status).toBe(200);
+    // The auto-pin marker survived into _handleErrorResponse: the model-path
+    // failover branch ran (a caller-pinned request would never get here).
+    expect(ranking).toHaveBeenCalledWith("deepseek-v4.1-flash", {
+      excludeBaseUrl: BASE_URL,
+    });
+    expect(findNext).not.toHaveBeenCalled();
+    // First attempt failed on BASE_URL; the retry went to the next node.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toContain(NEXT_BASE_URL);
+    // The failed node's selector is never forwarded; the retry pins the new
+    // node's own selector.
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
+        "x-routstr-model-path"
+      )
+    ).toBe(NEXT_SELECTOR);
+  });
+
+  it("never fails a caller-pinned request over through the real request seam", async () => {
+    const client = makeClient();
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+    const ranking = vi.spyOn(
+      (client as any).providerManager,
+      "getModelPathProviderRanking"
+    );
+    const fetchMock = vi.fn(
+      async (_input: unknown, _init?: RequestInit) =>
+        new Response(INVALID_MODEL_PATH_BODY, {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Caller pins its own selector and does NOT set autoModelPath.
+    await expect(
+      client.routeRequest({
+        path: "/v1/chat/completions",
+        method: "POST",
+        body: { messages: [] },
+        headers: { "x-routstr-model-path": SELECTOR },
+        baseUrl: BASE_URL,
+        mintUrl: MINT_URL,
+        modelId: "deepseek-v4.1-flash",
+      })
+    ).rejects.toThrow();
+
+    expect(ranking).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("still fails over when no path is pinned", async () => {
