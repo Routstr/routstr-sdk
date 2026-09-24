@@ -6,12 +6,18 @@ import type {
 } from "../wallet/interfaces";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import { StreamProcessor } from "./StreamProcessor";
-import type { AlertLevel, RoutstrClientMode } from "./RoutstrClient";
+import type {
+  AlertLevel,
+  ModelPathPin,
+  RoutstrClientMode,
+} from "./RoutstrClient";
 import { parseCoreError, summarizeCoreError } from "../core/errorTypes";
 import {
   resolveRequestContext,
   type ResolveContextInput,
+  type ResolvedContext,
 } from "./resolveRequestContext";
+import { MODEL_PATH_HEADER } from "../utils/modelPaths";
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import type { ModelManager } from "../discovery/ModelManager";
@@ -105,6 +111,8 @@ interface FetchAIResponseClient {
     modelId?: string;
     userCacheSecret?: string;
     signal?: AbortSignal;
+    /** SDK-pinned model path for this request, if any. */
+    autoModelPath?: ModelPathPin;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
 }
@@ -151,6 +159,7 @@ export async function fetchAIResponse(
     let baseUrl: string;
     let mintUrl: string;
     let client: FetchAIResponseClient;
+    let modelPath: ResolvedContext["modelPath"];
 
     if (options.selectedModel && options.baseUrl && options.mintUrl && deps.client) {
       // Pre-resolved path (backward-compatible)
@@ -181,6 +190,10 @@ export async function fetchAIResponse(
       const resolved = await resolveRequestContext({
         modelId: options.modelId,
         forcedProvider: options.forcedProvider,
+        // The caller's headers carry any x-routstr-model-path selector: it
+        // must suppress the SDK's automatic pinning (the caller pinned an
+        // upstream explicitly — and never fails over).
+        inputHeaders: headers,
         walletAdapter,
         storageAdapter,
         discoveryAdapter,
@@ -201,6 +214,7 @@ export async function fetchAIResponse(
       baseUrl = resolved.baseUrl;
       mintUrl = resolved.mintUrl;
       client = resolved.client;
+      modelPath = resolved.modelPath;
     } else {
       throw new Error(
         "fetchAIResponse requires either (selectedModel + baseUrl + mintUrl + client in deps) or (modelId + discoveryAdapter + walletAdapter + storageAdapter in options)"
@@ -227,16 +241,28 @@ export async function fetchAIResponse(
       body.tools = [{ type: "web_search" }];
     }
 
+    // An SDK auto-pin resolved above is only guaranteed valid on the node
+    // that advertised it: attach that node's own selector and mark the
+    // request auto-pinned so failover can swap in the next node's selector.
+    // A caller-supplied selector passes through untouched (and never fails
+    // over).
+    const requestHeaders = modelPath
+      ? { ...headers, [MODEL_PATH_HEADER]: modelPath.selector }
+      : headers;
+
     const response = await client.routeRequest({
       path: "/v1/chat/completions",
       method: "POST",
       body,
-      headers,
+      headers: requestHeaders,
       baseUrl,
       mintUrl,
       modelId: selectedModel.id,
       userCacheSecret: options.userCacheSecret,
       signal: options.abortSignal,
+      autoModelPath: modelPath
+        ? { selector: modelPath.selector, satsPricing: modelPath.satsPricing }
+        : undefined,
     });
 
     if (response.status !== 200) {
