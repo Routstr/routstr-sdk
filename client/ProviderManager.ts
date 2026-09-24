@@ -1132,6 +1132,12 @@ export class ProviderManager {
           return null;
         }
         if (disabledProviders.has(baseUrl)) return null;
+        // Enforce the transport invariant both ways (same as
+        // getProviderPriceRankingForModel): Tor mode is onion-only, clearnet
+        // mode never touches onion nodes. The auto-selection nodes are
+        // clearnet today, so Tor mode gets an empty ranking here and
+        // degrades to the normal onion-only price ranking (unpinned).
+        if (torMode && !isOnionUrl(baseUrl)) return null;
         if (!torMode && isOnionUrl(baseUrl)) return null;
         if (this.isOnCooldown(baseUrl, modelId)) return null;
 

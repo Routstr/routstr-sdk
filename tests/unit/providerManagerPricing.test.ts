@@ -1430,6 +1430,25 @@ describe("ProviderManager", () => {
       expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
     });
 
+    it("excludes clearnet nodes when torMode=true", async () => {
+      const fetchMock = stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0004 },
+        ]),
+        [NODE_B]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0004 },
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      // The whitelisted auto-selection nodes are clearnet; a Tor-mode
+      // request must not consider them — or even fetch their paths.
+      await expect(
+        manager.getModelPathProviderRanking(MODEL_ID, { torMode: true })
+      ).resolves.toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it("skips nodes that do not offer the model or advertise no whitelisted path", async () => {
       stubPathsFetch({
         [NODE_A]: pathsPayload([

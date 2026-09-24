@@ -219,6 +219,31 @@ describe("resolveRequestContext model-path selection", () => {
     expect(ctx.modelPath).toBeUndefined();
   });
 
+  it("keeps Tor-mode requests on the onion-only price ranking, unpinned", async () => {
+    const fetchMock = stubPathsFetch({
+      [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
+      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
+    });
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel()],
+      [`${NODE_B}/`]: [makeModel()],
+      "http://hidden.onion/": [makeModel(0.5)],
+    });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      torMode: true,
+      ...deps,
+    });
+
+    // The clearnet model-path nodes are cheaper but forbidden in Tor mode:
+    // degrade to the normal onion-only ranking, unpinned, without even
+    // fetching their /v1/models/paths.
+    expect(ctx.baseUrl).toBe("http://hidden.onion/");
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("routes other models through the normal price ranking", async () => {
     const fetchMock = stubPathsFetch({});
     const otherModel = { ...makeModel(), id: "glm-5.2" } as Model;
