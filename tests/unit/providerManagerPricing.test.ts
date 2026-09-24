@@ -3,6 +3,7 @@ import { ProviderManager } from "../../client/ProviderManager";
 import {
   clearModelPathsCache,
   DEEPSEEK_AUTO_NODE_URLS,
+  modelPathCandidateKey,
 } from "../../utils/modelPaths";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
@@ -1428,6 +1429,29 @@ describe("ProviderManager", () => {
         excludeBaseUrl: `${NODE_A}/`,
       });
       expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
+    });
+
+    it("drops candidates excluded as already attempted in the request", async () => {
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
+          { path: FIREWORKS_SELECTOR, completion: 0.0007 },
+        ]),
+        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID, {
+        excludeModelPaths: [
+          modelPathCandidateKey(`${NODE_A}/`, DEEPSEEK_SELECTOR),
+          modelPathCandidateKey(`${NODE_B}/`, DEEPSEEK_SELECTOR),
+        ],
+      });
+
+      // Node A keeps its second route after its first route's exclusion;
+      // node B has nothing left and drops out entirely.
+      expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_A}/`]);
+      expect(ranking[0].selectors).toEqual([FIREWORKS_SELECTOR]);
     });
 
     it("excludes clearnet nodes when torMode=true", async () => {

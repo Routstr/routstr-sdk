@@ -10,6 +10,11 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
+import {
+  clearModelPathsCache,
+  DEEPSEEK_AUTO_NODE_URLS,
+  modelPathCandidateKey,
+} from "../../utils/modelPaths";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 import type { Model } from "../../core/types";
@@ -26,6 +31,29 @@ const INVALID_MODEL_PATH_BODY = JSON.stringify({
     code: 404,
   },
   request_id: "req-1",
+});
+
+// Whitelisted upstream routes, as advertised on GET /v1/models/paths.
+const DEEPSEEK_SEL =
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
+const FIREWORKS_SEL =
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
+
+const pathsPayload = (selectors: string[]) => ({
+  data: [
+    {
+      id: "deepseek-v4.1-flash",
+      paths: selectors.map((path) => ({
+        path,
+        provider: { slug: "openrouter", type: "openrouter" },
+        endpoint: null,
+        model: {
+          sats_pricing: { prompt: 0.001, completion: 0.001, max_cost: 700 },
+        },
+      })),
+    },
+  ],
+  updated_at: null,
 });
 
 const createWallet = (): WalletAdapter => ({
@@ -62,7 +90,9 @@ const createStorage = (): StorageAdapter =>
     setCachedReceiveTokens: () => {},
   }) as StorageAdapter;
 
-const createDiscovery = (): DiscoveryAdapter =>
+const createDiscovery = (
+  overrides?: Partial<DiscoveryAdapter>
+): DiscoveryAdapter =>
   ({
     getCachedModels: () => ({}),
     setCachedModels: () => {},
@@ -84,6 +114,7 @@ const createDiscovery = (): DiscoveryAdapter =>
     setRoutstr21Models: () => {},
     getRoutstr21ModelsLastUpdate: () => null,
     setRoutstr21ModelsLastUpdate: () => {},
+    ...overrides,
   }) as DiscoveryAdapter;
 
 const makeModel = (): Model =>
@@ -107,11 +138,11 @@ const errorParams = (baseHeaders: Record<string, string>) => ({
   tinfoilEnabled: false,
 });
 
-function makeClient() {
+function makeClient(discovery?: DiscoveryAdapter) {
   return new RoutstrClient(
     createWallet(),
     createStorage(),
-    createDiscovery(),
+    discovery ?? createDiscovery(),
     "ERROR",
     "xcashu"
   );
@@ -210,10 +241,18 @@ describe("RoutstrClient pinned model-path failover", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(ranking).toHaveBeenCalledWith("deepseek-v4.1-flash", {
-      excludeBaseUrl: BASE_URL,
-    });
+    // A route-scoped failure keeps the node's other routes in play: only
+    // the failed candidate is excluded from the chain, never the whole
+    // node.
+    const [, rankingOptions] = ranking.mock.calls[0];
+    expect([...(rankingOptions.excludeModelPaths ?? [])]).toEqual([
+      modelPathCandidateKey(BASE_URL, SELECTOR),
+    ]);
+    expect(rankingOptions.excludeBaseUrl).toBeUndefined();
     const retry = makeRequest.mock.calls[0][0];
+    expect(retry.triedModelPaths).toEqual([
+      modelPathCandidateKey(BASE_URL, SELECTOR),
+    ]);
     expect(retry.baseUrl).toBe("https://routstr.otrta.me/");
     // The retry pins the NEW node's selector; the failed node's selector is
     // never forwarded.
@@ -321,9 +360,10 @@ describe("RoutstrClient pinned model-path failover", () => {
     expect(response.status).toBe(200);
     // The auto-pin marker survived into _handleErrorResponse: the model-path
     // failover branch ran (a caller-pinned request would never get here).
-    expect(ranking).toHaveBeenCalledWith("deepseek-v4.1-flash", {
-      excludeBaseUrl: BASE_URL,
-    });
+    const [, rankingOptions] = ranking.mock.calls[0];
+    expect([...(rankingOptions.excludeModelPaths ?? [])]).toEqual([
+      modelPathCandidateKey(BASE_URL, SELECTOR),
+    ]);
     expect(findNext).not.toHaveBeenCalled();
     // First attempt failed on BASE_URL; the retry went to the next node.
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -335,6 +375,156 @@ describe("RoutstrClient pinned model-path failover", () => {
         "x-routstr-model-path"
       )
     ).toBe(NEXT_SELECTOR);
+  });
+
+  it("walks the node-major chain and never retries a candidate that failed", async () => {
+    // Regression: failover used to exclude the whole failed node (skipping
+    // node1:fireworks) and, since one strike does not cool a route down,
+    // later hops could revisit candidates that already failed within the
+    // request. Drive the real routeRequest -> _makeRequest ->
+    // _handleErrorResponse seam with the REAL model-path ranking; only the
+    // payment/accounting boundaries, discovery cache and transport are
+    // stubbed.
+    const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
+    clearModelPathsCache();
+    const client = makeClient(
+      createDiscovery({
+        getCachedModels: () => ({
+          [`${NODE_A}/`]: [makeModel()],
+          [`${NODE_B}/`]: [makeModel()],
+        }),
+      })
+    );
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(
+      0
+    );
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+
+    const attempts: Array<{ url: string; selector: string | null }> = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/models/paths")) {
+        return new Response(
+          JSON.stringify(pathsPayload([DEEPSEEK_SEL, FIREWORKS_SEL])),
+          { headers: { "content-type": "application/json" } }
+        );
+      }
+      attempts.push({
+        url,
+        selector: new Headers(init?.headers).get("x-routstr-model-path"),
+      });
+      if (attempts.length < 3) {
+        return new Response(INVALID_MODEL_PATH_BODY, {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("ok");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [] },
+      headers: { "x-routstr-model-path": DEEPSEEK_SEL },
+      baseUrl: `${NODE_A}/`,
+      mintUrl: MINT_URL,
+      modelId: "deepseek-v4.1-flash",
+      autoModelPath: { selector: DEEPSEEK_SEL },
+    });
+
+    expect(response.status).toBe(200);
+    // Node-major chain: every route of the cheaper node before the next
+    // node, and no candidate is ever attempted twice.
+    expect(attempts).toEqual([
+      { url: `${NODE_A}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+      { url: `${NODE_A}/v1/chat/completions`, selector: FIREWORKS_SEL },
+      { url: `${NODE_B}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+    ]);
+  });
+
+  it("jumps straight to the next node after a provider-wide failure", async () => {
+    // A network failure is provider-wide (the host is down), matching the
+    // cooldown scope rules: the node's other routes share the host, so the
+    // chain must not burn a paid retry on them.
+    const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
+    clearModelPathsCache();
+    const client = makeClient(
+      createDiscovery({
+        getCachedModels: () => ({
+          [`${NODE_A}/`]: [makeModel()],
+          [`${NODE_B}/`]: [makeModel()],
+        }),
+      })
+    );
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(
+      0
+    );
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+
+    const attempts: Array<{ url: string; selector: string | null }> = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/models/paths")) {
+        return new Response(
+          JSON.stringify(pathsPayload([DEEPSEEK_SEL, FIREWORKS_SEL])),
+          { headers: { "content-type": "application/json" } }
+        );
+      }
+      attempts.push({
+        url,
+        selector: new Headers(init?.headers).get("x-routstr-model-path"),
+      });
+      if (attempts.length === 1) {
+        throw new Error("Failed to fetch");
+      }
+      return new Response("ok");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [] },
+      headers: { "x-routstr-model-path": DEEPSEEK_SEL },
+      baseUrl: `${NODE_A}/`,
+      mintUrl: MINT_URL,
+      modelId: "deepseek-v4.1-flash",
+      autoModelPath: { selector: DEEPSEEK_SEL },
+    });
+
+    expect(response.status).toBe(200);
+    expect(attempts).toEqual([
+      { url: `${NODE_A}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+      { url: `${NODE_B}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+    ]);
   });
 
   it("never fails a caller-pinned request over through the real request seam", async () => {

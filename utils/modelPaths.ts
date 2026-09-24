@@ -266,6 +266,22 @@ export function canonicalModelPath(selector: string): string | null {
 }
 
 /**
+ * Identity of one (node, route) failover candidate: the node's normalized
+ * URL plus the selector's canonical path. Both nodes advertise the same
+ * upstream route strings, so the canonical path alone cannot tell
+ * node1:deepseek from node2:deepseek — the pair can. Used to skip
+ * candidates a request already attempted: one strike does not trigger
+ * cooldown, so the exclusion must live on the request.
+ */
+export function modelPathCandidateKey(
+  baseUrl: string,
+  selector: string
+): string {
+  const node = (normalizeProviderUrl(baseUrl) ?? baseUrl).toLowerCase();
+  return `${node}|${canonicalModelPath(selector) ?? selector}`;
+}
+
+/**
  * The whitelisted route a selector identifies, or null when the selector is
  * malformed or routes through a non-whitelisted upstream. Only the stable
  * identity (url + endpoint tag) is matched.
@@ -390,4 +406,3 @@ export function sameNode(
   if (!left || !right) return false;
   return left.toLowerCase() === right.toLowerCase();
 }
-

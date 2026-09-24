@@ -24,7 +24,7 @@ import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
-import { MODEL_PATH_HEADER, canonicalModelPath } from "../utils/modelPaths";
+import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey } from "../utils/modelPaths";
 import {
   ProviderError,
   FailoverError,
@@ -688,6 +688,8 @@ export class RoutstrClient {
     signal?: AbortSignal;
     /** SDK-pinned model path for this request, if any. */
     autoModelPath?: ModelPathPin;
+    /** (node, canonical path) candidates already attempted in this request. */
+    triedModelPaths?: string[];
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -856,6 +858,8 @@ export class RoutstrClient {
       signal?: AbortSignal;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
+      /** (node, canonical path) candidates already attempted in this request. */
+      triedModelPaths?: string[];
     },
     token: string,
     status: number,
@@ -1539,14 +1543,16 @@ export class RoutstrClient {
     // the node that advertised it. A caller-pinned request must never fail
     // over to a different node: the selector may be rejected there (404
     // invalid_model_path) and the caller explicitly asked for that one
-    // upstream. An SDK auto-pinned request may fail over to the next ranked
-    // model-path node, with a fresh selector resolved from that node's own
-    // advertised paths.
+    // upstream. An SDK auto-pinned request walks the node-major model-path
+    // chain (node1:deepseek -> node1:fireworks -> node2:deepseek -> ...),
+    // swapping in a fresh selector resolved from the next candidate's own
+    // node.
     let nextProvider: string | null;
     let nextModelPathSelector: string | undefined;
     let nextModelPathPricing:
       | { prompt?: number; completion?: number; max_cost?: number }
       | undefined;
+    let nextTriedModelPaths: string[] | undefined;
     if (pinnedModelPath) {
       if (!params.autoModelPath) {
         this._log(
@@ -1555,10 +1561,25 @@ export class RoutstrClient {
         );
         nextProvider = null;
       } else {
+        // The failed candidate joins the request's attempted set: one
+        // strike does not cool a route down, so without this the chain
+        // could burn paid retries revisiting a route that already failed
+        // within this request.
+        const triedModelPaths = new Set(params.triedModelPaths ?? []);
+        triedModelPaths.add(modelPathCandidateKey(baseUrl, pinnedModelPath));
+        nextTriedModelPaths = [...triedModelPaths];
+        // A provider-wide failure (network error / mint unreachable — the
+        // empty cooldown scope) rules out the node's remaining routes too:
+        // they share the host. A route-scoped failure keeps them in play,
+        // so the chain walks every route of the cheaper node first.
+        const providerWideFailure = cooldownScope.modelId === undefined;
         const ranking =
           await this.providerManager.getModelPathProviderRanking(
             selectedModel.id,
-            { excludeBaseUrl: baseUrl }
+            {
+              excludeModelPaths: triedModelPaths,
+              ...(providerWideFailure ? { excludeBaseUrl: baseUrl } : {}),
+            }
           );
         const next = ranking[0];
         nextProvider = next?.baseUrl ?? null;
@@ -1567,7 +1588,7 @@ export class RoutstrClient {
         if (nextProvider) {
           this._log(
             "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: auto-pinned request failing over to next model-path node: ${nextProvider}`
+            `[RoutstrClient] _handleErrorResponse: auto-pinned request failing over to next model-path route: ${nextProvider} (${nextModelPathSelector})`
           );
         }
       }
@@ -1684,6 +1705,7 @@ export class RoutstrClient {
         token: spendResult.token!,
         selectedMintUrl: spendResult.selectedMintUrl,
         excludeMints: undefined,
+        triedModelPaths: nextTriedModelPaths ?? params.triedModelPaths,
         requiredSats: newRequiredSats,
         autoModelPath:
           nextModelPathSelector !== undefined

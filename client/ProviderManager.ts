@@ -20,6 +20,7 @@ import {
   canonicalModelPath,
   DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPaths,
+  modelPathCandidateKey,
   resolveDeepSeekModelPathSelectors,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
@@ -1100,12 +1101,22 @@ export class ProviderManager {
    * on GET /v1/models/paths. Entries are sorted by the per-route completion
    * price of the node's best available route; within an entry, `selectors`
    * and `satsPricing` are in whitelist preference order with cooled-down
-   * routes removed — the failover chain is node-major: every route of the
-   * cheapest node before the next node.
+   * routes (and `excludeModelPaths` candidates) removed — the failover
+   * chain is node-major: every route of the cheapest node before the next
+   * node.
    */
   async getModelPathProviderRanking(
     modelId: string,
-    options: { torMode?: boolean; excludeBaseUrl?: string } = {}
+    options: {
+      torMode?: boolean;
+      excludeBaseUrl?: string;
+      /**
+       * Candidate keys (see modelPathCandidateKey) already attempted in
+       * this request. One strike does not cool a route down, so the caller
+       * must exclude them itself to avoid revisiting dead routes.
+       */
+      excludeModelPaths?: Iterable<string>;
+    } = {}
   ): Promise<
     Array<{
       baseUrl: string;
@@ -1119,6 +1130,7 @@ export class ProviderManager {
     }>
   > {
     const torMode = options.torMode ?? isTorContext();
+    const excludedModelPaths = new Set(options.excludeModelPaths ?? []);
     const disabledProviders = new Set(
       this.discoveryAdapter.getDisabledProviders()
     );
@@ -1152,7 +1164,8 @@ export class ProviderManager {
         if (!resolved) return null;
 
         // Whitelist order, dropping routes this node has on path-scoped
-        // cooldown (or does not advertise at all).
+        // cooldown, already attempted in this request (or does not
+        // advertise at all).
         const selectors: string[] = [];
         const satsPricing: Array<{
           prompt?: number;
@@ -1162,6 +1175,9 @@ export class ProviderManager {
         for (let i = 0; i < resolved.selectors.length; i++) {
           const selector = resolved.selectors[i];
           if (!selector) continue;
+          if (excludedModelPaths.has(modelPathCandidateKey(baseUrl, selector))) {
+            continue;
+          }
           const pathId = canonicalModelPath(selector);
           if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
           selectors.push(selector);
