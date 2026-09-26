@@ -16,6 +16,7 @@
  * parameter; it is tolerated when matching but never required or built.
  */
 
+import type { ModelSatsPricing } from "../core/types";
 import { normalizeProviderUrl } from "./torUtils";
 
 /** The only request header the SDK forwards upstream on routed requests. */
@@ -70,14 +71,27 @@ export const DEEPSEEK_AUTO_NODE_URL = DEEPSEEK_AUTO_NODE_URLS[0];
  * metadata): each route of the same model prices and sizes itself.
  */
 export interface NodeModelPathMetadata {
-  sats_pricing?: {
-    prompt?: number;
-    completion?: number;
-    max_cost?: number;
-  };
+  /**
+   * The route's full advertised sats pricing. Every field the node sends is
+   * kept (not just prompt/completion/max_cost): the deposit gate in
+   * ProviderManager.getRequiredSatsForModel is only self-consistent when
+   * max_cost, max_prompt_cost and max_completion_cost all come from the
+   * same route's envelope.
+   */
+  sats_pricing?: ModelPathSatsPricing;
   context_length?: number;
   max_completion_tokens?: number | null;
 }
+
+/**
+ * Per-route sats pricing as advertised on GET /v1/models/paths. All fields
+ * optional: a route may advertise only a subset, and cache-pricing fields
+ * appear on live nodes without being part of ModelSatsPricing.
+ */
+export type ModelPathSatsPricing = Partial<ModelSatsPricing> & {
+  input_cache_read?: number;
+  input_cache_write?: number;
+};
 
 /** One advertised path: the selector string plus its per-route metadata. */
 export interface NodeModelPathEntry {
@@ -180,12 +194,20 @@ function parsePathMetadata(raw: unknown): NodeModelPathMetadata | undefined {
   const metadata: NodeModelPathMetadata = {};
   const pricing = record.sats_pricing;
   if (pricing && typeof pricing === "object") {
-    const p = pricing as Record<string, unknown>;
-    metadata.sats_pricing = {
-      prompt: typeof p.prompt === "number" ? p.prompt : undefined,
-      completion: typeof p.completion === "number" ? p.completion : undefined,
-      max_cost: typeof p.max_cost === "number" ? p.max_cost : undefined,
-    };
+    // Keep every numeric field the node advertises. Dropping fields here
+    // (e.g. max_completion_cost) silently mixes route-level and model-level
+    // numbers in the deposit gate, mis-sizing the reserve in both directions.
+    const parsed: Record<string, number> = {};
+    for (const [key, value] of Object.entries(
+      pricing as Record<string, unknown>
+    )) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        parsed[key] = value;
+      }
+    }
+    if (Object.keys(parsed).length > 0) {
+      metadata.sats_pricing = parsed as ModelPathSatsPricing;
+    }
   }
   if (typeof record.context_length === "number") {
     metadata.context_length = record.context_length;

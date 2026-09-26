@@ -29,6 +29,7 @@ import {
   MODEL_PATH_HEADER,
   resolveDeepSeekModelPathSelectors,
   sameNode,
+  type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 
 function hasModelPathHeader(headers?: Record<string, string>): boolean {
@@ -96,11 +97,7 @@ export interface ResolvedContext {
    */
   modelPath?: {
     selector: string;
-    satsPricing?: {
-      prompt?: number;
-      completion?: number;
-      max_cost?: number;
-    };
+    satsPricing?: ModelPathSatsPricing;
     autoPinned: true;
   };
 }

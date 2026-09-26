@@ -22,6 +22,7 @@ import {
   getNodeModelPaths,
   modelPathCandidateKey,
   resolveDeepSeekModelPathSelectors,
+  type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
 
@@ -1121,11 +1122,7 @@ export class ProviderManager {
     Array<{
       baseUrl: string;
       selectors: string[];
-      satsPricing: Array<{
-        prompt?: number;
-        completion?: number;
-        max_cost?: number;
-      } | null>;
+      satsPricing: Array<ModelPathSatsPricing | null>;
       model: Model;
     }>
   > {
@@ -1164,30 +1161,41 @@ export class ProviderManager {
         if (!resolved) return null;
 
         // Whitelist order, dropping routes this node has on path-scoped
-        // cooldown, already attempted in this request (or does not
-        // advertise at all).
-        const selectors: string[] = [];
-        const satsPricing: Array<{
-          prompt?: number;
-          completion?: number;
-          max_cost?: number;
-        } | null> = [];
+        // cooldown (or does not advertise at all).
+        const available: Array<{
+          selector: string;
+          pricing: ModelPathSatsPricing | null;
+        }> = [];
         for (let i = 0; i < resolved.selectors.length; i++) {
           const selector = resolved.selectors[i];
           if (!selector) continue;
-          if (excludedModelPaths.has(modelPathCandidateKey(baseUrl, selector))) {
-            continue;
-          }
           const pathId = canonicalModelPath(selector);
           if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
-          selectors.push(selector);
-          satsPricing.push(resolved.satsPricing[i] ?? null);
+          available.push({ selector, pricing: resolved.satsPricing[i] ?? null });
         }
-        if (selectors.length === 0) return null;
+        if (available.length === 0) return null;
 
-        const price = satsPricing.find((p) => p != null);
+        // Rank by the price of the node's best available route —
+        // deliberately BEFORE the request-scoped excludeModelPaths filter.
+        // The failover chain is node-major (every route of the cheapest node
+        // before the next node), so a node's position must stay fixed as the
+        // request walks the chain and excludes candidates hop by hop;
+        // re-ranking on the cheapest remaining route would interleave the
+        // nodes (e.g. node1:deepseek -> node2:deepseek -> node1:fireworks
+        // whenever node2's first route undercuts node1's second).
+        const price =
+          available[0].pricing ??
+          available.find((a) => a.pricing != null)?.pricing;
         const cost =
           price?.completion ?? model.sats_pricing?.completion ?? Infinity;
+
+        const remaining = available.filter(
+          (a) =>
+            !excludedModelPaths.has(modelPathCandidateKey(baseUrl, a.selector))
+        );
+        if (remaining.length === 0) return null;
+        const selectors = remaining.map((a) => a.selector);
+        const satsPricing = remaining.map((a) => a.pricing);
         return { baseUrl, selectors, satsPricing, model, cost };
       })
     );
@@ -1339,16 +1347,23 @@ export class ProviderManager {
     apiMessages: any[],
     maxTokens?: number,
     requestBody?: Record<string, unknown>,
-    pathPricing?: { prompt?: number; completion?: number; max_cost?: number }
+    pathPricing?: ModelPathSatsPricing
   ): number {
     try {
-      // A pinned model path prices itself: the node advertises per-route
-      // sats pricing alongside the path, which replaces the model's
-      // aggregate pricing — prompt/completion rates AND the max_cost
-      // envelope. Routes of one model can differ sharply (e.g. 348 vs 682
-      // sats of envelope on one live node), so keeping the model-level
-      // aggregate here would under- or over-reserve the deposit.
+      // A pinned model path prices itself: the node advertises a full
+      // per-route sats pricing set alongside the path, which replaces the
+      // model's aggregate pricing wholesale — prompt/completion rates, the
+      // max_cost envelope, AND the max_prompt_cost / max_completion_cost
+      // allowances the gate discounts against. The gate formula is only
+      // self-consistent when the envelope and its allowances come from the
+      // same route; mixing the route's max_cost with the aggregate
+      // allowances mis-sizes the deposit in both directions (e.g. one live
+      // node: 537 sats reserved against an 804-sat gate without max_tokens,
+      // 243 sats against a ~4-sat true cost with max_tokens=4000).
       if (pathPricing) {
+        const routePricing = Object.fromEntries(
+          Object.entries(pathPricing).filter(([, value]) => value !== undefined)
+        );
         model = {
           ...model,
           sats_pricing: {
@@ -1356,15 +1371,7 @@ export class ProviderManager {
               string,
               unknown
             >),
-            ...(pathPricing.prompt !== undefined
-              ? { prompt: pathPricing.prompt }
-              : {}),
-            ...(pathPricing.completion !== undefined
-              ? { completion: pathPricing.completion }
-              : {}),
-            ...(pathPricing.max_cost !== undefined
-              ? { max_cost: pathPricing.max_cost }
-              : {}),
+            ...routePricing,
           },
         } as unknown as Model;
       }

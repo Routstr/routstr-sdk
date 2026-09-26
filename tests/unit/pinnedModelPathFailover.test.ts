@@ -457,6 +457,107 @@ describe("RoutstrClient pinned model-path failover", () => {
     ]);
   });
 
+  it("keeps the node-major chain order when route prices differ across nodes", async () => {
+    // Regression: the ranking used to re-sort nodes by their cheapest
+    // REMAINING route at each hop, so once the cheaper node's first route
+    // failed, the chain interleaved (A:deepseek -> B:deepseek -> A:fireworks)
+    // whenever B's first route undercut A's second. Node positions must stay
+    // fixed as the request walks the chain. Only the payment/accounting
+    // boundaries, discovery cache and transport are stubbed.
+    const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
+    clearModelPathsCache();
+    const client = makeClient(
+      createDiscovery({
+        getCachedModels: () => ({
+          [`${NODE_A}/`]: [makeModel()],
+          [`${NODE_B}/`]: [makeModel()],
+        }),
+      })
+    );
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(
+      0
+    );
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+
+    // Live-shape prices: A is cheapest overall, but A's second route is
+    // MORE expensive than B's first route (otrta/redsh1ft ordering).
+    const pricedPayload = (prices: Record<string, number>) => ({
+      data: [
+        {
+          id: "deepseek-v4.1-flash",
+          paths: Object.entries(prices).map(([path, completion]) => ({
+            path,
+            model: {
+              sats_pricing: { prompt: 0.0002, completion, max_cost: 700 },
+            },
+          })),
+        },
+      ],
+      updated_at: null,
+    });
+    const nodePrices: Record<string, Record<string, number>> = {
+      [NODE_A]: { [DEEPSEEK_SEL]: 0.000718, [FIREWORKS_SEL]: 0.000790 },
+      [NODE_B]: { [DEEPSEEK_SEL]: 0.000747, [FIREWORKS_SEL]: 0.000822 },
+    };
+
+    const attempts: Array<{ url: string; selector: string | null }> = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/models/paths")) {
+        const node = url.startsWith(NODE_A) ? NODE_A : NODE_B;
+        return new Response(JSON.stringify(pricedPayload(nodePrices[node])), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      attempts.push({
+        url,
+        selector: new Headers(init?.headers).get("x-routstr-model-path"),
+      });
+      if (attempts.length < 4) {
+        return new Response(INVALID_MODEL_PATH_BODY, {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("ok");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [] },
+      headers: { "x-routstr-model-path": DEEPSEEK_SEL },
+      baseUrl: `${NODE_A}/`,
+      mintUrl: MINT_URL,
+      modelId: "deepseek-v4.1-flash",
+      autoModelPath: { selector: DEEPSEEK_SEL },
+    });
+
+    expect(response.status).toBe(200);
+    // Node-major: every route of the cheaper node before the next node,
+    // even though B's first route (0.000747) undercuts A's second (0.000790).
+    expect(attempts).toEqual([
+      { url: `${NODE_A}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+      { url: `${NODE_A}/v1/chat/completions`, selector: FIREWORKS_SEL },
+      { url: `${NODE_B}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+      { url: `${NODE_B}/v1/chat/completions`, selector: FIREWORKS_SEL },
+    ]);
+  });
+
   it("jumps straight to the next node after a provider-wide failure", async () => {
     // A network failure is provider-wide (the host is down), matching the
     // cooldown scope rules: the node's other routes share the host, so the

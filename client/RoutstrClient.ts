@@ -25,6 +25,7 @@ import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
 import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey } from "../utils/modelPaths";
+import type { ModelPathSatsPricing } from "../utils/modelPaths";
 import {
   ProviderError,
   FailoverError,
@@ -87,11 +88,7 @@ const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
  */
 export interface ModelPathPin {
   selector: string;
-  satsPricing?: {
-    prompt?: number;
-    completion?: number;
-    max_cost?: number;
-  };
+  satsPricing?: ModelPathSatsPricing;
 }
 
 export interface RouteRequestParams {
@@ -1549,9 +1546,7 @@ export class RoutstrClient {
     // node.
     let nextProvider: string | null;
     let nextModelPathSelector: string | undefined;
-    let nextModelPathPricing:
-      | { prompt?: number; completion?: number; max_cost?: number }
-      | undefined;
+    let nextModelPathPricing: ModelPathSatsPricing | undefined;
     let nextTriedModelPaths: string[] | undefined;
     if (pinnedModelPath) {
       if (!params.autoModelPath) {

@@ -241,3 +241,101 @@ describe("per-route model-path pricing", () => {
     });
   });
 });
+
+
+describe("route-level allowances replace the model aggregate", () => {
+  // Live-shape numbers (ai.redsh1ft.com, fireworks route vs the model
+  // aggregate): the route's envelope is ~2x the aggregate, so mixing the
+  // route's max_cost with the aggregate allowances mis-sizes the deposit
+  // in both directions.
+  const AGGREGATE = {
+    prompt: 0.000187,
+    completion: 0.000747,
+    request: 0.001,
+    max_prompt_cost: 196,
+    max_completion_cost: 287,
+    max_cost: 411,
+  };
+  const ROUTE = {
+    prompt: 0.000274,
+    completion: 0.000822,
+    request: 0.001,
+    max_prompt_cost: 287,
+    max_completion_cost: 775,
+    max_cost: 804,
+  };
+  const makeModel = (): Model =>
+    ({
+      id: "deepseek-v4.1-flash",
+      name: "test",
+      sats_pricing: { ...AGGREGATE },
+      context_length: 1_048_576,
+    }) as unknown as Model;
+  const messages = [{ role: "user", content: "hello ".repeat(200) }];
+  const expected = (pathPricing: any, maxTokens?: number) =>
+    new ProviderManager(createRegistry()).getRequiredSatsForModel(
+      { ...makeModel(), sats_pricing: { ...ROUTE } } as Model,
+      messages,
+      maxTokens,
+      maxTokens === undefined ? {} : { messages, max_tokens: maxTokens },
+      pathPricing
+    );
+
+  it("does not under-reserve when the request has no max_tokens", () => {
+    const manager = new ProviderManager(createRegistry());
+    const mixed = manager.getRequiredSatsForModel(
+      makeModel(),
+      messages,
+      undefined,
+      { messages },
+      ROUTE as any
+    );
+    const routeOnly = expected(ROUTE);
+    expect(mixed).toBe(routeOnly);
+    // Guard the regression: the route's own allowances matter.
+    expect(mixed).toBeGreaterThan(600);
+  });
+
+  it("does not over-reserve when the request declares max_tokens", () => {
+    const manager = new ProviderManager(createRegistry());
+    const body = { messages, max_tokens: 4000 };
+    const mixed = manager.getRequiredSatsForModel(
+      makeModel(),
+      messages,
+      4000,
+      body,
+      ROUTE as any
+    );
+    const routeOnly = expected(ROUTE, 4000);
+    expect(mixed).toBe(routeOnly);
+    // The route's max_completion_cost allowance (775) unlocks the full
+    // max_tokens discount; the aggregate's (287) capped it and reserved
+    // ~60x the true cost.
+    expect(mixed).toBeLessThan(20);
+  });
+
+  it("parsePathMetadata keeps the full advertised sats_pricing", async () => {
+    const { parseModelPathsPayload } = await import("../../utils/modelPaths");
+    const payload = {
+      data: [
+        {
+          id: "deepseek-v4.1-flash",
+          paths: [
+            {
+              path: "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks",
+              model: { sats_pricing: { ...ROUTE, image: 0 } },
+            },
+          ],
+        },
+      ],
+      updated_at: null,
+    };
+    const parsed = parseModelPathsPayload(payload);
+    expect(parsed?.data[0]?.paths[0]?.model?.sats_pricing).toMatchObject({
+      max_cost: 804,
+      max_prompt_cost: 287,
+      max_completion_cost: 775,
+      request: 0.001,
+    });
+  });
+});
