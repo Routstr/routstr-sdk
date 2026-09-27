@@ -62,7 +62,7 @@ export class CashuSpender {
   private readonly logger: SdkLogger;
 
   /** Maximum number of retry attempts for a 404 "Refund not found" xcashu token
-   *  before removing it from the store. */
+   *  before receiving the original token directly. */
   private static readonly MAX_REFUND_RETRIES = 3;
 
   /** Interval (ms) between background refund retries for 404 xcashu tokens. */
@@ -613,8 +613,10 @@ export class CashuSpender {
           // If the provider responds with 404 "Refund not found", the xcashu
           // token may be temporarily unavailable on the provider side. Instead
           // of removing it immediately, increment tryCount and schedule a
-          // background retry. Only after MAX_REFUND_RETRIES attempts do we
-          // give up and remove the token from the store.
+          // background retry. After MAX_REFUND_RETRIES attempts the provider
+          // still has no record of redeeming the token, so it is most likely
+          // unspent: receive it directly, and only remove it once it has been
+          // received or the mint reports it spent.
           if (
             !fetchResult.success &&
             fetchResult.status === 404 &&
@@ -624,27 +626,47 @@ export class CashuSpender {
             const newTryCount = currentTryCount + 1;
 
             if (newTryCount >= CashuSpender.MAX_REFUND_RETRIES) {
-              // Exhausted all retries — remove the unrefundable token.
-              this.storageAdapter.removeXcashuToken(
-                baseUrl,
-                xcashuToken.token
-              );
+              const directReceive = await this.receiveToken(xcashuToken.token);
+              const alreadySpent = (directReceive.message ?? "")
+                .toLowerCase()
+                .includes("already spent");
+              if (directReceive.success || alreadySpent) {
+                this.storageAdapter.removeXcashuToken(
+                  baseUrl,
+                  xcashuToken.token
+                );
+                results.push(
+                  directReceive.success
+                    ? { baseUrl, token: xcashuToken.token, success: true }
+                    : {
+                        baseUrl,
+                        token: xcashuToken.token,
+                        success: false,
+                        error: fetchResult.error,
+                      }
+                );
+                this._log(
+                  "WARN",
+                  `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; ${directReceive.success ? `recovered original token directly, amount=${directReceive.amount}` : "original token already spent, removing it from store"}`
+                );
+                continue;
+              }
               this._log(
                 "WARN",
-                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; removing unrefundable xcashu token from store`
+                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; direct original-token recovery failed, keeping token: ${directReceive.message ?? "unknown error"}`
               );
-            } else {
-              // Keep the token and schedule a background retry.
-              this.storageAdapter.updateXcashuTokenTryCount(
-                xcashuToken.token,
-                newTryCount
-              );
-              this._log(
-                "WARN",
-                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl}; tryCount=${newTryCount}/${CashuSpender.MAX_REFUND_RETRIES}, will retry in ${CashuSpender.REFUND_RETRY_INTERVAL_MS / 1000}s`
-              );
-              this._startRefundRetryInterval(mintUrl);
             }
+
+            // Keep the token and schedule a background retry.
+            this.storageAdapter.updateXcashuTokenTryCount(
+              xcashuToken.token,
+              newTryCount
+            );
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl}; tryCount=${newTryCount}/${CashuSpender.MAX_REFUND_RETRIES}, will retry in ${CashuSpender.REFUND_RETRY_INTERVAL_MS / 1000}s`
+            );
+            this._startRefundRetryInterval(mintUrl);
 
             results.push({
               baseUrl,

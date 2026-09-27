@@ -503,6 +503,72 @@ describe("CashuSpender background redemption recovery", () => {
     expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, token);
     expect(results).toEqual([{ baseUrl: BASE_URL, token, success: true }]);
   });
+
+  it.each([
+    { outcome: "received", receive: { success: true }, removed: true },
+    { outcome: "already spent", receive: { success: false, message: "Token already spent." }, removed: true },
+    { outcome: "mint unreachable", receive: { success: false, message: "fetch failed" }, removed: false },
+  ])("receives the original token after the last 404 Refund not found: $outcome", async ({ receive, removed }) => {
+    const token = "cashu_never_redeemed";
+    const store = storage();
+    store.getXcashuTokens = () => ({
+      [BASE_URL]: [{ token, tryCount: 2 }],
+    });
+    store.updateXcashuTokenTryCount = vi.fn();
+    const balanceManager = {
+      fetchRefundToken: vi.fn().mockResolvedValue({
+        success: false,
+        status: 404,
+        error: "API key refund failed: Refund not found",
+        parsedError: parseCoreError('{"detail":"Refund not found"}', 404),
+      }),
+    } as any;
+    const spender = new CashuSpender(wallet(), store, discovery(), balanceManager);
+    vi.spyOn(spender as any, "_startRefundRetryInterval").mockImplementation(() => {});
+    const receiveSpy = vi.spyOn(spender, "receiveToken").mockResolvedValue({
+      amount: 100,
+      unit: "sat",
+      ...receive,
+    });
+
+    const results = await spender.refundXcashuTokens(MINT_URL);
+
+    expect(receiveSpy).toHaveBeenCalledWith(token);
+    expect(results).toEqual([
+      expect.objectContaining({ token, success: receive.success }),
+    ]);
+    if (removed) {
+      expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, token);
+      expect(store.updateXcashuTokenTryCount).not.toHaveBeenCalled();
+    } else {
+      expect(store.removeXcashuToken).not.toHaveBeenCalled();
+      expect(store.updateXcashuTokenTryCount).toHaveBeenCalledWith(token, 3);
+    }
+  });
+
+  it("does not receive the original token before the last 404 Refund not found", async () => {
+    const token = "cashu_maybe_in_flight";
+    const store = storage();
+    store.getXcashuTokens = () => ({
+      [BASE_URL]: [{ token, tryCount: 0 }],
+    });
+    const balanceManager = {
+      fetchRefundToken: vi.fn().mockResolvedValue({
+        success: false,
+        status: 404,
+        error: "API key refund failed: Refund not found",
+        parsedError: parseCoreError('{"detail":"Refund not found"}', 404),
+      }),
+    } as any;
+    const spender = new CashuSpender(wallet(), store, discovery(), balanceManager);
+    vi.spyOn(spender as any, "_startRefundRetryInterval").mockImplementation(() => {});
+    const receiveSpy = vi.spyOn(spender, "receiveToken");
+
+    await spender.refundXcashuTokens(MINT_URL);
+
+    expect(receiveSpy).not.toHaveBeenCalled();
+    expect(store.removeXcashuToken).not.toHaveBeenCalled();
+  });
 });
 
 describe("BalanceManager standalone refund recovery", () => {
