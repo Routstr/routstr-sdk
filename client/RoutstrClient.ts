@@ -2254,6 +2254,26 @@ export class RoutstrClient {
           }
         }
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+
+        // This token is now the only credential for its deposit, so it must be
+        // stored before the provider sees it. If it cannot be stored, give the
+        // proofs back to the wallet instead of paying with it.
+        if (parentApiKey?.key === spendResult.token) {
+          try {
+            await this.storageAdapter.flush?.();
+          } catch (error) {
+            const receiveResult = await this.cashuSpender.receiveToken(
+              spendResult.token
+            );
+            if (
+              receiveResult.success &&
+              this.storageAdapter.getApiKey(baseUrl)?.key === spendResult.token
+            ) {
+              this.storageAdapter.removeApiKey(baseUrl);
+            }
+            throw error;
+          }
+        }
       } else {
         this._log(
           "DEBUG",

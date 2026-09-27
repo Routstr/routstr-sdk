@@ -604,6 +604,7 @@ export class BalanceManager {
       // outcome is known, so a refund sweep can still recover it when both the
       // top-up and the direct recovery below fail.
       this.storageAdapter.addXcashuToken(baseUrl, cashuToken);
+      await this.storageAdapter.flush?.();
 
       const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
@@ -662,8 +663,8 @@ export class BalanceManager {
       };
     } catch (error) {
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
-      if (cashuToken) {
-        await this._recoverFailedTopUp(cashuToken);
+      if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
+        this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       }
 
       return this._handleTopUpError(error, mintUrl, requestId);
