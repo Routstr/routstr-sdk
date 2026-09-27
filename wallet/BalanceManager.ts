@@ -600,6 +600,10 @@ export class BalanceManager {
       }
 
       cashuToken = tokenResult.token;
+      // The wallet no longer holds these proofs. Store the token until the
+      // outcome is known, so a refund sweep can still recover it when both the
+      // top-up and the direct recovery below fail.
+      this.storageAdapter.addXcashuToken(baseUrl, cashuToken);
 
       const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
@@ -617,6 +621,9 @@ export class BalanceManager {
           this.logger.warn(
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
           );
+        }
+        if (recoveredToken || !canRecover) {
+          this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
         }
 
         // A foreign-mint swap failure can be retried against the same provider
@@ -647,6 +654,7 @@ export class BalanceManager {
         };
       }
 
+      this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       return {
         success: true,
         toppedUpAmount: amount,

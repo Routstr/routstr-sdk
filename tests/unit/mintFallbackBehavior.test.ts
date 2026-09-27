@@ -12,6 +12,8 @@ const storage = {
   getApiKey: () => null,
   getApiKeyDistribution: () => [],
   getXcashuTokens: () => ({}),
+  addXcashuToken: () => {},
+  removeXcashuToken: () => {},
   getAllApiKeys: () => [],
 } as unknown as StorageAdapter;
 
