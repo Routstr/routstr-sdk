@@ -80,6 +80,9 @@ export interface XCashuTokenEntry {
 }
 
 export interface StorageAdapter {
+  /** Wait for API key and token writes to reach storage; rejects if one failed. */
+  flush?(): Promise<void>;
+
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
 

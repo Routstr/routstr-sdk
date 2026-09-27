@@ -13,6 +13,9 @@ export interface SdkStoreOptions {
 }
 
 export interface SdkStorageStore extends SdkStorageState {
+  /** Wait for API key and token writes to reach storage. Retries a write that
+   *  failed, and rejects while storage keeps failing. */
+  flush: () => Promise<void>;
   setNostrQueryLastUpdate: (value: Record<string, number>) => void;
   setModelsFromAllProviders: (value: Record<string, Model[]>) => void;
   setLastUsedModel: (value: string | null) => void;
@@ -97,8 +100,12 @@ export interface SdkStorageStore extends SdkStorageState {
 /** Store type returned after async initialization */
 export type SdkStore = StoreApi<SdkStorageStore>;
 
-const createEmptyStore = (driver: StorageDriver): SdkStore =>
+const createEmptyStore = (
+  driver: StorageDriver,
+  flush: () => Promise<void>
+): SdkStore =>
   createStore<SdkStorageStore>((set, get) => ({
+    flush,
     nostrQueryLastUpdate: {},
     setNostrQueryLastUpdate: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, value);
@@ -612,13 +619,48 @@ const hydrateStoreFromDriver = async (
   });
 };
 
+// Keys holding money or the credentials to spend it, and their state field.
+const CREDENTIAL_KEYS = {
+  [SDK_STORAGE_KEYS.API_KEYS]: "apiKeys",
+  [SDK_STORAGE_KEYS.CHILD_KEYS]: "childKeys",
+  [SDK_STORAGE_KEYS.XCASHU_TOKENS]: "xcashuTokens",
+  [SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS]: "cachedReceiveTokens",
+} as const;
+type CredentialKey = keyof typeof CREDENTIAL_KEYS;
+
 export const createSdkStore = ({
   driver,
 }: SdkStoreOptions): { store: SdkStore; hydrate: Promise<void> } => {
-  const store = createEmptyStore(driver);
+  // Setters write without waiting. Keep the latest credential write per key
+  // so flush() can wait for it, and retry it from memory if it failed.
+  const latestWrites = new Map<CredentialKey, Promise<void>>();
+  const trackedDriver: StorageDriver = {
+    getItem: (key, defaultValue) => driver.getItem(key, defaultValue),
+    removeItem: (key) => driver.removeItem(key),
+    setItem: (key, value) => {
+      const write = driver.setItem(key, value);
+      if (key in CREDENTIAL_KEYS) {
+        latestWrites.set(key as CredentialKey, write);
+        write.catch((error) => {
+          console.error(`[sdk store] write failed for "${key}":`, error);
+        });
+      }
+      return write;
+    },
+  };
+  const flush = async (): Promise<void> => {
+    await Promise.all(
+      [...latestWrites].map(([key, write]) =>
+        write.catch(() =>
+          trackedDriver.setItem(key, store.getState()[CREDENTIAL_KEYS[key]])
+        )
+      )
+    );
+  };
+  const store = createEmptyStore(trackedDriver, flush);
   return {
     store,
-    hydrate: hydrateStoreFromDriver(store, driver),
+    hydrate: hydrateStoreFromDriver(store, trackedDriver),
   };
 };
 
@@ -680,6 +722,7 @@ export const createDiscoveryAdapterFromStore = (
 export const createStorageAdapterFromStore = (
   store: SdkStore
 ): StorageAdapter => ({
+  flush: () => store.getState().flush(),
   getApiKeyDistribution: () => {
     const apiKeys = store.getState().apiKeys;
     const distributionMap: Record<

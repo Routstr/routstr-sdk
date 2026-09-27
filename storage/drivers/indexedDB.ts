@@ -116,6 +116,8 @@ export const createIndexedDBDriver = (
 
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
+          // A quota failure aborts the transaction without an error event.
+          tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
         });
       } catch (error) {
         console.error(`IndexedDB setItem failed for key "${key}":`, error);
