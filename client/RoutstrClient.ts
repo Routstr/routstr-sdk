@@ -1216,10 +1216,7 @@ export class RoutstrClient {
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
             if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-              if (storedApiKeyEntry) {
-                this.storageAdapter.removeApiKey(baseUrl);
-              }
-              this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+              this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
             }
             retryToken = latestBalanceInfo.apiKey;
           }
@@ -1750,8 +1747,7 @@ export class RoutstrClient {
           storedApiKeyEntry?.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
-          this.storageAdapter.removeApiKey(baseUrl);
-          this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+          this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(
@@ -2360,6 +2356,19 @@ export class RoutstrClient {
       tokenBalanceUnknown: false,
       selectedMintUrl: spendResult.selectedMintUrl,
     };
+  }
+
+  /**
+   * Swap the stored API key in one write where the adapter supports it, so
+   * storage never holds no key for a funded provider.
+   */
+  private _replaceApiKey(baseUrl: string, key: string): void {
+    if (this.storageAdapter.replaceApiKey) {
+      this.storageAdapter.replaceApiKey(baseUrl, key);
+      return;
+    }
+    this.storageAdapter.removeApiKey(baseUrl);
+    this.storageAdapter.setApiKey(baseUrl, key);
   }
 
   /**

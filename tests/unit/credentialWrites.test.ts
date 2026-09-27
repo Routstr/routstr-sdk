@@ -270,3 +270,56 @@ describe("paying with stored credentials", () => {
     expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER)).toEqual([]);
   });
 });
+
+describe("swapping a bootstrap key for the provider's key", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // Every value written for api_keys, in order.
+  function recordingDriver() {
+    const disk = createMemoryDriver();
+    const writes: Array<Array<{ baseUrl: string; key: string }>> = [];
+    const driver: StorageDriver = {
+      ...disk,
+      setItem: async (key, value) => {
+        if (key === SDK_STORAGE_KEYS.API_KEYS) writes.push(value as any);
+        await disk.setItem(key, value);
+      },
+    };
+    return { driver, writes };
+  }
+
+  it("replaceApiKey swaps the key in a single write", async () => {
+    const { driver, writes } = recordingDriver();
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
+    const storage = createStorageAdapterFromStore(store);
+    storage.setApiKey(PROVIDER, "cashu_bootstrap");
+    writes.length = 0;
+
+    storage.replaceApiKey!(PROVIDER, "sk-canonical");
+
+    expect(writes).toEqual([
+      [expect.objectContaining({ baseUrl: PROVIDER, key: "sk-canonical" })],
+    ]);
+  });
+
+  it("never stores an empty key list while swapping after a request", async () => {
+    const { driver, writes } = recordingDriver();
+    const c = await client(driver);
+    vi.spyOn(c.routstr.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 10,
+      reserved: 0,
+      unit: "sat",
+      apiKey: "sk-canonical",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ choices: [] })));
+
+    await c.request();
+
+    expect(c.storage.getApiKey(PROVIDER)?.key).toBe("sk-canonical");
+    expect(writes.map((keys) => keys.map((entry) => entry.key))).not.toContainEqual([]);
+  });
+});

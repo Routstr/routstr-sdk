@@ -83,6 +83,9 @@ export interface StorageAdapter {
   /** Wait for API key and token writes to reach storage; rejects if one failed. */
   flush?(): Promise<void>;
 
+  /** Replace the API key for a provider in one write. */
+  replaceApiKey?(baseUrl: string, key: string): void;
+
   /** Save provider info to cache */
   saveProviderInfo(baseUrl: string, info: ProviderInfo): void;
 
