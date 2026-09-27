@@ -159,7 +159,7 @@ async function client(driver: StorageDriver) {
     getBalances: async () => ({ [MINT]: 100 }),
     getMintUnits: () => ({ [MINT]: "sat" }),
     getActiveMintUrl: () => MINT,
-    sendToken: vi.fn(async () => TOKEN),
+    sendToken: vi.fn<WalletAdapter["sendToken"]>(async () => TOKEN),
     receiveToken: vi.fn(async () => ({ success: true, amount: 10, unit: "sat" })),
   } satisfies WalletAdapter;
   const routstr = new RoutstrClient(wallet, storage, discovery, "min", "apikeys", {
@@ -321,5 +321,140 @@ describe("swapping a bootstrap key for the provider's key", () => {
 
     expect(c.storage.getApiKey(PROVIDER)?.key).toBe("sk-canonical");
     expect(writes.map((keys) => keys.map((entry) => entry.key))).not.toContainEqual([]);
+  });
+});
+
+describe("handing a token over from the wallet", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const onDisk = async (disk: ReturnType<typeof createMemoryDriver>) => {
+    const reloaded = createSdkStore({ driver: disk });
+    await reloaded.hydrate;
+    return createStorageAdapterFromStore(reloaded.store)
+      .getXcashuTokensForBaseUrl(PROVIDER)
+      .map((entry) => entry.token);
+  };
+
+  it("stores the token before the wallet drops its own copy", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
+    control.release();
+    const c = await client(driver);
+    let storedAtHandoff: string[] = [];
+    c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
+      await persistToken?.(TOKEN);
+      storedAtHandoff = await onDisk(control.disk);
+      return TOKEN;
+    });
+
+    const result = await c.routstr
+      .getBalanceManager()
+      .createProviderToken({ mintUrl: MINT, baseUrl: PROVIDER, amount: 10 });
+
+    expect(result.success).toBe(true);
+    expect(storedAtHandoff).toEqual([TOKEN]);
+  });
+
+  it("refuses the handover when the token cannot be stored, so the wallet keeps it", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
+    control.broken = true;
+    const c = await client(driver);
+    let walletKeptCopy = false;
+    c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
+      try {
+        await persistToken?.(TOKEN);
+      } catch (error) {
+        walletKeptCopy = true;
+        throw error;
+      }
+      return TOKEN;
+    });
+    const network = vi.fn(async () => Response.json({ choices: [] }));
+    vi.stubGlobal("fetch", network);
+
+    await expect(c.request()).rejects.toThrow("QuotaExceededError");
+
+    expect(walletKeptCopy).toBe(true);
+    expect(network).not.toHaveBeenCalled();
+    expect(c.wallet.receiveToken).not.toHaveBeenCalled();
+    expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER)).toEqual([]);
+  });
+
+  it("drops the handover copy once a new API key holding it is stored", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
+    control.release();
+    const c = await client(driver);
+    c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
+      await persistToken?.(TOKEN);
+      return TOKEN;
+    });
+    const storedDuringRequest: string[][] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      storedDuringRequest.push(await onDisk(control.disk));
+      return Response.json({ choices: [] });
+    }));
+
+    await c.request();
+
+    expect(c.storage.getApiKey(PROVIDER)?.key).toBe(TOKEN);
+    expect(storedDuringRequest).toEqual([[]]);
+  });
+
+  it("drops the handover copy when a new API key is given back to the wallet", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.API_KEYS);
+    control.broken = true;
+    const c = await client(driver);
+    c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
+      await persistToken?.(TOKEN);
+      return TOKEN;
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ choices: [] })));
+
+    await expect(c.request()).rejects.toThrow("QuotaExceededError");
+
+    expect(c.wallet.receiveToken).toHaveBeenCalledWith(TOKEN);
+    expect(c.storage.getApiKey(PROVIDER)).toBeNull();
+    expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER)).toEqual([]);
+  });
+
+  it("drops the losing handover copy when two requests create a key at once", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
+    control.release();
+    const c = await client(driver);
+    let sends = 0;
+    let bothSent!: () => void;
+    const bothStarted = new Promise<void>((resolve) => (bothSent = resolve));
+    c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
+      const token = `cashuB_race_${++sends}`;
+      if (sends === 2) bothSent();
+      await bothStarted;
+      await persistToken?.(token);
+      return token;
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ choices: [] })));
+
+    await Promise.all([c.request(), c.request()]);
+
+    const winner = c.storage.getApiKey(PROVIDER)?.key;
+    expect(c.wallet.receiveToken).toHaveBeenCalledOnce();
+    expect(c.wallet.receiveToken.mock.calls[0][0]).not.toBe(winner);
+    expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER)).toEqual([]);
+  });
+
+  it("keeps a single stored copy of an xcashu token", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
+    control.release();
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
+    const storage = createStorageAdapterFromStore(store);
+
+    storage.addXcashuToken(PROVIDER, TOKEN);
+    storage.addXcashuToken(PROVIDER, TOKEN);
+
+    expect(storage.getXcashuTokensForBaseUrl(PROVIDER).map((e) => e.token)).toEqual([TOKEN]);
   });
 });

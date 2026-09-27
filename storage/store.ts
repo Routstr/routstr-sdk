@@ -958,6 +958,7 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().xcashuTokens;
     const existing = tokens[normalized] || [];
+    if (existing.some((entry) => entry.token === token)) return;
     const next = { ...tokens };
     next[normalized] = [
       ...existing,

@@ -27,12 +27,15 @@ export interface WalletAdapter {
    * @param mintUrl The mint URL to send from
    * @param amount Amount in sats
    * @param p2pkPubkey Optional P2PK public key
+   * @param persistToken Stores the token in the SDK. Await it before dropping
+   *   the wallet's own copy of the sent proofs; keep that copy if it rejects.
    * @returns Encoded cashu token string
    */
   sendToken(
     mintUrl: string,
     amount: number,
-    p2pkPubkey?: string
+    p2pkPubkey?: string,
+    persistToken?: (token: string) => Promise<void>
   ): Promise<string>;
 
   /**

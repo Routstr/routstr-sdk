@@ -2231,6 +2231,7 @@ export class RoutstrClient {
               spendResult.token
             );
             if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
               this._log(
                 "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
@@ -2261,14 +2262,18 @@ export class RoutstrClient {
             const receiveResult = await this.cashuSpender.receiveToken(
               spendResult.token
             );
-            if (
-              receiveResult.success &&
-              this.storageAdapter.getApiKey(baseUrl)?.key === spendResult.token
-            ) {
-              this.storageAdapter.removeApiKey(baseUrl);
+            if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+              if (
+                this.storageAdapter.getApiKey(baseUrl)?.key === spendResult.token
+              ) {
+                this.storageAdapter.removeApiKey(baseUrl);
+              }
             }
             throw error;
           }
+          // The key record now holds the token; drop the wallet handover copy.
+          this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
         }
       } else {
         this._log(

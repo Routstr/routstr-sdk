@@ -788,7 +788,17 @@ export class BalanceManager {
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
-          p2pkPubkey
+          p2pkPubkey,
+          async (sentToken) => {
+            this.storageAdapter.addXcashuToken(baseUrl, sentToken);
+            try {
+              await this.storageAdapter.flush?.();
+            } catch (error) {
+              // The wallet keeps its own copy when this rejects.
+              this.storageAdapter.removeXcashuToken(baseUrl, sentToken);
+              throw error;
+            }
+          }
         );
         this.logger.log(`createProviderToken: success from mint=${candidateMint}`);
         return {
