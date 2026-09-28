@@ -61,6 +61,7 @@ export const DEEPSEEK_AUTO_MODEL_ID = "deepseek-v4.1-flash";
 export const DEEPSEEK_AUTO_NODE_URLS: readonly string[] = [
   "https://ai.redsh1ft.com",
   "https://routstr.otrta.me",
+  "https://api.nonkycai.com",
 ];
 
 /** The preferred automatic-selection node (first of DEEPSEEK_AUTO_NODE_URLS). */
