@@ -44,6 +44,8 @@ export interface RouteRequestOptions {
   path?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; explicit path headers still work. */
+  autoModelPath?: boolean;
   /**
    * Optional per-request secret scoping Tinfoil's prompt cache. Prefer a
    * stable, opaque, per-end-user value in multi-user deployments so users
@@ -145,8 +147,8 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     requestResponseLogSink,
   } = options;
 
-  // Delegate to shared context resolution. For the auto-pinned DeepSeek
-  // model it ranks the whitelisted model-path nodes ("get baseUrl for model
+  // Delegate to shared context resolution. When explicitly enabled for the
+  // DeepSeek model it ranks the whitelisted model-path nodes ("get baseUrl for model
   // path") and returns the selector to pin; every other model — and every
   // request whose caller pinned its own path — resolves exactly as before.
   const { client: resolvedClient, baseUrl, mintUrl, selectedModel, modelPath } =
@@ -154,6 +156,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
       modelId,
       forcedProvider,
       inputHeaders: headers,
+      autoModelPath: options.autoModelPath,
       walletAdapter,
       storageAdapter,
       discoveryAdapter,

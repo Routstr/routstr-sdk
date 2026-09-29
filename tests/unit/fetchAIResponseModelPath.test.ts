@@ -163,6 +163,24 @@ afterEach(() => {
 });
 
 describe("fetchAIResponse model-path pinning", () => {
+  it("routes normally without the opt-in", async () => {
+    const fetchMock = stubPathsFetch({});
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    const routeRequest = vi.spyOn(RoutstrClient.prototype, "routeRequest")
+      .mockResolvedValue(new Response("data: [DONE]\\n\\n"));
+
+    await fetchAIResponse(
+      { modelId: DEEPSEEK_AUTO_MODEL_ID, messageHistory: [], ...deps },
+      makeCallbacks(),
+      makeFetchDeps()
+    );
+
+    expect(routeRequest).toHaveBeenCalledOnce();
+    expect(routeRequest.mock.calls[0][0].headers).toBeUndefined();
+    expect(routeRequest.mock.calls[0][0].autoModelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("threads the auto-pinned selector and per-route pricing into the request", async () => {
     stubPathsFetch({
       [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0013 }]),
@@ -179,6 +197,7 @@ describe("fetchAIResponse model-path pinning", () => {
     await fetchAIResponse(
       {
         modelId: DEEPSEEK_AUTO_MODEL_ID,
+        autoModelPath: true,
         messageHistory: [],
         ...deps,
       },
@@ -187,6 +206,9 @@ describe("fetchAIResponse model-path pinning", () => {
     );
 
     expect(routeRequest).toHaveBeenCalledOnce();
+    expect(vi.mocked(resolveRequestContext)).toHaveBeenCalledWith(
+      expect.objectContaining({ autoModelPath: true })
+    );
     const call = routeRequest.mock.calls[0][0];
     // The real resolver picked the cheaper node and pinned its selector.
     expect(call.baseUrl).toBe(`${NODE_B}/`);
@@ -217,6 +239,7 @@ describe("fetchAIResponse model-path pinning", () => {
     await fetchAIResponse(
       {
         modelId: DEEPSEEK_AUTO_MODEL_ID,
+        autoModelPath: true,
         messageHistory: [],
         headers: { "x-routstr-model-path": PPQ_SELECTOR },
         ...deps,
@@ -257,6 +280,7 @@ describe("fetchAIResponse model-path pinning", () => {
     await fetchAIResponse(
       {
         modelId: DEEPSEEK_AUTO_MODEL_ID,
+        autoModelPath: true,
         messageHistory: [],
         ...makeDeps({}),
       },

@@ -47,6 +47,8 @@ export interface ResolveContextInput {
   /** Optional: caller-supplied request headers (an x-routstr-model-path
    * header here suppresses the SDK's automatic model-path pinning). */
   inputHeaders?: Record<string, string>;
+  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; caller-supplied path headers still work. */
+  autoModelPath?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching. */
@@ -115,6 +117,7 @@ export async function resolveRequestContext(
     modelId,
     forcedProvider,
     inputHeaders,
+    autoModelPath = false,
     walletAdapter,
     storageAdapter,
     discoveryAdapter,
@@ -201,6 +204,7 @@ export async function resolveRequestContext(
     // that node: the selector is resolved from that node's own advertised
     // paths, so the node is guaranteed to accept it.
     if (
+      autoModelPath === true &&
       !hasModelPathHeader(inputHeaders) &&
       typeof modelId === "string" &&
       modelId.trim().toLowerCase() === DEEPSEEK_AUTO_MODEL_ID &&
@@ -224,6 +228,7 @@ export async function resolveRequestContext(
       }
     }
   } else if (
+    autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
     modelId.trim().toLowerCase() === DEEPSEEK_AUTO_MODEL_ID

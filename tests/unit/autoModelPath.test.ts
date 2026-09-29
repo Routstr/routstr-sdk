@@ -117,6 +117,35 @@ afterEach(() => {
 });
 
 describe("resolveRequestContext model-path selection", () => {
+  it.each([undefined, false])("defaults to normal provider ranking when opt-in is %s", async (autoModelPath) => {
+    const fetchMock = stubPathsFetch({});
+    const deps = makeDeps({
+      [`${NODE_A}/`]: [makeModel(2)],
+      [`${NODE_B}/`]: [makeModel(1)],
+    });
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath,
+      ...deps,
+    });
+    expect(ctx.baseUrl).toBe(`${NODE_B}/`);
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-pin a forced node without opt-in", async () => {
+    const fetchMock = stubPathsFetch({});
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A,
+      ...deps,
+    });
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("pins the cheapest whitelisted node's preferred route for deepseek-v4.1-flash", async () => {
     stubPathsFetch({
       [NODE_A]: pathsPayload([
@@ -132,6 +161,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       ...deps,
     });
 
@@ -155,6 +185,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       forcedProvider: NODE_A,
       ...deps,
     });
@@ -174,6 +205,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       forcedProvider: "https://other.example/",
       ...deps,
     });
@@ -191,6 +223,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       inputHeaders: { "X-Routstr-Model-Path": PPQ_SELECTOR },
       ...deps,
     });
@@ -212,6 +245,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       ...deps,
     });
 
@@ -232,6 +266,7 @@ describe("resolveRequestContext model-path selection", () => {
 
     const ctx = await resolveRequestContext({
       modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
       torMode: true,
       ...deps,
     });
@@ -293,6 +328,30 @@ describe("routeRequests model-path passthrough", () => {
           satsPricing: { prompt: 0.001, completion: 0.0013, max_cost: 700 },
         },
       })
+    );
+  });
+
+  it("forwards opt-in to the shared resolver", async () => {
+    const { resolveRequestContext: mockedResolve } = await import(
+      "../../client/resolveRequestContext"
+    );
+    const client = { routeRequest: vi.fn().mockResolvedValue(new Response("ok")) };
+    vi.mocked(mockedResolve).mockResolvedValueOnce({
+      client,
+      baseUrl: `${NODE_A}/`,
+      mintUrl: "https://mint.example/",
+      selectedModel: makeModel(),
+    } as never);
+    await routeRequests({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
+      requestBody: { messages: [] },
+      walletAdapter: {} as never,
+      storageAdapter: {} as never,
+      discoveryAdapter: {} as never,
+    });
+    expect(vi.mocked(mockedResolve)).toHaveBeenCalledWith(
+      expect.objectContaining({ autoModelPath: true })
     );
   });
 

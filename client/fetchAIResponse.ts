@@ -75,6 +75,8 @@ export interface FetchOptions {
   maxTokens?: number;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /** Opt into automatic DeepSeek V4.1 Flash model-path selection for auto-discovery. Defaults to false; explicit path headers still work. */
+  autoModelPath?: boolean;
   /**
    * Optional secret scoping Tinfoil's prompt cache for this request. Prefer a
    * stable, opaque, per-end-user value in multi-user deployments.
@@ -194,6 +196,7 @@ export async function fetchAIResponse(
         // must suppress the SDK's automatic pinning (the caller pinned an
         // upstream explicitly — and never fails over).
         inputHeaders: headers,
+        autoModelPath: options.autoModelPath,
         walletAdapter,
         storageAdapter,
         discoveryAdapter,
