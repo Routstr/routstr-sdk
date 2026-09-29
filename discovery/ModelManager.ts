@@ -46,7 +46,12 @@ export const DEFAULT_NOSTR_RELAYS = [
 ];
 
 /** Kind 38425 review labels that mark a provider node as OK to route to. */
-const POSITIVE_REVIEW_LABELS = new Set(["trusted", "verified", "lgtm"]);
+const POSITIVE_REVIEW_LABELS = new Set([
+  "trusted",
+  "verified",
+  "lgtm",
+  "lgtm2",
+]);
 
 /** Kind 38425 review labels that mark a provider node as unsafe to route to. */
 const NEGATIVE_REVIEW_LABELS = new Set([
@@ -868,8 +873,8 @@ export class ModelManager {
    *
    * Review events are expected to have:
    * - `node`: the reviewed 38421 provider event pubkey
-   * - `t`: review label, where `lgtm`/`trusted`/`verified` mean the node looks
-   *   good and `avoid`/`suspicious`/`blacklisted`/`removed` mean it is unsafe
+   * - `t`: review label, where `lgtm`/`lgtm2`/`trusted`/`verified` mean the node
+   *   looks good and `avoid`/`suspicious`/`blacklisted`/`removed` mean it is unsafe
    *
    * Kind 38425 is not replaceable, so several review events can exist for one
    * node; the newest event (by `created_at`) is authoritative.
