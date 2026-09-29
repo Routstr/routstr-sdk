@@ -76,6 +76,9 @@ export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.4;
 
+/** Never put spendable credentials (including even a prefix) in SDK logs. */
+const REDACTED_CREDENTIAL = "[REDACTED]";
+
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
@@ -709,7 +712,8 @@ export class RoutstrClient {
         rawBody: requestBodyText,
       });
 
-      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+      // Request headers contain bearer credentials / x-cashu tokens. The
+      // request-response sink has its own header redaction; do not log raw headers.
 
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
@@ -880,7 +884,7 @@ export class RoutstrClient {
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
 
     // ── Handle token_already_spent ────────────────────────────────────
@@ -923,7 +927,7 @@ export class RoutstrClient {
     if (!tryNextProvider && this.mode === "xcashu" && xCashuRefundToken) {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
+        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token=${REDACTED_CREDENTIAL}`
       );
       recoveryAttempted = true;
       const receiveResult =
@@ -1342,7 +1346,7 @@ export class RoutstrClient {
     if (status === 401 && this.mode === "apikeys") {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${token}`
+        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
       );
       const latestBalanceInfo = await this.balanceManager.getTokenBalance(
         token,
@@ -1375,7 +1379,7 @@ export class RoutstrClient {
       if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
+          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
         const latestBalanceInfo = await this.balanceManager.getTokenBalance(
           token,
@@ -1403,13 +1407,10 @@ export class RoutstrClient {
           !latestBalanceInfo.balanceUnknown
         ) {
           if (this._isTransientRefundError(refundResult.message)) {
-            // Known transient refund failure: the upstream wallet refuses to
-            // refund a shared API key while other in-flight requests are still
-            // using it (HTTP 400 "Cannot refund key. There are ongoing
-            // requests for this api key."). The sats are still on the key and
-            // will be reclaimed by a later refund sweep — this is not a
-            // terminal provider failure, so fall through to markFailed() +
-            // findNextBestProvider() instead of throwing.
+            // A provider-wallet guard (recent/in-progress topup), or a
+            // provider refusing to refund a key with ongoing requests, is a
+            // transient refund skip. Preserve the key for a later sweep and
+            // continue provider failover instead of aborting this request.
             this._log(
               "WARN",
               `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
@@ -1828,6 +1829,7 @@ export class RoutstrClient {
     if (!message) return false;
     const lower = message.toLowerCase();
     return (
+      lower.startsWith("provider wallet operation locked;") ||
       lower.includes("ongoing requests for this api key") ||
       lower.includes("cannot refund key")
     );
@@ -1908,7 +1910,7 @@ export class RoutstrClient {
           "LATEST Balance",
           latestBalanceInfo.amount,
           latestBalanceInfo.reserved,
-          latestBalanceInfo.apiKey,
+          REDACTED_CREDENTIAL,
           baseUrl
         );
         const latestTokenBalance = latestBalanceInfo.balanceUnknown
@@ -2392,13 +2394,13 @@ export class RoutstrClient {
         } else {
           this._log(
             "DEBUG",
-            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
+            `[RoutstrClient] _spendToken: Cashu token created, token=${REDACTED_CREDENTIAL}`
           );
         }
 
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}, balance: ${spendResult.balance}`
         );
 
         try {
@@ -2434,7 +2436,7 @@ export class RoutstrClient {
       } else {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}`
+          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
       }
 
@@ -2503,7 +2505,7 @@ export class RoutstrClient {
     } else {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
+        `[RoutstrClient] _spendToken: Cashu token created, token=${REDACTED_CREDENTIAL}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
       // Store xcashu token using the storage adapter
       this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);
