@@ -1875,6 +1875,38 @@ export class RoutstrClient {
       });
     }
 
+    // Provider/infrastructure failure with the node's own envelope on hand:
+    // forward the last attempt's answer instead of flattening it into a generic
+    // FailoverError. routstrd bridges a returned Response verbatim but maps
+    // FailoverError to a 500, so throwing here is what turned a provider's
+    // useful 503/429 answer into "All providers failed".
+    //
+    // Deliberately scoped to failures that are the *provider's*, not the
+    // caller's:
+    //   * 4xx request/auth/model-path/payment errors keep their typed error. A
+    //     caller-pinned `invalid_model_path` (404) and a stale key (401) must
+    //     stay branchable, and a 402 must keep surfacing as a payment failure
+    //     (routstrd maps InsufficientBalanceError to a 402) rather than a
+    //     forwarded provider envelope.
+    //   * a network failure has no envelope at all (status -1).
+    const isProviderInfrastructureFailure =
+      status >= 500 || status === 424 || status === 429;
+    if (isProviderInfrastructureFailure) {
+      const passthrough = this._upstreamErrorResponse(
+        upstream,
+        responseBody,
+        baseUrl
+      );
+      if (passthrough) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: all providers exhausted; forwarding last upstream envelope ${status} from ${baseUrl}`
+        );
+        (passthrough as any).passthrough = true;
+        return passthrough;
+      }
+    }
+
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
