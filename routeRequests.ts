@@ -242,10 +242,13 @@ export async function routeRequests(
         : undefined,
     });
 
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
-    }
-
+    // A proxy caller forwards the node's own envelope (status + headers + body)
+    // verbatim. `client.routeRequest` has already recovered, failed over, or
+    // decided that this response IS the answer — an upstream request error it
+    // short-circuited, or the last provider's envelope at failover exhaustion.
+    // Both proxy consumers bridge a returned Response as-is (status + headers +
+    // piped body), so throwing here flattened a provider's useful 400 into a
+    // local 500 ("All providers failed").
     return response;
   } catch (error) {
     // Preserve typed SDK errors so callers (e.g. routstrd) can instanceof-check
