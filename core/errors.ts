@@ -231,6 +231,18 @@ export class InvalidTokenError extends CoreRedemptionError {
   }
 }
 
+/** Error thrown when provider trust-policy rejection exhausts failover. */
+export class UntrustedMintError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "UntrustedMintError",
+      400,
+      "Source Cashu mint is not accepted — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
 /** Error thrown after provider failover is exhausted for a Cashu wallet error. */
 export class CashuRedemptionError extends CoreRedemptionError {
   constructor(opts: CoreRedemptionErrorOptions) {

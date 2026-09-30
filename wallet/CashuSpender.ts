@@ -62,7 +62,7 @@ export class CashuSpender {
   private readonly logger: SdkLogger;
 
   /** Maximum number of retry attempts for a 404 "Refund not found" xcashu token
-   *  before removing it from the store. */
+   *  before moving its original token to cached receive storage. */
   private static readonly MAX_REFUND_RETRIES = 3;
 
   /** Interval (ms) between background refund retries for 404 xcashu tokens. */
@@ -95,25 +95,43 @@ export class CashuSpender {
         error instanceof Error ? error.message : String(error);
 
       if (errorMessage.includes("Failed to fetch mint")) {
-        const cachedTokens = this.storageAdapter.getCachedReceiveTokens();
-        const existingIndex = cachedTokens.findIndex((t) => t.token === token);
-        if (existingIndex === -1) {
-          const { amount, unit } = this._decodeTokenAmount(token);
-          this.storageAdapter.setCachedReceiveTokens([
-            ...cachedTokens,
-            {
-              token,
-              amount,
-              unit,
-              createdAt: Date.now(),
-            },
-          ]);
-        }
+        this.cacheReceiveToken(token);
       }
 
       const { amount, unit } = this._decodeTokenAmount(token);
       return { success: false, amount, unit, message: errorMessage };
     }
+  }
+
+  /** Preserve an unrecovered token without adding duplicate entries. */
+  cacheReceiveToken(token: string): void {
+    const cached = this.storageAdapter.getCachedReceiveTokens();
+    if (cached.some((entry) => entry.token === token)) return;
+    const { amount, unit } = this._decodeTokenAmount(token);
+    this.storageAdapter.setCachedReceiveTokens([
+      ...cached,
+      { token, amount, unit, createdAt: Date.now() },
+    ]);
+  }
+
+  /** Retry cached tokens; only successful receives are removed from storage. */
+  async recoverCachedReceiveTokens(): Promise<
+    { token: string; success: boolean }[]
+  > {
+    const results: { token: string; success: boolean }[] = [];
+    for (const entry of this.storageAdapter.getCachedReceiveTokens()) {
+      const result = await this.receiveToken(entry.token);
+      if (result.success) {
+        // Re-read so tokens cached during the receive are not overwritten.
+        this.storageAdapter.setCachedReceiveTokens(
+          this.storageAdapter
+            .getCachedReceiveTokens()
+            .filter((t) => t.token !== entry.token)
+        );
+      }
+      results.push({ token: entry.token, success: result.success });
+    }
+    return results;
   }
 
   private _decodeTokenAmount(token: string): {
@@ -580,12 +598,15 @@ export class CashuSpender {
 
           // For structured redemption failures, the provider-side refund was
           // attempted first. Try receiving the stored original token directly
-          // before scheduling another refund retry. Keep it in storage when
-          // both recovery paths fail so a later sweep can try again.
+          // before scheduling another refund retry. A missing refund can also
+          // mean the provider never accepted the token (e.g. untrusted mint).
+          // Keep the original proofs when both recovery paths fail.
           if (
             !fetchResult.success &&
-            fetchResult.parsedError &&
-            isHandledRedemptionError(fetchResult.parsedError)
+            ((fetchResult.parsedError &&
+              isHandledRedemptionError(fetchResult.parsedError)) ||
+              (fetchResult.status === 404 &&
+                (fetchResult.error || "").includes("Refund not found")))
           ) {
             const directReceive = await this.receiveToken(xcashuToken.token);
             if (directReceive.success) {
@@ -600,13 +621,13 @@ export class CashuSpender {
               });
               this._log(
                 "DEBUG",
-                `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError.type}/${fetchResult.parsedError.code}; recovered original token directly, amount=${directReceive.amount}`
+                `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError?.type ?? fetchResult.status}/${fetchResult.parsedError?.code ?? "unknown"}; recovered original token directly, amount=${directReceive.amount}`
               );
               continue;
             }
             this._log(
               "WARN",
-              `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError.type}/${fetchResult.parsedError.code}; direct original-token recovery also failed: ${directReceive.message ?? "unknown error"}`
+              `[CashuSpender] refundXcashuTokens: provider returned ${fetchResult.parsedError?.type ?? fetchResult.status}/${fetchResult.parsedError?.code ?? "unknown"}; direct original-token recovery also failed: ${directReceive.message ?? "unknown error"}`
             );
           }
 
@@ -614,7 +635,7 @@ export class CashuSpender {
           // token may be temporarily unavailable on the provider side. Instead
           // of removing it immediately, increment tryCount and schedule a
           // background retry. Only after MAX_REFUND_RETRIES attempts do we
-          // give up and remove the token from the store.
+          // stop provider polling and preserve the token in receive storage.
           if (
             !fetchResult.success &&
             fetchResult.status === 404 &&
@@ -624,14 +645,16 @@ export class CashuSpender {
             const newTryCount = currentTryCount + 1;
 
             if (newTryCount >= CashuSpender.MAX_REFUND_RETRIES) {
-              // Exhausted all retries — remove the unrefundable token.
+              // Stop polling the provider, but preserve the original proofs
+              // for cached-token recovery before removing the IOU reference.
+              this.cacheReceiveToken(xcashuToken.token);
               this.storageAdapter.removeXcashuToken(
                 baseUrl,
                 xcashuToken.token
               );
               this._log(
                 "WARN",
-                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; removing unrefundable xcashu token from store`
+                `[CashuSpender] refundXcashuTokens: 404 "Refund not found" for ${baseUrl} after ${newTryCount} retries; moving original token to cached receive storage`
               );
             } else {
               // Keep the token and schedule a background retry.

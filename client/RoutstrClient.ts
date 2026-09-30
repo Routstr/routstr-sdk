@@ -33,6 +33,7 @@ import {
   TokenAlreadySpentError,
   MintError,
   InvalidTokenError,
+  UntrustedMintError,
   CashuRedemptionError,
   TokenConsumedError,
   CoreInternalError,
@@ -42,6 +43,7 @@ import {
   CoreErrorCode,
   CoreErrorType,
   isInvalidTokenError,
+  isUntrustedMintError,
   isCashuRedemptionError,
   isTokenConsumedError,
   isCoreInternalError,
@@ -1777,6 +1779,7 @@ export class RoutstrClient {
     recoverySucceeded: boolean;
   }):
     | InvalidTokenError
+    | UntrustedMintError
     | CashuRedemptionError
     | TokenConsumedError
     | CoreInternalError {
@@ -1793,6 +1796,9 @@ export class RoutstrClient {
 
     if (isInvalidTokenError(opts.parsedError)) {
       return new InvalidTokenError(shared);
+    }
+    if (isUntrustedMintError(opts.parsedError)) {
+      return new UntrustedMintError(shared);
     }
     if (isCashuRedemptionError(opts.parsedError)) {
       return new CashuRedemptionError(shared);

@@ -133,3 +133,25 @@ describe("CashuSpender", () => {
     ).rejects.toThrow(InsufficientBalanceError);
   });
 });
+
+describe("cached receive recovery", () => {
+  it("removes successful tokens, keeps failures, and preserves concurrently cached entries", async () => {
+    let cached = ["good", "bad"].map((token) => ({ token, amount: 10, unit: "sat" as const, createdAt: 1 }));
+    const spender = new CashuSpender(createWallet({
+      receiveToken: async (token) => {
+        if (token === "good") {
+          spender.cacheReceiveToken("new");
+          return { success: true, amount: 10, unit: "sat" };
+        }
+        throw new Error("mint unavailable");
+      },
+    }), createStorage({
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (entries) => { cached = entries.map((entry) => ({ ...entry, createdAt: entry.createdAt ?? 1 })); },
+    }));
+    expect(await spender.recoverCachedReceiveTokens()).toEqual([
+      { token: "good", success: true }, { token: "bad", success: false },
+    ]);
+    expect(cached.map((entry) => entry.token)).toEqual(["bad", "new"]);
+  });
+});

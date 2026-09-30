@@ -6,6 +6,7 @@ import {
   CashuRedemptionError,
   CoreInternalError,
   InvalidTokenError,
+  UntrustedMintError,
   TokenConsumedError,
 } from "../../core/errors";
 import {
@@ -15,6 +16,7 @@ import {
   isCoreInternalError,
   isHandledRedemptionError,
   isInvalidTokenError,
+  isUntrustedMintError,
   isTokenConsumedError,
   parseCoreError,
 } from "../../core/errorTypes";
@@ -109,6 +111,11 @@ const body = (type: string, code: string) =>
 
 const cases = [
   {
+    type: CoreErrorType.UNTRUSTED_MINT,
+    code: CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT,
+    ErrorClass: UntrustedMintError,
+  },
+  {
     type: CoreErrorType.INVALID_TOKEN,
     code: CoreErrorCode.INVALID_CASHU_TOKEN,
     ErrorClass: InvalidTokenError,
@@ -148,6 +155,12 @@ describe("routstr-core redemption classification", () => {
     );
     expect(isCashuRedemptionError(parsed)).toBe(false);
     expect(isHandledRedemptionError(parsed)).toBe(false);
+  });
+
+  it("matches untrusted mint by both type and code", () => {
+    expect(isUntrustedMintError(parseCoreError(body("untrusted_mint", "cashu_untrusted_source_mint")))).toBe(true);
+    expect(isUntrustedMintError(parseCoreError(body("untrusted_mint", "unknown")))).toBe(false);
+    expect(isUntrustedMintError(parseCoreError(body("cashu_error", "cashu_untrusted_source_mint")))).toBe(false);
   });
 
   it("exposes focused helpers", () => {
@@ -472,7 +485,10 @@ describe("RoutstrClient purge unusable stored credential on permanent errors", (
 });
 
 describe("CashuSpender background redemption recovery", () => {
-  it("tries the provider refund first, then receives the stored original token", async () => {
+  it.each([
+    [CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED],
+    [CoreErrorType.UNTRUSTED_MINT, CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT],
+  ])("tries provider refund then original receive for %s", async (type, code) => {
     const token = "cashu_stored_original";
     const store = storage();
     store.getXcashuTokens = () => ({
@@ -484,7 +500,7 @@ describe("CashuSpender background redemption recovery", () => {
         status: 500,
         error: "consumed",
         parsedError: parseCoreError(
-          body(CoreErrorType.TOKEN_CONSUMED, CoreErrorCode.CASHU_TOKEN_CONSUMED),
+          body(type, code),
           500
         ),
       }),
@@ -510,7 +526,10 @@ describe("CashuSpender background redemption recovery", () => {
 });
 
 describe("BalanceManager standalone refund recovery", () => {
-  it("tries to receive a bootstrap Cashu credential after structured refund failure", async () => {
+  it.each([
+    [CoreErrorType.INVALID_TOKEN, CoreErrorCode.INVALID_CASHU_TOKEN],
+    [CoreErrorType.UNTRUSTED_MINT, CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT],
+  ])("recovers bootstrap credential after %s refund failure", async (type, code) => {
     const bootstrap = "cashu_bootstrap_key";
     const store = storage();
     store.getApiKey = () => ({
@@ -532,7 +551,7 @@ describe("BalanceManager standalone refund recovery", () => {
       status: 400,
       error: "invalid token",
       parsedError: parseCoreError(
-        body(CoreErrorType.INVALID_TOKEN, CoreErrorCode.INVALID_CASHU_TOKEN),
+        body(type, code),
         400
       ),
     });
@@ -550,8 +569,8 @@ describe("BalanceManager standalone refund recovery", () => {
       success: true,
       refundedAmount: 100_000,
       parsedError: {
-        type: CoreErrorType.INVALID_TOKEN,
-        code: CoreErrorCode.INVALID_CASHU_TOKEN,
+        type,
+        code,
       },
     });
   });
@@ -597,4 +616,122 @@ describe("BalanceManager structured top-up recovery", () => {
       code: CoreErrorCode.CASHU_TOKEN_CONSUMED,
     });
   });
+});
+
+describe("untrusted mint recovery regressions", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(["xcashu", "apikeys"] as const)("%s fails over after unsuccessful recovery and preserves the credential", async (mode) => {
+    const store = storage();
+    const token = mode === "xcashu" ? "cashu_original" : "canonical-api-key";
+    store.getApiKey = () => ({ key: token, balance: 100, lastUsed: null });
+    const providerManager = {
+      markFailed: vi.fn(),
+      findNextBestProvider: vi.fn(() => NEXT_URL),
+      getModelForProvider: vi.fn(async () => MODEL),
+      getRequiredSatsForModel: vi.fn(() => 100),
+    } as any;
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", mode, { providerManager });
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 0, unit: "sat" });
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({ amount: 100, balanceUnknown: false } as any);
+    vi.spyOn(client.getBalanceManager(), "refundApiKey").mockResolvedValue({ success: false, message: "refund failed" });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({ token: "fresh", tokenBalance: 100, tokenBalanceUnit: "sat" });
+    const request = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(new Response("ok"));
+
+    await (client as any)._handleErrorResponse(params(token), token, mode === "apikeys" ? 401 : 400,
+      undefined, undefined, body("untrusted_mint", "cashu_untrusted_source_mint"));
+
+    expect(request.mock.calls[0][0]).toMatchObject({ baseUrl: NEXT_URL, token: "fresh" });
+    expect(store.removeXcashuToken).not.toHaveBeenCalled();
+    expect(store.removeApiKey).not.toHaveBeenCalled();
+  });
+
+  it("receives the refund header first and does not receive the original after success", async () => {
+    const store = storage();
+    const providerManager = { markFailed: vi.fn(), findNextBestProvider: () => null, getFailedProviders: () => new Set([BASE_URL]) } as any;
+    const client = new RoutstrClient(wallet(), store, discovery(), "ERROR", "xcashu", { providerManager });
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: true, amount: 100, unit: "sat" });
+    await expect((client as any)._handleErrorResponse(params("cashu_original"), "cashu_original", 400,
+      undefined, "cashu_refund", body("untrusted_mint", "cashu_untrusted_source_mint")))
+      .rejects.toMatchObject({ name: "UntrustedMintError", recoverySucceeded: true });
+    expect(receive.mock.calls).toEqual([["cashu_refund"]]);
+    expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, "cashu_original");
+  });
+});
+
+describe("unrecovered topup persistence", () => {
+  it.each(["result", "throw", "fetch"])("does not spend a second token when recovery fails via %s", async (failure) => {
+    const store = storage();
+    let cached: any[] = [];
+    store.getCachedReceiveTokens = () => cached;
+    store.setCachedReceiveTokens = (entries: any[]) => { cached = entries; };
+    const w = wallet();
+    w.receiveToken = vi.fn(async () => {
+      if (failure === "throw") throw new Error("receive failed");
+      if (failure === "fetch") throw new Error("Failed to fetch mint");
+      return { success: false, amount: 100, unit: "sat", message: "receive failed" };
+    });
+    const manager = new BalanceManager(w, store, discovery());
+    const create = vi.spyOn(manager, "createProviderToken").mockResolvedValue({ success: true, token: "cashu_topup", selectedMintUrl: MINT_URL });
+    const parsedError = { type: "mint_error", code: "cashu_foreign_mint_swap_failed", raw: false };
+    vi.spyOn(manager as any, "_postTopUp").mockResolvedValue({ success: false, parsedError });
+    const result = await manager.topUp({ mintUrl: MINT_URL, baseUrl: BASE_URL, amount: 100, token: "api-key" });
+    expect(create).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ success: false, recoveredToken: false, parsedError });
+    expect(cached).toHaveLength(1);
+    expect(cached[0].token).toBe("cashu_topup");
+    await (manager as any)._recoverFailedTopUp("cashu_topup");
+    expect(cached).toHaveLength(1);
+  });
+});
+
+describe("404 IOU recovery", () => {
+  it.each([true, false])("tries direct receive before exhausting provider retries (success=%s)", async (success) => {
+    const store = storage();
+    let cached: any[] = [];
+    store.getCachedReceiveTokens = () => cached;
+    store.setCachedReceiveTokens = (entries: any[]) => { cached = entries; };
+    store.getXcashuTokens = () => ({ [BASE_URL]: [{ token: "cashu_original", tryCount: 2 }] });
+    const manager = { fetchRefundToken: vi.fn().mockResolvedValue({ success: false, status: 404, error: "Refund not found" }) } as any;
+    const spender = new CashuSpender(wallet(), store, discovery(), manager);
+    const receive = vi.spyOn(spender, "receiveToken").mockResolvedValue({ success, amount: 100, unit: "sat" });
+    const results = await spender.refundXcashuTokens(MINT_URL);
+    expect(receive).toHaveBeenCalledWith("cashu_original");
+    expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, "cashu_original");
+    expect(results[0].success).toBe(success);
+    expect(cached.map((t) => t.token)).toEqual(success ? [] : ["cashu_original"]);
+  });
+
+  it("leaves pending 425 refunds untouched", async () => {
+    const store = storage();
+    store.getXcashuTokens = () => ({ [BASE_URL]: [{ token: "cashu_original", tryCount: 0 }] });
+    store.updateXcashuTokenTryCount = vi.fn();
+    const spender = new CashuSpender(wallet(), store, discovery(), { fetchRefundToken: async () => ({ success: false, status: 425 }) } as any);
+    const receive = vi.spyOn(spender, "receiveToken");
+    await spender.refundXcashuTokens(MINT_URL);
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.removeXcashuToken).not.toHaveBeenCalled();
+    expect(store.updateXcashuTokenTryCount).not.toHaveBeenCalled();
+  });
+});
+
+it("keeps the 404 IOU before the polling limit when direct recovery fails", async () => {
+  vi.useFakeTimers();
+  try {
+    const store = storage();
+    store.getXcashuTokens = () => ({ [BASE_URL]: [{ token: "cashu_original", tryCount: 0 }] });
+    store.updateXcashuTokenTryCount = vi.fn();
+    const spender = new CashuSpender(wallet(), store, discovery(), {
+      fetchRefundToken: async () => ({ success: false, status: 404, error: "Refund not found" }),
+    } as any);
+    vi.spyOn(spender, "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat" });
+    await spender.refundXcashuTokens(MINT_URL);
+    expect(store.removeXcashuToken).not.toHaveBeenCalled();
+    expect(store.updateXcashuTokenTryCount).toHaveBeenCalledWith("cashu_original", 1);
+    expect(vi.getTimerCount()).toBe(1);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });
