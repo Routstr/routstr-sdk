@@ -502,12 +502,10 @@ export class RoutstrClient {
       selectedMintUrl,
     } = spendResult;
 
-    // Proactive topup (apikeys mode): if the key we are about to use has a
-    // balance snapshot below the request price, spin off a background topup
-    // BEFORE the request goes out. Fire-and-forget — the request proceeds in
-    // parallel, and if it still 402s, _handleErrorResponse joins the
-    // in-flight topup instead of stacking a second deposit.
-    this._spinOffTopupIfNeeded({
+    // Wait for a topup when the stored available balance cannot cover this
+    // request. Within the margin, refill in the background without delaying
+    // a request that can already succeed.
+    await this._topUpIfNeeded({
       token,
       baseUrl,
       mintUrl,
@@ -2136,16 +2134,16 @@ export class RoutstrClient {
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
   // Stored API-key snapshots contain both total and last-known reserved
-  // balance. The trigger and background task both trust this snapshot (no
-  // extra balance round-trip); the post-topup total is persisted from topUp's
+  // balance. The trigger and topup both trust this snapshot (no extra
+  // balance round-trip); the post-topup total is persisted from topUp's
   // toppedUpAmount so the stored snapshot isn't stale-low and re-triggering.
 
   /**
-   * Fire-and-forget topup spun off before a request when the API key's
-   * balance snapshot is below the request price. Never blocks the request
-   * and never throws.
+   * Wait for a topup if the snapshot cannot cover this request; otherwise
+   * refill the margin in the background. A failed topup does not prevent the
+   * request from trying the provider (the snapshot may be stale). Never throws.
    */
-  private _spinOffTopupIfNeeded(snapshot: {
+  private async _topUpIfNeeded(snapshot: {
     token: string;
     baseUrl: string;
     mintUrl: string;
@@ -2154,7 +2152,7 @@ export class RoutstrClient {
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
-  }): void {
+  }): Promise<void> {
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
 
@@ -2169,33 +2167,40 @@ export class RoutstrClient {
         : tokenReserved;
     const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
     // Maintain the margin up front: proactively top up whenever the available
-    // balance is at or below the request price scaled by TOPUP_MARGIN, so the
+    // balance is below the request price scaled by TOPUP_MARGIN, so the
     // key stays covered at the margin instead of reacting only after a 402.
     const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
     if (snapshotAvailableSats >= targetSats) return;
 
     const key = `${snapshot.baseUrl}:${snapshot.token}`;
-    // A topup is already in flight for this key — join it instead of
-    // stacking another deposit. This in-flight guard is the only
-    // concurrency control needed under heavy parallel request load.
-    if (this._inflightTopups.has(key)) return;
-
+    const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
-      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; spinning off background topup`
+      `[RoutstrClient] _topUpIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
     );
 
-    void this._topUpOnce(key, () => this._runProactiveTopup(snapshot)).catch(
-      (e: unknown) => {
-        // Unreachable in practice (_runProactiveTopup never throws), but a
-        // fire-and-forget promise must never surface an unhandled rejection.
+    // Concurrent callers join the same deposit. In the margin zone this is
+    // deliberately detached; below the request price we wait for it first.
+    const topup = this._topUpOnce(key, () => this._runProactiveTopup(snapshot));
+    if (mustWait) {
+      try {
+        await topup;
+      } catch (e) {
         this._log(
           "WARN",
-          `[RoutstrClient] _spinOffTopupIfNeeded: background topup crashed for ${snapshot.baseUrl}`,
+          `[RoutstrClient] _topUpIfNeeded: topup crashed for ${snapshot.baseUrl}`,
           e
         );
       }
-    );
+    } else {
+      void topup.catch((e: unknown) => {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _topUpIfNeeded: background topup crashed for ${snapshot.baseUrl}`,
+          e
+        );
+      });
+    }
   }
 
   /**

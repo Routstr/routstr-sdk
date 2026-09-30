@@ -19,7 +19,7 @@ async function prepare(path: string, body: unknown) {
   client._spendToken = vi.fn().mockResolvedValue({
     token: "sdk-payment", tokenBalance: 1, tokenBalanceUnit: "sat",
   });
-  client._spinOffTopupIfNeeded = vi.fn();
+  client._topUpIfNeeded = vi.fn();
   const stop = new Error("transport boundary reached");
   client._makeRequest = vi.fn().mockRejectedValue(stop);
 

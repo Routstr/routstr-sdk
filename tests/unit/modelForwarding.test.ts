@@ -113,7 +113,7 @@ async function prepareRequest(opts: {
     tokenBalance: 1,
     tokenBalanceUnit: "sat",
   });
-  client._spinOffTopupIfNeeded = vi.fn();
+  client._topUpIfNeeded = vi.fn();
   const stop = new Error("transport boundary reached");
   client._makeRequest = vi.fn().mockRejectedValue(stop);
   await expect(

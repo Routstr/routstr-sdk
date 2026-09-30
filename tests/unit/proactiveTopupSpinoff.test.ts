@@ -114,8 +114,8 @@ function createClient(
   return { client, providerManager, updateApiKeyBalance };
 }
 
-/** Call _spinOffTopupIfNeeded with a balance snapshot. */
-function spinOff(
+/** Call _topUpIfNeeded with a balance snapshot. */
+function topUpIfNeeded(
   client: RoutstrClient,
   snapshot: Partial<{
     token: string;
@@ -128,7 +128,7 @@ function spinOff(
     tokenBalanceUnknown: boolean;
   }> = {}
 ) {
-  (client as any)._spinOffTopupIfNeeded({
+  return (client as any)._topUpIfNeeded({
     token: API_KEY,
     baseUrl: BASE_URL,
     mintUrl: MINT_URL,
@@ -141,13 +141,13 @@ function spinOff(
   });
 }
 
-describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
+describe("RoutstrClient proactive (pre-request) topup", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
-  it("spins off a background topup when the snapshot balance is below the required sats", async () => {
+  it("tops up when the snapshot balance is below the required sats", async () => {
     const { client, updateApiKeyBalance } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
@@ -160,7 +160,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
 
-    spinOff(client);
+    topUpIfNeeded(client);
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // target = 100 * 1.4 = 140; shortfall = 140 - 20 = 120 (floor 21)
@@ -192,7 +192,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
 
     // Total alone covers 100 sats, but the stored reserved snapshot makes
     // only 90 sats available (below the 140-sat margin) so it must trigger.
-    spinOff(client, { tokenBalance: 120, tokenReserved: 30 });
+    topUpIfNeeded(client, { tokenBalance: 120, tokenReserved: 30 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
@@ -217,7 +217,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    spinOff(client, { tokenBalance: 125 });
+    topUpIfNeeded(client, { tokenBalance: 125 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // floor = 0.21 * 100 = 21
@@ -247,7 +247,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
 
-    spinOff(client); // snapshot: 20 sat available < target 140
+    topUpIfNeeded(client); // snapshot: 20 sat available < target 140
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
@@ -263,7 +263,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const { client } = createClient();
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    spinOff(client, { tokenBalance: 200 }); // ≥ required * 1.4 (margin)
+    topUpIfNeeded(client, { tokenBalance: 200 }); // ≥ required * 1.4 (margin)
     await new Promise((r) => setTimeout(r, 10));
 
     expect(topUp).not.toHaveBeenCalled();
@@ -273,7 +273,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const { client } = createClient();
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    spinOff(client, { tokenBalanceUnknown: true, tokenBalance: 0 });
+    topUpIfNeeded(client, { tokenBalanceUnknown: true, tokenBalance: 0 });
     await new Promise((r) => setTimeout(r, 10));
 
     expect(topUp).not.toHaveBeenCalled();
@@ -283,13 +283,13 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     const { client } = createClient({}, {}, "xcashu");
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    spinOff(client);
+    topUpIfNeeded(client);
     await new Promise((r) => setTimeout(r, 10));
 
     expect(topUp).not.toHaveBeenCalled();
   });
 
-  it("swallows background topup failures without unhandled rejections", async () => {
+  it("does not reject when an awaited topup fails", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
@@ -305,11 +305,8 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
         message: "Insufficient balance: need 500 have 96",
       });
 
-    spinOff(client);
-
-    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // Nothing threw to the caller (spinOff is sync void) and no unhandled
-    // rejection surfaced — vitest fails the run on those by default.
+    await expect(topUpIfNeeded(client)).resolves.toBeUndefined();
+    expect(topUp).toHaveBeenCalledOnce();
   });
 
   it("allows a new proactive attempt as soon as the previous one settles (no cooldown)", async () => {
@@ -325,7 +322,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    spinOff(client);
+    topUpIfNeeded(client);
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // Wait until the in-flight entry is fully cleared (the post-topup
     // persist is the last step) before firing the next snapshot.
@@ -334,7 +331,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     // The first attempt settled, so a new low-balance snapshot may start
     // another one immediately — the in-flight guard is the only
     // concurrency control.
-    spinOff(client);
+    topUpIfNeeded(client);
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledTimes(2));
   });
 
@@ -354,14 +351,12 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
           r({ success: true, message: "ok" }), 5))
       );
 
-    spinOff(client);
-    spinOff(client); // a concurrent request with the same low snapshot
-    await new Promise((r) => setTimeout(r, 20));
+    await Promise.all([topUpIfNeeded(client), topUpIfNeeded(client)]);
 
     expect(topUp).toHaveBeenCalledOnce();
   });
 
-  it("the 402 handler joins an in-flight proactive topup instead of stacking a second deposit", async () => {
+  it("concurrent requests join an in-flight awaited topup instead of stacking a second deposit", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
@@ -379,15 +374,38 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
             resolveTopUp = res;
           })
       );
+    // Both pre-request callers wait on the same deposit.
+    const first = topUpIfNeeded(client);
+    const second = topUpIfNeeded(client);
+    expect(topUp).toHaveBeenCalledOnce();
+    resolveTopUp({ success: true, toppedUpAmount: 112, message: "ok" });
+    await Promise.all([first, second]);
+    expect(topUp).toHaveBeenCalledOnce();
+  });
+
+  it("the 402 handler joins an in-flight margin topup instead of stacking a second deposit", async () => {
+    const { client } = createClient();
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 20_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    let resolveTopUp!: (r: TopUpResult) => void;
+    const topUp = vi.spyOn(balanceManager, "topUp").mockImplementation(
+      () =>
+        new Promise<TopUpResult>((res) => {
+          resolveTopUp = res;
+        })
+    );
     const retry = vi
       .spyOn(client as any, "_makeRequest")
       .mockResolvedValue(new Response("ok", { status: 200 }));
 
-    // Pre-request spin-off — its topUp stays in flight.
-    spinOff(client);
-    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    await topUpIfNeeded(client, { tokenBalance: 120 }); // margin zone
+    expect(topUp).toHaveBeenCalledOnce();
 
-    // The same request 402s while the proactive topup is still running.
     const handled = (client as any)._handleErrorResponse(
       {
         path: "/v1/chat/completions",
@@ -419,7 +437,7 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
 
-  it("spins off the topup before the request goes out and does not block it", async () => {
+  it("awaits the topup before sending a request when available balance is below its price", async () => {
     const { client } = createClient(
       {
         getApiKeyDistribution: () => [
@@ -438,12 +456,12 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       unit: "msat",
       apiKey: API_KEY,
     });
-    let topUpStarted = false;
+    let resolveTopUp!: (r: TopUpResult) => void;
     const topUp = vi.spyOn(balanceManager, "topUp").mockImplementation(
-      async () => {
-        topUpStarted = true;
-        return { success: true, toppedUpAmount: 50, message: "ok" };
-      }
+      () =>
+        new Promise<TopUpResult>((resolve) => {
+          resolveTopUp = resolve;
+        })
     );
 
     // Hold the actual HTTP request in flight so we can observe ordering.
@@ -467,10 +485,11 @@ describe("RoutstrClient proactive (pre-request) topup spin-off", () => {
       modelId: model.id,
     });
 
-    // While the request is still in flight, the background topup already
-    // started — proving the spin-off runs concurrently, not after.
-    await vi.waitFor(() => expect(topUpStarted).toBe(true));
-    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    resolveTopUp({ success: true, toppedUpAmount: 50, message: "ok" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
 
     resolveFetch(
       new Response("{}", {
