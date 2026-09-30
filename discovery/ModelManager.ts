@@ -176,6 +176,19 @@ export class ModelManager {
     this.eventStoreDbPath = config.eventStoreDbPath;
     this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
     this.eventStore = config.eventStore ?? null;
+
+    for (const method of ["getModelIdMappings", "setModelIdMappings",
+      "getModelIdMappingsEvent", "setModelIdMappingsEvent"] as const) {
+      if (typeof adapter[method] !== "function") {
+        throw new Error(`DiscoveryAdapter must implement ${method} for Nostr model mappings`);
+      }
+    }
+    // The signed event is the source of truth. Discard legacy/unscoped
+    // projections and rebuild only from evidence for the configured author.
+    const saved = adapter.getModelIdMappingsEvent();
+    adapter.setModelIdMappings(saved && this.isModelIdMappingEvent(saved)
+      ? this.parseModelIdMappings(saved) : null);
+
   }
 
   /**
@@ -1388,7 +1401,7 @@ export class ModelManager {
 
   /** Current per-adapter mapping snapshot; offline first runs use the bundled fallback. */
   getModelIdMappings(): ModelIdMappings {
-    return this.adapter.getModelIdMappings?.() ?? MODEL_ID_MAPPINGS;
+    return this.adapter.getModelIdMappings() ?? MODEL_ID_MAPPINGS;
   }
 
   /**
@@ -1398,57 +1411,77 @@ export class ModelManager {
    * snapshot (or the bundled fallback on a fresh install).
    */
   async fetchModelIdMappings(forceRefresh: boolean = false): Promise<ModelIdMappings> {
-    const cached = this.adapter.getModelIdMappings?.() ?? null;
+    const cached = this.adapter.getModelIdMappings() ?? null;
     const lastUpdate = this.adapter.getModelIdMappingsLastUpdate?.();
     if (!forceRefresh && cached !== null && lastUpdate != null &&
         lastUpdate <= Date.now() && Date.now() - lastUpdate <= this.cacheTTL) {
       return cached;
     }
 
+    // Hydrate the local event store from driver-backed evidence as well.
+    const saved = this.adapter.getModelIdMappingsEvent();
+    if (saved && this.isModelIdMappingEvent(saved)) {
+      const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
+      store.add(saved);
+    }
     const events = await this.getNostrEvents(
       { kinds: [38426], "#d": [MODEL_ID_MAPPINGS_D_TAG], authors: [this.routstrModelsPubkey] },
-      forceRefresh
+      forceRefresh,
+      undefined,
+      event => this.isModelIdMappingEvent(event)
     );
     return this.applyModelIdMappingEvents(events);
   }
 
-  private applyModelIdMappingEvents(events: NostrEvent[]): ModelIdMappings {
-    const event = events.reduce<NostrEvent | null>(
-      (latest, candidate) => !latest || candidate.created_at > latest.created_at
-        ? candidate : latest,
-      null
-    );
-    if (!event) return this.getModelIdMappings();
+  private parseModelIdMappings(event: NostrEvent): ModelIdMappings {
+    const content = JSON.parse(event.content);
+    const mappings = content?.mappings;
+    if (mappings === null || typeof mappings !== "object" || Array.isArray(mappings)) {
+      throw new Error("mappings must be an object");
+    }
+    const entries = Object.entries(mappings);
+    if (entries.length > 10_000) throw new Error("too many mappings");
+    const snapshot = Object.fromEntries(entries) as ModelIdMappings;
+    for (const [variant, canonical] of Object.entries(snapshot)) {
+      if (variant === "__proto__" || variant === "constructor" || variant === "prototype" ||
+          !variant.trim() || typeof canonical !== "string" || !canonical.trim() ||
+          variant === canonical) {
+        throw new Error(`invalid mapping for ${variant}`);
+      }
+    }
+    for (const canonical of Object.values(snapshot)) {
+      if (Object.hasOwn(snapshot, canonical)) throw new Error(`chained mapping at ${canonical}`);
+    }
+    return snapshot;
+  }
 
+  private isModelIdMappingEvent(event: NostrEvent): boolean {
+    if (event.kind !== 38426 || event.pubkey !== this.routstrModelsPubkey ||
+        getReplaceableIdentifier(event) !== MODEL_ID_MAPPINGS_D_TAG ||
+        !this.isNostrEventTrustworthy(event)) return false;
     try {
-      const content = JSON.parse(event.content);
-      const mappings = content?.mappings;
-      if (mappings === null || typeof mappings !== "object" || Array.isArray(mappings)) {
-        throw new Error("mappings must be an object");
-      }
-      // Object.fromEntries creates own data properties even for "__proto__".
-      const entries = Object.entries(mappings);
-      if (entries.length > 10_000) throw new Error("too many mappings");
-      const snapshot = Object.fromEntries(entries) as ModelIdMappings;
-      for (const [variant, canonical] of Object.entries(snapshot)) {
-        if (variant === "__proto__" || variant === "constructor" || variant === "prototype" ||
-            !variant.trim() || typeof canonical !== "string" || !canonical.trim() ||
-            variant === canonical) {
-          throw new Error(`invalid mapping for ${variant}`);
-        }
-      }
-      for (const canonical of Object.values(snapshot)) {
-        if (Object.hasOwn(snapshot, canonical)) {
-          throw new Error(`chained mapping at ${canonical}`);
-        }
-      }
-      this.adapter.setModelIdMappings?.(snapshot);
-      this.adapter.setModelIdMappingsLastUpdate?.(Date.now());
-      return snapshot;
+      this.parseModelIdMappings(event);
+      return true;
     } catch (error) {
       this.logger.warn("ModelIdMappings: invalid kind 38426 content:", event.id, error);
-      return this.getModelIdMappings();
+      return false;
     }
+  }
+
+  private applyModelIdMappingEvents(events: NostrEvent[]): ModelIdMappings {
+    // Include the adapter's signed event: SQLite persistence is optional,
+    // but a stale relay must never roll back the accepted snapshot on restart.
+    const saved = this.adapter.getModelIdMappingsEvent();
+    const candidates = saved ? [...events, saved] : events;
+    const event = candidates.filter(e => this.isModelIdMappingEvent(e)).sort(
+      (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id)
+    )[0];
+    if (!event) return this.getModelIdMappings();
+    const snapshot = this.parseModelIdMappings(event);
+    this.adapter.setModelIdMappingsEvent(event);
+    this.adapter.setModelIdMappings(snapshot);
+    this.adapter.setModelIdMappingsLastUpdate?.(Date.now());
+    return snapshot;
   }
 
   /**

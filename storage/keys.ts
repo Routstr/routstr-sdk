@@ -13,6 +13,7 @@ export const SDK_STORAGE_KEYS = {
   API_KEYS: "api_keys",
   CHILD_KEYS: "child_keys",
   XCASHU_TOKENS: "xcashu_tokens",
+  MODEL_ID_MAPPINGS_EVENT: "modelIdMappingsEvent",
   MODEL_ID_MAPPINGS: "modelIdMappings",
   LAST_MODEL_ID_MAPPINGS_UPDATE: "lastModelIdMappingsUpdate",
   ROUTSTR21_MODELS: "routstr21Models",

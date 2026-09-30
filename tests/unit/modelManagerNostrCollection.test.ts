@@ -70,7 +70,13 @@ function makeAdapter(): DiscoveryAdapter {
   let cachedModels: Record<string, Model[]> = {};
   const lastUpdate = new Map<string, number>();
   let baseUrls: string[] = [];
+  let mappings: import("../../core/modelMappings").ModelIdMappings | null = null;
+  let mappingEvent: NostrEvent | null = null;
   return {
+    getModelIdMappings: () => mappings,
+    setModelIdMappings: value => { mappings = value; },
+    getModelIdMappingsEvent: () => mappingEvent,
+    setModelIdMappingsEvent: value => { mappingEvent = value; },
     getCachedModels: () => cachedModels,
     setCachedModels: (models) => {
       cachedModels = models;

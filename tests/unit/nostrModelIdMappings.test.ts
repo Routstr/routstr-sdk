@@ -84,12 +84,12 @@ describe("kind 38426 model ID mappings", () => {
     const { manager, adapter } = await open();
     relay.events = [event({ variant: "canonical" }, author, now() - 3)];
     await manager.fetchModelIdMappings(true);
-    const stamp = adapter.getModelIdMappingsLastUpdate?.();
+    const accepted = adapter.getModelIdMappingsEvent();
     for (const invalid of [[], { variant: 123 }, { a: "b", b: "c" },
-      { a: "a" }, { "__proto__": "evil" }, null]) {
+      { a: "a" }, JSON.parse('{"__proto__":"evil"}'), null]) {
       relay.events = [event(invalid, author, now() + 1)];
       expect(await manager.fetchModelIdMappings(true)).toEqual({ variant: "canonical" });
-      expect(adapter.getModelIdMappingsLastUpdate?.()).toBe(stamp);
+      expect(adapter.getModelIdMappingsEvent()?.id).toBe(accepted?.id);
     }
     relay.events = [event({}, author, now() + 2)];
     expect(await manager.fetchModelIdMappings(true)).toEqual({});
@@ -134,5 +134,71 @@ describe("kind 38426 model ID mappings", () => {
     relay.events = [event({}, author, now() + 1)];
     await first.manager.refreshNostrEvents();
     expect(new ProviderManager(first.adapter).getProviderPriceRankingForModel("canonical")).toEqual([]);
+  });
+});
+
+describe("mapping snapshot provenance and persistence", () => {
+  afterEach(() => {
+    relay.events = [];
+    relay.filters = [];
+    relay.offline = false;
+  });
+
+  it("rejects legacy adapters explicitly rather than silently ignoring mappings", async () => {
+    const { adapter } = await open();
+    delete (adapter as any).setModelIdMappings;
+    expect(() => new ModelManager(adapter)).toThrow("DiscoveryAdapter must implement setModelIdMappings");
+  });
+
+  it("does not reuse a snapshot from a different configured author", async () => {
+    const { adapter, manager } = await open();
+    relay.events = [event({ variant: "first-author" })];
+    await manager.fetchModelIdMappings(true);
+    relay.filters = [];
+    const changed = new ModelManager(adapter, {
+      routstrModelsPubkey: getPublicKey(other), logger: quiet,
+    });
+    expect(changed.getModelIdMappings()).toEqual(MODEL_ID_MAPPINGS);
+    relay.events = [event({ variant: "second-author" }, other)];
+    expect(await changed.fetchModelIdMappings()).toEqual({ variant: "second-author" });
+    expect(relay.filters[0].authors).toEqual([getPublicKey(other)]);
+  });
+
+  for (const sharded of [false, true]) {
+    it(`prevents rollback after restart without a persistent event database (${sharded ? "sharded" : "store"})`, async () => {
+      const driver = createMemoryDriver();
+      const createAdapter = async () => {
+        if (sharded) return createShardedDiscoveryAdapter({ driver });
+        const { store, hydrate } = createSdkStore({ driver });
+        await hydrate;
+        return createDiscoveryAdapterFromStore(store);
+      };
+      const adapter = await createAdapter();
+      const config = { routstrModelsPubkey: pubkey, logger: quiet };
+      const manager = new ModelManager(adapter, config);
+      const newest = event({ variant: "new-canonical" }, author, now() - 10);
+      relay.events = [newest];
+      await manager.fetchModelIdMappings(true);
+      await flush();
+      const reloaded = await createAdapter();
+      const restarted = new ModelManager(reloaded, config);
+      expect(reloaded.getModelIdMappingsEvent()?.id).toBe(newest.id);
+      relay.events = [event({ variant: "old-canonical" }, author, now() - 1000)];
+      expect(await restarted.fetchModelIdMappings(true)).toEqual({ variant: "new-canonical" });
+      expect(reloaded.getModelIdMappingsEvent()?.id).toBe(newest.id);
+    });
+  }
+
+  it("ignores malformed newer events before they replace valid stored evidence", async () => {
+    const { manager, eventStore, driver } = await open();
+    const good = event({ variant: "canonical" }, author, now() - 10);
+    relay.events = [good, event({ a: "b", b: "c" })];
+    expect(await manager.fetchModelIdMappings(true)).toEqual({ variant: "canonical" });
+    await manager.pruneSupersededDiscoveryEvents();
+    expect(eventStore.getTimeline({ kinds: [38426] }).map(e => e.id)).toEqual([good.id]);
+    await flush();
+    const restarted = await open(driver);
+    relay.offline = true;
+    expect(await restarted.manager.fetchModelIdMappings(true)).toEqual({ variant: "canonical" });
   });
 });

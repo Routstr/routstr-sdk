@@ -71,6 +71,10 @@ const makeModel = (completion = 1): Model =>
 
 function makeDeps(modelsByNode: Record<string, Model[]>) {
   const discoveryAdapter = {
+    getModelIdMappings: () => null,
+    setModelIdMappings: () => {},
+    getModelIdMappingsEvent: () => null,
+    setModelIdMappingsEvent: () => {},
     getCachedModels: () => modelsByNode,
     setCachedModels: () => {},
     getCachedMints: () => ({}),

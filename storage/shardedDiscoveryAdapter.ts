@@ -114,6 +114,7 @@ export const createShardedDiscoveryAdapter = async (
     rawManuallyEnabled,
     rawBaseUrls,
     lastBaseUrlsUpdate,
+    rawModelIdMappingsEvent,
     rawModelIdMappings,
     lastModelIdMappingsUpdate,
     rawRoutstr21Models,
@@ -136,6 +137,7 @@ export const createShardedDiscoveryAdapter = async (
     driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_ENABLED_PROVIDERS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
+    driver.getItem<import("applesauce-core/helpers").NostrEvent | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, null),
     driver.getItem<ModelIdMappings | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, null),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
@@ -228,6 +230,7 @@ export const createShardedDiscoveryAdapter = async (
   let _manuallyEnabledProviders: string[] = rawManuallyEnabled.map(normalizeBaseUrl);
   let _baseUrlsList: string[] = rawBaseUrls.map(normalizeBaseUrl);
   let _lastBaseUrlsUpdate: number | null = lastBaseUrlsUpdate;
+  let _modelIdMappingsEvent = rawModelIdMappingsEvent;
   let _modelIdMappings: ModelIdMappings | null = rawModelIdMappings;
   let _lastModelIdMappingsUpdate: number | null = lastModelIdMappingsUpdate;
   let _routstr21Models: string[] = rawRoutstr21Models;
@@ -389,8 +392,13 @@ export const createShardedDiscoveryAdapter = async (
 
     // -- Kind 38426 model ID mappings (kv) --
 
+    getModelIdMappingsEvent: () => _modelIdMappingsEvent,
+    setModelIdMappingsEvent: (event) => {
+      _modelIdMappingsEvent = event;
+      void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, event);
+    },
     getModelIdMappings: () => _modelIdMappings,
-    setModelIdMappings: (mappings: ModelIdMappings) => {
+    setModelIdMappings: (mappings: ModelIdMappings | null) => {
       _modelIdMappings = mappings;
       void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, mappings);
     },

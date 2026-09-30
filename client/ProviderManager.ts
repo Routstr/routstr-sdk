@@ -1048,7 +1048,7 @@ export class ProviderManager {
 
         // Find the model in this provider's list (by native id or a
         // mapped variant/alias of it)
-        const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+        const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings() ?? undefined);
         if (!model) {
           continue;
         }
@@ -1084,7 +1084,7 @@ export class ProviderManager {
     const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
     // First try exact or mapped (variant/alias) match
-    const mappedMatch = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+    const mappedMatch = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings() ?? undefined);
     if (mappedMatch) return mappedMatch;
 
     // Try matching by ID suffix (for backward compatibility with v0.1.x providers)
@@ -1235,7 +1235,7 @@ export class ProviderManager {
       if (!torMode && isOnionUrl(baseUrl))
         continue;
 
-      const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+      const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings() ?? undefined);
       if (!model) continue;
 
       const cost = model.sats_pricing?.completion ?? 0;
@@ -1268,7 +1268,7 @@ export class ProviderManager {
       )
         continue;
 
-      const match = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+      const match = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings() ?? undefined);
       if (!match?.sats_pricing) continue;
 
       const prompt = match.sats_pricing.prompt;

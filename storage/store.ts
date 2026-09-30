@@ -62,7 +62,8 @@ export interface SdkStorageStore extends SdkStorageState {
     >
   ) => void;
   updateXcashuTokenTryCount: (token: string, tryCount: number) => void;
-  setModelIdMappings: (value: ModelIdMappings) => void;
+  setModelIdMappingsEvent: (value: import("applesauce-core/helpers").NostrEvent) => void;
+  setModelIdMappings: (value: ModelIdMappings | null) => void;
   setModelIdMappingsLastUpdate: (value: number | null) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
@@ -146,6 +147,7 @@ const createEmptyStore = (
     apiKeys: [],
     childKeys: [],
     xcashuTokens: {},
+    modelIdMappingsEvent: null,
     modelIdMappings: null,
     lastModelIdMappingsUpdate: null,
     routstr21Models: [],
@@ -309,6 +311,10 @@ const createEmptyStore = (
       void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, updatedTokens);
       set({ xcashuTokens: updatedTokens });
     },
+    setModelIdMappingsEvent: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, value);
+      set({ modelIdMappingsEvent: value });
+    },
     setModelIdMappings: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, value);
       set({ modelIdMappings: value });
@@ -465,6 +471,7 @@ const hydrateStoreFromDriver = async (
     rawApiKeys,
     rawChildKeys,
     rawXcashuTokens,
+    rawModelIdMappingsEvent,
     rawModelIdMappings,
     rawLastModelIdMappingsUpdate,
     rawRoutstr21Models,
@@ -528,6 +535,7 @@ const hydrateStoreFromDriver = async (
         }>
       >
     >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
+    driver.getItem<import("applesauce-core/helpers").NostrEvent | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, null),
     driver.getItem<ModelIdMappings | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, null),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
@@ -688,6 +696,7 @@ const hydrateStoreFromDriver = async (
     apiKeys,
     childKeys,
     xcashuTokens,
+    modelIdMappingsEvent: rawModelIdMappingsEvent,
     modelIdMappings: rawModelIdMappings,
     lastModelIdMappingsUpdate: rawLastModelIdMappingsUpdate,
     routstr21Models,
@@ -794,6 +803,8 @@ export const createDiscoveryAdapterFromStore = (
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
   setBaseUrlsLastUpdate: (timestamp) =>
     store.getState().setBaseUrlsLastUpdate(timestamp),
+  getModelIdMappingsEvent: () => store.getState().modelIdMappingsEvent,
+  setModelIdMappingsEvent: (event) => store.getState().setModelIdMappingsEvent(event),
   getModelIdMappings: () => store.getState().modelIdMappings,
   setModelIdMappings: (mappings) => store.getState().setModelIdMappings(mappings),
   getModelIdMappingsLastUpdate: () => store.getState().lastModelIdMappingsUpdate,

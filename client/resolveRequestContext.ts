@@ -191,7 +191,7 @@ export async function resolveRequestContext(
     const models = cachedModels[normalizedProvider] || [];
     // Match by native id or a mapped variant/alias of it, so a
     // forced provider also serves requests using the canonical id.
-    const match = findModelForId(models, modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined);
+    const match = findModelForId(models, modelId, discoveryAdapter.getModelIdMappings() ?? undefined);
     if (!match) {
       throw new Error(
         `Provider ${normalizedProvider} does not offer model: ${modelId}`
