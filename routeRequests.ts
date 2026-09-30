@@ -82,7 +82,7 @@ export interface RouteRequestOptions {
   providerManager?: ProviderManager;
   /** Nostr pubkey for routstr review/audit events (kind 38425). Defaults to routstr's key. */
   routstrPubkey?: string;
-  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  /** Nostr pubkey for routstr-21 models (38423) and model ID mappings (38426). Falls back to routstrPubkey. */
   routstrModelsPubkey?: string;
   /** Optional: injectable logger for structured/prefixed logging */
   logger?: SdkLogger;

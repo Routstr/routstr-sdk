@@ -38,6 +38,8 @@ export interface SdkStorageState {
     createdAt: number;
     tryCount: number;
   }>>;
+  modelIdMappings: import("../core/modelMappings").ModelIdMappings | null;
+  lastModelIdMappingsUpdate: number | null;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
   cachedReceiveTokens: Array<{

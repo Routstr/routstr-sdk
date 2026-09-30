@@ -135,11 +135,11 @@ describe("ModelManager Nostr collection", () => {
 
     const manager = new ModelManager(makeAdapter(), { logger: silentLogger });
     const promise = manager.bootstrapProviders(false, true);
-    // All three queries run concurrently, so one timeout window covers them.
+    // All four queries run concurrently, so one timeout window covers them.
     await vi.advanceTimersByTimeAsync(5000);
     const bases = await promise;
     expect(bases).toEqual([NORMALIZED_A]);
-    expect(teardowns).toBe(3);
+    expect(teardowns).toBe(4);
   });
 
   it("does not announce onion providers the clearnet result drops", async () => {

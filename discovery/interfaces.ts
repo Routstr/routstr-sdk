@@ -4,6 +4,7 @@
  */
 
 import type { Model, ProviderInfo } from "../core/types";
+import type { ModelIdMappings } from "../core/modelMappings";
 export { ProviderInfo };
 
 /**
@@ -139,6 +140,12 @@ export interface DiscoveryAdapter {
    * @param timestamp Timestamp in milliseconds
    */
   setBaseUrlsLastUpdate(timestamp: number): void;
+
+  /** Trusted kind 38426 snapshot, or null before the first successful fetch. */
+  getModelIdMappings?(): ModelIdMappings | null;
+  setModelIdMappings?(mappings: ModelIdMappings): void;
+  getModelIdMappingsLastUpdate?(): number | null;
+  setModelIdMappingsLastUpdate?(timestamp: number): void;
 
   /**
    * Get list of routstr21 models

@@ -63,6 +63,8 @@ function makeAdapter(): DiscoveryAdapter {
     getBaseUrlsLastUpdate: () => null,
     setBaseUrlsList: () => {},
     setBaseUrlsLastUpdate: () => {},
+    getModelIdMappings: () => ({}),
+    getModelIdMappingsLastUpdate: () => Date.now(),
     getRoutstr21Models: () => [],
     setRoutstr21Models: () => {},
     getRoutstr21ModelsLastUpdate: () => null,

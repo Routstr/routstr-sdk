@@ -3,6 +3,7 @@ import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter } from "../wallet/interfaces";
 import type { ProviderInfo, Model } from "../core";
+import type { ModelIdMappings } from "../core/modelMappings";
 import { SDK_STORAGE_KEYS } from "./keys";
 import type { StorageDriver, SdkStorageState } from "./types";
 
@@ -61,6 +62,8 @@ export interface SdkStorageStore extends SdkStorageState {
     >
   ) => void;
   updateXcashuTokenTryCount: (token: string, tryCount: number) => void;
+  setModelIdMappings: (value: ModelIdMappings) => void;
+  setModelIdMappingsLastUpdate: (value: number | null) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
   setCachedReceiveTokens: (
@@ -143,6 +146,8 @@ const createEmptyStore = (
     apiKeys: [],
     childKeys: [],
     xcashuTokens: {},
+    modelIdMappings: null,
+    lastModelIdMappingsUpdate: null,
     routstr21Models: [],
     lastRoutstr21ModelsUpdate: null,
     cachedReceiveTokens: [],
@@ -304,6 +309,14 @@ const createEmptyStore = (
       void driver.setItem(SDK_STORAGE_KEYS.XCASHU_TOKENS, updatedTokens);
       set({ xcashuTokens: updatedTokens });
     },
+    setModelIdMappings: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, value);
+      set({ modelIdMappings: value });
+    },
+    setModelIdMappingsLastUpdate: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, value);
+      set({ lastModelIdMappingsUpdate: value });
+    },
     setRoutstr21Models: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
       set({ routstr21Models: value });
@@ -452,6 +465,8 @@ const hydrateStoreFromDriver = async (
     rawApiKeys,
     rawChildKeys,
     rawXcashuTokens,
+    rawModelIdMappings,
+    rawLastModelIdMappingsUpdate,
     rawRoutstr21Models,
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
@@ -513,6 +528,8 @@ const hydrateStoreFromDriver = async (
         }>
       >
     >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
+    driver.getItem<ModelIdMappings | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, null),
+    driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
     driver.getItem<number | null>(
       SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
@@ -671,6 +688,8 @@ const hydrateStoreFromDriver = async (
     apiKeys,
     childKeys,
     xcashuTokens,
+    modelIdMappings: rawModelIdMappings,
+    lastModelIdMappingsUpdate: rawLastModelIdMappingsUpdate,
     routstr21Models,
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens: deduplicatedReceiveTokens,
@@ -775,6 +794,11 @@ export const createDiscoveryAdapterFromStore = (
   getBaseUrlsLastUpdate: () => store.getState().lastBaseUrlsUpdate,
   setBaseUrlsLastUpdate: (timestamp) =>
     store.getState().setBaseUrlsLastUpdate(timestamp),
+  getModelIdMappings: () => store.getState().modelIdMappings,
+  setModelIdMappings: (mappings) => store.getState().setModelIdMappings(mappings),
+  getModelIdMappingsLastUpdate: () => store.getState().lastModelIdMappingsUpdate,
+  setModelIdMappingsLastUpdate: (timestamp) =>
+    store.getState().setModelIdMappingsLastUpdate(timestamp),
   getRoutstr21Models: () => store.getState().routstr21Models,
   setRoutstr21Models: (models) => store.getState().setRoutstr21Models(models),
   getRoutstr21ModelsLastUpdate: () =>

@@ -114,7 +114,7 @@ export interface Model {
   per_request_limits?: PerRequestLimits;
   /**
    * Alternative IDs the provider accepts for this model (OpenRouter-style).
-   * Used together with the static MODEL_ID_MAPPINGS to resolve non-canonical
+   * Used together with kind 38426 model ID mappings to resolve non-canonical
    * provider IDs to canonical routstr21 model IDs. See core/modelMappings.ts.
    */
   alias_ids?: string[];
