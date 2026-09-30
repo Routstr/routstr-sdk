@@ -330,6 +330,27 @@ export function shouldFailoverToAnotherMint(
   );
 }
 
+/** Every `type` value routstr-core itself emits (values, not keys). */
+const CORE_TYPES = new Set<string>(Object.values(CoreErrorType));
+
+/**
+ * True when the node forwarded an upstream complaint about the request body or
+ * parameters. Not a payment failure — and no other provider can fix it, since
+ * the client's request is what the upstream rejected.
+ *
+ * routstr-core tags these `type: "upstream_error"` / `"invalid_request_error"` and
+ * leaves provider-side 4xx status untouched, so "400/422 and not one of our own
+ * wallet types" is the fallback when the envelope is unrecognized.
+ */
+export function isUpstreamRequestError(
+  status: number,
+  parsed: ParsedCoreError
+): boolean {
+  if (status !== 400 && status !== 422) return false;
+  if (parsed.type && CORE_TYPES.has(parsed.type)) return false; // our wallet, ours to fix
+  return true;
+}
+
 /**
  * Build a concise human-readable summary of a parsed core error,
  * preferring the structured `type`/`message` over raw text.

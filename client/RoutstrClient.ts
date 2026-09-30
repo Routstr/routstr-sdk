@@ -49,6 +49,7 @@ import {
   isTokenConsumedError,
   isCoreInternalError,
   isHandledRedemptionError,
+  isUpstreamRequestError,
   shouldFailoverToAnotherMint,
   shouldPurgeStoredCredential,
   type ParsedCoreError,
@@ -339,6 +340,13 @@ export class RoutstrClient {
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
+
+    // A forwarded upstream request error is the node's own answer: nothing was
+    // spent, so there is no balance accounting to run and no usage to derive.
+    // Returning before the finalize wiring also keeps `finalize` off it.
+    if ((prepared.response as any).passthrough) {
+      return prepared.response;
+    }
 
     // For SSE, defer accounting until the inspector (tee'd branch) has seen
     // usage — which only happens as the client consumes the stream. We expose
@@ -939,6 +947,28 @@ export class RoutstrClient {
       "DEBUG",
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
+
+    // ── Upstream-attributable request errors are terminal, not failover ──
+    // The upstream rejected the request body/parameters, so every node will
+    // reject it identically: refunding the key, cooling the provider down and
+    // paying for a retry elsewhere cannot help. routstr-core passes the
+    // provider's 4xx through unchanged, so hand the caller the node's own
+    // envelope and stop here.
+    if (isUpstreamRequestError(status, parsedError)) {
+      const passthrough = this._upstreamErrorResponse(
+        upstream,
+        responseBody,
+        baseUrl
+      );
+      if (passthrough) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: forwarding upstream request error ${status} from ${baseUrl} (type=${parsedError.type ?? "none"}); no refund, no cooldown, no failover`
+        );
+        (passthrough as any).passthrough = true;
+        return passthrough;
+      }
+    }
 
     // ── Handle token_already_spent ────────────────────────────────────
     // The token is permanently spent — core deliberately withholds the
@@ -1820,6 +1850,35 @@ export class RoutstrClient {
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
     );
+  }
+
+  /**
+   * Rebuild the provider's own error response from the captured envelope so a
+   * proxy caller can forward it verbatim (status + headers + body).
+   *
+   * Returns `undefined` when there is no status to forward — notably a network
+   * failure (status -1), where `new Response` would also reject any status
+   * below 200.
+   */
+  private _upstreamErrorResponse(
+    upstream: UpstreamEnvelope | undefined,
+    bodyText: string | undefined,
+    baseUrl: string
+  ): Response | undefined {
+    if (!upstream || upstream.status < 400) return undefined;
+    const headers = new Headers(upstream.headers);
+    headers.set(
+      "content-type",
+      upstream.headers["content-type"] ?? "application/json"
+    );
+    if (!headers.has("x-routstr-provider")) {
+      headers.set("x-routstr-provider", baseUrl);
+    }
+    return new Response(bodyText ?? "", {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
   }
 
   private _createRedemptionError(opts: {
