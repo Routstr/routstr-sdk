@@ -38,6 +38,7 @@ import {
   TokenConsumedError,
   CoreInternalError,
 } from "../core/errors";
+import type { UpstreamEnvelope } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorCode,
@@ -80,6 +81,47 @@ const TOPUP_MARGIN = 1.4;
 
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";
+
+/** Response headers safe to hand to a caller forwarding an upstream error. */
+const FORWARDABLE_ERROR_HEADERS = new Set([
+  "content-type",
+  "retry-after",
+  "retry-after-ms",
+  "x-routstr-request-id",
+  "x-routstr-error-scope",
+  "x-routstr-provider",
+  "x-cashu",
+  "ratelimit-limit",
+  "ratelimit-remaining",
+  "ratelimit-reset",
+]);
+
+/**
+ * Framing/hop-by-hop headers are tied to the body we consumed; never reuse
+ * them for a body we re-wrap ourselves. Checked separately so they stay blocked
+ * even if the allowlist above ever grows.
+ */
+const NEVER_FORWARDED_ERROR_HEADERS = new Set([
+  "transfer-encoding",
+  "content-length",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+/** Pick the forwardable, non-framing subset of an upstream error's headers. */
+function forwardableErrorHeaders(headers: Headers): Record<string, string> {
+  const captured: Record<string, string> = {};
+  headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (NEVER_FORWARDED_ERROR_HEADERS.has(lower)) return;
+    if (!FORWARDABLE_ERROR_HEADERS.has(lower)) return;
+    captured[lower] = value;
+  });
+  return captured;
+}
 
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
@@ -750,6 +792,12 @@ export class RoutstrClient {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
+        // Capture the wire-level envelope before the body read consumes the response.
+        const upstream: UpstreamEnvelope = {
+          status: response.status,
+          statusText: response.statusText,
+          headers: forwardableErrorHeaders(response.headers),
+        };
         let bodyText: string | undefined;
         try {
           bodyText = await response.text();
@@ -776,7 +824,8 @@ export class RoutstrClient {
             ? (response.headers.get("x-cashu") ?? undefined)
             : undefined,
           bodyText,
-          params.retryCount ?? 0
+          params.retryCount ?? 0,
+          upstream
         );
       }
 
@@ -867,11 +916,15 @@ export class RoutstrClient {
     requestId?: string,
     xCashuRefundToken?: string,
     responseBody?: string,
-    retryCount: number = 0
+    retryCount: number = 0,
+    upstream?: UpstreamEnvelope
   ): Promise<Response> {
     const MAX_RETRIES_PER_PROVIDER = 2;
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
+
+    // Wire-level upstream detail captured for later forwarding; not consumed yet.
+    const upstreamEnvelope = upstream;
 
     const errorMessage = responseBody;
 

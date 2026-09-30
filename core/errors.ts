@@ -27,6 +27,14 @@ export class InsufficientBalanceError extends Error {
   }
 }
 
+/** Wire-level detail of an upstream error response, preserved so callers can forward it. */
+export interface UpstreamEnvelope {
+  status: number;
+  statusText: string;
+  /** Lower-cased header name -> value, restricted to forwardable headers. */
+  headers: Record<string, string>;
+}
+
 /**
  * Error thrown when a provider returns an error response
  */
