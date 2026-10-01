@@ -125,10 +125,10 @@ irreversibly sending does not close that window. Custom storage adapters without
 `flush()` likewise do not provide the persistence barrier.
 
 Failed top-ups remain in `xcashuTokens`, not also in `cachedReceiveTokens`.
-Initialization durably removes legacy cached-receive duplicates whose original
-tokens already have xcashu records. If this cleanup cannot be saved, initialization
-rejects: repair storage capacity/permissions and retry rather than silently
-starting with stale recovery owners.
+Initialization removes legacy cached-receive duplicates in memory when their
+original tokens already have xcashu records, then schedules a tracked cleanup
+write. A failed cleanup does not stop startup: a subsequent `flush()` retries
+the hydrated value, and payments remain blocked until persistence succeeds.
 
 The xcashu list currently holds provider IOUs, temporary wallet handover copies,
 and top-up tokens. Refund sweeps treat these entries through the same recovery

@@ -143,6 +143,7 @@ it("migrates duplicate recovery owners durably without removing unrelated cached
   });
   const { store, hydrate } = createSdkStore({ driver }); await hydrate;
   const storage = createStorageAdapterFromStore(store);
+  await storage.flush!();
   expect(storage.getCachedReceiveTokens().map((t) => t.token)).toEqual(["unrelated"]);
   expect(await driver.getItem<any[]>(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, [])).toEqual([
     expect.objectContaining({ token: "unrelated" }),
@@ -154,7 +155,7 @@ it("migrates duplicate recovery owners durably without removing unrelated cached
   expect(createStorageAdapterFromStore(reload.store).getXcashuTokens()).toEqual({});
 });
 
-it("rejects hydration if duplicate-owner cleanup cannot be persisted", async () => {
+it("hydrates deduplicated recovery state while cleanup fails, then flush retries", async () => {
   const disk = createMemoryDriver({
     [SDK_STORAGE_KEYS.XCASHU_TOKENS]: JSON.stringify({
       "https://provider.example/": [{ token: "duplicate", baseUrl: "https://provider.example/", createdAt: 1 }],
@@ -163,10 +164,21 @@ it("rejects hydration if duplicate-owner cleanup cannot be persisted", async () 
       { token: "duplicate", amount: 1, unit: "sat", createdAt: 1 },
     ]),
   });
-  const { hydrate } = createSdkStore({ driver: {
+  let broken = true;
+  const { store, hydrate } = createSdkStore({ driver: {
     ...disk,
-    setItem: async () => { throw new Error("cleanup failed"); },
+    setItem: async (key, value) => {
+      if (broken) throw new Error("cleanup failed");
+      await disk.setItem(key, value);
+    },
   } });
-  await expect(hydrate).rejects.toThrow("cleanup failed");
+  await hydrate;
+  const storage = createStorageAdapterFromStore(store);
+  expect(storage.getCachedReceiveTokens()).toEqual([]);
+  expect(storage.getXcashuTokensForBaseUrl("https://provider.example/")).toHaveLength(1);
+  await expect(storage.flush!()).rejects.toThrow("cleanup failed");
   expect(await disk.getItem<any[]>(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, [])).toHaveLength(1);
+  broken = false;
+  await storage.flush!();
+  expect(await disk.getItem<any[]>(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, [])).toEqual([]);
 });

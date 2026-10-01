@@ -1,3 +1,4 @@
+import { CREDENTIAL_KEYS, isCredentialStorageKey } from "./credentialKeys";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter } from "../wallet/interfaces";
@@ -655,15 +656,6 @@ const hydrateStoreFromDriver = async (
   const deduplicatedReceiveTokens = cachedReceiveTokens.filter(
     (entry) => !ownedTokens.has(entry.token)
   );
-  // Persist the migration before exposing the hydrated state. If it fails,
-  // reject initialization rather than silently retaining duplicate owners.
-  if (deduplicatedReceiveTokens.length !== cachedReceiveTokens.length) {
-    await driver.setItem(
-      SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS,
-      deduplicatedReceiveTokens
-    );
-  }
-
   store.setState({
     nostrQueryLastUpdate,
     modelsFromAllProviders,
@@ -687,15 +679,17 @@ const hydrateStoreFromDriver = async (
     lastFailed,
     providersOnCooldown,
   });
+
+  // Hydrate first so a later flush retries the deduplicated in-memory value.
+  // The tracked driver logs failures; payment remains blocked until flush works.
+  if (deduplicatedReceiveTokens.length !== cachedReceiveTokens.length) {
+    void driver.setItem(
+      SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS,
+      deduplicatedReceiveTokens
+    ).catch(() => {});
+  }
 };
 
-// Keys holding money or the credentials to spend it, and their state field.
-const CREDENTIAL_KEYS = {
-  [SDK_STORAGE_KEYS.API_KEYS]: "apiKeys",
-  [SDK_STORAGE_KEYS.CHILD_KEYS]: "childKeys",
-  [SDK_STORAGE_KEYS.XCASHU_TOKENS]: "xcashuTokens",
-  [SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS]: "cachedReceiveTokens",
-} as const;
 type CredentialKey = keyof typeof CREDENTIAL_KEYS;
 
 export const createSdkStore = ({
@@ -709,7 +703,7 @@ export const createSdkStore = ({
     removeItem: (key) => driver.removeItem(key),
     setItem: (key, value) => {
       const write = driver.setItem(key, value);
-      if (key in CREDENTIAL_KEYS) {
+      if (isCredentialStorageKey(key)) {
         latestWrites.set(key as CredentialKey, write);
         write.catch((error) => {
           console.error(`[sdk store] write failed for "${key}":`, error);
