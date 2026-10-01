@@ -1,3 +1,4 @@
+import { CREDENTIAL_KEYS, isCredentialStorageKey } from "./credentialKeys";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter } from "../wallet/interfaces";
@@ -13,6 +14,9 @@ export interface SdkStoreOptions {
 }
 
 export interface SdkStorageStore extends SdkStorageState {
+  /** Wait for API key and token writes to reach storage. Retries a write that
+   *  failed, and rejects while storage keeps failing. */
+  flush: () => Promise<void>;
   setNostrQueryLastUpdate: (value: Record<string, number>) => void;
   setModelsFromAllProviders: (value: Record<string, Model[]>) => void;
   setLastUsedModel: (value: string | null) => void;
@@ -115,8 +119,12 @@ export interface SdkStorageStore extends SdkStorageState {
 /** Store type returned after async initialization */
 export type SdkStore = StoreApi<SdkStorageStore>;
 
-const createEmptyStore = (driver: StorageDriver): SdkStore =>
+const createEmptyStore = (
+  driver: StorageDriver,
+  flush: () => Promise<void>
+): SdkStore =>
   createStore<SdkStorageStore>((set, get) => ({
+    flush,
     nostrQueryLastUpdate: {},
     setNostrQueryLastUpdate: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.NOSTR_QUERY_LAST_UPDATE, value);
@@ -640,6 +648,14 @@ const hydrateStoreFromDriver = async (
     timestamp: entry.timestamp,
   }));
 
+  const ownedTokens = new Set(
+    Object.values(xcashuTokens).flatMap((tokens) =>
+      tokens.map((entry) => entry.token)
+    )
+  );
+  const deduplicatedReceiveTokens = cachedReceiveTokens.filter(
+    (entry) => !ownedTokens.has(entry.token)
+  );
   store.setState({
     nostrQueryLastUpdate,
     modelsFromAllProviders,
@@ -657,21 +673,58 @@ const hydrateStoreFromDriver = async (
     xcashuTokens,
     routstr21Models,
     lastRoutstr21ModelsUpdate,
-    cachedReceiveTokens,
+    cachedReceiveTokens: deduplicatedReceiveTokens,
     clientIds,
     failedProviders,
     lastFailed,
     providersOnCooldown,
   });
+
+  // Hydrate first so a later flush retries the deduplicated in-memory value.
+  // The tracked driver logs failures; payment remains blocked until flush works.
+  if (deduplicatedReceiveTokens.length !== cachedReceiveTokens.length) {
+    void driver.setItem(
+      SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS,
+      deduplicatedReceiveTokens
+    ).catch(() => {});
+  }
 };
+
+type CredentialKey = keyof typeof CREDENTIAL_KEYS;
 
 export const createSdkStore = ({
   driver,
 }: SdkStoreOptions): { store: SdkStore; hydrate: Promise<void> } => {
-  const store = createEmptyStore(driver);
+  // Setters write without waiting. Keep the latest credential write per key
+  // so flush() can wait for it, and retry it from memory if it failed.
+  const latestWrites = new Map<CredentialKey, Promise<void>>();
+  const trackedDriver: StorageDriver = {
+    getItem: (key, defaultValue) => driver.getItem(key, defaultValue),
+    removeItem: (key) => driver.removeItem(key),
+    setItem: (key, value) => {
+      const write = driver.setItem(key, value);
+      if (isCredentialStorageKey(key)) {
+        latestWrites.set(key as CredentialKey, write);
+        write.catch((error) => {
+          console.error(`[sdk store] write failed for "${key}":`, error);
+        });
+      }
+      return write;
+    },
+  };
+  const flush = async (): Promise<void> => {
+    await Promise.all(
+      [...latestWrites].map(([key, write]) =>
+        write.catch(() =>
+          trackedDriver.setItem(key, store.getState()[CREDENTIAL_KEYS[key]])
+        )
+      )
+    );
+  };
+  const store = createEmptyStore(trackedDriver, flush);
   return {
     store,
-    hydrate: hydrateStoreFromDriver(store, driver),
+    hydrate: hydrateStoreFromDriver(store, trackedDriver),
   };
 };
 
@@ -733,6 +786,7 @@ export const createDiscoveryAdapterFromStore = (
 export const createStorageAdapterFromStore = (
   store: SdkStore
 ): StorageAdapter => ({
+  flush: () => store.getState().flush(),
   getApiKeyDistribution: () => {
     const apiKeys = store.getState().apiKeys;
     const distributionMap: Record<
@@ -829,6 +883,21 @@ export const createStorageAdapterFromStore = (
     const next = store
       .getState()
       .apiKeys.filter((entry) => entry.baseUrl !== normalized);
+    store.getState().setApiKeys(next);
+  },
+
+  replaceApiKey: (baseUrl, key) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const next = store
+      .getState()
+      .apiKeys.filter((entry) => entry.baseUrl !== normalized);
+    next.push({
+      baseUrl: normalized,
+      key,
+      balance: 0,
+      reserved: 0,
+      lastUsed: Date.now(),
+    });
     store.getState().setApiKeys(next);
   },
 
@@ -953,6 +1022,7 @@ export const createStorageAdapterFromStore = (
     const normalized = normalizeBaseUrl(baseUrl);
     const tokens = store.getState().xcashuTokens;
     const existing = tokens[normalized] || [];
+    if (existing.some((entry) => entry.token === token)) return;
     const next = { ...tokens };
     next[normalized] = [
       ...existing,

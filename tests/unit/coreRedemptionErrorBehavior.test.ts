@@ -519,7 +519,7 @@ describe("CashuSpender background redemption recovery", () => {
       token,
       true
     );
-    expect(receive).toHaveBeenCalledWith(token);
+    expect(receive).toHaveBeenCalledWith(token, false);
     expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, token);
     expect(results).toEqual([{ baseUrl: BASE_URL, token, success: true }]);
   });
@@ -662,6 +662,8 @@ describe("untrusted mint recovery regressions", () => {
 describe("unrecovered topup persistence", () => {
   it.each(["result", "throw", "fetch"])("does not spend a second token when recovery fails via %s", async (failure) => {
     const store = storage();
+    const tokens: string[] = [];
+    store.addXcashuToken = (_baseUrl, token) => { if (!tokens.includes(token)) tokens.push(token); };
     let cached: any[] = [];
     store.getCachedReceiveTokens = () => cached;
     store.setCachedReceiveTokens = (entries: any[]) => { cached = entries; };
@@ -678,10 +680,11 @@ describe("unrecovered topup persistence", () => {
     const result = await manager.topUp({ mintUrl: MINT_URL, baseUrl: BASE_URL, amount: 100, token: "api-key" });
     expect(create).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ success: false, recoveredToken: false, parsedError });
-    expect(cached).toHaveLength(1);
-    expect(cached[0].token).toBe("cashu_topup");
+    expect(tokens).toEqual(["cashu_topup"]);
+    expect(cached).toEqual([]);
     await (manager as any)._recoverFailedTopUp("cashu_topup");
-    expect(cached).toHaveLength(1);
+    expect(tokens).toEqual(["cashu_topup"]);
+    expect(cached).toEqual([]);
   });
 });
 
@@ -696,7 +699,7 @@ describe("404 IOU recovery", () => {
     const spender = new CashuSpender(wallet(), store, discovery(), manager);
     const receive = vi.spyOn(spender, "receiveToken").mockResolvedValue({ success, amount: 100, unit: "sat" });
     const results = await spender.refundXcashuTokens(MINT_URL);
-    expect(receive).toHaveBeenCalledWith("cashu_original");
+    expect(receive).toHaveBeenCalledWith("cashu_original", false);
     expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, "cashu_original");
     expect(results[0].success).toBe(success);
     expect(cached.map((t) => t.token)).toEqual(success ? [] : ["cashu_original"]);

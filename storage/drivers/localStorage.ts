@@ -1,3 +1,4 @@
+import { isCredentialStorageKey } from "../credentialKeys";
 import type { StorageDriver } from "../types";
 
 const canUseLocalStorage = (): boolean => {
@@ -46,7 +47,10 @@ export const localStorageDriver: StorageDriver = {
     }
   },
   async setItem<T>(key: string, value: T): Promise<void> {
-    if (!canUseLocalStorage()) return;
+    if (!canUseLocalStorage()) {
+      if (isCredentialStorageKey(key)) throw new Error("localStorage is not available");
+      return;
+    }
     try {
       window.localStorage.setItem(key, JSON.stringify(value));
     } catch (error) {
@@ -68,10 +72,12 @@ export const localStorageDriver: StorageDriver = {
             `Storage quota exceeded; unable to persist key "${key}" after cleanup attempt.`,
             retryError
           );
+          if (isCredentialStorageKey(key)) throw retryError;
           return;
         }
       }
       console.error(`Error storing item with key "${key}":`, error);
+      if (isCredentialStorageKey(key)) throw error;
     }
   },
   async removeItem(key: string): Promise<void> {

@@ -101,3 +101,39 @@ Run:
 ```bash
 npm run test:sdk
 ```
+
+## Credential persistence and recovery
+
+With the built-in storage adapter, API-key requests wait for credential writes
+before using either a new or reused key. Top-ups persist their outgoing token
+before POSTing. `flush()` waits for **all** tracked credential categories (API
+keys, child keys, xcashu tokens, cached receive tokens); a failure in any category
+can therefore block payment. Failed writes are retried from current memory on a
+later flush. Drivers must apply writes in submission order.
+
+SQLite, Bun SQLite, localStorage and IndexedDB report critical credential-write
+failures instead of silently discarding them. Noncritical cache writes remain
+best-effort where supported. In SSR/server environments, select a server storage
+driver: credential writes using unavailable localStorage now reject. A memory
+store is not durable across process restarts.
+
+Wallet adapters can accept `sendToken`'s optional fourth argument, `persistToken`.
+They must await it **before relinquishing their own recoverable copy**, and retain
+that copy if it rejects. Existing adapters ignoring this argument retain a crash
+window between wallet send and SDK persistence; invoking the callback only after
+irreversibly sending does not close that window. Custom storage adapters without
+`flush()` likewise do not provide the persistence barrier.
+
+Failed top-ups remain in `xcashuTokens`, not also in `cachedReceiveTokens`.
+Initialization removes legacy cached-receive duplicates in memory when their
+original tokens already have xcashu records, then schedules a tracked cleanup
+write. A failed cleanup does not stop startup: a subsequent `flush()` retries
+the hydrated value, and payments remain blocked until persistence succeeds.
+
+The xcashu list currently holds provider IOUs, temporary wallet handover copies,
+and top-up tokens. Refund sweeps treat these entries through the same recovery
+path; there is no token-purpose field yet. **API-key mode does not automatically
+sweep this list.** Applications must call `refundXcashuTokens` or use
+`scripts/refund-all.ts --xcashu`; default script mode handles cached receive tokens
+and API keys. Do not run recovery sweeps concurrently with active payments.
+Alternate-mint top-up retries require successful recovery of the first token.

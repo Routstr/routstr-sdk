@@ -50,3 +50,11 @@ jobs:
 
       - name: Integration tests
         run: pnpm test:sdk:integration
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Bun storage regression tests
+        run: pnpm test:sdk:bun

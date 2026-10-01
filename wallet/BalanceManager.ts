@@ -578,6 +578,11 @@ export class BalanceManager {
       }
 
       cashuToken = tokenResult.token;
+      // The wallet no longer holds these proofs. Store the token until the
+      // outcome is known, so a refund sweep can still recover it when both the
+      // top-up and the direct recovery below fail.
+      this.storageAdapter.addXcashuToken(baseUrl, cashuToken);
+      await this.storageAdapter.flush?.();
 
       const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
@@ -595,6 +600,9 @@ export class BalanceManager {
           this.logger.warn(
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
           );
+        }
+        if (recoveredToken || !canRecover) {
+          this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
         }
 
         // A foreign-mint swap failure can be retried against the same provider
@@ -626,6 +634,7 @@ export class BalanceManager {
         };
       }
 
+      this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       return {
         success: true,
         toppedUpAmount: amount,
@@ -633,8 +642,8 @@ export class BalanceManager {
       };
     } catch (error) {
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
-      if (cashuToken) {
-        await this._recoverFailedTopUp(cashuToken);
+      if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
+        this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       }
 
       return this._handleTopUpError(error, mintUrl, requestId);
@@ -758,7 +767,17 @@ export class BalanceManager {
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
-          p2pkPubkey
+          p2pkPubkey,
+          async (sentToken) => {
+            this.storageAdapter.addXcashuToken(baseUrl, sentToken);
+            try {
+              await this.storageAdapter.flush?.();
+            } catch (error) {
+              // The wallet keeps its own copy when this rejects.
+              this.storageAdapter.removeXcashuToken(baseUrl, sentToken);
+              throw error;
+            }
+          }
         );
         this.logger.log(`createProviderToken: success from mint=${candidateMint}`);
         return {
@@ -1062,17 +1081,17 @@ export class BalanceManager {
    */
   private async _recoverFailedTopUp(cashuToken: string): Promise<boolean> {
     try {
-      const result = await this.cashuSpender.receiveToken(cashuToken);
+      const result = await this.cashuSpender.receiveToken(cashuToken, false);
       if (!result.success) {
         this.logger.warn(
           `_recoverFailedTopUp: receive failed: ${result.message ?? "unknown error"}`
         );
-        this.cashuSpender.cacheReceiveToken(cashuToken);
+        // The pre-POST xcashu record owns recovery for this token.
       }
       return result.success;
     } catch (error) {
       this.logger.error("_recoverFailedTopUp: failed to recover token", error);
-      this.cashuSpender.cacheReceiveToken(cashuToken);
+      // Keep the existing xcashu record; do not create a second recovery owner.
       return false;
     }
   }

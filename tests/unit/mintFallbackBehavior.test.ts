@@ -12,6 +12,8 @@ const storage = {
   getApiKey: () => null,
   getApiKeyDistribution: () => [],
   getXcashuTokens: () => ({}),
+  addXcashuToken: () => {},
+  removeXcashuToken: () => {},
   getAllApiKeys: () => [],
 } as unknown as StorageAdapter;
 
@@ -52,7 +54,12 @@ describe("BalanceManager request-scoped mint selection", () => {
       selectedMintUrl: MINT_B,
       token: `token:${MINT_B}`,
     });
-    expect(sendToken).toHaveBeenCalledWith(MINT_B, 10, undefined);
+    expect(sendToken).toHaveBeenCalledWith(
+      MINT_B,
+      10,
+      undefined,
+      expect.any(Function)
+    );
   });
 
   it("never falls back to a funded mint the provider does not advertise", async () => {
@@ -203,6 +210,7 @@ describe("BalanceManager request-scoped mint selection", () => {
 
 describe("topup recovery spending invariant", () => {
   it("calls sendToken once when recovery fails and preserves the emitted token", async () => {
+    const tokens: string[] = [];
     let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
     const sendToken = vi.fn(async (mint: string) => `token:${mint}`);
     const manager = new BalanceManager({
@@ -210,6 +218,7 @@ describe("topup recovery spending invariant", () => {
       receiveToken: async () => ({ success: false, amount: 10, unit: "sat" }),
     }, {
       ...storage,
+      addXcashuToken: (_baseUrl, token) => { if (!tokens.includes(token)) tokens.push(token); },
       getCachedReceiveTokens: () => cached,
       setCachedReceiveTokens: (entries) => {
         cached = entries.map((entry) => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
@@ -224,6 +233,7 @@ describe("topup recovery spending invariant", () => {
     expect(sendToken).toHaveBeenCalledOnce();
     expect(create).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ success: false, recoveredToken: false });
-    expect(cached.map((entry) => entry.token)).toEqual([`token:${MINT_A}`]);
+    expect(tokens).toEqual([`token:${MINT_A}`]);
+    expect(cached).toEqual([]);
   });
 });

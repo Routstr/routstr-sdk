@@ -1,3 +1,4 @@
+import { isCredentialStorageKey } from "../credentialKeys";
 import type { StorageDriver } from "../types";
 import type { SdkLogger } from "../../core/types";
 import { consoleLogger } from "../../core/types";
@@ -52,6 +53,7 @@ export async function createBunSqliteDriver(
         ).run(key, JSON.stringify(value));
       } catch (error) {
         logger.error(`setItem failed for key "${key}":`, error);
+        if (isCredentialStorageKey(key)) throw error;
       }
     },
     async removeItem(key: string): Promise<void> {

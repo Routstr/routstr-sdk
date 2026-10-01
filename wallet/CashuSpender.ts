@@ -81,7 +81,8 @@ export class CashuSpender {
     this.logger = (logger ?? consoleLogger).child("CashuSpender");
   }
 
-  async receiveToken(token: string): Promise<{
+  /** Disable failure caching when a durable xcashu record already owns recovery. */
+  async receiveToken(token: string, cacheOnFailure = true): Promise<{
     success: boolean;
     amount: number;
     unit: "sat" | "msat";
@@ -94,7 +95,7 @@ export class CashuSpender {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
-      if (errorMessage.includes("Failed to fetch mint")) {
+      if (cacheOnFailure && errorMessage.includes("Failed to fetch mint")) {
         this.cacheReceiveToken(token);
       }
 
@@ -608,7 +609,7 @@ export class CashuSpender {
               (fetchResult.status === 404 &&
                 (fetchResult.error || "").includes("Refund not found")))
           ) {
-            const directReceive = await this.receiveToken(xcashuToken.token);
+            const directReceive = await this.receiveToken(xcashuToken.token, false);
             if (directReceive.success) {
               this.storageAdapter.removeXcashuToken(
                 baseUrl,

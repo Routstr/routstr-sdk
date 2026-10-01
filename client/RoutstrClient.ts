@@ -1403,10 +1403,7 @@ export class RoutstrClient {
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
             if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-              if (storedApiKeyEntry) {
-                this.storageAdapter.removeApiKey(baseUrl);
-              }
-              this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+              this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
             }
             retryToken = latestBalanceInfo.apiKey;
           }
@@ -2098,8 +2095,7 @@ export class RoutstrClient {
           storedApiKeyEntry?.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
-          this.storageAdapter.removeApiKey(baseUrl);
-          this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+          this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(
@@ -2504,6 +2500,10 @@ export class RoutstrClient {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       let selectedMintUrl: string | undefined;
 
+      // A reused key may belong to another request whose write is pending,
+      // or survive a failed save and failed recovery. Do not expose it yet.
+      if (parentApiKey) await this.storageAdapter.flush?.();
+
       // A stored key that is still a bootstrap Cashu token (i.e. the
       // provider's canonical key was never swapped in) may be a zombie: if the
       // first request failed before the swap (e.g. 503 mint_unreachable) the
@@ -2579,6 +2579,9 @@ export class RoutstrClient {
           `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}, balance: ${spendResult.balance}`
         );
 
+        // Legacy wallet adapters may ignore persistToken. Establish a recovery
+        // owner before attempting either key persistence or wallet recovery.
+        this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);
         try {
           this.storageAdapter.setApiKey(baseUrl, spendResult.token);
         } catch (error) {
@@ -2587,9 +2590,11 @@ export class RoutstrClient {
             error.message.includes("ApiKey already exists")
           ) {
             const receiveResult = await this.cashuSpender.receiveToken(
-              spendResult.token
+              spendResult.token,
+              false
             );
             if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
               this._log(
                 "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
@@ -2609,11 +2614,44 @@ export class RoutstrClient {
           }
         }
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+
+        // This token is now the only credential for its deposit, so it must be
+        // stored before the provider sees it. If it cannot be stored, give the
+        // proofs back to the wallet instead of paying with it.
+        if (parentApiKey?.key === spendResult.token) {
+          try {
+            await this.storageAdapter.flush?.();
+          } catch (error) {
+            const receiveResult = await this.cashuSpender.receiveToken(
+              spendResult.token,
+              false
+            );
+            if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+              if (
+                this.storageAdapter.getApiKey(baseUrl)?.key === spendResult.token
+              ) {
+                this.storageAdapter.removeApiKey(baseUrl);
+              }
+            }
+            throw error;
+          }
+          // The key record now holds the token; drop the wallet handover copy.
+          this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+        }
       } else {
         this._log(
           "DEBUG",
           `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
+      }
+
+      // Also covers the winner when concurrent key creation lost the race.
+      await this.storageAdapter.flush?.();
+      if (this.storageAdapter.flush && parentApiKey?.key.startsWith("cashu")) {
+        // A previous failed save may have left its recovery copy behind.
+        // The key is durable now, so that handover copy is no longer needed.
+        this.storageAdapter.removeXcashuToken(baseUrl, parentApiKey.key);
       }
 
       let tokenBalance = 0;
@@ -2695,6 +2733,19 @@ export class RoutstrClient {
       tokenBalanceUnknown: false,
       selectedMintUrl: spendResult.selectedMintUrl,
     };
+  }
+
+  /**
+   * Swap the stored API key in one write where the adapter supports it, so
+   * storage never holds no key for a funded provider.
+   */
+  private _replaceApiKey(baseUrl: string, key: string): void {
+    if (this.storageAdapter.replaceApiKey) {
+      this.storageAdapter.replaceApiKey(baseUrl, key);
+      return;
+    }
+    this.storageAdapter.removeApiKey(baseUrl);
+    this.storageAdapter.setApiKey(baseUrl, key);
   }
 
   /**
