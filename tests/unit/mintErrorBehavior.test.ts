@@ -36,6 +36,14 @@ const MINT_ERROR_BODY = JSON.stringify({
   },
   request_id: "req-422",
 });
+const UNTRUSTED_MINT_BODY = JSON.stringify({
+  error: {
+    type: "untrusted_mint",
+    code: "cashu_untrusted_source_mint",
+    message: "Source mint is not trusted",
+  },
+  request_id: "req-untrusted",
+});
 const FEES_EXCEED_BODY = JSON.stringify({
   error: {
     type: "mint_error",
@@ -348,6 +356,95 @@ describe("RoutstrClient._handleErrorResponse — mint_error (422)", () => {
     expect(retryParams.token).toBe("cashu_fresh_fallback_token");
     expect(retryParams.selectedMintUrl).toBe(FALLBACK_MINT_URL);
     expect(retryParams.excludeMints).toEqual([SECOND_MINT_URL]);
+  });
+});
+
+describe("untrusted source mint failover", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reclaims the token and retries the same provider excluding the actual rejected mint", async () => {
+    const { storage, removedXcashu } = createStorage();
+    const providerManager = {
+      markFailed: vi.fn(),
+      findNextBestProvider: vi.fn(),
+    } as any;
+    const client = new RoutstrClient(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "xcashu",
+      { providerManager }
+    );
+    const spendSpy = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_from_trusted_mint",
+      tokenBalance: 100,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+      selectedMintUrl: FALLBACK_MINT_URL,
+    });
+    const requestSpy = vi
+      .spyOn(client as any, "_makeRequest")
+      .mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const token = "cashu_from_untrusted_mint";
+    const result = await (client as any)._handleErrorResponse(
+      { ...errorParams(token), selectedMintUrl: SECOND_MINT_URL },
+      token,
+      400,
+      "req-untrusted",
+      undefined,
+      UNTRUSTED_MINT_BODY,
+      0
+    );
+
+    expect(result.status).toBe(200);
+    expect(removedXcashu).toEqual([[BASE_URL, token]]);
+    expect(spendSpy).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+      excludeMints: [SECOND_MINT_URL],
+    });
+    expect(requestSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseUrl: BASE_URL,
+        token: "cashu_from_trusted_mint",
+        selectedMintUrl: FALLBACK_MINT_URL,
+        excludeMints: [SECOND_MINT_URL],
+      })
+    );
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+  });
+
+  it("does not spend from another mint when recovery fails", async () => {
+    const { storage, removedXcashu } = createStorage();
+    const client = new RoutstrClient(
+      createWallet({
+        receiveToken: async () => ({ success: false, error: "not recovered" }),
+      }),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "xcashu"
+    );
+    const spendSpy = vi.spyOn(client as any, "_spendToken");
+
+    await expect(
+      (client as any)._handleErrorResponse(
+        errorParams("cashu_unrecovered"),
+        "cashu_unrecovered",
+        400,
+        "req-untrusted",
+        undefined,
+        UNTRUSTED_MINT_BODY,
+        0
+      )
+    ).rejects.toThrow();
+
+    expect(spendSpy).not.toHaveBeenCalled();
+    expect(removedXcashu).toEqual([]);
   });
 });
 

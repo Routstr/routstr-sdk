@@ -314,17 +314,19 @@ export function shouldPurgeStoredCredential(
 /**
  * Determine whether this error should be retried using another Cashu mint.
  *
- * This does not control provider failover. A mint-unreachable response and a
- * foreign-mint swap failure can be recovered by selecting another mint. A
- * token whose amount is too small for swap fees cannot: changing mints alone
- * does not fix the token sizing problem. Unknown mint-error codes remain
- * non-retryable by default.
+ * This does not control provider failover. Mint-unreachable, foreign-mint
+ * swap failure, and a rejected source mint can be retried with another mint
+ * after the token is recovered. A token whose amount is too small for swap
+ * fees cannot: changing mints alone does not fix the token sizing problem.
+ * Unknown codes remain non-retryable by default.
  */
 export function shouldFailoverToAnotherMint(
   parsed: ParsedCoreError
 ): boolean {
   return (
     parsed.type === CoreErrorType.MINT_UNREACHABLE ||
+    (parsed.type === CoreErrorType.UNTRUSTED_MINT &&
+      parsed.code === CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT) ||
     (parsed.type === CoreErrorType.MINT_ERROR &&
       parsed.code === CoreErrorCode.CASHU_FOREIGN_MINT_SWAP_FAILED)
   );
