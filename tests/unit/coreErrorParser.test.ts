@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseCoreError,
   isCoreErrorType,
+  isKeyNotFoundError,
   shouldFailoverToAnotherMint,
   summarizeCoreError,
   CoreErrorType,
@@ -345,5 +346,58 @@ describe("CoreErrorCode constants", () => {
     expect(CoreErrorCode.INVALID_CASHU_TOKEN).toBe("invalid_cashu_token");
     expect(CoreErrorCode.CASHU_MINT_UNREACHABLE).toBe("cashu_mint_unreachable");
     expect(CoreErrorCode.INVALID_API_KEY).toBe("invalid_api_key");
+    expect(CoreErrorCode.KEY_NOT_FOUND).toBe("key_not_found");
+  });
+});
+
+describe("isKeyNotFoundError", () => {
+  it("matches the structured key_not_found code", () => {
+    const body = JSON.stringify({
+      detail: {
+        error: {
+          message:
+            "Key not found. Deposit first via /v1/wallet/create to get a key on this node.",
+          type: "invalid_request_error",
+          code: "key_not_found",
+        },
+      },
+    });
+    expect(isKeyNotFoundError(parseCoreError(body, 401))).toBe(true);
+  });
+
+  it("matches a reworded message carrying the key_not_found code", () => {
+    const body = JSON.stringify({
+      detail: { error: { message: "No such key here.", code: "key_not_found" } },
+    });
+    expect(isKeyNotFoundError(parseCoreError(body, 401))).toBe(true);
+  });
+
+  it("still matches the legacy bare-detail message with no code", () => {
+    const body = JSON.stringify({
+      detail:
+        "Key not found. Deposit first via /v1/wallet/create before requesting a refund.",
+    });
+    expect(isKeyNotFoundError(parseCoreError(body, 401))).toBe(true);
+  });
+
+  it("does not match a malformed-credential 401", () => {
+    const body = JSON.stringify({
+      detail: {
+        error: {
+          message:
+            "Invalid API key format. Expected an 'sk-...' API key or a 'cashu...' token.",
+          type: "invalid_request_error",
+          code: "invalid_api_key",
+        },
+      },
+    });
+    expect(isKeyNotFoundError(parseCoreError(body, 401))).toBe(false);
+  });
+
+  it("does not match the same code on a non-401 status", () => {
+    const body = JSON.stringify({
+      detail: { error: { message: "Key not found.", code: "key_not_found" } },
+    });
+    expect(isKeyNotFoundError(parseCoreError(body, 404))).toBe(false);
   });
 });

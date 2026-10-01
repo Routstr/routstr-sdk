@@ -884,4 +884,74 @@ describe("BalanceManager non-JSON error responses", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("getTokenBalance marks the structured key_not_found code as an invalid API key", async () => {
+    const manager = new BalanceManager(createWallet(), createStorage());
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetchResponse(
+      401,
+      "Unauthorized",
+      JSON.stringify({
+        detail: {
+          error: {
+            message: "No record of this key.",
+            type: "invalid_request_error",
+            code: "key_not_found",
+          },
+        },
+      })
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.getTokenBalance(
+        "sk-dead-key",
+        "https://provider.example.com/"
+      );
+
+      expect(result.isInvalidApiKey).toBe(true);
+      expect(result.balanceUnknown).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("refundApiKey removes the key when the refund endpoint replies with the structured key_not_found code", async () => {
+    const Provider = "https://provider.example.com/";
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [Provider]: { key: "sk-dead-key", balance: 0, lastUsed: null },
+      },
+    });
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetchResponse(
+      401,
+      "Unauthorized",
+      JSON.stringify({
+        detail: {
+          error: {
+            message: "No record of this key.",
+            type: "invalid_request_error",
+            code: "key_not_found",
+          },
+        },
+        request_id: "req-key-not-found",
+      })
+    ) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-dead-key",
+        forceRefund: true,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe("Key not found, removed dead API key");
+      expect(storage.getApiKey(Provider)).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

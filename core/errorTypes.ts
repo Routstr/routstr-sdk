@@ -73,6 +73,8 @@ export const CoreErrorCode = {
   CASHU_TOKEN_CONSUMED: "cashu_token_consumed",
   INTERNAL_ERROR: "internal_error",
   INVALID_API_KEY: "invalid_api_key",
+  /** A well-formed API key that the node has no record of */
+  KEY_NOT_FOUND: "key_not_found",
   /** The API key's available balance is below the request requirement */
   INSUFFICIENT_BALANCE: "insufficient_balance",
   /** A configured spending cap was reached; adding funds will not fix it */
@@ -262,6 +264,23 @@ export function isTokenConsumedError(parsed: ParsedCoreError): boolean {
   return (
     parsed.type === CoreErrorType.TOKEN_CONSUMED &&
     parsed.code === CoreErrorCode.CASHU_TOKEN_CONSUMED
+  );
+}
+
+/**
+ * A 401 meaning the API key does not exist on this node.
+ *
+ * The refund path sends a structured `key_not_found` code since routstr-core
+ * 0.4.5, and the auth path after routstr-core#779. Older nodes only send the
+ * `"Key not found. …"` message (a bare `detail` string on the refund path), so
+ * the message is also matched whenever the code does not match. Either way the
+ * key is permanently dead and should be purged.
+ */
+export function isKeyNotFoundError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.status === 401 &&
+    (parsed.code === CoreErrorCode.KEY_NOT_FOUND ||
+      (parsed.message?.includes("Key not found") ?? false))
   );
 }
 
