@@ -334,13 +334,8 @@ export function shouldFailoverToAnotherMint(
 const CORE_TYPES = new Set<string>(Object.values(CoreErrorType));
 
 /**
- * True when the node forwarded an upstream complaint about the request body or
- * parameters. Not a payment failure — and no other provider can fix it, since
- * the client's request is what the upstream rejected.
- *
- * routstr-core tags these `type: "upstream_error"` / `"invalid_request_error"` and
- * leaves provider-side 4xx status untouched, so "400/422 and not one of our own
- * wallet types" is the fallback when the envelope is unrecognized.
+ * Classify non-wallet 400/422 rejections. They can be provider-specific, so
+ * recover payment and try other candidates without applying a cooldown.
  */
 export function isUpstreamRequestError(
   status: number,

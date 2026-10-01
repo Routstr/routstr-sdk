@@ -139,7 +139,7 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns the last provider's 503 instead of throwing FailoverError", async () => {
+  it("returns both diagnostics with the last provider's 503 status", async () => {
     const { client, providerManager } = setup();
     const fetchMock = stubFetchByProvider({
       [baseUrl]: {
@@ -173,7 +173,9 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     expect(response.statusText).toBe("Service Unavailable");
     expect((response as any).passthrough).toBe(true);
     expect(response.headers.get("x-routstr-request-id")).toBe("req-second");
-    expect(await response.text()).toBe(providerBody("second-node"));
+    expect((await response.json()).error.errors.map((error: any) => error.message)).toEqual([
+      "first-node says no", "second-node says no",
+    ]);
   });
 
   it("forwards a 429 envelope at exhaustion", async () => {
@@ -196,10 +198,12 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     const response = await routeRequest(client);
 
     expect(response.status).toBe(429);
-    expect(await response.text()).toBe(providerBody("second-node"));
+    expect((await response.json()).error.errors.map((error: any) => error.message)).toEqual([
+      "first-node says no", "second-node says no",
+    ]);
   });
 
-  it("still throws FailoverError when a network failure exhausts the chain", async () => {
+  it("returns a 502 aggregate when network failures exhaust the chain", async () => {
     const { client } = setup();
     vi.stubGlobal(
       "fetch",
@@ -208,7 +212,9 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
       })
     );
 
-    await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.errors[0].status).toBe(-1);
   });
 
   it("still throws TokenAlreadySpentError at exhaustion", async () => {

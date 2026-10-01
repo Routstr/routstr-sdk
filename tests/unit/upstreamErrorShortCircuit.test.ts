@@ -1,16 +1,5 @@
-/**
- * L2: upstream-attributable request errors short-circuit failover.
- *
- * A 400/422 that came from the upstream (routstr-core tags these
- * `type: "upstream_error"` / `"invalid_request_error"` and passes the provider's
- * 4xx through unchanged) is the node's final answer. Every other node would
- * reject the same body identically, so the SDK must NOT refund the key, cool the
- * provider down, or pay for a retry elsewhere — it must hand the caller the
- * node's own envelope. These tests pin that behaviour, plus the guard rails that
- * keep our own wallet errors and 401/429 on their existing paths.
- */
-
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ProviderManager } from "../../client/ProviderManager";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import type { SdkLogger, Model } from "../../core/types";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
@@ -78,7 +67,7 @@ function setup(mode: "apikeys" | "xcashu" = "apikeys") {
   const providerManager = {
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([baseUrl]),
-    findNextBestProvider: vi.fn(() => nextUrl),
+    findNextBestProvider: vi.fn((_model, current, attempted) => current === baseUrl && !attempted?.has(nextUrl) ? nextUrl : null),
     getModelForProvider: vi.fn(async () => model),
     getRequiredSatsForModel: vi.fn(() => 100),
   };
@@ -165,65 +154,117 @@ function routeRequest(client: RoutstrClient) {
   });
 }
 
-describe("L2 upstream request errors stop the failover machine", () => {
+describe("upstream request errors refund, fail over, and aggregate at exhaustion", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it("forwards the upstream 400 verbatim without refund, cooldown, or failover", async () => {
-    const { client, providerManager, refund, spend, finalize } = setup();
-    const fetchMock = stubFetch({
-      status: 400,
-      statusText: "Bad Request",
-      body: webSearchOptionsBody,
+  it("walks three real provider candidates once and groups duplicate errors", async () => {
+    const thirdUrl = "https://third.example/";
+    const { client, refund } = setup();
+    const registry = {
+      getCachedModels: () => ({ [baseUrl]: [model], [nextUrl]: [model], [thirdUrl]: [model] }),
+      getDisabledProviders: () => [],
+    } as unknown as DiscoveryAdapter;
+    const manager = new ProviderManager(registry);
+    (client as any).providerManager = manager;
+    const markFailed = vi.spyOn(manager, "markFailed");
+    const fetchMock = vi.fn(async (url: string) => {
+      const last = url.startsWith(thirdUrl);
+      return Response.json({ error: { type: "upstream_error", code: "unsupported", message: last ? "Different rejection" : "Same rejection" }, request_id: url }, { status: last ? 422 : 400 });
     });
-
+    vi.stubGlobal("fetch", fetchMock);
     const response = await routeRequest(client);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      `${baseUrl}v1/messages`, `${nextUrl}v1/messages`, `${thirdUrl}v1/messages`,
+    ]);
+    expect(refund).toHaveBeenCalledTimes(3);
+    expect(markFailed).not.toHaveBeenCalled();
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.errors).toEqual([
+      { status: 400, type: "upstream_error", code: "unsupported", message: "Same rejection", providers: [baseUrl, nextUrl] },
+      { status: 422, type: "upstream_error", code: "unsupported", message: "Different rejection", providers: [thirdUrl] },
+    ]);
+  });
 
-    // Exactly one node was asked: the request error is terminal.
+  it("retains earlier errors when the final provider has a network failure", async () => {
+    const { client } = setup();
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.startsWith(nextUrl)) throw new TypeError("Failed to fetch");
+      return Response.json({ error: { type: "invalid_model", message: "Model not found" } }, { status: 400 });
+    }));
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.errors.map((error: any) => error.status)).toEqual([400, -1]);
+  });
+
+  it("redacts payment proofs and credentials from the aggregate", async () => {
+    const { client } = setup();
+    stubFetch({ status: 400, statusText: "Bad Request", body: JSON.stringify({ error: { type: "upstream_error", message: `${credential} cashuBabc123 Bearer secret-key`, refund_token: "cashuBrefund123" } }), headers: { "x-cashu": "cashuBrefund123" } });
+    const response = await routeRequest(client);
+    const text = await response.text();
+    expect(text).not.toContain(credential);
+    expect(text).not.toContain("cashuB");
+    expect(text).not.toContain("secret-key");
+    expect(response.headers.get("x-cashu")).toBeNull();
+  });
+
+  it("keeps histories isolated between requests on the same client", async () => {
+    const { client, providerManager } = setup();
+    providerManager.findNextBestProvider.mockReturnValue(null);
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string);
+      await Promise.resolve();
+      return Response.json({ error: { type: "upstream_error", message: body.marker } }, { status: 400 });
+    }));
+    const request = (marker: string) => client.routeRequest({ path: "/v1/messages", method: "POST", body: { model: model.id, marker }, baseUrl, mintUrl, modelId: model.id });
+    const responses = await Promise.all([request("first"), request("second")]);
+    expect((await responses[0].json()).error.errors.map((error: any) => error.message)).toEqual(["first"]);
+    expect((await responses[1].json()).error.errors.map((error: any) => error.message)).toEqual(["second"]);
+  });
+
+  it("does not fail a caller-pinned request over after a 400", async () => {
+    const { client, providerManager } = setup();
+    const fetchMock = stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });
+    const response = await client.routeRequest({ path: "/v1/messages", method: "POST", body: { model: model.id }, baseUrl, mintUrl, modelId: model.id, headers: { "x-routstr-model-path": "pinned-route" } });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
-    expect(providerManager.markFailed).not.toHaveBeenCalled();
-    expect(refund).not.toHaveBeenCalled();
-    // Only the initial spend happened; no failover topup.
-    expect(spend).toHaveBeenCalledTimes(1);
-    // Nothing was spent upstream, so no post-response accounting.
-    expect(finalize).not.toHaveBeenCalled();
-
     expect(response.status).toBe(400);
-    expect(response.statusText).toBe("Bad Request");
-    expect((response as any).passthrough).toBe(true);
-    expect(response.headers.get("x-routstr-request-id")).toBe(
-      "04aee611-2e54-4151-8be4-4ef6c7e9523b"
-    );
-    expect(response.headers.get("transfer-encoding")).toBeNull();
-    expect(await response.text()).toBe(webSearchOptionsBody);
   });
 
-  it("does not spend a failover token for an unrecognized 422 body", async () => {
+  it.each([400, 422])("refunds and retries on upstream %i, returning success from the next node", async (status) => {
     const { client, providerManager, refund, spend } = setup();
-    const fetchMock = stubFetch({
-      status: 422,
-      statusText: "Unprocessable Entity",
-      body: JSON.stringify({ detail: "invalid tool schema" }),
-    });
-
+    const fetchMock = stubFetch({ status, statusText: "Rejected", body: webSearchOptionsBody }, okResponse());
     const response = await routeRequest(client);
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(refund).toHaveBeenCalledTimes(1);
+    expect(spend).toHaveBeenCalledTimes(2);
     expect(providerManager.markFailed).not.toHaveBeenCalled();
-    expect(refund).not.toHaveBeenCalled();
-    expect(spend).toHaveBeenCalledTimes(1);
-    expect(response.status).toBe(422);
-    expect((response as any).passthrough).toBe(true);
-    expect(await response.text()).toBe(
-      JSON.stringify({ detail: "invalid tool schema" })
-    );
+    expect(response.status).toBe(200);
   });
 
-  it.each([400, 422])("recovers X-Cashu refunds on %i without retrying", async (status) => {
+  it("deduplicates identical rejections across providers", async () => {
+    const { client, providerManager, refund, spend, finalize } = setup();
+    const fetchMock = stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });
+    const response = await routeRequest(client);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(refund).toHaveBeenCalledTimes(2);
+    expect(spend).toHaveBeenCalledTimes(2);
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(finalize).not.toHaveBeenCalled();
+    expect(response.status).toBe(400);
+    expect((response as any).passthrough).toBe(true);
+    const body = await response.json();
+    expect(body.error.type).toBe("all_providers_failed");
+    expect(body.error.errors).toHaveLength(1);
+    expect(body.error.errors[0].providers).toEqual([baseUrl, nextUrl]);
+    expect(body.error.errors[0].message).toContain("web_search_options");
+  });
+
+  it.each([400, 422])("recovers X-Cashu refunds on %i at exhaustion", async (status) => {
     const { client, providerManager, spend, refund, removeXcashuToken, finalize } = setup("xcashu");
+    providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: true, amount: 100, unit: "sat" });
     const fetchMock = stubFetch({ status, statusText: "Rejected", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
 
@@ -235,14 +276,15 @@ describe("L2 upstream request errors stop the failover machine", () => {
     expect(spend).toHaveBeenCalledTimes(1);
     expect(refund).not.toHaveBeenCalled();
     expect(providerManager.markFailed).not.toHaveBeenCalled();
-    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
     expect(response.status).toBe(status);
-    expect(await response.text()).toBe(webSearchOptionsBody);
+    expect((await response.json()).error.errors[0].message).toContain("web_search_options");
   });
 
   it("recovers an unredeemed original X-Cashu token when no refund is returned", async () => {
-    const { client, removeXcashuToken } = setup("xcashu");
+    const { client, removeXcashuToken, providerManager } = setup("xcashu");
+    providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: true, amount: 100, unit: "sat" });
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });
     await routeRequest(client);
@@ -252,6 +294,7 @@ describe("L2 upstream request errors stop the failover machine", () => {
 
   it("preserves failed refund proofs and the original IOU for later recovery", async () => {
     const { client, removeXcashuToken, providerManager } = setup("xcashu");
+    providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat", message: "mint unavailable" });
     const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
@@ -259,12 +302,13 @@ describe("L2 upstream request errors stop the failover machine", () => {
     expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
     expect(cache).toHaveBeenCalledExactlyOnceWith("cashu-refund");
     expect(removeXcashuToken).not.toHaveBeenCalled();
-    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     expect(response.status).toBe(400);
   });
 
   it("does not receive identical refund and original proofs twice", async () => {
-    const { client, removeXcashuToken } = setup("xcashu");
+    const { client, removeXcashuToken, providerManager } = setup("xcashu");
+    providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat" });
     vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-original" } });
@@ -281,7 +325,7 @@ describe("L2 upstream request errors stop the failover machine", () => {
     expect((response as any).passthrough).toBe(true);
     expect((response as any).finalize).toBeUndefined();
     expect((response as any).usagePromise).toBeUndefined();
-    expect(await response.text()).toBe(body);
+    expect((await response.json()).error.errors[0].message).toBe(body);
     expect(finalize).not.toHaveBeenCalled();
   });
 
@@ -308,7 +352,8 @@ describe("L2 upstream request errors stop the failover machine", () => {
     );
     expect(providerManager.findNextBestProvider).toHaveBeenCalledWith(
       model.id,
-      baseUrl
+      baseUrl,
+      expect.any(Set)
     );
     expect(spend).toHaveBeenCalledTimes(2);
     expect(response.status).toBe(200);
