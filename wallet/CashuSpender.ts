@@ -609,7 +609,7 @@ export class CashuSpender {
               (fetchResult.status === 404 &&
                 (fetchResult.error || "").includes("Refund not found")))
           ) {
-            const directReceive = await this.receiveToken(xcashuToken.token);
+            const directReceive = await this.receiveToken(xcashuToken.token, false);
             if (directReceive.success) {
               this.storageAdapter.removeXcashuToken(
                 baseUrl,

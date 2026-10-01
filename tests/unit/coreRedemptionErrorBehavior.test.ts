@@ -519,7 +519,7 @@ describe("CashuSpender background redemption recovery", () => {
       token,
       true
     );
-    expect(receive).toHaveBeenCalledWith(token);
+    expect(receive).toHaveBeenCalledWith(token, false);
     expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, token);
     expect(results).toEqual([{ baseUrl: BASE_URL, token, success: true }]);
   });
@@ -699,7 +699,7 @@ describe("404 IOU recovery", () => {
     const spender = new CashuSpender(wallet(), store, discovery(), manager);
     const receive = vi.spyOn(spender, "receiveToken").mockResolvedValue({ success, amount: 100, unit: "sat" });
     const results = await spender.refundXcashuTokens(MINT_URL);
-    expect(receive).toHaveBeenCalledWith("cashu_original");
+    expect(receive).toHaveBeenCalledWith("cashu_original", false);
     expect(store.removeXcashuToken).toHaveBeenCalledWith(BASE_URL, "cashu_original");
     expect(results[0].success).toBe(success);
     expect(cached.map((t) => t.token)).toEqual(success ? [] : ["cashu_original"]);

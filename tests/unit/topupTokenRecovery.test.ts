@@ -1,3 +1,4 @@
+import { CashuSpender } from "../../wallet/CashuSpender";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BalanceManager } from "../../wallet/BalanceManager";
 import {
@@ -37,7 +38,7 @@ async function setup(receiveToken: WalletAdapter["receiveToken"]) {
   };
   const topUp = () =>
     manager.topUp({ mintUrl: MINT, baseUrl: PROVIDER, amount: 10, token: "api-key" });
-  return { storage, storedOnDisk, topUp };
+  return { storage, storedOnDisk, topUp, driver, manager, wallet };
 }
 
 const received = async () => ({ success: true, amount: 10, unit: "sat" as const });
@@ -73,6 +74,36 @@ describe("top-up token recovery", () => {
     await t.topUp();
     expect(await t.storedOnDisk()).toEqual([TOPUP_TOKEN]);
     expect(t.storage.getCachedReceiveTokens()).toEqual([]);
+  });
+
+  it("keeps one recovery owner through failed and successful sweeps and restart", async () => {
+    let mintUp = false;
+    const t = await setup(async () => {
+      if (!mintUp) throw new Error("Failed to fetch mint");
+      return received();
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    await t.topUp();
+    const spender = new CashuSpender(t.wallet, t.storage, discovery, t.manager);
+    vi.spyOn(t.manager, "fetchRefundToken").mockResolvedValue({
+      success: false, status: 404, error: "Refund not found",
+    });
+    // Prevent a background interval; explicitly exercise both sweeps here.
+    vi.spyOn(spender as any, "_startRefundRetryInterval").mockImplementation(() => {});
+    expect(t.storage.getXcashuTokensForBaseUrl(PROVIDER)).toHaveLength(1);
+    expect(t.storage.getCachedReceiveTokens()).toEqual([]);
+    await spender.refundXcashuTokens(MINT);
+    expect(t.storage.getXcashuTokensForBaseUrl(PROVIDER)).toHaveLength(1);
+    expect(t.storage.getCachedReceiveTokens()).toEqual([]);
+    mintUp = true;
+    await spender.refundXcashuTokens(MINT);
+    await t.storage.flush!();
+    expect(t.storage.getXcashuTokens()).toEqual({});
+    expect(t.storage.getCachedReceiveTokens()).toEqual([]);
+    const reload = createSdkStore({ driver: t.driver }); await reload.hydrate;
+    const storage = createStorageAdapterFromStore(reload.store);
+    expect(storage.getXcashuTokens()).toEqual({});
+    expect(storage.getCachedReceiveTokens()).toEqual([]);
   });
 
   it("stores the token before the POST and removes it after the top-up succeeds", async () => {
