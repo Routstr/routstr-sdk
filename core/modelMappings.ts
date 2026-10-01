@@ -26,14 +26,9 @@ export const MODEL_ID_MAPPINGS: Record<string, string> = {
   "openai-gpt-56-luna": "gpt-5.6-luna",
   "openai-gpt-6-astra": "gpt-6-astra",
   "deepseek-v4-1-flash": "deepseek-v4.1-flash",
-  "claude-fable-5-1": "claude-fable-5.1",
   "grok-4-6": "grok-4.6",
   "gemini-3-8-flash": "gemini-3.8-flash",
   "minimax-m3-preview": "minimax-m3",
-  // Verified 2026-09: routstr.otrta.me serves both claude-opus-5-5 and
-  // claude-opus-5.5 with identical name ("Claude Opus 5.5") and 1M ctx;
-  // cypherpunk declares claude-opus-5.5 as an alias of its claude-opus-5-5.
-  "claude-opus-5-5": "claude-opus-5.5",
 };
 
 /**
