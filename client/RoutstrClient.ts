@@ -341,9 +341,8 @@ export class RoutstrClient {
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
 
-    // A forwarded upstream request error is the node's own answer: nothing was
-    // spent, so there is no balance accounting to run and no usage to derive.
-    // Returning before the finalize wiring also keeps `finalize` off it.
+    // Error payment recovery is handled in _handleErrorResponse. There is no
+    // successful usage to account for; keep finalization off passthrough errors.
     if ((prepared.response as any).passthrough) {
       return prepared.response;
     }
@@ -630,7 +629,11 @@ export class RoutstrClient {
       capturedResponseId?: string;
     }> = Promise.resolve({});
 
-    if (contentType.includes("text/event-stream") && response.body) {
+    if (
+      !(response as any).passthrough &&
+      contentType.includes("text/event-stream") &&
+      response.body
+    ) {
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
       const [clientStream, inspectStream] = response.body.tee();
@@ -961,9 +964,35 @@ export class RoutstrClient {
         baseUrl
       );
       if (passthrough) {
+        // X-Cashu proofs may already have been redeemed even though the
+        // upstream rejected the request. Recover payment independently of
+        // retry policy; API-key balances stay on the provider untouched.
+        if (this.mode === "xcashu") {
+          let recovered = false;
+          if (xCashuRefundToken) {
+            const result = await this.cashuSpender.receiveToken(xCashuRefundToken);
+            recovered = result.success;
+            if (!recovered) {
+              // The replacement proofs are only present in this response.
+              // Preserve them for later recovery before returning to the caller.
+              this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
+            }
+          }
+          if (
+            !recovered &&
+            params.token.startsWith("cashu") &&
+            params.token !== xCashuRefundToken
+          ) {
+            const result = await this.cashuSpender.receiveToken(params.token);
+            recovered = result.success;
+          }
+          if (recovered) {
+            this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+          }
+        }
         this._log(
           "WARN",
-          `[RoutstrClient] _handleErrorResponse: forwarding upstream request error ${status} from ${baseUrl} (type=${parsedError.type ?? "none"}); no refund, no cooldown, no failover`
+          `[RoutstrClient] _handleErrorResponse: forwarding upstream request error ${status} from ${baseUrl} (type=${parsedError.type ?? "none"}); no API-key refund, no cooldown, no failover`
         );
         (passthrough as any).passthrough = true;
         return passthrough;

@@ -46,7 +46,8 @@ const tokenAlreadySpentBody = JSON.stringify({
   },
 });
 
-function setup() {
+function setup(mode: "apikeys" | "xcashu" = "apikeys") {
+  const paymentToken = mode === "xcashu" ? "cashu-original" : credential;
   const logger: SdkLogger = {
     log: () => {},
     warn: () => {},
@@ -67,9 +68,11 @@ function setup() {
     }),
   } as unknown as WalletAdapter;
   const removeApiKey = vi.fn();
+  const removeXcashuToken = vi.fn();
   const storage = {
     getApiKey: () => ({ key: credential, baseUrl, balance: 399, lastUsed: null }),
     removeApiKey,
+    removeXcashuToken,
     getApiKeyDistribution: () => [],
   } as unknown as StorageAdapter;
   const providerManager = {
@@ -84,7 +87,7 @@ function setup() {
     storage,
     {} as DiscoveryAdapter,
     "max",
-    "apikeys",
+    mode,
     { providerManager: providerManager as any, logger }
   );
   // Everything before/after the transport is irrelevant here: only the error
@@ -94,7 +97,7 @@ function setup() {
   const spend = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
     // Same value the storage mock holds, so the token_already_spent identity
     // guard recognises the spent key as the current one.
-    token: credential,
+    token: paymentToken,
     tokenBalance: 200,
     tokenBalanceUnit: "sat",
     tokenBalanceUnknown: false,
@@ -112,7 +115,7 @@ function setup() {
   const finalize = vi
     .spyOn(client as any, "_handlePostResponseBalanceUpdate")
     .mockResolvedValue(0);
-  return { client, providerManager, refund, spend, removeApiKey, finalize };
+  return { client, providerManager, refund, spend, removeApiKey, removeXcashuToken, finalize };
 }
 
 /** `_makeRequest` is real here; only the transport is stubbed. */
@@ -217,6 +220,69 @@ describe("L2 upstream request errors stop the failover machine", () => {
     expect(await response.text()).toBe(
       JSON.stringify({ detail: "invalid tool schema" })
     );
+  });
+
+  it.each([400, 422])("recovers X-Cashu refunds on %i without retrying", async (status) => {
+    const { client, providerManager, spend, refund, removeXcashuToken, finalize } = setup("xcashu");
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: true, amount: 100, unit: "sat" });
+    const fetchMock = stubFetch({ status, statusText: "Rejected", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
+
+    const response = await routeRequest(client);
+
+    expect(receive).toHaveBeenCalledExactlyOnceWith("cashu-refund");
+    expect(removeXcashuToken).toHaveBeenCalledExactlyOnceWith(baseUrl, "cashu-original");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(spend).toHaveBeenCalledTimes(1);
+    expect(refund).not.toHaveBeenCalled();
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+    expect(finalize).not.toHaveBeenCalled();
+    expect(response.status).toBe(status);
+    expect(await response.text()).toBe(webSearchOptionsBody);
+  });
+
+  it("recovers an unredeemed original X-Cashu token when no refund is returned", async () => {
+    const { client, removeXcashuToken } = setup("xcashu");
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: true, amount: 100, unit: "sat" });
+    stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });
+    await routeRequest(client);
+    expect(receive).toHaveBeenCalledExactlyOnceWith("cashu-original");
+    expect(removeXcashuToken).toHaveBeenCalledWith(baseUrl, "cashu-original");
+  });
+
+  it("preserves failed refund proofs and the original IOU for later recovery", async () => {
+    const { client, removeXcashuToken, providerManager } = setup("xcashu");
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat", message: "mint unavailable" });
+    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
+    const response = await routeRequest(client);
+    expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
+    expect(cache).toHaveBeenCalledExactlyOnceWith("cashu-refund");
+    expect(removeXcashuToken).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+    expect(response.status).toBe(400);
+  });
+
+  it("does not receive identical refund and original proofs twice", async () => {
+    const { client, removeXcashuToken } = setup("xcashu");
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat" });
+    vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-original" } });
+    await routeRequest(client);
+    expect(receive).toHaveBeenCalledExactlyOnceWith("cashu-original");
+    expect(removeXcashuToken).not.toHaveBeenCalled();
+  });
+
+  it("does not inspect or finalize a passthrough event-stream error", async () => {
+    const { client, finalize } = setup();
+    const body = "data: error\n\n";
+    stubFetch({ status: 400, statusText: "Bad Request", body, headers: { "content-type": "text/event-stream" } });
+    const response = await routeRequest(client);
+    expect((response as any).passthrough).toBe(true);
+    expect((response as any).finalize).toBeUndefined();
+    expect((response as any).usagePromise).toBeUndefined();
+    expect(await response.text()).toBe(body);
+    expect(finalize).not.toHaveBeenCalled();
   });
 
   it("still cleans up and fails over on a routstr-core token_already_spent", async () => {
