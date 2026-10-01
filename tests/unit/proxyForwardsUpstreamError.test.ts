@@ -114,7 +114,11 @@ function makeClient() {
 }
 
 /** Route through the public entrypoint with the context resolver stubbed. */
-async function routeThroughProxy(client: RoutstrClientImpl, body: unknown = {}) {
+async function routeThroughProxy(
+  client: RoutstrClientImpl,
+  body: unknown = {},
+  path = "/v1/chat/completions"
+) {
   vi.mocked(resolveRequestContext).mockResolvedValueOnce({
     client,
     baseUrl,
@@ -124,6 +128,7 @@ async function routeThroughProxy(client: RoutstrClientImpl, body: unknown = {}) 
 
   return routeRequests({
     modelId: model.id,
+    path,
     requestBody: body,
     walletAdapter: {} as never,
     storageAdapter: {} as never,
@@ -213,7 +218,12 @@ describe("acceptance: the web_search_options bug is fixed end to end", () => {
       model: "deepseek-v4.1-flash",
       messages: [{ role: "user", content: "hi" }],
       web_search_options: {},
-    });
+    }, "/v1/messages");
+
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      `${baseUrl}v1/messages`,
+      expect.objectContaining({ method: "POST" })
+    );
 
     // Before L1-L4 this was a 500 with
     // {"error":"All providers failed. Original: https://routstr.cypherpunk.today/, Failed: ..."}
