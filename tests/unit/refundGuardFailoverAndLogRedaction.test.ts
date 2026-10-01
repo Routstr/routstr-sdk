@@ -77,7 +77,7 @@ describe("500 refund guard and credential logging", () => {
     expect(removeApiKey).not.toHaveBeenCalled();
     expect(providerManager.markFailed).toHaveBeenCalledWith(
       baseUrl, expect.stringContaining("status=500"), model.id, undefined);
-    expect(providerManager.findNextBestProvider).toHaveBeenCalledWith(model.id, baseUrl);
+    expect(providerManager.findNextBestProvider).toHaveBeenCalledWith(model.id, baseUrl, expect.any(Set));
     expect(spend).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: nextUrl }));
     expect(retry).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: nextUrl }));
   });

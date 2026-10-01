@@ -155,3 +155,30 @@ describe("BalanceManager request-scoped mint selection", () => {
     });
   });
 });
+
+describe("topup recovery spending invariant", () => {
+  it("calls sendToken once when recovery fails and preserves the emitted token", async () => {
+    let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
+    const sendToken = vi.fn(async (mint: string) => `token:${mint}`);
+    const manager = new BalanceManager({
+      ...wallet(sendToken),
+      receiveToken: async () => ({ success: false, amount: 10, unit: "sat" }),
+    }, {
+      ...storage,
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (entries) => {
+        cached = entries.map((entry) => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+      },
+    }, discovery);
+    const create = vi.spyOn(manager, "createProviderToken");
+    vi.spyOn(manager as any, "_postTopUp").mockResolvedValue({
+      success: false,
+      parsedError: { type: "mint_unreachable", code: "cashu_mint_unreachable", raw: false },
+    });
+    const result = await manager.topUp({ mintUrl: MINT_A, baseUrl: PROVIDER, amount: 10, token: "api-key" });
+    expect(sendToken).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ success: false, recoveredToken: false });
+    expect(cached.map((entry) => entry.token)).toEqual([`token:${MINT_A}`]);
+  });
+});

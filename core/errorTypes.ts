@@ -35,6 +35,8 @@ export const CoreErrorType = {
   TOKEN_ALREADY_SPENT: "token_already_spent",
   /** Token is malformed or cannot be decoded (400, not retryable) */
   INVALID_TOKEN: "invalid_token",
+  /** Source mint is not accepted by this provider (400) */
+  UNTRUSTED_MINT: "untrusted_mint",
   /** Fee/melt failures from the mint (422, not retryable) */
   MINT_ERROR: "mint_error",
   /** Mint could not be reached — retryable with backoff (503) */
@@ -62,6 +64,7 @@ export type CoreErrorTypeValue =
 export const CoreErrorCode = {
   TOKEN_ALREADY_SPENT: "cashu_token_already_spent",
   INVALID_CASHU_TOKEN: "invalid_cashu_token",
+  CASHU_UNTRUSTED_SOURCE_MINT: "cashu_untrusted_source_mint",
   CASHU_TOKEN_SWAP_FEES_EXCEED_AMOUNT: "cashu_token_swap_fees_exceed_amount",
   CASHU_FOREIGN_MINT_SWAP_FAILED: "cashu_foreign_mint_swap_failed",
   CASHU_MINT_UNREACHABLE: "cashu_mint_unreachable",
@@ -231,6 +234,14 @@ export function isInvalidTokenError(parsed: ParsedCoreError): boolean {
   );
 }
 
+/** A source mint rejected by the provider's trust policy. */
+export function isUntrustedMintError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.UNTRUSTED_MINT &&
+    parsed.code === CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT
+  );
+}
+
 /**
  * An expected Cashu redemption failure.
  *
@@ -263,7 +274,7 @@ export function isCoreInternalError(parsed: ParsedCoreError): boolean {
 }
 
 /**
- * True for the four structured redemption failures handled by provider
+ * True for the structured redemption failures handled by provider
  * recovery/failover. This intentionally excludes `token_already_spent` and
  * `mint_error`, which have their own specialized flows.
  */
@@ -272,6 +283,7 @@ export function isHandledRedemptionError(
 ): boolean {
   return (
     isInvalidTokenError(parsed) ||
+    isUntrustedMintError(parsed) ||
     isCashuRedemptionError(parsed) ||
     isTokenConsumedError(parsed) ||
     isCoreInternalError(parsed)
@@ -316,6 +328,22 @@ export function shouldFailoverToAnotherMint(
     (parsed.type === CoreErrorType.MINT_ERROR &&
       parsed.code === CoreErrorCode.CASHU_FOREIGN_MINT_SWAP_FAILED)
   );
+}
+
+/** Every `type` value routstr-core itself emits (values, not keys). */
+const CORE_TYPES = new Set<string>(Object.values(CoreErrorType));
+
+/**
+ * Classify non-wallet 400/422 rejections. They can be provider-specific, so
+ * recover payment and try other candidates without applying a cooldown.
+ */
+export function isUpstreamRequestError(
+  status: number,
+  parsed: ParsedCoreError
+): boolean {
+  if (status !== 400 && status !== 422) return false;
+  if (parsed.type && CORE_TYPES.has(parsed.type)) return false; // our wallet, ours to fix
+  return true;
 }
 
 /**

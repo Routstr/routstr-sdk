@@ -1004,9 +1004,14 @@ export class ProviderManager {
    * Find the next best provider for a model
    * @param modelId The model ID to find a provider for
    * @param currentBaseUrl The current provider to exclude
+   * @param attemptedProviders Request-local exclusions to prevent revisiting nodes
    * @returns The best provider URL or null if none available
    */
-  findNextBestProvider(modelId: string, currentBaseUrl: string): string | null {
+  findNextBestProvider(
+    modelId: string,
+    currentBaseUrl: string,
+    attemptedProviders: ReadonlySet<string> = new Set()
+  ): string | null {
     try {
       const torMode = isTorContext();
       const disabledProviders = new Set(
@@ -1021,7 +1026,7 @@ export class ProviderManager {
 
       for (const [baseUrl, models] of Object.entries(allProviders)) {
         // Skip current, failed, disabled, and cooldown providers
-        if (baseUrl === currentBaseUrl) {
+        if (baseUrl === currentBaseUrl || attemptedProviders.has(baseUrl)) {
           continue;
         }
         // if (this.failedProviders.has(baseUrl)) {

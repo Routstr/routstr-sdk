@@ -620,10 +620,11 @@ export class BalanceManager {
         }
 
         // A foreign-mint swap failure can be retried against the same provider
-        // with another mint it advertises. Keep the exclusion local to this
+        // with another mint it advertises only after successful recovery.
+        // Keep the exclusion local to this
         // topup operation; fee/amount and unknown mint errors do not qualify.
         if (
-          canRecover &&
+          recoveredToken &&
           tokenResult.selectedMintUrl &&
           topUpResult.parsedError &&
           shouldFailoverToAnotherMint(topUpResult.parsedError) &&
@@ -1088,10 +1089,12 @@ export class BalanceManager {
         this.logger.warn(
           `_recoverFailedTopUp: receive failed: ${result.message ?? "unknown error"}`
         );
+        this.cashuSpender.cacheReceiveToken(cashuToken);
       }
       return result.success;
     } catch (error) {
       this.logger.error("_recoverFailedTopUp: failed to recover token", error);
+      this.cashuSpender.cacheReceiveToken(cashuToken);
       return false;
     }
   }

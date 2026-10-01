@@ -33,19 +33,23 @@ import {
   TokenAlreadySpentError,
   MintError,
   InvalidTokenError,
+  UntrustedMintError,
   CashuRedemptionError,
   TokenConsumedError,
   CoreInternalError,
 } from "../core/errors";
+import type { UpstreamEnvelope } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorCode,
   CoreErrorType,
   isInvalidTokenError,
+  isUntrustedMintError,
   isCashuRedemptionError,
   isTokenConsumedError,
   isCoreInternalError,
   isHandledRedemptionError,
+  isUpstreamRequestError,
   shouldFailoverToAnotherMint,
   shouldPurgeStoredCredential,
   type ParsedCoreError,
@@ -78,6 +82,57 @@ const TOPUP_MARGIN = 1.4;
 
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";
+
+interface RequestFailures {
+  attemptedProviders: Set<string>;
+  errors: Array<{
+    status: number;
+    type?: string;
+    code?: string | number;
+    message: string;
+    providers: string[];
+  }>;
+}
+
+/** Response headers safe to hand to a caller forwarding an upstream error. */
+const FORWARDABLE_ERROR_HEADERS = new Set([
+  "content-type",
+  "retry-after",
+  "retry-after-ms",
+  "x-routstr-request-id",
+  "x-routstr-error-scope",
+  "x-routstr-provider",
+  "ratelimit-limit",
+  "ratelimit-remaining",
+  "ratelimit-reset",
+]);
+
+/**
+ * Framing/hop-by-hop headers are tied to the body we consumed; never reuse
+ * them for a body we re-wrap ourselves. Checked separately so they stay blocked
+ * even if the allowlist above ever grows.
+ */
+const NEVER_FORWARDED_ERROR_HEADERS = new Set([
+  "transfer-encoding",
+  "content-length",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+/** Pick the forwardable, non-framing subset of an upstream error's headers. */
+function forwardableErrorHeaders(headers: Headers): Record<string, string> {
+  const captured: Record<string, string> = {};
+  headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (NEVER_FORWARDED_ERROR_HEADERS.has(lower)) return;
+    if (!FORWARDABLE_ERROR_HEADERS.has(lower)) return;
+    captured[lower] = value;
+  });
+  return captured;
+}
 
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
@@ -295,6 +350,12 @@ export class RoutstrClient {
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
+
+    // Error payment recovery is handled in _handleErrorResponse. There is no
+    // successful usage to account for; keep finalization off passthrough errors.
+    if ((prepared.response as any).passthrough) {
+      return prepared.response;
+    }
 
     // For SSE, defer accounting until the inspector (tee'd branch) has seen
     // usage — which only happens as the client consumes the stream. We expose
@@ -578,7 +639,11 @@ export class RoutstrClient {
       capturedResponseId?: string;
     }> = Promise.resolve({});
 
-    if (contentType.includes("text/event-stream") && response.body) {
+    if (
+      !(response as any).passthrough &&
+      contentType.includes("text/event-stream") &&
+      response.body
+    ) {
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
       const [clientStream, inspectStream] = response.body.tee();
@@ -688,6 +753,7 @@ export class RoutstrClient {
     autoModelPath?: ModelPathPin;
     /** (node, canonical path) candidates already attempted in this request. */
     triedModelPaths?: string[];
+    failures?: RequestFailures;
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -748,6 +814,12 @@ export class RoutstrClient {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
+        // Capture the wire-level envelope before the body read consumes the response.
+        const upstream: UpstreamEnvelope = {
+          status: response.status,
+          statusText: response.statusText,
+          headers: forwardableErrorHeaders(response.headers),
+        };
         let bodyText: string | undefined;
         try {
           bodyText = await response.text();
@@ -774,7 +846,8 @@ export class RoutstrClient {
             ? (response.headers.get("x-cashu") ?? undefined)
             : undefined,
           bodyText,
-          params.retryCount ?? 0
+          params.retryCount ?? 0,
+          upstream
         );
       }
 
@@ -859,17 +932,24 @@ export class RoutstrClient {
       autoModelPath?: ModelPathPin;
       /** (node, canonical path) candidates already attempted in this request. */
       triedModelPaths?: string[];
+      failures?: RequestFailures;
     },
     token: string,
     status: number,
     requestId?: string,
     xCashuRefundToken?: string,
     responseBody?: string,
-    retryCount: number = 0
+    retryCount: number = 0,
+    upstream?: UpstreamEnvelope
   ): Promise<Response> {
     const MAX_RETRIES_PER_PROVIDER = 2;
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
+
+    // Request-local history is shared by retries, never by concurrent requests.
+    const failures = params.failures ?? { attemptedProviders: new Set<string>(), errors: [] };
+    params = { ...params, failures };
+    failures.attemptedProviders.add(baseUrl);
 
     const errorMessage = responseBody;
 
@@ -884,6 +964,38 @@ export class RoutstrClient {
       "DEBUG",
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
+
+    const upstreamRequestError = isUpstreamRequestError(status, parsedError);
+    const aggregateFailure = upstreamRequestError || status >= 500 ||
+      status === 424 || status === 429 || status === -1;
+    // Keep only diagnostic fields, never raw envelopes containing refund proofs.
+    if (aggregateFailure) {
+      const redact = (value: string) => [params.token, xCashuRefundToken]
+        .filter((secret): secret is string => !!secret)
+        .reduce((text, secret) => text.split(secret).join("[REDACTED]"), value)
+        .replace(/cashu[AB][A-Za-z0-9_-]+/g, "[REDACTED]")
+        .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+      const message = redact(parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`));
+      const type = parsedError.type ? redact(parsedError.type) : undefined;
+      let code: string | number | undefined = parsedError.code ? redact(parsedError.code) : undefined;
+      // Provider envelopes also use numeric codes; the wallet parser only
+      // recognizes strings, but diagnostics should preserve either format.
+      if (code === undefined && responseBody) {
+        try {
+          const body = JSON.parse(responseBody);
+          const numericCode = body?.error?.code ?? body?.detail?.error?.code;
+          if (typeof numericCode === "number") code = numericCode;
+        } catch { /* Plain-text upstream errors have no structured code. */ }
+      }
+      const existing = failures.errors.find((error) =>
+        error.status === status && error.type === type && error.code === code && error.message === message
+      );
+      if (existing) {
+        if (!existing.providers.includes(baseUrl)) existing.providers.push(baseUrl);
+      } else {
+        failures.errors.push({ status, type, code, message, providers: [baseUrl] });
+      }
+    }
 
     // ── Handle token_already_spent ────────────────────────────────────
     // The token is permanently spent — core deliberately withholds the
@@ -942,6 +1054,7 @@ export class RoutstrClient {
         refundReceived = true;
         recoverySucceeded = true;
       } else {
+        this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed${xCashuRefundToken === params.token ? " (same as original; not receiving twice)" : ", falling back to original token"}: ${receiveResult.message}`
@@ -1055,17 +1168,16 @@ export class RoutstrClient {
       }
     }
 
-    // For recognized redemption errors, a failed receive is still a provider
-    // failure: preserve the stored token for later recovery, mark this provider
-    // failed below, and retry with a fresh token on a different provider.
+    // Preserve failed payment recovery for a later sweep, but allow a fresh
+    // attempt elsewhere for redemption failures and upstream rejections.
     if (
       this.mode === "xcashu" &&
-      handledRedemptionError &&
+      (handledRedemptionError || upstreamRequestError) &&
       !tryNextProvider
     ) {
       this._log(
         "WARN",
-        `[RoutstrClient] _handleErrorResponse: recovery failed for structured redemption error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
+        `[RoutstrClient] _handleErrorResponse: recovery failed for retryable error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
       );
       tryNextProvider = true;
     }
@@ -1362,6 +1474,7 @@ export class RoutstrClient {
         status === 404 ||
         status === 413 ||
         status === 400 ||
+        status === 422 ||
         status === 429 ||
         status === 500 ||
         status === 502 ||
@@ -1499,22 +1612,24 @@ export class RoutstrClient {
       selectedModel,
       pinnedModelPath
     );
-    this.providerManager.markFailed(
-      baseUrl,
-      failReason,
-      cooldownScope.modelId,
-      cooldownScope.modelPath
-    );
-    this._log(
-      "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Marked ${
+    if (!upstreamRequestError) {
+      this.providerManager.markFailed(
+        baseUrl,
+        failReason,
+        cooldownScope.modelId,
         cooldownScope.modelPath
-          ? `path ${cooldownScope.modelPath} on provider ${baseUrl}`
-          : cooldownScope.modelId
-            ? `model ${cooldownScope.modelId} on provider ${baseUrl}`
-            : `provider ${baseUrl}`
-      } as failed (${failReason})`
-    );
+      );
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: Marked ${
+          cooldownScope.modelPath
+            ? `path ${cooldownScope.modelPath} on provider ${baseUrl}`
+            : cooldownScope.modelId
+              ? `model ${cooldownScope.modelId} on provider ${baseUrl}`
+              : `provider ${baseUrl}`
+        } as failed (${failReason})`
+      );
+    }
 
     if (!selectedModel) {
       if (handledRedemptionError) {
@@ -1589,8 +1704,13 @@ export class RoutstrClient {
     } else {
       nextProvider = this.providerManager.findNextBestProvider(
         selectedModel.id,
-        baseUrl
+        baseUrl,
+        failures.attemptedProviders
       );
+    }
+
+    if (nextProvider && !pinnedModelPath && failures.attemptedProviders.has(nextProvider)) {
+      nextProvider = null;
     }
 
     if (nextProvider) {
@@ -1761,10 +1881,57 @@ export class RoutstrClient {
       });
     }
 
+    // Financial and pinned-path failures above retain their typed semantics.
+    // Ordinary upstream failures return a deduplicated diagnostic envelope.
+    if (aggregateFailure) {
+      const response = this._upstreamErrorResponse(
+        upstream ?? { status: 502, statusText: "Bad Gateway", headers: {} },
+        JSON.stringify({ error: {
+          type: "all_providers_failed",
+          message: failures.errors.map((error) => error.message).join("; "),
+          errors: failures.errors,
+        } }),
+        baseUrl
+      )!;
+      response.headers.set("content-type", "application/json");
+      response.headers.delete("x-routstr-error-scope");
+      (response as any).passthrough = true;
+      return response;
+    }
+
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
     );
+  }
+
+  /**
+   * Rebuild the provider's own error response from the captured envelope so a
+   * proxy caller can forward it verbatim (status + headers + body).
+   *
+   * Returns `undefined` when there is no status to forward — notably a network
+   * failure (status -1), where `new Response` would also reject any status
+   * below 200.
+   */
+  private _upstreamErrorResponse(
+    upstream: UpstreamEnvelope | undefined,
+    bodyText: string | undefined,
+    baseUrl: string
+  ): Response | undefined {
+    if (!upstream || upstream.status < 400) return undefined;
+    const headers = new Headers(upstream.headers);
+    headers.set(
+      "content-type",
+      upstream.headers["content-type"] ?? "application/json"
+    );
+    if (!headers.has("x-routstr-provider")) {
+      headers.set("x-routstr-provider", baseUrl);
+    }
+    return new Response(bodyText ?? "", {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
   }
 
   private _createRedemptionError(opts: {
@@ -1777,6 +1944,7 @@ export class RoutstrClient {
     recoverySucceeded: boolean;
   }):
     | InvalidTokenError
+    | UntrustedMintError
     | CashuRedemptionError
     | TokenConsumedError
     | CoreInternalError {
@@ -1793,6 +1961,9 @@ export class RoutstrClient {
 
     if (isInvalidTokenError(opts.parsedError)) {
       return new InvalidTokenError(shared);
+    }
+    if (isUntrustedMintError(opts.parsedError)) {
+      return new UntrustedMintError(shared);
     }
     if (isCashuRedemptionError(opts.parsedError)) {
       return new CashuRedemptionError(shared);
