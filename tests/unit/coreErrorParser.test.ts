@@ -263,6 +263,22 @@ describe("shouldFailoverToAnotherMint", () => {
     expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
   });
 
+  it("retries only the structured untrusted source mint error", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: {
+          type: "untrusted_mint",
+          code: "cashu_untrusted_source_mint",
+          message: "Source mint not trusted",
+        },
+      }),
+      400
+    );
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
+    expect(shouldFailoverToAnotherMint({ ...parsed, code: undefined })).toBe(false);
+    expect(shouldFailoverToAnotherMint({ ...parsed, type: "cashu_error" })).toBe(false);
+  });
+
   it("returns false for mint_error without a known code", () => {
     const parsed = parseCoreError(
       JSON.stringify({
