@@ -1,3 +1,4 @@
+import { isCredentialStorageKey } from "../credentialKeys";
 import type { StorageDriver } from "../types";
 
 export interface IndexedDBDriverOptions {
@@ -121,6 +122,7 @@ export const createIndexedDBDriver = (
         });
       } catch (error) {
         console.error(`IndexedDB setItem failed for key "${key}":`, error);
+        if (isCredentialStorageKey(key)) throw error;
       }
     },
 

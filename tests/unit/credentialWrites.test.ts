@@ -1,3 +1,4 @@
+import { localStorageDriver } from "../../storage/drivers/localStorage";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { noopLogger as logger } from "../../core/types";
@@ -186,6 +187,21 @@ describe("paying with stored credentials", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("does not pay when the actual localStorage driver hits quota", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("window", { localStorage: {
+      getItem: () => null, removeItem: () => {},
+      setItem: () => { throw new DOMException("full", "QuotaExceededError"); },
+    } });
+    const c = await client(localStorageDriver);
+    const network = vi.fn(async () => Response.json({ choices: [] }));
+    vi.stubGlobal("fetch", network);
+    await expect(c.request()).rejects.toThrow("full");
+    expect(network).not.toHaveBeenCalled();
+    expect(c.wallet.receiveToken).toHaveBeenCalledWith(TOKEN);
   });
 
   it("does not pay with a new API key until it is stored", async () => {
