@@ -11,10 +11,13 @@
  * - Bodies without a string `model` field are left untouched.
  * - Failover retries rewrite body.model to the failover provider's native id.
  * - resolveRequestContext honors mappings for forced providers.
+ * - A mapped variant and its canonical id share one cooldown, and failover
+ *   looks up the canonical id.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
+import { ProviderManager } from "../../client/ProviderManager";
 import { resolveRequestContext } from "../../client/resolveRequestContext";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -236,6 +239,9 @@ describe("RoutstrClient failover upstream model forwarding", () => {
     const retryParams = makeRequestSpy.mock.calls[0][0];
     expect(retryParams.baseUrl).toBe(SECOND_BASE_URL);
     expect(retryParams.body.model).toBe("glm-zai-5.3");
+    // Failover looks up the canonical id, so providers serving it natively qualify.
+    expect(providerManager.findNextBestProvider.mock.calls[0][0]).toBe("glm-5.3");
+    expect(providerManager.getModelForProvider).toHaveBeenCalledWith(SECOND_BASE_URL, "glm-5.3");
   });
 });
 
@@ -266,5 +272,33 @@ describe("resolveRequestContext forced provider with mappings", () => {
 
     expect(resolved.baseUrl).toBe("https://cypherpunk.example/");
     expect(resolved.selectedModel.id).toBe("z-ai-glm-5-3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cooldown across a mapped variant and its canonical id
+// ---------------------------------------------------------------------------
+
+describe("mapped variant and canonical id share one cooldown", () => {
+  it("skips a mapped provider cooled down under its native id", () => {
+    const CHEAP_URL = "https://cheap.example/";
+    const providerManager = new ProviderManager(
+      createDiscovery({
+        getCachedModels: () => ({
+          [CHEAP_URL]: [makeModel({ id: "z-ai-glm-5-3" })],
+          "https://native.example/": [makeModel({ id: "glm-5.3" })],
+        }),
+      })
+    );
+    providerManager.markFailed(CHEAP_URL, "status=502", "z-ai-glm-5-3");
+    providerManager.markFailed(CHEAP_URL, "status=502", "z-ai-glm-5-3");
+
+    for (const requested of ["glm-5.3", "z-ai-glm-5-3"]) {
+      expect(
+        providerManager
+          .getProviderPriceRankingForModel(requested)
+          .map((entry) => entry.baseUrl)
+      ).not.toContain(CHEAP_URL);
+    }
   });
 });

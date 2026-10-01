@@ -13,7 +13,7 @@
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
-import { findModelForId } from "../core/modelMappings";
+import { MODEL_ID_MAPPINGS, findModelForId } from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
 import {
@@ -676,7 +676,7 @@ const cooldownKey = (
   modelPath != null
     ? `${baseUrl}::path::${modelPath}`
     : modelId != null
-      ? `${baseUrl}::${modelId}`
+      ? `${baseUrl}::${MODEL_ID_MAPPINGS[modelId] ?? modelId}`
       : baseUrl;
 
 /**

@@ -26,6 +26,7 @@ import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
 import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey } from "../utils/modelPaths";
 import type { ModelPathSatsPricing } from "../utils/modelPaths";
+import { canonicalIdForModel } from "../core/modelMappings";
 import {
   ProviderError,
   FailoverError,
@@ -1715,7 +1716,7 @@ export class RoutstrClient {
       }
     } else {
       nextProvider = this.providerManager.findNextBestProvider(
-        selectedModel.id,
+        canonicalIdForModel(selectedModel),
         baseUrl,
         failures.attemptedProviders
       );
@@ -1734,7 +1735,7 @@ export class RoutstrClient {
       const newModel =
         (await this.providerManager.getModelForProvider(
           nextProvider,
-          selectedModel.id
+          canonicalIdForModel(selectedModel)
         )) ?? selectedModel;
 
       const messagesForPricing = Array.isArray(
