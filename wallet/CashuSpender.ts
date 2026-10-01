@@ -81,7 +81,8 @@ export class CashuSpender {
     this.logger = (logger ?? consoleLogger).child("CashuSpender");
   }
 
-  async receiveToken(token: string): Promise<{
+  /** Disable failure caching when a durable xcashu record already owns recovery. */
+  async receiveToken(token: string, cacheOnFailure = true): Promise<{
     success: boolean;
     amount: number;
     unit: "sat" | "msat";
@@ -94,7 +95,7 @@ export class CashuSpender {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
-      if (errorMessage.includes("Failed to fetch mint")) {
+      if (cacheOnFailure && errorMessage.includes("Failed to fetch mint")) {
         this.cacheReceiveToken(token);
       }
 

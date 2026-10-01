@@ -64,6 +64,15 @@ describe("top-up token recovery", () => {
 
     expect(result).toMatchObject({ success: false, recoveredToken: false });
     expect(await t.storedOnDisk()).toEqual([TOPUP_TOKEN]);
+    expect(t.storage.getCachedReceiveTokens()).toEqual([]);
+  });
+
+  it("does not cache a thrown mint-fetch failure in a second store", async () => {
+    const t = await setup(async () => { throw new Error("Failed to fetch mint"); });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    await t.topUp();
+    expect(await t.storedOnDisk()).toEqual([TOPUP_TOKEN]);
+    expect(t.storage.getCachedReceiveTokens()).toEqual([]);
   });
 
   it("stores the token before the POST and removes it after the top-up succeeds", async () => {

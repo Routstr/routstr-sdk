@@ -1103,17 +1103,17 @@ export class BalanceManager {
    */
   private async _recoverFailedTopUp(cashuToken: string): Promise<boolean> {
     try {
-      const result = await this.cashuSpender.receiveToken(cashuToken);
+      const result = await this.cashuSpender.receiveToken(cashuToken, false);
       if (!result.success) {
         this.logger.warn(
           `_recoverFailedTopUp: receive failed: ${result.message ?? "unknown error"}`
         );
-        this.cashuSpender.cacheReceiveToken(cashuToken);
+        // The pre-POST xcashu record owns recovery for this token.
       }
       return result.success;
     } catch (error) {
       this.logger.error("_recoverFailedTopUp: failed to recover token", error);
-      this.cashuSpender.cacheReceiveToken(cashuToken);
+      // Keep the existing xcashu record; do not create a second recovery owner.
       return false;
     }
   }

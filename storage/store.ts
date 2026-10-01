@@ -647,6 +647,23 @@ const hydrateStoreFromDriver = async (
     timestamp: entry.timestamp,
   }));
 
+  const ownedTokens = new Set(
+    Object.values(xcashuTokens).flatMap((tokens) =>
+      tokens.map((entry) => entry.token)
+    )
+  );
+  const deduplicatedReceiveTokens = cachedReceiveTokens.filter(
+    (entry) => !ownedTokens.has(entry.token)
+  );
+  // Persist the migration before exposing the hydrated state. If it fails,
+  // reject initialization rather than silently retaining duplicate owners.
+  if (deduplicatedReceiveTokens.length !== cachedReceiveTokens.length) {
+    await driver.setItem(
+      SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS,
+      deduplicatedReceiveTokens
+    );
+  }
+
   store.setState({
     nostrQueryLastUpdate,
     modelsFromAllProviders,
@@ -664,7 +681,7 @@ const hydrateStoreFromDriver = async (
     xcashuTokens,
     routstr21Models,
     lastRoutstr21ModelsUpdate,
-    cachedReceiveTokens,
+    cachedReceiveTokens: deduplicatedReceiveTokens,
     clientIds,
     failedProviders,
     lastFailed,
