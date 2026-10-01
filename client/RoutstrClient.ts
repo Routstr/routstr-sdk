@@ -708,7 +708,16 @@ export class RoutstrClient {
   }
 
   /**
-   * Extract clientApiKey from Authorization Bearer token if present
+   * Extract clientApiKey from the inbound request headers if present.
+   *
+   * The key identifies which configured client made the call (usage
+   * attribution); it is never forwarded as payment auth. Transports disagree
+   * about where a key belongs: OpenAI-style clients send
+   * `Authorization: Bearer <key>`, while Anthropic-style ones send
+   * `x-api-key: <key>` — the Anthropic SDKs put `apiKey` there and reserve
+   * `Authorization` for an OAuth `authToken`. Accept both spellings, so a
+   * request routed over the Anthropic transport is attributed to its client
+   * instead of being recorded as `unknown`.
    */
   private _extractClientApiKey(
     headers: Record<string, string>
@@ -716,7 +725,13 @@ export class RoutstrClient {
     const authHeader = headers["Authorization"] || headers["authorization"];
     if (authHeader?.startsWith("Bearer ")) {
       const extractedKey = authHeader.slice(7);
-      return extractedKey;
+      if (extractedKey) return extractedKey;
+    }
+    // Header names arrive lower-cased from Node's IncomingMessage; scan
+    // case-insensitively anyway so callers passing their own map work too.
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() !== "x-api-key") continue;
+      if (typeof value === "string" && value.trim()) return value.trim();
     }
     return undefined;
   }
@@ -2268,6 +2283,12 @@ export class RoutstrClient {
         requestId: finalRequestId,
         client: matchingClient?.clientId,
         ...usage,
+        // Anthropic responses may omit the body provider; the node can
+        // still identify the route in a response header (including SSE).
+        provider:
+          usage.provider ||
+          response.headers.get("x-routstr-provider")?.trim() ||
+          undefined,
       };
 
       // For xcashu mode, use satsSpent directly for satsCost instead of calculating from usage
