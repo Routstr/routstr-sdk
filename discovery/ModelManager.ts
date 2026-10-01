@@ -6,6 +6,7 @@
 
 import type { Model, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
+import { canonicalIdForModel } from "../core/modelMappings";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import {
   NoProvidersAvailableError,
@@ -45,7 +46,12 @@ export const DEFAULT_NOSTR_RELAYS = [
 ];
 
 /** Kind 38425 review labels that mark a provider node as OK to route to. */
-const POSITIVE_REVIEW_LABELS = new Set(["trusted", "verified", "lgtm"]);
+const POSITIVE_REVIEW_LABELS = new Set([
+  "trusted",
+  "verified",
+  "lgtm",
+  "lgtm2",
+]);
 
 /** Kind 38425 review labels that mark a provider node as unsafe to route to. */
 const NEGATIVE_REVIEW_LABELS = new Set([
@@ -867,8 +873,8 @@ export class ModelManager {
    *
    * Review events are expected to have:
    * - `node`: the reviewed 38421 provider event pubkey
-   * - `t`: review label, where `lgtm`/`trusted`/`verified` mean the node looks
-   *   good and `avoid`/`suspicious`/`blacklisted`/`removed` mean it is unsafe
+   * - `t`: review label, where `lgtm`/`lgtm2`/`trusted`/`verified` mean the node
+   *   looks good and `avoid`/`suspicious`/`blacklisted`/`removed` mean it is unsafe
    *
    * Kind 38425 is not replaceable, so several review events can exist for one
    * node; the newest event (by `created_at`) is authoritative.
@@ -1184,13 +1190,16 @@ export class ModelManager {
         // Update best-priced models if provider not disabled
         if (!disabledProviders.includes(base)) {
           for (const m of list) {
-            const existing = bestById.get(m.id);
+            // Group by canonical id so providers serving the same model
+            // under a mapped variant id or alias fold into one entry.
+            const canonicalId = canonicalIdForModel(m);
+            const existing = bestById.get(canonicalId);
 
             // Skip models without sats pricing
             if (!m.sats_pricing) continue;
 
             if (!existing) {
-              bestById.set(m.id, { model: m, base });
+              bestById.set(canonicalId, { model: m, base });
               continue;
             }
 
@@ -1198,7 +1207,7 @@ export class ModelManager {
             const currentCost = estimateMinCost(m);
             const existingCost = estimateMinCost(existing.model);
             if (currentCost < existingCost && m.sats_pricing) {
-              bestById.set(m.id, { model: m, base });
+              bestById.set(canonicalId, { model: m, base });
             }
           }
         }

@@ -13,8 +13,17 @@
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
+import { findModelForId } from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
-import { isOnionUrl, isTorContext } from "../utils/torUtils";
+import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
+import {
+  canonicalModelPath,
+  DEEPSEEK_AUTO_NODE_URLS,
+  getNodeModelPaths,
+  modelPathCandidateKey,
+  resolveDeepSeekModelPathSelectors,
+  type ModelPathSatsPricing,
+} from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
 
 const normalizeBaseUrl = (baseUrl: string): string =>
@@ -636,14 +645,49 @@ interface CandidateProvider {
 }
 
 /**
+ * A cooldown entry. When `modelId` is present, only that model is cooled
+ * down on the provider; other models on the same provider stay selectable.
+ * When `modelId` is undefined, the whole provider is on cooldown.
+ */
+export interface CooldownEntry {
+  baseUrl: string;
+  modelId?: string;
+  /**
+   * Canonical x-routstr-model-path identity (see canonicalModelPath) for
+   * path-scoped entries: only that upstream route is cooled on the provider,
+   * the provider's other routes for the same model stay selectable.
+   */
+  modelPath?: string;
+  timestamp: number;
+}
+
+/**
+ * Map key for a cooldown entry: `baseUrl` for provider-scoped entries,
+ * `baseUrl::modelId` for model-scoped entries,
+ * `baseUrl::path::<canonical path>` for path-scoped entries. (A fourth
+ * scope — a path cooled across every node for upstream-wide outages — is a
+ * deliberate future extension, not implemented.)
+ */
+const cooldownKey = (
+  baseUrl: string,
+  modelId?: string,
+  modelPath?: string
+): string =>
+  modelPath != null
+    ? `${baseUrl}::path::${modelPath}`
+    : modelId != null
+      ? `${baseUrl}::${modelId}`
+      : baseUrl;
+
+/**
  * ProviderManager handles provider selection and failover
  */
 export class ProviderManager {
   private failedProviders = new Set<string>();
-  /** Track when each provider last failed (provider URL -> timestamp) */
+  /** Track when each scope (provider URL or baseUrl::modelId) last failed */
   private lastFailed = new Map<string, number>();
-  /** Providers on cooldown: [provider_url, cooldown_started_timestamp][] */
-  private providersOnCoolDown: [string, number][] = [];
+  /** Cooldown entries keyed by cooldownKey(baseUrl, modelId) */
+  private providersOnCoolDown = new Map<string, CooldownEntry>();
   /** Cooldown duration in milliseconds (210 seconds) */
   private static readonly COOLDOWN_DURATION_MS = 210 * 1000;
   /** Optional persistent store for failure tracking */
@@ -680,12 +724,24 @@ export class ProviderManager {
 
     // Hydrate providersOnCooldown (filter out expired)
     const now = Date.now();
-    this.providersOnCoolDown = state.providersOnCooldown
-      .filter(
-        (entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS
-      )
-      .map((entry) => [entry.baseUrl, entry.timestamp] as [string, number]);
-
+    this.providersOnCoolDown = new Map(
+      state.providersOnCooldown
+        .filter(
+          (entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS
+        )
+        .map(
+          (entry) =>
+            [
+              cooldownKey(entry.baseUrl, entry.modelId, entry.modelPath),
+              {
+                baseUrl: entry.baseUrl,
+                modelId: entry.modelId,
+                modelPath: entry.modelPath,
+                timestamp: entry.timestamp,
+              },
+            ] as const
+        )
+    );
   }
 
   /**
@@ -697,25 +753,52 @@ export class ProviderManager {
 
   /**
    * Clean up expired cooldown entries
-   * Also removes the provider from failedProviders so it can be retried
+   * Also removes the provider from failedProviders (once none of its
+   * cooldown entries remain) so it can be retried
    */
   private cleanupExpiredCooldowns(): void {
     const now = Date.now();
-    this.providersOnCoolDown = this.providersOnCoolDown.filter(
-      ([url, timestamp]) => {
-        const age = now - timestamp;
-        const isExpired = age >= ProviderManager.COOLDOWN_DURATION_MS;
-        if (isExpired) {
-          // Also remove from failedProviders so the provider can be retried
-          this.failedProviders.delete(url);
-          // Persist to store
-          if (this.store) {
-            this.store.getState().removeFailedProvider(url);
-          }
+    const expiredProviders = new Set<string>();
+    for (const [key, entry] of this.providersOnCoolDown) {
+      if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
+        this.providersOnCoolDown.delete(key);
+        expiredProviders.add(entry.baseUrl);
+        // Persist the removal of this exact entry (other entries for the
+        // same provider, e.g. still-live model-scoped ones, are kept)
+        if (this.store) {
+          this.store
+            .getState()
+            .removeProviderFromCooldown(
+              entry.baseUrl,
+              entry.modelId,
+              entry.modelPath
+            );
         }
-        return !isExpired;
       }
-    );
+    }
+
+    // Prune strike timestamps older than the cooldown window: they can no
+    // longer combine with a fresh failure into a two-strike cooldown, and
+    // pruning keeps the per-scope map bounded.
+    for (const [key, ts] of this.lastFailed) {
+      if (now - ts >= ProviderManager.COOLDOWN_DURATION_MS) {
+        this.lastFailed.delete(key);
+      }
+    }
+
+    // Remove providers from failedProviders once they have no active
+    // cooldown entries left, so they can be retried
+    for (const baseUrl of expiredProviders) {
+      const stillCooled = [...this.providersOnCoolDown.values()].some(
+        (entry) => entry.baseUrl === baseUrl
+      );
+      if (!stillCooled) {
+        this.failedProviders.delete(baseUrl);
+        if (this.store) {
+          this.store.getState().removeFailedProvider(baseUrl);
+        }
+      }
+    }
   }
 
   /**
@@ -727,20 +810,43 @@ export class ProviderManager {
 
   /**
    * Check if a provider is currently on cooldown
+   *
+   * A provider-scoped cooldown entry blocks every model on the provider.
+   * A model-scoped entry only blocks the given `modelId`; a path-scoped
+   * entry only blocks the given canonical `modelPath`. Pass `modelId` and/or
+   * `modelPath` to check a specific scope, or omit both to check whether the
+   * provider as a whole is unavailable.
    */
-  isOnCooldown(baseUrl: string): boolean {
+  isOnCooldown(baseUrl: string, modelId?: string, modelPath?: string): boolean {
     this.cleanupExpiredCooldowns();
 
-    const result = this.providersOnCoolDown.some(([url]) => url === baseUrl);
-    return result;
+    // Provider-wide cooldown blocks all models
+    if (this.providersOnCoolDown.has(cooldownKey(baseUrl))) {
+      return true;
+    }
+    // Model-scoped cooldown blocks only that model
+    if (
+      modelId !== undefined &&
+      this.providersOnCoolDown.has(cooldownKey(baseUrl, modelId))
+    ) {
+      return true;
+    }
+    // Path-scoped cooldown blocks only that upstream route
+    if (
+      modelPath !== undefined &&
+      this.providersOnCoolDown.has(cooldownKey(baseUrl, undefined, modelPath))
+    ) {
+      return true;
+    }
+    return false;
   }
 
   /**
-   * Get all providers currently on cooldown
+   * Get all cooldown entries currently active (provider- and model-scoped)
    */
-  getProvidersOnCooldown(): [string, number][] {
+  getProvidersOnCooldown(): CooldownEntry[] {
     this.cleanupExpiredCooldowns();
-    return [...this.providersOnCoolDown];
+    return [...this.providersOnCoolDown.values()];
   }
 
   /**
@@ -769,20 +875,40 @@ export class ProviderManager {
   }
 
   /**
-   * Mark a provider as failed
-   * If a provider fails twice within 5 minutes, it's added to cooldown
+   * Mark a provider (optionally a specific model or model path on it) as
+   * failed
+   *
+   * If the same scope fails twice within the cooldown window, that scope is
+   * added to cooldown:
+   * - With `modelPath`: only that upstream route is cooled down on the
+   *   provider (the canonical path identity, see canonicalModelPath).
+   * - With `modelId` only: only that model is cooled down on the provider.
+   * - Without either: the whole provider is cooled down (legacy behavior).
    */
-  markFailed(baseUrl: string, reason?: string): void {
+  markFailed(
+    baseUrl: string,
+    reason?: string,
+    modelId?: string,
+    modelPath?: string
+  ): void {
+    // Drop expired entries first so a stale entry can't suppress a fresh
+    // second-strike cooldown for the same scope
+    this.cleanupExpiredCooldowns();
     const now = Date.now();
-    const lastFailure = this.lastFailed.get(baseUrl);
+    const key = cooldownKey(baseUrl, modelId, modelPath);
+    const lastFailure = this.lastFailed.get(key);
 
     // Track this failure in memory
-    this.lastFailed.set(baseUrl, now);
+    this.lastFailed.set(key, now);
     this.failedProviders.add(baseUrl);
 
-    // Persist to store
+    // Persist to store. Model- and path-scoped strike counts stay in-memory
+    // only; the cooldown entries themselves are persisted, so cross-restart
+    // behavior is preserved once a cooldown actually triggers.
     if (this.store) {
-      this.store.getState().setLastFailedTimestamp(baseUrl, now);
+      if (modelId === undefined && modelPath === undefined) {
+        this.store.getState().setLastFailedTimestamp(baseUrl, now);
+      }
       this.store.getState().addFailedProvider(baseUrl);
     }
 
@@ -791,12 +917,19 @@ export class ProviderManager {
       lastFailure !== undefined &&
       now - lastFailure < ProviderManager.COOLDOWN_DURATION_MS
     ) {
-      // Second failure within 5 minutes - add to cooldown
-      if (!this.isOnCooldown(baseUrl)) {
-        this.providersOnCoolDown.push([baseUrl, now]);
+      // Second failure within the window - add this scope to cooldown
+      if (!this.providersOnCoolDown.has(key)) {
+        this.providersOnCoolDown.set(key, {
+          baseUrl,
+          modelId,
+          modelPath,
+          timestamp: now,
+        });
         // Persist to store
         if (this.store) {
-          this.store.getState().addProviderOnCooldown(baseUrl, now);
+          this.store
+            .getState()
+            .addProviderOnCooldown(baseUrl, now, modelId, modelPath);
         }
       }
     }
@@ -804,14 +937,30 @@ export class ProviderManager {
 
   /**
    * Remove a provider from cooldown (e.g., after successful request)
+   *
+   * With `modelPath`, only that path's cooldown entry is removed; with
+   * `modelId` only, only that model's entry; without either, every cooldown
+   * entry for the provider is removed.
    */
-  removeFromCooldown(baseUrl: string): void {
-    this.providersOnCoolDown = this.providersOnCoolDown.filter(
-      ([url]) => url !== baseUrl
-    );
+  removeFromCooldown(baseUrl: string, modelId?: string, modelPath?: string): void {
+    if (modelId === undefined && modelPath === undefined) {
+      for (const [key, entry] of [...this.providersOnCoolDown]) {
+        if (entry.baseUrl === baseUrl) {
+          this.providersOnCoolDown.delete(key);
+        }
+      }
+    } else {
+      this.providersOnCoolDown.delete(cooldownKey(baseUrl, modelId, modelPath));
+    }
     // Persist to store
     if (this.store) {
-      this.store.getState().removeProviderFromCooldown(baseUrl);
+      if (modelId === undefined && modelPath === undefined) {
+        this.store.getState().removeAllProviderCooldowns(baseUrl);
+      } else {
+        this.store
+          .getState()
+          .removeProviderFromCooldown(baseUrl, modelId, modelPath);
+      }
     }
   }
 
@@ -819,7 +968,7 @@ export class ProviderManager {
    * Clear all cooldown tracking
    */
   clearCooldowns(): void {
-    this.providersOnCoolDown = [];
+    this.providersOnCoolDown.clear();
     // Persist to store
     if (this.store) {
       this.store.getState().clearProvidersOnCooldown();
@@ -855,9 +1004,14 @@ export class ProviderManager {
    * Find the next best provider for a model
    * @param modelId The model ID to find a provider for
    * @param currentBaseUrl The current provider to exclude
+   * @param attemptedProviders Request-local exclusions to prevent revisiting nodes
    * @returns The best provider URL or null if none available
    */
-  findNextBestProvider(modelId: string, currentBaseUrl: string): string | null {
+  findNextBestProvider(
+    modelId: string,
+    currentBaseUrl: string,
+    attemptedProviders: ReadonlySet<string> = new Set()
+  ): string | null {
     try {
       const torMode = isTorContext();
       const disabledProviders = new Set(
@@ -872,7 +1026,7 @@ export class ProviderManager {
 
       for (const [baseUrl, models] of Object.entries(allProviders)) {
         // Skip current, failed, disabled, and cooldown providers
-        if (baseUrl === currentBaseUrl) {
+        if (baseUrl === currentBaseUrl || attemptedProviders.has(baseUrl)) {
           continue;
         }
         // if (this.failedProviders.has(baseUrl)) {
@@ -883,7 +1037,7 @@ export class ProviderManager {
         if (disabledProviders.has(baseUrl)) {
           continue;
         }
-        if (this.isOnCooldown(baseUrl)) {
+        if (this.isOnCooldown(baseUrl, modelId)) {
           continue;
         }
 
@@ -892,8 +1046,9 @@ export class ProviderManager {
           continue;
         }
 
-        // Find the model in this provider's list
-        const model = models.find((m: Model) => m.id === modelId);
+        // Find the model in this provider's list (by native id or a
+        // statically mapped variant/alias of it)
+        const model = findModelForId(models, modelId);
         if (!model) {
           continue;
         }
@@ -928,9 +1083,9 @@ export class ProviderManager {
     // Get models for this provider
     const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
-    // First try exact match
-    const exactMatch = models.find((m) => m.id === modelId);
-    if (exactMatch) return exactMatch;
+    // First try exact or statically mapped (variant/alias) match
+    const mappedMatch = findModelForId(models, modelId);
+    if (mappedMatch) return mappedMatch;
 
     // Try matching by ID suffix (for backward compatibility with v0.1.x providers)
     const providerInfo = await fetchProviderInfo(this.discoveryAdapter, baseUrl, this.logger);
@@ -941,6 +1096,121 @@ export class ProviderManager {
     }
 
     return null;
+  }
+
+  /**
+   * Ranked DeepSeek model-path candidates for automatic pinning
+   * ("get baseUrl for model path").
+   *
+   * One entry per whitelisted node that (a) is enabled and not cooled down
+   * for the model, and (b) advertises at least one whitelisted route for it
+   * on GET /v1/models/paths. Entries are sorted by the per-route completion
+   * price of the node's best available route; within an entry, `selectors`
+   * and `satsPricing` are in whitelist preference order with cooled-down
+   * routes (and `excludeModelPaths` candidates) removed — the failover
+   * chain is node-major: every route of the cheapest node before the next
+   * node.
+   */
+  async getModelPathProviderRanking(
+    modelId: string,
+    options: {
+      torMode?: boolean;
+      excludeBaseUrl?: string;
+      /**
+       * Candidate keys (see modelPathCandidateKey) already attempted in
+       * this request. One strike does not cool a route down, so the caller
+       * must exclude them itself to avoid revisiting dead routes.
+       */
+      excludeModelPaths?: Iterable<string>;
+    } = {}
+  ): Promise<
+    Array<{
+      baseUrl: string;
+      selectors: string[];
+      satsPricing: Array<ModelPathSatsPricing | null>;
+      model: Model;
+    }>
+  > {
+    const torMode = options.torMode ?? isTorContext();
+    const excludedModelPaths = new Set(options.excludeModelPaths ?? []);
+    const disabledProviders = new Set(
+      this.discoveryAdapter.getDisabledProviders()
+    );
+    const allModels = this.discoveryAdapter.getCachedModels();
+
+    const candidates = await Promise.all(
+      DEEPSEEK_AUTO_NODE_URLS.map(async (nodeUrl) => {
+        const baseUrl = normalizeProviderUrl(nodeUrl);
+        if (!baseUrl) return null;
+        if (options.excludeBaseUrl && baseUrl === options.excludeBaseUrl) {
+          return null;
+        }
+        if (disabledProviders.has(baseUrl)) return null;
+        // Enforce the transport invariant both ways (same as
+        // getProviderPriceRankingForModel): Tor mode is onion-only, clearnet
+        // mode never touches onion nodes. The auto-selection nodes are
+        // clearnet today, so Tor mode gets an empty ranking here and
+        // degrades to the normal onion-only price ranking (unpinned).
+        if (torMode && !isOnionUrl(baseUrl)) return null;
+        if (!torMode && isOnionUrl(baseUrl)) return null;
+        if (this.isOnCooldown(baseUrl, modelId)) return null;
+
+        const model = (allModels[baseUrl] || []).find(
+          (m: Model) => m.id === modelId
+        );
+        if (!model) return null;
+
+        const nodePaths = await getNodeModelPaths(baseUrl);
+        if (!nodePaths) return null;
+        const resolved = resolveDeepSeekModelPathSelectors(nodePaths, modelId);
+        if (!resolved) return null;
+
+        // Whitelist order, dropping routes this node has on path-scoped
+        // cooldown (or does not advertise at all).
+        const available: Array<{
+          selector: string;
+          pricing: ModelPathSatsPricing | null;
+        }> = [];
+        for (let i = 0; i < resolved.selectors.length; i++) {
+          const selector = resolved.selectors[i];
+          if (!selector) continue;
+          const pathId = canonicalModelPath(selector);
+          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
+          available.push({ selector, pricing: resolved.satsPricing[i] ?? null });
+        }
+        if (available.length === 0) return null;
+
+        // Rank by the price of the node's best available route —
+        // deliberately BEFORE the request-scoped excludeModelPaths filter.
+        // The failover chain is node-major (every route of the cheapest node
+        // before the next node), so a node's position must stay fixed as the
+        // request walks the chain and excludes candidates hop by hop;
+        // re-ranking on the cheapest remaining route would interleave the
+        // nodes (e.g. node1:deepseek -> node2:deepseek -> node1:fireworks
+        // whenever node2's first route undercuts node1's second).
+        const price =
+          available[0].pricing ??
+          available.find((a) => a.pricing != null)?.pricing;
+        const cost =
+          price?.completion ?? model.sats_pricing?.completion ?? Infinity;
+
+        const remaining = available.filter(
+          (a) =>
+            !excludedModelPaths.has(modelPathCandidateKey(baseUrl, a.selector))
+        );
+        if (remaining.length === 0) return null;
+        const selectors = remaining.map((a) => a.selector);
+        const satsPricing = remaining.map((a) => a.pricing);
+        return { baseUrl, selectors, satsPricing, model, cost };
+      })
+    );
+
+    return candidates
+      .filter(
+        (c): c is NonNullable<typeof c> => c !== null
+      )
+      .sort((a, b) => a.cost - b.cost)
+      .map(({ cost: _cost, ...candidate }) => candidate);
   }
 
   /**
@@ -961,11 +1231,11 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allProviders)) {
       if (disabledProviders.has(baseUrl)) continue;
-      if (this.isOnCooldown(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl, modelId)) continue;
       if (!torMode && isOnionUrl(baseUrl))
         continue;
 
-      const model = models.find((m: Model) => m.id === modelId);
+      const model = findModelForId(models, modelId);
       if (!model) continue;
 
       const cost = model.sats_pricing?.completion ?? 0;
@@ -990,7 +1260,7 @@ export class ProviderManager {
 
     for (const [baseUrl, models] of Object.entries(allModels)) {
       if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
-      if (this.isOnCooldown(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl, modelId)) continue;
       if (torMode && !baseUrl.includes(".onion")) continue;
       if (
         !torMode &&
@@ -998,7 +1268,7 @@ export class ProviderManager {
       )
         continue;
 
-      const match = models.find((model) => model.id === modelId);
+      const match = findModelForId(models, modelId);
       if (!match?.sats_pricing) continue;
 
       const prompt = match.sats_pricing.prompt;
@@ -1081,9 +1351,35 @@ export class ProviderManager {
     model: Model,
     apiMessages: any[],
     maxTokens?: number,
-    requestBody?: Record<string, unknown>
+    requestBody?: Record<string, unknown>,
+    pathPricing?: ModelPathSatsPricing
   ): number {
     try {
+      // A pinned model path prices itself: the node advertises a full
+      // per-route sats pricing set alongside the path, which replaces the
+      // model's aggregate pricing wholesale — prompt/completion rates, the
+      // max_cost envelope, AND the max_prompt_cost / max_completion_cost
+      // allowances the gate discounts against. The gate formula is only
+      // self-consistent when the envelope and its allowances come from the
+      // same route; mixing the route's max_cost with the aggregate
+      // allowances mis-sizes the deposit in both directions (e.g. one live
+      // node: 537 sats reserved against an 804-sat gate without max_tokens,
+      // 243 sats against a ~4-sat true cost with max_tokens=4000).
+      if (pathPricing) {
+        const routePricing = Object.fromEntries(
+          Object.entries(pathPricing).filter(([, value]) => value !== undefined)
+        );
+        model = {
+          ...model,
+          sats_pricing: {
+            ...((model.sats_pricing ?? {}) as unknown as Record<
+              string,
+              unknown
+            >),
+            ...routePricing,
+          },
+        } as unknown as Model;
+      }
       const body = requestBody ?? {};
 
       let imageTokens = 0;

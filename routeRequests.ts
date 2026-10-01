@@ -26,6 +26,7 @@ import {
   type ResolvedContext,
 } from "./client/resolveRequestContext";
 import { InsufficientBalanceError } from "./core/errors";
+import { MODEL_PATH_HEADER } from "./utils/modelPaths";
 
 // Re-export for consumers that want access to the shared resolver
 export { resolveRequestContext };
@@ -43,6 +44,8 @@ export interface RouteRequestOptions {
   path?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; explicit path headers still work. */
+  autoModelPath?: boolean;
   /**
    * Optional per-request secret scoping Tinfoil's prompt cache. Prefer a
    * stable, opaque, per-end-user value in multi-user deployments so users
@@ -120,6 +123,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
   headers: Record<string, string>;
   modelId: string;
   proxiedBody: Record<string, unknown>;
+  modelPath?: ResolvedContext["modelPath"];
 }> {
   const {
     modelId,
@@ -143,11 +147,16 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     requestResponseLogSink,
   } = options;
 
-  // Delegate to shared context resolution
-  const { client: resolvedClient, baseUrl, mintUrl, selectedModel } =
+  // Delegate to shared context resolution. When explicitly enabled for the
+  // DeepSeek model it ranks the whitelisted model-path nodes ("get baseUrl for model
+  // path") and returns the selector to pin; every other model — and every
+  // request whose caller pinned its own path — resolves exactly as before.
+  const { client: resolvedClient, baseUrl, mintUrl, selectedModel, modelPath } =
     await resolveRequestContext({
       modelId,
       forcedProvider,
+      inputHeaders: headers,
+      autoModelPath: options.autoModelPath,
       walletAdapter,
       storageAdapter,
       discoveryAdapter,
@@ -168,6 +177,12 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     });
 
   const client = resolvedClient;
+
+  // The selector was resolved from this node's own advertised paths, so
+  // the node is guaranteed to accept it.
+  const effectiveHeaders = modelPath
+    ? { ...headers, [MODEL_PATH_HEADER]: modelPath.selector }
+    : headers;
 
   const maxTokens = extractMaxTokens(requestBody);
   const stream = extractStream(requestBody);
@@ -192,9 +207,10 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     baseUrl,
     mintUrl,
     path,
-    headers,
+    headers: effectiveHeaders,
     modelId,
     proxiedBody,
+    modelPath,
   };
 }
 
@@ -204,7 +220,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<Response> {
-  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody } =
+  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody, modelPath } =
     await resolveRouteRequestContext(options);
 
 
@@ -218,12 +234,21 @@ export async function routeRequests(
       mintUrl,
       modelId,
       userCacheSecret: options.userCacheSecret,
+      autoModelPath: modelPath?.autoPinned
+        ? {
+            selector: modelPath.selector,
+            satsPricing: modelPath.satsPricing,
+          }
+        : undefined,
     });
 
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
-    }
-
+    // A proxy caller forwards the node's own envelope (status + headers + body)
+    // verbatim. `client.routeRequest` has already recovered, failed over, or
+    // decided that this response IS the answer — an upstream request error it
+    // short-circuited, or the last provider's envelope at failover exhaustion.
+    // Both proxy consumers bridge a returned Response as-is (status + headers +
+    // piped body), so throwing here flattened a provider's useful 400 into a
+    // local 500 ("All providers failed").
     return response;
   } catch (error) {
     // Preserve typed SDK errors so callers (e.g. routstrd) can instanceof-check

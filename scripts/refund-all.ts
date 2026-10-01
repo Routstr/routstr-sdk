@@ -1,11 +1,11 @@
-import { RoutstrClient } from "@routstr/sdk";
-import type { WalletAdapter } from "@routstr/sdk";
-import { createSdkStore } from "@routstr/sdk/storage";
-import { createSqliteDriver } from "@routstr/sdk/storage/node";
+import { RoutstrClient } from "../client/RoutstrClient";
+import type { WalletAdapter } from "../wallet/interfaces";
+import { createSdkStore } from "../storage";
+import { createSqliteDriver } from "../storage/node";
 import {
   createDiscoveryAdapterFromStore,
   createStorageAdapterFromStore,
-} from "@routstr/sdk/storage";
+} from "../storage";
 import { spawn } from "child_process";
 import { getTokenMetadata } from "@cashu/cashu-ts";
 
@@ -145,8 +145,6 @@ async function main(): Promise<void> {
     }
   }
 
-  const refundBaseUrls = apiKeysStored.map((p) => p.baseUrl);
-
   let mintUnits: Record<string, "sat" | "msat"> = {};
 
   const walletAdapter: WalletAdapter = {
@@ -212,6 +210,10 @@ async function main(): Promise<void> {
       );
     }
   } else {
+    // Recover locally-held proofs before asking providers for API-key refunds.
+    const cachedResults = await spender.recoverCachedReceiveTokens();
+    console.log(`Cached receive recovery: ${cachedResults.filter((r) => r.success).length}/${cachedResults.length} succeeded`);
+
     // Refund API keys (apikeys mode)
     const results = await spender.refundProviders(mintUrl, true);
 

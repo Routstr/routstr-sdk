@@ -305,7 +305,10 @@ describe("RoutstrClient._handleErrorResponse — token_already_spent", () => {
     expect(removedXcashu).toEqual([[BASE_URL, token]]);
     expect(providerManager.markFailed).toHaveBeenCalledWith(
       BASE_URL,
-      expect.stringContaining("type=token_already_spent")
+      expect.stringContaining("type=token_already_spent"),
+      "gpt-4o-mini",
+      // no pinned model path: no path-scoped cooldown
+      undefined
     );
     expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     // Retry went to the failover provider with a fresh token, not the spent one.

@@ -35,6 +35,8 @@ export const CoreErrorType = {
   TOKEN_ALREADY_SPENT: "token_already_spent",
   /** Token is malformed or cannot be decoded (400, not retryable) */
   INVALID_TOKEN: "invalid_token",
+  /** Source mint is not accepted by this provider (400) */
+  UNTRUSTED_MINT: "untrusted_mint",
   /** Fee/melt failures from the mint (422, not retryable) */
   MINT_ERROR: "mint_error",
   /** Mint could not be reached — retryable with backoff (503) */
@@ -62,6 +64,7 @@ export type CoreErrorTypeValue =
 export const CoreErrorCode = {
   TOKEN_ALREADY_SPENT: "cashu_token_already_spent",
   INVALID_CASHU_TOKEN: "invalid_cashu_token",
+  CASHU_UNTRUSTED_SOURCE_MINT: "cashu_untrusted_source_mint",
   CASHU_TOKEN_SWAP_FEES_EXCEED_AMOUNT: "cashu_token_swap_fees_exceed_amount",
   CASHU_FOREIGN_MINT_SWAP_FAILED: "cashu_foreign_mint_swap_failed",
   CASHU_MINT_UNREACHABLE: "cashu_mint_unreachable",
@@ -70,6 +73,8 @@ export const CoreErrorCode = {
   CASHU_TOKEN_CONSUMED: "cashu_token_consumed",
   INTERNAL_ERROR: "internal_error",
   INVALID_API_KEY: "invalid_api_key",
+  /** A well-formed API key that the node has no record of */
+  KEY_NOT_FOUND: "key_not_found",
   /** The API key's available balance is below the request requirement */
   INSUFFICIENT_BALANCE: "insufficient_balance",
   /** A configured spending cap was reached; adding funds will not fix it */
@@ -231,6 +236,14 @@ export function isInvalidTokenError(parsed: ParsedCoreError): boolean {
   );
 }
 
+/** A source mint rejected by the provider's trust policy. */
+export function isUntrustedMintError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.type === CoreErrorType.UNTRUSTED_MINT &&
+    parsed.code === CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT
+  );
+}
+
 /**
  * An expected Cashu redemption failure.
  *
@@ -254,6 +267,23 @@ export function isTokenConsumedError(parsed: ParsedCoreError): boolean {
   );
 }
 
+/**
+ * A 401 meaning the API key does not exist on this node.
+ *
+ * The refund path sends a structured `key_not_found` code since routstr-core
+ * 0.4.5, and the auth path after routstr-core#779. Older nodes only send the
+ * `"Key not found. …"` message (a bare `detail` string on the refund path), so
+ * the message is also matched whenever the code does not match. Either way the
+ * key is permanently dead and should be purged.
+ */
+export function isKeyNotFoundError(parsed: ParsedCoreError): boolean {
+  return (
+    parsed.status === 401 &&
+    (parsed.code === CoreErrorCode.KEY_NOT_FOUND ||
+      (parsed.message?.includes("Key not found") ?? false))
+  );
+}
+
 /** An unexpected internal fault during token redemption. */
 export function isCoreInternalError(parsed: ParsedCoreError): boolean {
   return (
@@ -263,7 +293,7 @@ export function isCoreInternalError(parsed: ParsedCoreError): boolean {
 }
 
 /**
- * True for the four structured redemption failures handled by provider
+ * True for the structured redemption failures handled by provider
  * recovery/failover. This intentionally excludes `token_already_spent` and
  * `mint_error`, which have their own specialized flows.
  */
@@ -272,6 +302,7 @@ export function isHandledRedemptionError(
 ): boolean {
   return (
     isInvalidTokenError(parsed) ||
+    isUntrustedMintError(parsed) ||
     isCashuRedemptionError(parsed) ||
     isTokenConsumedError(parsed) ||
     isCoreInternalError(parsed)
@@ -302,20 +333,38 @@ export function shouldPurgeStoredCredential(
 /**
  * Determine whether this error should be retried using another Cashu mint.
  *
- * This does not control provider failover. A mint-unreachable response and a
- * foreign-mint swap failure can be recovered by selecting another mint. A
- * token whose amount is too small for swap fees cannot: changing mints alone
- * does not fix the token sizing problem. Unknown mint-error codes remain
- * non-retryable by default.
+ * This does not control provider failover. Mint-unreachable, foreign-mint
+ * swap failure, and a rejected source mint can be retried with another mint
+ * after the token is recovered. A token whose amount is too small for swap
+ * fees cannot: changing mints alone does not fix the token sizing problem.
+ * Unknown codes remain non-retryable by default.
  */
 export function shouldFailoverToAnotherMint(
   parsed: ParsedCoreError
 ): boolean {
   return (
     parsed.type === CoreErrorType.MINT_UNREACHABLE ||
+    (parsed.type === CoreErrorType.UNTRUSTED_MINT &&
+      parsed.code === CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT) ||
     (parsed.type === CoreErrorType.MINT_ERROR &&
       parsed.code === CoreErrorCode.CASHU_FOREIGN_MINT_SWAP_FAILED)
   );
+}
+
+/** Every `type` value routstr-core itself emits (values, not keys). */
+const CORE_TYPES = new Set<string>(Object.values(CoreErrorType));
+
+/**
+ * Classify non-wallet 400/422 rejections. They can be provider-specific, so
+ * recover payment and try other candidates without applying a cooldown.
+ */
+export function isUpstreamRequestError(
+  status: number,
+  parsed: ParsedCoreError
+): boolean {
+  if (status !== 400 && status !== 422) return false;
+  if (parsed.type && CORE_TYPES.has(parsed.type)) return false; // our wallet, ours to fix
+  return true;
 }
 
 /**

@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 
-const selector = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&provider-id=2&model-id=glm-5.3-flash&endpoint=z-ai%2Ffp8";
+const selector = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=glm-5.3-flash&endpoint=z-ai%2Ffp8";
 
 // Run real request preparation up to the transport boundary, without wallet spend.
 async function prepare(headers: Record<string, string>, mode = "xcashu") {
   const client = Object.create(RoutstrClient.prototype) as any;
   client.mode = mode;
+  // Object.create skips the constructor, so instance fields are missing;
+  // the proactive-topup path reads this map unconditionally.
+  client._inflightTopups = new Map();
   client._checkBalance = vi.fn().mockResolvedValue(undefined);
   client._log = vi.fn();
   client.providerManager = { getModelForProvider: vi.fn().mockResolvedValue(null) };
@@ -16,7 +19,7 @@ async function prepare(headers: Record<string, string>, mode = "xcashu") {
   // The proactive API-key topup (apikeys mode) is a wallet-spend side effect
   // that is out of scope for header assertions — and this fake client has none
   // of the state a real topup needs. Neutralize it and assert headers only.
-  client._spinOffTopupIfNeeded = vi.fn();
+  client._topUpIfNeeded = vi.fn();
   const stop = new Error("transport boundary reached");
   client._makeRequest = vi.fn().mockRejectedValue(stop);
   await expect(client.routeRequest({

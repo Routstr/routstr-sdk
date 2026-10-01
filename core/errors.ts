@@ -27,6 +27,14 @@ export class InsufficientBalanceError extends Error {
   }
 }
 
+/** Wire-level detail of an upstream error response, preserved so callers can forward it. */
+export interface UpstreamEnvelope {
+  status: number;
+  statusText: string;
+  /** Lower-cased header name -> value, restricted to forwardable headers. */
+  headers: Record<string, string>;
+}
+
 /**
  * Error thrown when a provider returns an error response
  */
@@ -226,6 +234,18 @@ export class InvalidTokenError extends CoreRedemptionError {
       "InvalidTokenError",
       400,
       "Invalid Cashu token — recovery and provider failover exhausted",
+      opts
+    );
+  }
+}
+
+/** Error thrown when provider trust-policy rejection exhausts failover. */
+export class UntrustedMintError extends CoreRedemptionError {
+  constructor(opts: CoreRedemptionErrorOptions) {
+    super(
+      "UntrustedMintError",
+      400,
+      "Source Cashu mint is not accepted — recovery and provider failover exhausted",
       opts
     );
   }

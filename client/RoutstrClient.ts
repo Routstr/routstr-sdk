@@ -24,6 +24,8 @@ import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
+import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey } from "../utils/modelPaths";
+import type { ModelPathSatsPricing } from "../utils/modelPaths";
 import {
   ProviderError,
   FailoverError,
@@ -31,19 +33,23 @@ import {
   TokenAlreadySpentError,
   MintError,
   InvalidTokenError,
+  UntrustedMintError,
   CashuRedemptionError,
   TokenConsumedError,
   CoreInternalError,
 } from "../core/errors";
+import type { UpstreamEnvelope } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorCode,
   CoreErrorType,
   isInvalidTokenError,
+  isUntrustedMintError,
   isCashuRedemptionError,
   isTokenConsumedError,
   isCoreInternalError,
   isHandledRedemptionError,
+  isUpstreamRequestError,
   shouldFailoverToAnotherMint,
   shouldPurgeStoredCredential,
   type ParsedCoreError,
@@ -74,9 +80,74 @@ export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.4;
 
+/** Never put spendable credentials (including even a prefix) in SDK logs. */
+const REDACTED_CREDENTIAL = "[REDACTED]";
+
+interface RequestFailures {
+  attemptedProviders: Set<string>;
+  errors: Array<{
+    status: number;
+    type?: string;
+    code?: string | number;
+    message: string;
+    providers: string[];
+  }>;
+}
+
+/** Response headers safe to hand to a caller forwarding an upstream error. */
+const FORWARDABLE_ERROR_HEADERS = new Set([
+  "content-type",
+  "retry-after",
+  "retry-after-ms",
+  "x-routstr-request-id",
+  "x-routstr-error-scope",
+  "x-routstr-provider",
+  "ratelimit-limit",
+  "ratelimit-remaining",
+  "ratelimit-reset",
+]);
+
+/**
+ * Framing/hop-by-hop headers are tied to the body we consumed; never reuse
+ * them for a body we re-wrap ourselves. Checked separately so they stay blocked
+ * even if the allowlist above ever grows.
+ */
+const NEVER_FORWARDED_ERROR_HEADERS = new Set([
+  "transfer-encoding",
+  "content-length",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+/** Pick the forwardable, non-framing subset of an upstream error's headers. */
+function forwardableErrorHeaders(headers: Headers): Record<string, string> {
+  const captured: Record<string, string> = {};
+  headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (NEVER_FORWARDED_ERROR_HEADERS.has(lower)) return;
+    if (!FORWARDABLE_ERROR_HEADERS.has(lower)) return;
+    captured[lower] = value;
+  });
+  return captured;
+}
+
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
+
+/**
+ * An SDK-pinned x-routstr-model-path selector and the per-route pricing the
+ * node advertised for it. Marks the request as auto-pinned (failover may
+ * re-resolve a selector on the next model-path node); caller-supplied
+ * selectors never fail over.
+ */
+export interface ModelPathPin {
+  selector: string;
+  satsPricing?: ModelPathSatsPricing;
+}
 
 export interface RouteRequestParams {
   path: string;
@@ -97,6 +168,10 @@ export interface RouteRequestParams {
   userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
+  /**
+   * Set by the SDK's automatic model-path pinning (see resolveRequestContext).
+   */
+  autoModelPath?: ModelPathPin;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -276,6 +351,12 @@ export class RoutstrClient {
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
 
+    // Error payment recovery is handled in _handleErrorResponse. There is no
+    // successful usage to account for; keep finalization off passthrough errors.
+    if ((prepared.response as any).passthrough) {
+      return prepared.response;
+    }
+
     // For SSE, defer accounting until the inspector (tee'd branch) has seen
     // usage — which only happens as the client consumes the stream. We expose
     // the finalization as `(response).finalize` so callers that want to block
@@ -394,7 +475,8 @@ export class RoutstrClient {
           selectedModel,
           requestMessages,
           requestMaxTokens,
-          requestBodyForPricing
+          requestBodyForPricing,
+          params.autoModelPath?.satsPricing
         );
       }
     }
@@ -410,14 +492,31 @@ export class RoutstrClient {
       }
     }
 
+    // Forward the provider-native model id when selection resolved through a
+    // static mapping: mapped providers only know their own id, so the
+    // caller-facing canonical id would 400/404 upstream. Only touches JSON
+    // bodies that already carry a string `model` field.
+    if (selectedModel && requestBody && typeof requestBody === "object") {
+      const bodyObj = requestBody as Record<string, unknown>;
+      if (
+        typeof bodyObj.model === "string" &&
+        bodyObj.model !== selectedModel.id
+      ) {
+        requestBody = { ...bodyObj, model: selectedModel.id };
+      }
+    }
+
     // Keep the opaque selector in baseHeaders so request retries preserve it.
+    // A caller-supplied selector is never forwarded to a different provider:
+    // failover is disabled for caller-pinned requests in _handleErrorResponse.
+    // An SDK auto-pin (params.autoModelPath) may fail over, with the selector
+    // swapped for one the next node advertised.
     // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
     // to the caller, not the upstream payment connection.
     const baseHeaders = this._buildBaseHeaders();
-    for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() === "x-routstr-model-path") {
-        baseHeaders["x-routstr-model-path"] = value;
-      }
+    const modelPathSelector = this._findModelPathHeader(headers);
+    if (modelPathSelector) {
+      baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
     }
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
@@ -464,12 +563,10 @@ export class RoutstrClient {
       selectedMintUrl,
     } = spendResult;
 
-    // Proactive topup (apikeys mode): if the key we are about to use has a
-    // balance snapshot below the request price, spin off a background topup
-    // BEFORE the request goes out. Fire-and-forget — the request proceeds in
-    // parallel, and if it still 402s, _handleErrorResponse joins the
-    // in-flight topup instead of stacking a second deposit.
-    this._spinOffTopupIfNeeded({
+    // Wait for a topup when the stored available balance cannot cover this
+    // request. Within the margin, refill in the background without delaying
+    // a request that can already succeed.
+    await this._topUpIfNeeded({
       token,
       baseUrl,
       mintUrl,
@@ -505,6 +602,12 @@ export class RoutstrClient {
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
+      // The SDK auto-pin marker must reach _handleErrorResponse to
+      // distinguish an SDK-pinned selector (may fail over) from a
+      // caller-pinned one (never does). Retry call sites inside
+      // _handleErrorResponse spread ...params, so this is the single place
+      // it can get lost.
+      autoModelPath: params.autoModelPath,
     });
 
     let tokenBalanceInSats =
@@ -536,7 +639,11 @@ export class RoutstrClient {
       capturedResponseId?: string;
     }> = Promise.resolve({});
 
-    if (contentType.includes("text/event-stream") && response.body) {
+    if (
+      !(response as any).passthrough &&
+      contentType.includes("text/event-stream") &&
+      response.body
+    ) {
       // Tee the upstream Web stream: one branch goes untouched to the client,
       // the other is consumed by an inspector that extracts usage / responseId.
       const [clientStream, inspectStream] = response.body.tee();
@@ -601,7 +708,16 @@ export class RoutstrClient {
   }
 
   /**
-   * Extract clientApiKey from Authorization Bearer token if present
+   * Extract clientApiKey from the inbound request headers if present.
+   *
+   * The key identifies which configured client made the call (usage
+   * attribution); it is never forwarded as payment auth. Transports disagree
+   * about where a key belongs: OpenAI-style clients send
+   * `Authorization: Bearer <key>`, while Anthropic-style ones send
+   * `x-api-key: <key>` — the Anthropic SDKs put `apiKey` there and reserve
+   * `Authorization` for an OAuth `authToken`. Accept both spellings, so a
+   * request routed over the Anthropic transport is attributed to its client
+   * instead of being recorded as `unknown`.
    */
   private _extractClientApiKey(
     headers: Record<string, string>
@@ -609,7 +725,13 @@ export class RoutstrClient {
     const authHeader = headers["Authorization"] || headers["authorization"];
     if (authHeader?.startsWith("Bearer ")) {
       const extractedKey = authHeader.slice(7);
-      return extractedKey;
+      if (extractedKey) return extractedKey;
+    }
+    // Header names arrive lower-cased from Node's IncomingMessage; scan
+    // case-insensitively anyway so callers passing their own map work too.
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() !== "x-api-key") continue;
+      if (typeof value === "string" && value.trim()) return value.trim();
     }
     return undefined;
   }
@@ -642,6 +764,11 @@ export class RoutstrClient {
     tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
+    /** SDK-pinned model path for this request, if any. */
+    autoModelPath?: ModelPathPin;
+    /** (node, canonical path) candidates already attempted in this request. */
+    triedModelPaths?: string[];
+    failures?: RequestFailures;
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -664,7 +791,8 @@ export class RoutstrClient {
         rawBody: requestBodyText,
       });
 
-      if (this.mode === "xcashu") this._log("DEBUG", "HEADERS,", headers);
+      // Request headers contain bearer credentials / x-cashu tokens. The
+      // request-response sink has its own header redaction; do not log raw headers.
 
       const response = tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
@@ -701,6 +829,12 @@ export class RoutstrClient {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
+        // Capture the wire-level envelope before the body read consumes the response.
+        const upstream: UpstreamEnvelope = {
+          status: response.status,
+          statusText: response.statusText,
+          headers: forwardableErrorHeaders(response.headers),
+        };
         let bodyText: string | undefined;
         try {
           bodyText = await response.text();
@@ -727,7 +861,8 @@ export class RoutstrClient {
             ? (response.headers.get("x-cashu") ?? undefined)
             : undefined,
           bodyText,
-          params.retryCount ?? 0
+          params.retryCount ?? 0,
+          upstream
         );
       }
 
@@ -762,8 +897,32 @@ export class RoutstrClient {
   }
 
   /**
-   * Store request details to a file in the reqs/ folder before fetch.
+   * Decide the cooldown scope for a failure.
+   *
+   * - Network errors (status -1) and `mint_unreachable` are model-independent:
+   *   the provider host or its mint/wallet infrastructure is down, so the
+   *   whole provider is cooled down (empty scope).
+   * - A pinned x-routstr-model-path request attributes the failure to that
+   *   upstream route: only the canonical path is cooled on the provider, so
+   *   the provider's other routes for the same model stay usable.
+   * - Otherwise the failure is attributed to the selected model only.
    */
+  private _getCooldownScope(
+    status: number,
+    parsedError: ParsedCoreError,
+    selectedModel?: Model,
+    pinnedModelPath?: string
+  ): { modelId?: string; modelPath?: string } {
+    if (!selectedModel) return {};
+    if (status === -1) return {};
+    if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return {};
+    if (pinnedModelPath) {
+      const modelPath = canonicalModelPath(pinnedModelPath);
+      if (modelPath) return { modelId: selectedModel.id, modelPath };
+    }
+    return { modelId: selectedModel.id };
+  }
+
   /**
    * Handle error responses with failover
    */
@@ -784,17 +943,28 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
+      /** SDK-pinned model path for this request, if any. */
+      autoModelPath?: ModelPathPin;
+      /** (node, canonical path) candidates already attempted in this request. */
+      triedModelPaths?: string[];
+      failures?: RequestFailures;
     },
     token: string,
     status: number,
     requestId?: string,
     xCashuRefundToken?: string,
     responseBody?: string,
-    retryCount: number = 0
+    retryCount: number = 0,
+    upstream?: UpstreamEnvelope
   ): Promise<Response> {
     const MAX_RETRIES_PER_PROVIDER = 2;
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
+
+    // Request-local history is shared by retries, never by concurrent requests.
+    const failures = params.failures ?? { attemptedProviders: new Set<string>(), errors: [] };
+    params = { ...params, failures };
+    failures.attemptedProviders.add(baseUrl);
 
     const errorMessage = responseBody;
 
@@ -807,8 +977,40 @@ export class RoutstrClient {
 
     this._log(
       "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token preview=${token}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
+      `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
+
+    const upstreamRequestError = isUpstreamRequestError(status, parsedError);
+    const aggregateFailure = upstreamRequestError || status >= 500 ||
+      status === 424 || status === 429 || status === -1;
+    // Keep only diagnostic fields, never raw envelopes containing refund proofs.
+    if (aggregateFailure) {
+      const redact = (value: string) => [params.token, xCashuRefundToken]
+        .filter((secret): secret is string => !!secret)
+        .reduce((text, secret) => text.split(secret).join("[REDACTED]"), value)
+        .replace(/cashu[AB][A-Za-z0-9_-]+/g, "[REDACTED]")
+        .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+      const message = redact(parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`));
+      const type = parsedError.type ? redact(parsedError.type) : undefined;
+      let code: string | number | undefined = parsedError.code ? redact(parsedError.code) : undefined;
+      // Provider envelopes also use numeric codes; the wallet parser only
+      // recognizes strings, but diagnostics should preserve either format.
+      if (code === undefined && responseBody) {
+        try {
+          const body = JSON.parse(responseBody);
+          const numericCode = body?.error?.code ?? body?.detail?.error?.code;
+          if (typeof numericCode === "number") code = numericCode;
+        } catch { /* Plain-text upstream errors have no structured code. */ }
+      }
+      const existing = failures.errors.find((error) =>
+        error.status === status && error.type === type && error.code === code && error.message === message
+      );
+      if (existing) {
+        if (!existing.providers.includes(baseUrl)) existing.providers.push(baseUrl);
+      } else {
+        failures.errors.push({ status, type, code, message, providers: [baseUrl] });
+      }
+    }
 
     // ── Handle token_already_spent ────────────────────────────────────
     // The token is permanently spent — core deliberately withholds the
@@ -850,7 +1052,7 @@ export class RoutstrClient {
     if (!tryNextProvider && this.mode === "xcashu" && xCashuRefundToken) {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token, preview=${xCashuRefundToken.substring(0, 20)}...`
+        `[RoutstrClient] _handleErrorResponse: Attempting to receive xcashu refund token=${REDACTED_CREDENTIAL}`
       );
       recoveryAttempted = true;
       const receiveResult =
@@ -867,6 +1069,7 @@ export class RoutstrClient {
         refundReceived = true;
         recoverySucceeded = true;
       } else {
+        this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed${xCashuRefundToken === params.token ? " (same as original; not receiving twice)" : ", falling back to original token"}: ${receiveResult.message}`
@@ -980,17 +1183,16 @@ export class RoutstrClient {
       }
     }
 
-    // For recognized redemption errors, a failed receive is still a provider
-    // failure: preserve the stored token for later recovery, mark this provider
-    // failed below, and retry with a fresh token on a different provider.
+    // Preserve failed payment recovery for a later sweep, but allow a fresh
+    // attempt elsewhere for redemption failures and upstream rejections.
     if (
       this.mode === "xcashu" &&
-      handledRedemptionError &&
+      (handledRedemptionError || upstreamRequestError) &&
       !tryNextProvider
     ) {
       this._log(
         "WARN",
-        `[RoutstrClient] _handleErrorResponse: recovery failed for structured redemption error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
+        `[RoutstrClient] _handleErrorResponse: recovery failed for retryable error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
       );
       tryNextProvider = true;
     }
@@ -1216,10 +1418,7 @@ export class RoutstrClient {
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
             if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-              if (storedApiKeyEntry) {
-                this.storageAdapter.removeApiKey(baseUrl);
-              }
-              this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+              this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
             }
             retryToken = latestBalanceInfo.apiKey;
           }
@@ -1269,7 +1468,7 @@ export class RoutstrClient {
     if (status === 401 && this.mode === "apikeys") {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key preview=${token}`
+        `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
       );
       const latestBalanceInfo = await this.balanceManager.getTokenBalance(
         token,
@@ -1287,6 +1486,7 @@ export class RoutstrClient {
         status === 404 ||
         status === 413 ||
         status === 400 ||
+        status === 422 ||
         status === 429 ||
         status === 500 ||
         status === 502 ||
@@ -1302,7 +1502,7 @@ export class RoutstrClient {
       if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key preview=${token}`
+          `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
         const latestBalanceInfo = await this.balanceManager.getTokenBalance(
           token,
@@ -1330,13 +1530,10 @@ export class RoutstrClient {
           !latestBalanceInfo.balanceUnknown
         ) {
           if (this._isTransientRefundError(refundResult.message)) {
-            // Known transient refund failure: the upstream wallet refuses to
-            // refund a shared API key while other in-flight requests are still
-            // using it (HTTP 400 "Cannot refund key. There are ongoing
-            // requests for this api key."). The sats are still on the key and
-            // will be reclaimed by a later refund sweep — this is not a
-            // terminal provider failure, so fall through to markFailed() +
-            // findNextBestProvider() instead of throwing.
+            // A provider-wallet guard (recent/in-progress topup), or a
+            // provider refusing to refund a key with ongoing requests, is a
+            // transient refund skip. Preserve the key for a later sweep and
+            // continue provider failover instead of aborting this request.
             this._log(
               "WARN",
               `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
@@ -1414,11 +1611,37 @@ export class RoutstrClient {
     ]
       .filter(Boolean)
       .join(" ");
-    this.providerManager.markFailed(baseUrl, failReason);
-    this._log(
-      "DEBUG",
-      `[RoutstrClient] _handleErrorResponse: Marked provider ${baseUrl} as failed (${failReason})`
+    // The pinned model-path selector (if any) decides both the cooldown
+    // scope below and the failover behavior further down.
+    const pinnedModelPath = this._findModelPathHeader(params.baseHeaders);
+
+    // Scope the cooldown: a pinned request cools only its upstream route on
+    // the provider, an unpinned model-specific failure cools only that
+    // model, and network/mint failures cool the whole provider.
+    const cooldownScope = this._getCooldownScope(
+      status,
+      parsedError,
+      selectedModel,
+      pinnedModelPath
     );
+    if (!upstreamRequestError) {
+      this.providerManager.markFailed(
+        baseUrl,
+        failReason,
+        cooldownScope.modelId,
+        cooldownScope.modelPath
+      );
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: Marked ${
+          cooldownScope.modelPath
+            ? `path ${cooldownScope.modelPath} on provider ${baseUrl}`
+            : cooldownScope.modelId
+              ? `model ${cooldownScope.modelId} on provider ${baseUrl}`
+              : `provider ${baseUrl}`
+        } as failed (${failReason})`
+      );
+    }
 
     if (!selectedModel) {
       if (handledRedemptionError) {
@@ -1439,10 +1662,68 @@ export class RoutstrClient {
       );
     }
 
-    const nextProvider = this.providerManager.findNextBestProvider(
-      selectedModel.id,
-      baseUrl
-    );
+    // A pinned x-routstr-model-path selector is only guaranteed valid on
+    // the node that advertised it. A caller-pinned request must never fail
+    // over to a different node: the selector may be rejected there (404
+    // invalid_model_path) and the caller explicitly asked for that one
+    // upstream. An SDK auto-pinned request walks the node-major model-path
+    // chain (node1:deepseek -> node1:fireworks -> node2:deepseek -> ...),
+    // swapping in a fresh selector resolved from the next candidate's own
+    // node.
+    let nextProvider: string | null;
+    let nextModelPathSelector: string | undefined;
+    let nextModelPathPricing: ModelPathSatsPricing | undefined;
+    let nextTriedModelPaths: string[] | undefined;
+    if (pinnedModelPath) {
+      if (!params.autoModelPath) {
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: not failing over, request is pinned to a model path (${pinnedModelPath})`
+        );
+        nextProvider = null;
+      } else {
+        // The failed candidate joins the request's attempted set: one
+        // strike does not cool a route down, so without this the chain
+        // could burn paid retries revisiting a route that already failed
+        // within this request.
+        const triedModelPaths = new Set(params.triedModelPaths ?? []);
+        triedModelPaths.add(modelPathCandidateKey(baseUrl, pinnedModelPath));
+        nextTriedModelPaths = [...triedModelPaths];
+        // A provider-wide failure (network error / mint unreachable — the
+        // empty cooldown scope) rules out the node's remaining routes too:
+        // they share the host. A route-scoped failure keeps them in play,
+        // so the chain walks every route of the cheaper node first.
+        const providerWideFailure = cooldownScope.modelId === undefined;
+        const ranking =
+          await this.providerManager.getModelPathProviderRanking(
+            selectedModel.id,
+            {
+              excludeModelPaths: triedModelPaths,
+              ...(providerWideFailure ? { excludeBaseUrl: baseUrl } : {}),
+            }
+          );
+        const next = ranking[0];
+        nextProvider = next?.baseUrl ?? null;
+        nextModelPathSelector = next?.selectors[0];
+        nextModelPathPricing = next?.satsPricing[0] ?? undefined;
+        if (nextProvider) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: auto-pinned request failing over to next model-path route: ${nextProvider} (${nextModelPathSelector})`
+          );
+        }
+      }
+    } else {
+      nextProvider = this.providerManager.findNextBestProvider(
+        selectedModel.id,
+        baseUrl,
+        failures.attemptedProviders
+      );
+    }
+
+    if (nextProvider && !pinnedModelPath && failures.attemptedProviders.has(nextProvider)) {
+      nextProvider = null;
+    }
 
     if (nextProvider) {
       this._log(
@@ -1462,14 +1743,16 @@ export class RoutstrClient {
         ? ((body as { messages?: unknown }).messages as any[])
         : [];
 
-      const newRequiredSats = this.providerManager.getRequiredSatsForModel(
-        newModel,
-        messagesForPricing,
-        params.maxTokens,
-        body && typeof body === "object"
-          ? (body as Record<string, unknown>)
-          : undefined
-      );
+      const newRequiredSats =
+        this.providerManager.getRequiredSatsForModel(
+          newModel,
+          messagesForPricing,
+          params.maxTokens,
+          body && typeof body === "object"
+            ? (body as Record<string, unknown>)
+            : undefined,
+          nextModelPathPricing
+        );
 
       if (params.tinfoilEnabled) {
         this._log(
@@ -1521,19 +1804,44 @@ export class RoutstrClient {
       // Retry with new provider (reset retry count). Attach the balance that
       // was observed before the retry request so callers do not have to query
       // after the provider may already have charged the request.
+      // The failover target may serve the model under a different native id
+      // (static mapping), so forward newModel.id, not the original body model.
+      const bodyObj =
+        body && typeof body === "object"
+          ? (body as Record<string, unknown>)
+          : undefined;
+      const retryBody =
+        bodyObj && typeof bodyObj.model === "string"
+          ? { ...bodyObj, model: newModel.id }
+          : body;
+      // An auto-pinned request swaps its selector for one the new node
+      // advertised; the failed node's selector is never forwarded.
+      const retryBaseHeaders = { ...params.baseHeaders };
+      if (nextModelPathSelector !== undefined) {
+        retryBaseHeaders[MODEL_PATH_HEADER] = nextModelPathSelector;
+      }
       const retryResponse = await this._makeRequest({
         ...params,
         path,
         method,
-        body,
+        body: retryBody,
         baseUrl: nextProvider,
+        baseHeaders: retryBaseHeaders,
         selectedModel: newModel,
         token: spendResult.token!,
         selectedMintUrl: spendResult.selectedMintUrl,
         excludeMints: undefined,
+        triedModelPaths: nextTriedModelPaths ?? params.triedModelPaths,
         requiredSats: newRequiredSats,
+        autoModelPath:
+          nextModelPathSelector !== undefined
+            ? {
+                selector: nextModelPathSelector,
+                satsPricing: nextModelPathPricing,
+              }
+            : undefined,
         headers: this._withAuthAndTinfoilHeaders(
-          params.baseHeaders,
+          retryBaseHeaders,
           spendResult.token!,
           params.tinfoilEnabled,
           newModel.id
@@ -1585,10 +1893,57 @@ export class RoutstrClient {
       });
     }
 
+    // Financial and pinned-path failures above retain their typed semantics.
+    // Ordinary upstream failures return a deduplicated diagnostic envelope.
+    if (aggregateFailure) {
+      const response = this._upstreamErrorResponse(
+        upstream ?? { status: 502, statusText: "Bad Gateway", headers: {} },
+        JSON.stringify({ error: {
+          type: "all_providers_failed",
+          message: failures.errors.map((error) => error.message).join("; "),
+          errors: failures.errors,
+        } }),
+        baseUrl
+      )!;
+      response.headers.set("content-type", "application/json");
+      response.headers.delete("x-routstr-error-scope");
+      (response as any).passthrough = true;
+      return response;
+    }
+
     throw new FailoverError(
       baseUrl,
       Array.from(this.providerManager.getFailedProviders())
     );
+  }
+
+  /**
+   * Rebuild the provider's own error response from the captured envelope so a
+   * proxy caller can forward it verbatim (status + headers + body).
+   *
+   * Returns `undefined` when there is no status to forward — notably a network
+   * failure (status -1), where `new Response` would also reject any status
+   * below 200.
+   */
+  private _upstreamErrorResponse(
+    upstream: UpstreamEnvelope | undefined,
+    bodyText: string | undefined,
+    baseUrl: string
+  ): Response | undefined {
+    if (!upstream || upstream.status < 400) return undefined;
+    const headers = new Headers(upstream.headers);
+    headers.set(
+      "content-type",
+      upstream.headers["content-type"] ?? "application/json"
+    );
+    if (!headers.has("x-routstr-provider")) {
+      headers.set("x-routstr-provider", baseUrl);
+    }
+    return new Response(bodyText ?? "", {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
   }
 
   private _createRedemptionError(opts: {
@@ -1601,6 +1956,7 @@ export class RoutstrClient {
     recoverySucceeded: boolean;
   }):
     | InvalidTokenError
+    | UntrustedMintError
     | CashuRedemptionError
     | TokenConsumedError
     | CoreInternalError {
@@ -1617,6 +1973,9 @@ export class RoutstrClient {
 
     if (isInvalidTokenError(opts.parsedError)) {
       return new InvalidTokenError(shared);
+    }
+    if (isUntrustedMintError(opts.parsedError)) {
+      return new UntrustedMintError(shared);
     }
     if (isCashuRedemptionError(opts.parsedError)) {
       return new CashuRedemptionError(shared);
@@ -1651,6 +2010,7 @@ export class RoutstrClient {
     if (!message) return false;
     const lower = message.toLowerCase();
     return (
+      lower.startsWith("provider wallet operation locked;") ||
       lower.includes("ongoing requests for this api key") ||
       lower.includes("cannot refund key")
     );
@@ -1731,7 +2091,7 @@ export class RoutstrClient {
           "LATEST Balance",
           latestBalanceInfo.amount,
           latestBalanceInfo.reserved,
-          latestBalanceInfo.apiKey,
+          REDACTED_CREDENTIAL,
           baseUrl
         );
         const latestTokenBalance = latestBalanceInfo.balanceUnknown
@@ -1750,8 +2110,7 @@ export class RoutstrClient {
           storedApiKeyEntry?.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
-          this.storageAdapter.removeApiKey(baseUrl);
-          this.storageAdapter.setApiKey(baseUrl, latestBalanceInfo.apiKey);
+          this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
         if (latestTokenBalance !== undefined) {
           this.storageAdapter.updateApiKeyBalance(
@@ -1924,6 +2283,12 @@ export class RoutstrClient {
         requestId: finalRequestId,
         client: matchingClient?.clientId,
         ...usage,
+        // Anthropic responses may omit the body provider; the node can
+        // still identify the route in a response header (including SSE).
+        provider:
+          usage.provider ||
+          response.headers.get("x-routstr-provider")?.trim() ||
+          undefined,
       };
 
       // For xcashu mode, use satsSpent directly for satsCost instead of calculating from usage
@@ -1957,16 +2322,16 @@ export class RoutstrClient {
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
   // Stored API-key snapshots contain both total and last-known reserved
-  // balance. The trigger and background task both trust this snapshot (no
-  // extra balance round-trip); the post-topup total is persisted from topUp's
+  // balance. The trigger and topup both trust this snapshot (no extra
+  // balance round-trip); the post-topup total is persisted from topUp's
   // toppedUpAmount so the stored snapshot isn't stale-low and re-triggering.
 
   /**
-   * Fire-and-forget topup spun off before a request when the API key's
-   * balance snapshot is below the request price. Never blocks the request
-   * and never throws.
+   * Wait for a topup if the snapshot cannot cover this request; otherwise
+   * refill the margin in the background. A failed topup does not prevent the
+   * request from trying the provider (the snapshot may be stale). Never throws.
    */
-  private _spinOffTopupIfNeeded(snapshot: {
+  private async _topUpIfNeeded(snapshot: {
     token: string;
     baseUrl: string;
     mintUrl: string;
@@ -1975,7 +2340,7 @@ export class RoutstrClient {
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
-  }): void {
+  }): Promise<void> {
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
 
@@ -1990,33 +2355,40 @@ export class RoutstrClient {
         : tokenReserved;
     const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
     // Maintain the margin up front: proactively top up whenever the available
-    // balance is at or below the request price scaled by TOPUP_MARGIN, so the
+    // balance is below the request price scaled by TOPUP_MARGIN, so the
     // key stays covered at the margin instead of reacting only after a 402.
     const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
     if (snapshotAvailableSats >= targetSats) return;
 
     const key = `${snapshot.baseUrl}:${snapshot.token}`;
-    // A topup is already in flight for this key — join it instead of
-    // stacking another deposit. This in-flight guard is the only
-    // concurrency control needed under heavy parallel request load.
-    if (this._inflightTopups.has(key)) return;
-
+    const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
-      `[RoutstrClient] _spinOffTopupIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; spinning off background topup`
+      `[RoutstrClient] _topUpIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
     );
 
-    void this._topUpOnce(key, () => this._runProactiveTopup(snapshot)).catch(
-      (e: unknown) => {
-        // Unreachable in practice (_runProactiveTopup never throws), but a
-        // fire-and-forget promise must never surface an unhandled rejection.
+    // Concurrent callers join the same deposit. In the margin zone this is
+    // deliberately detached; below the request price we wait for it first.
+    const topup = this._topUpOnce(key, () => this._runProactiveTopup(snapshot));
+    if (mustWait) {
+      try {
+        await topup;
+      } catch (e) {
         this._log(
           "WARN",
-          `[RoutstrClient] _spinOffTopupIfNeeded: background topup crashed for ${snapshot.baseUrl}`,
+          `[RoutstrClient] _topUpIfNeeded: topup crashed for ${snapshot.baseUrl}`,
           e
         );
       }
-    );
+    } else {
+      void topup.catch((e: unknown) => {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _topUpIfNeeded: background topup crashed for ${snapshot.baseUrl}`,
+          e
+        );
+      });
+    }
   }
 
   /**
@@ -2149,6 +2521,10 @@ export class RoutstrClient {
       let parentApiKey = this.storageAdapter.getApiKey(baseUrl);
       let selectedMintUrl: string | undefined;
 
+      // A reused key may belong to another request whose write is pending,
+      // or survive a failed save and failed recovery. Do not expose it yet.
+      if (parentApiKey) await this.storageAdapter.flush?.();
+
       // A stored key that is still a bootstrap Cashu token (i.e. the
       // provider's canonical key was never swapped in) may be a zombie: if the
       // first request failed before the swap (e.g. 503 mint_unreachable) the
@@ -2215,15 +2591,18 @@ export class RoutstrClient {
         } else {
           this._log(
             "DEBUG",
-            `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}`
+            `[RoutstrClient] _spendToken: Cashu token created, token=${REDACTED_CREDENTIAL}`
           );
         }
 
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key preview: ${spendResult.token}, balance: ${spendResult.balance}`
+          `[RoutstrClient] _spendToken: Created API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}, balance: ${spendResult.balance}`
         );
 
+        // Legacy wallet adapters may ignore persistToken. Establish a recovery
+        // owner before attempting either key persistence or wallet recovery.
+        this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);
         try {
           this.storageAdapter.setApiKey(baseUrl, spendResult.token);
         } catch (error) {
@@ -2232,9 +2611,11 @@ export class RoutstrClient {
             error.message.includes("ApiKey already exists")
           ) {
             const receiveResult = await this.cashuSpender.receiveToken(
-              spendResult.token
+              spendResult.token,
+              false
             );
             if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
               this._log(
                 "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
@@ -2254,11 +2635,44 @@ export class RoutstrClient {
           }
         }
         parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+
+        // This token is now the only credential for its deposit, so it must be
+        // stored before the provider sees it. If it cannot be stored, give the
+        // proofs back to the wallet instead of paying with it.
+        if (parentApiKey?.key === spendResult.token) {
+          try {
+            await this.storageAdapter.flush?.();
+          } catch (error) {
+            const receiveResult = await this.cashuSpender.receiveToken(
+              spendResult.token,
+              false
+            );
+            if (receiveResult.success) {
+              this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+              if (
+                this.storageAdapter.getApiKey(baseUrl)?.key === spendResult.token
+              ) {
+                this.storageAdapter.removeApiKey(baseUrl);
+              }
+            }
+            throw error;
+          }
+          // The key record now holds the token; drop the wallet handover copy.
+          this.storageAdapter.removeXcashuToken(baseUrl, spendResult.token);
+        }
       } else {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key preview: ${parentApiKey.key}`
+          `[RoutstrClient] _spendToken: Using existing API key for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
+      }
+
+      // Also covers the winner when concurrent key creation lost the race.
+      await this.storageAdapter.flush?.();
+      if (this.storageAdapter.flush && parentApiKey?.key.startsWith("cashu")) {
+        // A previous failed save may have left its recovery copy behind.
+        // The key is durable now, so that handover copy is no longer needed.
+        this.storageAdapter.removeXcashuToken(baseUrl, parentApiKey.key);
       }
 
       let tokenBalance = 0;
@@ -2326,7 +2740,7 @@ export class RoutstrClient {
     } else {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _spendToken: Cashu token created, token preview: ${spendResult.token}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
+        `[RoutstrClient] _spendToken: Cashu token created, token=${REDACTED_CREDENTIAL}, balance: ${spendResult.balance} ${spendResult.unit ?? "sat"}`
       );
       // Store xcashu token using the storage adapter
       this.storageAdapter.addXcashuToken(baseUrl, spendResult.token);
@@ -2340,6 +2754,19 @@ export class RoutstrClient {
       tokenBalanceUnknown: false,
       selectedMintUrl: spendResult.selectedMintUrl,
     };
+  }
+
+  /**
+   * Swap the stored API key in one write where the adapter supports it, so
+   * storage never holds no key for a funded provider.
+   */
+  private _replaceApiKey(baseUrl: string, key: string): void {
+    if (this.storageAdapter.replaceApiKey) {
+      this.storageAdapter.replaceApiKey(baseUrl, key);
+      return;
+    }
+    this.storageAdapter.removeApiKey(baseUrl);
+    this.storageAdapter.setApiKey(baseUrl, key);
   }
 
   /**
@@ -2373,6 +2800,16 @@ export class RoutstrClient {
     }
 
     return nextHeaders;
+  }
+
+  /** The x-routstr-model-path selector on these headers, if any. */
+  private _findModelPathHeader(
+    headers: Record<string, string>
+  ): string | undefined {
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() === MODEL_PATH_HEADER) return value;
+    }
+    return undefined;
   }
 
   /**

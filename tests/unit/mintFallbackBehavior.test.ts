@@ -12,6 +12,8 @@ const storage = {
   getApiKey: () => null,
   getApiKeyDistribution: () => [],
   getXcashuTokens: () => ({}),
+  addXcashuToken: () => {},
+  removeXcashuToken: () => {},
   getAllApiKeys: () => [],
 } as unknown as StorageAdapter;
 
@@ -52,7 +54,12 @@ describe("BalanceManager request-scoped mint selection", () => {
       selectedMintUrl: MINT_B,
       token: `token:${MINT_B}`,
     });
-    expect(sendToken).toHaveBeenCalledWith(MINT_B, 10, undefined);
+    expect(sendToken).toHaveBeenCalledWith(
+      MINT_B,
+      10,
+      undefined,
+      expect.any(Function)
+    );
   });
 
   it("never falls back to a funded mint the provider does not advertise", async () => {
@@ -153,5 +160,80 @@ describe("BalanceManager request-scoped mint selection", () => {
       amount: 10,
       excludeMints: [MINT_A],
     });
+  });
+
+  it("retries a topup rejected as untrusted_mint with that mint excluded", async () => {
+    const manager = new BalanceManager(wallet(), storage, discovery);
+    const createTokenSpy = vi
+      .spyOn(manager, "createProviderToken")
+      .mockResolvedValueOnce({
+        success: true,
+        token: "token-a",
+        selectedMintUrl: MINT_A,
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        token: "token-b",
+        selectedMintUrl: MINT_B,
+      });
+    vi.spyOn(manager as any, "_recoverFailedTopUp").mockResolvedValue(true);
+    const postSpy = vi
+      .spyOn(manager as any, "_postTopUp")
+      .mockResolvedValueOnce({
+        success: false,
+        error: "Source mint not trusted",
+        parsedError: {
+          type: "untrusted_mint",
+          code: "cashu_untrusted_source_mint",
+          raw: false,
+        },
+      })
+      .mockResolvedValueOnce({ success: true });
+
+    const result = await manager.topUp({
+      mintUrl: MINT_A,
+      baseUrl: PROVIDER,
+      amount: 10,
+      token: "api-key",
+    });
+
+    expect(result.success).toBe(true);
+    expect(postSpy).toHaveBeenCalledTimes(2);
+    expect(createTokenSpy).toHaveBeenNthCalledWith(2, {
+      mintUrl: MINT_A,
+      baseUrl: PROVIDER,
+      amount: 10,
+      excludeMints: [MINT_A],
+    });
+  });
+});
+
+describe("topup recovery spending invariant", () => {
+  it("calls sendToken once when recovery fails and preserves the emitted token", async () => {
+    const tokens: string[] = [];
+    let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
+    const sendToken = vi.fn(async (mint: string) => `token:${mint}`);
+    const manager = new BalanceManager({
+      ...wallet(sendToken),
+      receiveToken: async () => ({ success: false, amount: 10, unit: "sat" }),
+    }, {
+      ...storage,
+      addXcashuToken: (_baseUrl, token) => { if (!tokens.includes(token)) tokens.push(token); },
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (entries) => {
+        cached = entries.map((entry) => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+      },
+    }, discovery);
+    const create = vi.spyOn(manager, "createProviderToken");
+    vi.spyOn(manager as any, "_postTopUp").mockResolvedValue({
+      success: false,
+      parsedError: { type: "mint_unreachable", code: "cashu_mint_unreachable", raw: false },
+    });
+    const result = await manager.topUp({ mintUrl: MINT_A, baseUrl: PROVIDER, amount: 10, token: "api-key" });
+    expect(sendToken).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ success: false, recoveredToken: false });
+    expect(tokens).toEqual([`token:${MINT_A}`]);
+    expect(cached).toEqual([]);
   });
 });

@@ -22,6 +22,7 @@ import {
   parseCoreError,
   CoreErrorType,
   isHandledRedemptionError,
+  isKeyNotFoundError,
   shouldFailoverToAnotherMint,
   type ParsedCoreError,
 } from "../core/errorTypes";
@@ -31,29 +32,6 @@ import {
   isNetworkErrorMessage,
   selectMintWithBalance,
 } from "./tokenUtils";
-
-/**
- * Detect a provider "key not found" response (HTTP 401).
- *
- * Nodes before routstr-core 0.4.5 return a bare
- * `{"detail":"Key not found. Deposit first via /v1/wallet/create before
- * requesting a refund."}` body instead of the structured
- * `{"detail":{"error":{...,"code":"key_not_found"}}}` envelope added in
- * 0.4.5. Both mean the key is permanently dead — it was never funded (or its
- * proofs were consumed locally) — so it can never authenticate and should be
- * purged instead of retried. Once all nodes run 0.4.5, switch to matching the
- * structured `key_not_found` code (tracked as a routstr-sdk task).
- */
-function isKeyNotFoundResponse(
-  status: number,
-  body: string | undefined
-): boolean {
-  return (
-    status === 401 &&
-    typeof body === "string" &&
-    body.includes("Key not found")
-  );
-}
 
 /**
  * Options for refunding API key balance
@@ -314,10 +292,10 @@ export class BalanceManager {
         };
       }
 
-      // Pre-0.4.5 nodes answer a refund for an unknown key with 401
-      // "Key not found" — the key is permanently dead, so clean it up instead
-      // of leaving it for endless refund sweeps. Same "only if still current"
-      // guard as token_already_spent above.
+      // A refund for a key this node does not know answers 401 key_not_found —
+      // the key is permanently dead, so clean it up instead of leaving it for
+      // endless refund sweeps. Same "only if still current" guard as
+      // token_already_spent above.
       if (fetchResult.keyNotFound) {
         this.logger.warn(
           `refundApiKey: key not found for ${baseUrl}; removing dead API key`
@@ -428,7 +406,7 @@ export class BalanceManager {
     error?: string;
     status?: number;
     parsedError?: ParsedCoreError;
-    /** True when the provider replied 401 "Key not found" (pre-0.4.5 body). */
+    /** True when the provider replied 401 key_not_found. */
     keyNotFound?: boolean;
   }> {
     if (!baseUrl) {
@@ -505,9 +483,9 @@ export class BalanceManager {
           status: response.status,
           error: errorMessage,
           parsedError,
-          // Pre-0.4.5 nodes reply 401 "Key not found" to refunds for an
-          // unknown/dead key — a deterministic signal the key should be purged.
-          keyNotFound: isKeyNotFoundResponse(response.status, responseBody),
+          // A 401 key_not_found on a refund is a deterministic signal that the
+          // key is dead and should be purged.
+          keyNotFound: isKeyNotFoundError(parsedError),
         };
       }
 
@@ -600,6 +578,11 @@ export class BalanceManager {
       }
 
       cashuToken = tokenResult.token;
+      // The wallet no longer holds these proofs. Store the token until the
+      // outcome is known, so a refund sweep can still recover it when both the
+      // top-up and the direct recovery below fail.
+      this.storageAdapter.addXcashuToken(baseUrl, cashuToken);
+      await this.storageAdapter.flush?.();
 
       const topUpResult = await this._postTopUp(baseUrl, apiKey, cashuToken);
       requestId = topUpResult.requestId;
@@ -618,12 +601,16 @@ export class BalanceManager {
             `topUp: cashu token already spent for ${baseUrl}; skipping recovery`
           );
         }
+        if (recoveredToken || !canRecover) {
+          this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+        }
 
         // A foreign-mint swap failure can be retried against the same provider
-        // with another mint it advertises. Keep the exclusion local to this
+        // with another mint it advertises only after successful recovery.
+        // Keep the exclusion local to this
         // topup operation; fee/amount and unknown mint errors do not qualify.
         if (
-          canRecover &&
+          recoveredToken &&
           tokenResult.selectedMintUrl &&
           topUpResult.parsedError &&
           shouldFailoverToAnotherMint(topUpResult.parsedError) &&
@@ -647,6 +634,7 @@ export class BalanceManager {
         };
       }
 
+      this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       return {
         success: true,
         toppedUpAmount: amount,
@@ -654,8 +642,8 @@ export class BalanceManager {
       };
     } catch (error) {
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
-      if (cashuToken) {
-        await this._recoverFailedTopUp(cashuToken);
+      if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
+        this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
       }
 
       return this._handleTopUpError(error, mintUrl, requestId);
@@ -779,7 +767,17 @@ export class BalanceManager {
         const token = await this.walletAdapter.sendToken(
           candidateMint,
           requiredAmount,
-          p2pkPubkey
+          p2pkPubkey,
+          async (sentToken) => {
+            this.storageAdapter.addXcashuToken(baseUrl, sentToken);
+            try {
+              await this.storageAdapter.flush?.();
+            } catch (error) {
+              // The wallet keeps its own copy when this rejects.
+              this.storageAdapter.removeXcashuToken(baseUrl, sentToken);
+              throw error;
+            }
+          }
         );
         this.logger.log(`createProviderToken: success from mint=${candidateMint}`);
         return {
@@ -1083,15 +1081,17 @@ export class BalanceManager {
    */
   private async _recoverFailedTopUp(cashuToken: string): Promise<boolean> {
     try {
-      const result = await this.cashuSpender.receiveToken(cashuToken);
+      const result = await this.cashuSpender.receiveToken(cashuToken, false);
       if (!result.success) {
         this.logger.warn(
           `_recoverFailedTopUp: receive failed: ${result.message ?? "unknown error"}`
         );
+        // The pre-POST xcashu record owns recovery for this token.
       }
       return result.success;
     } catch (error) {
       this.logger.error("_recoverFailedTopUp: failed to recover token", error);
+      // Keep the existing xcashu record; do not create a second recovery owner.
       return false;
     }
   }
@@ -1184,14 +1184,12 @@ export class BalanceManager {
           try { data = JSON.parse(responseBody); } catch { data = {}; }
         }
 
-        // Check for invalid/expired API key error. Two body shapes mean the
-        // key is permanently dead and should be purged:
-        //  - structured: 401 {detail:{error:{code:"invalid_api_key",
+        // Two cases mean the key is permanently dead and should be purged:
+        //  - 401 key_not_found (the key does not exist on this node)
+        //  - 401 {detail:{error:{code:"invalid_api_key",
         //    message:"...proofs already spent"}}}
-        //  - pre-0.4.5 nodes: 401 {detail:"Key not found. Deposit first via
-        //    /v1/wallet/create before requesting a refund."}
         const isInvalidApiKey =
-          isKeyNotFoundResponse(response.status, responseBody) ||
+          isKeyNotFoundError(parsedError) ||
           (response.status === 401 &&
             data?.detail?.error?.code === "invalid_api_key" &&
             data?.detail?.error?.message?.includes("proofs already spent"));

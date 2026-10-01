@@ -1,3 +1,4 @@
+import { isCredentialStorageKey } from "../credentialKeys";
 import type { StorageDriver } from "../types";
 
 type BetterSqlite3Database = {
@@ -99,6 +100,7 @@ export const createSqliteDriver = (
         upsertStmt.run(key, JSON.stringify(value));
       } catch (error) {
         console.error(`SQLite setItem failed for key "${key}":`, error);
+        if (isCredentialStorageKey(key)) throw error;
       }
     },
     async removeItem(key: string): Promise<void> {
