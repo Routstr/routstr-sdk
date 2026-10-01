@@ -13,7 +13,11 @@
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
-import { findModelForId } from "../core/modelMappings";
+import {
+  canonicalizeModelId,
+  findModelForId,
+  modelIdVariants,
+} from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
 import {
@@ -663,7 +667,9 @@ export interface CooldownEntry {
 
 /**
  * Map key for a cooldown entry: `baseUrl` for provider-scoped entries,
- * `baseUrl::modelId` for model-scoped entries,
+ * `baseUrl::<canonical modelId>` for model-scoped entries (the id goes
+ * through canonicalizeModelId, so "claude-opus-5-5" and "claude-opus-5.5"
+ * share one key),
  * `baseUrl::path::<canonical path>` for path-scoped entries. (A fourth
  * scope — a path cooled across every node for upstream-wide outages — is a
  * deliberate future extension, not implemented.)
@@ -676,7 +682,7 @@ const cooldownKey = (
   modelPath != null
     ? `${baseUrl}::path::${modelPath}`
     : modelId != null
-      ? `${baseUrl}::${modelId}`
+      ? `${baseUrl}::${canonicalizeModelId(modelId)}`
       : baseUrl;
 
 /**
@@ -724,24 +730,45 @@ export class ProviderManager {
 
     // Hydrate providersOnCooldown (filter out expired)
     const now = Date.now();
-    this.providersOnCoolDown = new Map(
-      state.providersOnCooldown
-        .filter(
-          (entry) => now - entry.timestamp < ProviderManager.COOLDOWN_DURATION_MS
-        )
-        .map(
-          (entry) =>
-            [
-              cooldownKey(entry.baseUrl, entry.modelId, entry.modelPath),
-              {
-                baseUrl: entry.baseUrl,
-                modelId: entry.modelId,
-                modelPath: entry.modelPath,
-                timestamp: entry.timestamp,
-              },
-            ] as const
-        )
-    );
+    // Entries persisted before model ids were canonicalized may carry a
+    // variant spelling; they are re-keyed (and re-labelled) canonically so a
+    // legacy "claude-opus-5-5" entry still blocks "claude-opus-5.5". If a
+    // legacy and a canonical entry collide, the newer timestamp wins.
+    this.providersOnCoolDown = new Map();
+    for (const entry of state.providersOnCooldown) {
+      if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
+        continue;
+      }
+      const modelId =
+        entry.modelId !== undefined
+          ? canonicalizeModelId(entry.modelId)
+          : undefined;
+      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
+      const existing = this.providersOnCoolDown.get(key);
+      if (existing && existing.timestamp >= entry.timestamp) continue;
+      this.providersOnCoolDown.set(key, {
+        baseUrl: entry.baseUrl,
+        modelId,
+        modelPath: entry.modelPath,
+        timestamp: entry.timestamp,
+      });
+    }
+  }
+
+  /**
+   * Remove a persisted cooldown entry under every spelling of its model id,
+   * so entries written before canonicalization are cleaned up too.
+   */
+  private removeStoredCooldown(
+    baseUrl: string,
+    modelId?: string,
+    modelPath?: string
+  ): void {
+    if (!this.store) return;
+    const ids = modelId === undefined ? [undefined] : modelIdVariants(modelId);
+    for (const id of ids) {
+      this.store.getState().removeProviderFromCooldown(baseUrl, id, modelPath);
+    }
   }
 
   /**
@@ -765,15 +792,7 @@ export class ProviderManager {
         expiredProviders.add(entry.baseUrl);
         // Persist the removal of this exact entry (other entries for the
         // same provider, e.g. still-live model-scoped ones, are kept)
-        if (this.store) {
-          this.store
-            .getState()
-            .removeProviderFromCooldown(
-              entry.baseUrl,
-              entry.modelId,
-              entry.modelPath
-            );
-        }
+        this.removeStoredCooldown(entry.baseUrl, entry.modelId, entry.modelPath);
       }
     }
 
@@ -819,6 +838,7 @@ export class ProviderManager {
    */
   isOnCooldown(baseUrl: string, modelId?: string, modelPath?: string): boolean {
     this.cleanupExpiredCooldowns();
+    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
 
     // Provider-wide cooldown blocks all models
     if (this.providersOnCoolDown.has(cooldownKey(baseUrl))) {
@@ -894,6 +914,9 @@ export class ProviderManager {
     // Drop expired entries first so a stale entry can't suppress a fresh
     // second-strike cooldown for the same scope
     this.cleanupExpiredCooldowns();
+    // Canonicalize so a native/variant spelling strikes the same scope the
+    // ranking checks (e.g. claude-opus-5-5 vs claude-opus-5.5).
+    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
     const now = Date.now();
     const key = cooldownKey(baseUrl, modelId, modelPath);
     const lastFailure = this.lastFailed.get(key);
@@ -943,6 +966,7 @@ export class ProviderManager {
    * entry for the provider is removed.
    */
   removeFromCooldown(baseUrl: string, modelId?: string, modelPath?: string): void {
+    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
     if (modelId === undefined && modelPath === undefined) {
       for (const [key, entry] of [...this.providersOnCoolDown]) {
         if (entry.baseUrl === baseUrl) {
@@ -957,9 +981,7 @@ export class ProviderManager {
       if (modelId === undefined && modelPath === undefined) {
         this.store.getState().removeAllProviderCooldowns(baseUrl);
       } else {
-        this.store
-          .getState()
-          .removeProviderFromCooldown(baseUrl, modelId, modelPath);
+        this.removeStoredCooldown(baseUrl, modelId, modelPath);
       }
     }
   }
@@ -1012,6 +1034,7 @@ export class ProviderManager {
     currentBaseUrl: string,
     attemptedProviders: ReadonlySet<string> = new Set()
   ): string | null {
+    modelId = canonicalizeModelId(modelId);
     try {
       const torMode = isTorContext();
       const disabledProviders = new Set(
@@ -1080,6 +1103,10 @@ export class ProviderManager {
     baseUrl: string,
     modelId: string
   ): Promise<Model | null> {
+    // Canonicalize so a node listing only the canonical spelling is found
+    // from a provider-native variant id and vice versa. Both spellings on one
+    // node resolve to the canonical entry.
+    modelId = canonicalizeModelId(modelId);
     // Get models for this provider
     const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
@@ -1131,6 +1158,7 @@ export class ProviderManager {
       model: Model;
     }>
   > {
+    modelId = canonicalizeModelId(modelId);
     const torMode = options.torMode ?? isTorContext();
     const excludedModelPaths = new Set(options.excludeModelPaths ?? []);
     const disabledProviders = new Set(
@@ -1222,6 +1250,7 @@ export class ProviderManager {
     model: Model;
     cost: number;
   }> {
+    modelId = canonicalizeModelId(modelId);
     const candidates: CandidateProvider[] = [];
     const allProviders = this.discoveryAdapter.getCachedModels();
     const disabledProviders = new Set(
@@ -1252,6 +1281,7 @@ export class ProviderManager {
     modelId: string,
     options: { torMode?: boolean; includeDisabled?: boolean } = {}
   ): ModelProviderPrice[] {
+    modelId = canonicalizeModelId(modelId);
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
     const disabledProviders = new Set(this.discoveryAdapter.getDisabledProviders());

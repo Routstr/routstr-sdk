@@ -31,6 +31,43 @@ export const MODEL_ID_MAPPINGS: Record<string, string> = {
   "minimax-m3-preview": "minimax-m3",
 };
 
+const hasMapping = (id: string, mappings: ModelIdMappings): boolean =>
+  Object.prototype.hasOwnProperty.call(mappings, id);
+
+/**
+ * Canonicalize a bare model id (as requested by a client, or as stored in a
+ * cooldown key). Mapped variants resolve to their canonical id; everything
+ * else is returned unchanged. Idempotent because the map is single-hop.
+ *
+ * Use this wherever a model id is used as an identity (cooldown keys,
+ * provider lookups) so spellings such as "claude-opus-5-5" and
+ * "claude-opus-5.5" can never drift apart.
+ */
+export function canonicalizeModelId(
+  id: string,
+  mappings: ModelIdMappings = MODEL_ID_MAPPINGS,
+): string {
+  return hasMapping(id, mappings) ? mappings[id] : id;
+}
+
+/**
+ * Every spelling of a model id: the canonical id plus all mapped variants
+ * (canonical first). Used to clean up persisted entries written before
+ * model ids were canonicalized.
+ */
+export function modelIdVariants(
+  id: string,
+  mappings: ModelIdMappings = MODEL_ID_MAPPINGS,
+): string[] {
+  const canonical = canonicalizeModelId(id, mappings);
+  return [
+    canonical,
+    ...Object.keys(mappings).filter(
+      (variant) => mappings[variant] === canonical
+    ),
+  ];
+}
+
 /**
  * All identifiers a provider model claims: native id first, then any
  * provider-declared aliases.
@@ -61,9 +98,13 @@ export function canonicalIdForModel(
 /**
  * Find which model a provider would serve for a requested (canonical) ID.
  *
- * Priority: exact native id match → mapped match via id or alias. The exact
- * match always wins so a mapping can never shadow a model the provider
- * serves natively.
+ * Priority: exact native id match → mapped match via id or alias (the
+ * requested id is canonicalized first, so a variant spelling such as
+ * "claude-opus-5-5" also finds a node that lists only "claude-opus-5.5"). The
+ * exact match always wins so a mapping can never shadow a model the provider
+ * serves natively. Callers that want a deterministic choice when a node
+ * lists several spellings as separate entries should pass the canonical id
+ * (see canonicalizeModelId): the canonical entry is then the exact match.
  *
  * Callers forwarding a request upstream must use the returned model's native
  * `id`, not the requested canonical ID.
@@ -73,8 +114,9 @@ export function findModelForId(
   requestedId: string,
   mappings: ModelIdMappings = MODEL_ID_MAPPINGS,
 ): Model | undefined {
+  const canonicalRequested = canonicalizeModelId(requestedId, mappings);
   return (
     models.find((m) => m.id === requestedId) ??
-    models.find((m) => canonicalIdForModel(m, mappings) === requestedId)
+    models.find((m) => canonicalIdForModel(m, mappings) === canonicalRequested)
   );
 }

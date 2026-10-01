@@ -135,6 +135,23 @@ describe("_getCooldownScope", () => {
     expect(scope).toEqual({ modelId: "gpt-test" });
   });
 
+  it("keys the scope by the requested model id, not the provider-native id", () => {
+    const { client } = createClient();
+    const native = { ...model, id: "claude-opus-5-5" } as Model;
+    const scope = (client as any)._getCooldownScope(
+      404,
+      { raw: true },
+      native,
+      undefined,
+      "claude-opus-5.5"
+    );
+    expect(scope).toEqual({ modelId: "claude-opus-5.5" });
+    // Without a requested id, the native id is canonicalized instead.
+    expect(
+      (client as any)._getCooldownScope(404, { raw: true }, native)
+    ).toEqual({ modelId: "claude-opus-5.5" });
+  });
+
   it("scopes a network error (status -1) provider-wide", () => {
     const { client } = createClient();
     const scope = (client as any)._getCooldownScope(-1, { raw: true }, model);

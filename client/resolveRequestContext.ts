@@ -14,7 +14,7 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
-import { findModelForId } from "../core/modelMappings";
+import { canonicalizeModelId, findModelForId } from "../core/modelMappings";
 import {
   RoutstrClient,
   type DebugLevel,
@@ -90,6 +90,13 @@ export interface ResolvedContext {
   baseUrl: string;
   mintUrl: string;
   selectedModel: Model;
+  /**
+   * The canonical form of the model id the caller requested. Pass it as
+   * `modelId` to RoutstrClient.routeRequest so cooldowns and failover use
+   * one stable identity; `selectedModel.id` is only the chosen provider's
+   * native spelling (forward that in the upstream request body).
+   */
+  requestedModelId: string;
   /**
    * Present when the SDK auto-pinned an x-routstr-model-path selector for
    * this request (see DEEPSEEK_AUTO_MODEL_ID): the selector to send and the
@@ -309,5 +316,12 @@ export async function resolveRequestContext(
     client.setDebugLevel(debugLevel);
   }
 
-  return { client, baseUrl, mintUrl, selectedModel, modelPath };
+  return {
+    client,
+    baseUrl,
+    mintUrl,
+    selectedModel,
+    requestedModelId: canonicalizeModelId(modelId),
+    modelPath,
+  };
 }

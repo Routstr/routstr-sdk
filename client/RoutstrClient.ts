@@ -50,10 +50,15 @@ import {
   isCoreInternalError,
   isHandledRedemptionError,
   isUpstreamRequestError,
+  isUnknownPathError,
   shouldFailoverToAnotherMint,
   shouldPurgeStoredCredential,
   type ParsedCoreError,
 } from "../core/errorTypes";
+import {
+  canonicalIdForModel,
+  canonicalizeModelId,
+} from "../core/modelMappings";
 import { isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
@@ -608,6 +613,7 @@ export class RoutstrClient {
       // _handleErrorResponse spread ...params, so this is the single place
       // it can get lost.
       autoModelPath: params.autoModelPath,
+      requestedModelId: modelId,
     });
 
     let tokenBalanceInSats =
@@ -766,6 +772,13 @@ export class RoutstrClient {
     signal?: AbortSignal;
     /** SDK-pinned model path for this request, if any. */
     autoModelPath?: ModelPathPin;
+    /**
+     * The model id the caller originally requested. Cooldown keys, failover
+     * candidate search and per-provider model lookup are all keyed by this
+     * id (canonicalized) rather than selectedModel.id, which is just the
+     * current provider's native spelling and differs between nodes.
+     */
+    requestedModelId?: string;
     /** (node, canonical path) candidates already attempted in this request. */
     triedModelPaths?: string[];
     failures?: RequestFailures;
@@ -911,16 +924,40 @@ export class RoutstrClient {
     status: number,
     parsedError: ParsedCoreError,
     selectedModel?: Model,
-    pinnedModelPath?: string
+    pinnedModelPath?: string,
+    requestedModelId?: string
   ): { modelId?: string; modelPath?: string } {
     if (!selectedModel) return {};
     if (status === -1) return {};
     if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return {};
+    const modelId = this._canonicalRequestModelId(
+      selectedModel,
+      requestedModelId
+    );
     if (pinnedModelPath) {
       const modelPath = canonicalModelPath(pinnedModelPath);
-      if (modelPath) return { modelId: selectedModel.id, modelPath };
+      if (modelPath) return { modelId, modelPath };
     }
-    return { modelId: selectedModel.id };
+    return { modelId };
+  }
+
+  /**
+   * The model identity used for cooldowns and failover: the canonical form
+   * of the id the caller requested. A provider's native id for the model
+   * (selectedModel.id) can differ per node — e.g. "claude-opus-5-5" on a
+   * node that aliases the requested "claude-opus-5.5" — and keying state by
+   * it makes cooldown writes miss the checks the ranking performs with the
+   * requested id, and makes failover skip nodes that list only the
+   * requested spelling. Falls back to the selected model's own canonical id
+   * when the request carries no requested id.
+   */
+  private _canonicalRequestModelId(
+    selectedModel: Model,
+    requestedModelId?: string
+  ): string {
+    return requestedModelId
+      ? canonicalizeModelId(requestedModelId)
+      : canonicalIdForModel(selectedModel);
   }
 
   /**
@@ -945,6 +982,8 @@ export class RoutstrClient {
       signal?: AbortSignal;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
+      /** The originally requested model id (see _makeRequest). */
+      requestedModelId?: string;
       /** (node, canonical path) candidates already attempted in this request. */
       triedModelPaths?: string[];
       failures?: RequestFailures;
@@ -981,6 +1020,9 @@ export class RoutstrClient {
     );
 
     const upstreamRequestError = isUpstreamRequestError(status, parsedError);
+    // A 404 for an unknown PATH (e.g. /v1/v1/messages) is the caller's
+    // mistake, identical on every node: no cooldown, no failover.
+    const unknownPathError = isUnknownPathError(status, parsedError);
     const aggregateFailure = upstreamRequestError || status >= 500 ||
       status === 424 || status === 429 || status === -1;
     // Keep only diagnostic fields, never raw envelopes containing refund proofs.
@@ -1187,7 +1229,7 @@ export class RoutstrClient {
     // attempt elsewhere for redemption failures and upstream rejections.
     if (
       this.mode === "xcashu" &&
-      (handledRedemptionError || upstreamRequestError) &&
+      (handledRedemptionError || upstreamRequestError || unknownPathError) &&
       !tryNextProvider
     ) {
       this._log(
@@ -1622,9 +1664,10 @@ export class RoutstrClient {
       status,
       parsedError,
       selectedModel,
-      pinnedModelPath
+      pinnedModelPath,
+      params.requestedModelId
     );
-    if (!upstreamRequestError) {
+    if (!upstreamRequestError && !unknownPathError) {
       this.providerManager.markFailed(
         baseUrl,
         failReason,
@@ -1641,6 +1684,21 @@ export class RoutstrClient {
               : `provider ${baseUrl}`
         } as failed (${failReason})`
       );
+    }
+
+    // Unknown-path 404: payment recovery above has already run. Every node
+    // would 404 the same way, so hand the upstream response back verbatim
+    // instead of failing over or aggregating it into all_providers_failed.
+    if (unknownPathError) {
+      const response = this._upstreamErrorResponse(upstream, responseBody, baseUrl);
+      if (response) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] _handleErrorResponse: unknown path 404 from ${baseUrl} (${parsedError.message}); not cooling down or failing over`
+        );
+        (response as any).passthrough = true;
+        return response;
+      }
     }
 
     if (!selectedModel) {
@@ -1670,6 +1728,12 @@ export class RoutstrClient {
     // chain (node1:deepseek -> node1:fireworks -> node2:deepseek -> ...),
     // swapping in a fresh selector resolved from the next candidate's own
     // node.
+    // Failover is keyed by the requested (canonical) model id, never by the
+    // failed provider's native id.
+    const failoverModelId = this._canonicalRequestModelId(
+      selectedModel,
+      params.requestedModelId
+    );
     let nextProvider: string | null;
     let nextModelPathSelector: string | undefined;
     let nextModelPathPricing: ModelPathSatsPricing | undefined;
@@ -1696,7 +1760,7 @@ export class RoutstrClient {
         const providerWideFailure = cooldownScope.modelId === undefined;
         const ranking =
           await this.providerManager.getModelPathProviderRanking(
-            selectedModel.id,
+            failoverModelId,
             {
               excludeModelPaths: triedModelPaths,
               ...(providerWideFailure ? { excludeBaseUrl: baseUrl } : {}),
@@ -1715,7 +1779,7 @@ export class RoutstrClient {
       }
     } else {
       nextProvider = this.providerManager.findNextBestProvider(
-        selectedModel.id,
+        failoverModelId,
         baseUrl,
         failures.attemptedProviders
       );
@@ -1728,13 +1792,13 @@ export class RoutstrClient {
     if (nextProvider) {
       this._log(
         "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${selectedModel.id}`
+        `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${failoverModelId}`
       );
       // Get new model for this provider
       const newModel =
         (await this.providerManager.getModelForProvider(
           nextProvider,
-          selectedModel.id
+          failoverModelId
         )) ?? selectedModel;
 
       const messagesForPricing = Array.isArray(
