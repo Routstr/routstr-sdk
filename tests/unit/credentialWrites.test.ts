@@ -235,6 +235,62 @@ describe("paying with stored credentials", () => {
     expect(c.storage.getApiKey(PROVIDER)).toBeNull();
   });
 
+  it("waits for an existing key write before using its credential", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.API_KEYS);
+    const c = await client(driver);
+    c.storage.setApiKey(PROVIDER, TOKEN);
+    const balance = vi.spyOn(c.routstr.getBalanceManager(), "getTokenBalance");
+    balance.mockClear();
+    const network = vi.fn(async () => Response.json({ choices: [] }));
+    vi.stubGlobal("fetch", network);
+    const pending = c.request();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(balance).not.toHaveBeenCalled();
+    expect(network).not.toHaveBeenCalled();
+    control.release();
+    await pending;
+    expect(network).toHaveBeenCalledOnce();
+    expect(c.wallet.sendToken).not.toHaveBeenCalled();
+  });
+
+  it("blocks a concurrent request reusing a newly created in-memory key", async () => {
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.API_KEYS);
+    const c = await client(driver);
+    const network = vi.fn(async () => Response.json({ choices: [] }));
+    vi.stubGlobal("fetch", network);
+    const first = c.request();
+    await vi.waitFor(() => expect(c.storage.getApiKey(PROVIDER)?.key).toBe(TOKEN));
+    const second = c.request();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(network).not.toHaveBeenCalled();
+    expect(c.wallet.sendToken).toHaveBeenCalledOnce();
+    control.release();
+    await Promise.all([first, second]);
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses reuse after failed save and recovery, then resumes once storage works", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.API_KEYS);
+    control.broken = true;
+    control.release();
+    const c = await client(driver);
+    c.wallet.receiveToken.mockRejectedValue(new Error("Failed to fetch mint"));
+    const network = vi.fn(async () => Response.json({ choices: [] }));
+    vi.stubGlobal("fetch", network);
+    await expect(c.request()).rejects.toThrow("QuotaExceededError");
+    expect(c.storage.getApiKey(PROVIDER)?.key).toBe(TOKEN);
+    expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER).map((t) => t.token)).toEqual([TOKEN]);
+    expect(c.storage.getCachedReceiveTokens()).toEqual([]);
+    await expect(c.request()).rejects.toThrow("QuotaExceededError");
+    expect(network).not.toHaveBeenCalled();
+    expect(c.wallet.sendToken).toHaveBeenCalledOnce();
+    control.broken = false;
+    await c.request();
+    expect(network).toHaveBeenCalledOnce();
+    expect(c.storage.getXcashuTokensForBaseUrl(PROVIDER)).toEqual([]);
+  });
+
   it("does not post a top-up token until it is stored", async () => {
     const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
     const c = await client(driver);
