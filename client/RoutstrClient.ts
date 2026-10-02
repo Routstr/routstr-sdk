@@ -1013,6 +1013,8 @@ export class RoutstrClient {
     const handledRedemptionError = isHandledRedemptionError(parsedError);
     let recoveryAttempted = false;
     let recoverySucceeded = false;
+    // Thrown only once no other provider is left to try.
+    let insufficientBalance: InsufficientBalanceError | undefined;
 
     this._log(
       "DEBUG",
@@ -1373,15 +1375,17 @@ export class RoutstrClient {
               const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
               this._log(
                 "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}`
+                `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}; trying next provider`
               );
-              throw new InsufficientBalanceError(
+              // Another provider may accept a mint this one does not.
+              insufficientBalance = new InsufficientBalanceError(
                 required,
                 available,
                 0,
                 "",
                 message
               );
+              tryNextProvider = true;
             } else {
               this._log(
                 "DEBUG",
@@ -1949,6 +1953,8 @@ export class RoutstrClient {
     // No more providers to try. If the root cause was a specific core error
     // type (e.g. token_already_spent), surface that instead of a generic
     // FailoverError so callers can branch on the specific failure.
+    if (insufficientBalance) throw insufficientBalance;
+
     if (parsedError.type === CoreErrorType.TOKEN_ALREADY_SPENT) {
       throw new TokenAlreadySpentError({
         baseUrl,

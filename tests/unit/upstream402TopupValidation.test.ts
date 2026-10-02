@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
-import { FailoverError } from "../../core/errors";
+import { FailoverError, InsufficientBalanceError } from "../../core/errors";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -100,11 +100,13 @@ const localInsufficientBalanceBody = JSON.stringify({
   },
 });
 
-function createClient() {
+function createClient(nextProvider: string | null = null) {
   const providerManager = {
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([BASE_URL]),
-    findNextBestProvider: vi.fn(() => null),
+    findNextBestProvider: vi.fn(() => nextProvider),
+    getModelForProvider: vi.fn(async () => model),
+    getRequiredSatsForModel: vi.fn(() => 5),
   } as any;
   const client = new RoutstrClient(
     createWallet(),
@@ -250,5 +252,42 @@ describe("RoutstrClient 402 top-up validation", () => {
     await expect(handle402(client, body)).rejects.toBeInstanceOf(FailoverError);
     expect(getBalance).not.toHaveBeenCalled();
     expect(topUp).not.toHaveBeenCalled();
+  });
+
+
+  function walletShortForTopup(client: RoutstrClient) {
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 0, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
+    vi.spyOn(balanceManager, "topUp").mockResolvedValue({
+      success: false,
+      message: "Insufficient balance: need 117 sats, have 349 sats available.",
+    });
+  }
+
+  it("fails over when the wallet cannot fund this provider's top-up", async () => {
+    const { client } = createClient("https://other.example.com/");
+    walletShortForTopup(client);
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu-next", selectedMintUrl: MINT_URL, tokenBalance: 5, tokenBalanceUnit: "sat",
+    });
+    const retry = vi
+      .spyOn(client as any, "_makeRequest")
+      .mockResolvedValue(new Response("ok", { status: 200 }));
+
+    expect((await handle402(client, localInsufficientBalanceBody)).status).toBe(200);
+    expect(retry).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: "https://other.example.com/" })
+    );
+  });
+
+  it("still reports insufficient balance when no provider is left", async () => {
+    const { client } = createClient();
+    walletShortForTopup(client);
+
+    await expect(
+      handle402(client, localInsufficientBalanceBody)
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
   });
 });
