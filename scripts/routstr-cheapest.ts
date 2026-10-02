@@ -260,7 +260,7 @@ async function main(): Promise<void> {
     ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }> {
       await runWalletCommand(["receive", "cashu", token]);
       const { amount, unit } = getTokenMetadata(token);
-      return { success: true, amount, unit: unit === "msat" ? "msat" : "sat" };
+      return { success: true, amount: amount.toNumber(), unit: unit === "msat" ? "msat" : "sat" };
     },
     isUsingNip60(): boolean {
       return false;

@@ -1,4 +1,4 @@
-import { getEncodedTokenV4 } from "@cashu/cashu-ts";
+import { getEncodedToken } from "@cashu/cashu-ts";
 import { describe, expect, it } from "vitest";
 import { CashuSpender } from "../../wallet/CashuSpender";
 import { InsufficientBalanceError } from "../../core";
@@ -44,7 +44,7 @@ const createStorage = (
 describe("CashuSpender", () => {
   it("caches the real amount when a short-keyset token fails on an unreachable mint", async () => {
     const shortKeysetId = `01${"11".repeat(32)}`;
-    const token = getEncodedTokenV4({
+    const token = getEncodedToken({
       mint: "https://mint.example.com",
       unit: "msat",
       proofs: [

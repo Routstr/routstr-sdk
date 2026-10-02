@@ -347,7 +347,7 @@ async function main(): Promise<void> {
         const { amount, unit } = getTokenMetadata(token);
         return {
           success: true,
-          amount,
+          amount: amount.toNumber(),
           unit: unit === "msat" ? "msat" : "sat",
         };
       } catch (error) {

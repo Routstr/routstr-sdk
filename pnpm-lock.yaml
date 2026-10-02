@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@cashu/cashu-ts':
-        specifier: ^3.1.1
-        version: 3.7.0
+        specifier: ^4.11.0
+        version: 4.11.0
       applesauce-core:
         specifier: ^5.1.0
         version: 5.2.0(typescript@5.9.3)
@@ -28,7 +28,7 @@ importers:
         version: 7.8.2
       tinfoil:
         specifier: ^1.2.1
-        version: 1.2.1(@noble/curves@2.2.0)(zod@4.4.3)
+        version: 1.2.1(@noble/curves@1.9.7)(zod@4.4.3)
       zustand:
         specifier: ^5.0.5
         version: 5.0.13
@@ -74,10 +74,9 @@ packages:
     resolution: {integrity: sha512-fX2ENAc7iDpZ+Wp4+Rk06Usn/Ys7dI9uAkGv0jlF6XVrW13NkRWx5Ou+U6lIM2E1fTLkCs16GGrUAaVvroag7A==}
     engines: {node: '>=22'}
 
-  '@cashu/cashu-ts@3.7.0':
-    resolution: {integrity: sha512-Jy4Hek+Wouh94xS4InmTJRLpBPXA6fddVOAHR5lfNyTsCk9r3desY0vnwUGvOZBZWsSKZXedqdD/YpjWb3zngQ==}
+  '@cashu/cashu-ts@4.11.0':
+    resolution: {integrity: sha512-euNst5ZZCCAYDpIs9qXm0CElJYgvUargsODu+WvlI7SiRCVjTEPOIoeSsdBuEfj30qYfyufBopEDipVzS0d22Q==}
     engines: {node: '>=22.4.0'}
-    deprecated: 'v3 long-term support ends at the v5 release. v3 cannot be brought to current spec without breaking changes: upgrade with npm i @cashu/cashu-ts@^4'
 
   '@emnapi/core@1.11.1':
     resolution: {integrity: sha512-RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ==}
@@ -351,8 +350,16 @@ packages:
   '@noble/curves@1.2.0':
     resolution: {integrity: sha512-oYclrNgRaM9SsBUBVbb8M6DTV7ZHRTKugureoYEncY5c65HOmRzvSiTE3y5CYaPYJA/GVkrhXEoF0M3Ya9PMnw==}
 
+  '@noble/curves@1.9.7':
+    resolution: {integrity: sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==}
+    engines: {node: ^14.21.3 || >=16}
+
   '@noble/curves@2.2.0':
     resolution: {integrity: sha512-T/BoHgFXirb0ENSPBquzX0rcjXeM6Lo892a2jlYJkqk83LqZx0l1Of7DzlKJ6jkpvMrkHSnAcgb5JegL8SeIkQ==}
+    engines: {node: '>= 20.19.0'}
+
+  '@noble/curves@2.4.0':
+    resolution: {integrity: sha512-P4/62zrgfH33CneE3Dn4WhJVA22YUU0eR51wKIan4NVRvwsA0YnPTwWGpNbpuacSujmSFLvyzpyuR30+fbq2Ew==}
     engines: {node: '>= 20.19.0'}
 
   '@noble/hashes@1.3.1':
@@ -369,6 +376,10 @@ packages:
 
   '@noble/hashes@2.2.0':
     resolution: {integrity: sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==}
+    engines: {node: '>= 20.19.0'}
+
+  '@noble/hashes@2.4.0':
+    resolution: {integrity: sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==}
     engines: {node: '>= 20.19.0'}
 
   '@noble/post-quantum@0.6.1':
@@ -622,14 +633,14 @@ packages:
   '@scure/base@1.1.1':
     resolution: {integrity: sha512-ZxOhsSyxYwLJj3pLZCefNitxsj093tb2vq90mp2txoYeBqbcjDjqFhyM8eUjq/uFm6zJ+mUuqxlS2FkuSY1MTA==}
 
-  '@scure/base@2.2.0':
-    resolution: {integrity: sha512-b8XEupJibegiXV+tDUseI8oLQc8ei3d/4Jkb2RpbHh3MfE054ov3uIz2dhFkB3FI8iwYkEh0gGCApkrYggkPNg==}
+  '@scure/base@2.4.0':
+    resolution: {integrity: sha512-thZ1TuJwFwBblOhgsjDKvvGirBxNp+wSvY/DR6tJBJOTDhdAAcHJ8Vbr2eFnqaxeca4+t0i9KBf+uHYGWwZORg==}
 
   '@scure/bip32@1.3.1':
     resolution: {integrity: sha512-osvveYtyzdEVbt3OfwwXFr4P2iVBL5u1Q3q4ONBfDY/UpOuXmOlbgwc1xECEboY8wIays8Yt6onaWMUdUbfl0A==}
 
-  '@scure/bip32@2.2.0':
-    resolution: {integrity: sha512-zFr7t2F+a9+5tB7QbarF2HQNYrgjCNaoLAupZdKkrFMYMozJf5zqH2WJCQibMzm1qQ0QogrxVGO3qXfQDYMaQg==}
+  '@scure/bip32@2.4.0':
+    resolution: {integrity: sha512-i3DS0CptAocyvqE4n3SUkpzeQK4vJMFwWLofTwRiiKo2aWojBOfyMCgfKw9HVpO6fSY5AK86sHS/Uzn8kK9Few==}
 
   '@scure/bip39@1.2.1':
     resolution: {integrity: sha512-Z3/Fsz1yr904dduJD0NpiyRHhRYHdcnyh73FZWiV+/qhWi83wNJ3NWolYqCEN+ZWsUz2TWwajJggcRE9r1zUYg==}
@@ -1477,12 +1488,12 @@ snapshots:
     dependencies:
       json-schema: 0.4.0
 
-  '@cashu/cashu-ts@3.7.0':
+  '@cashu/cashu-ts@4.11.0':
     dependencies:
-      '@noble/curves': 2.2.0
-      '@noble/hashes': 2.2.0
-      '@scure/base': 2.2.0
-      '@scure/bip32': 2.2.0
+      '@noble/curves': 2.4.0
+      '@noble/hashes': 2.4.0
+      '@scure/base': 2.4.0
+      '@scure/bip32': 2.4.0
 
   '@emnapi/core@1.11.1':
     dependencies:
@@ -1575,6 +1586,10 @@ snapshots:
   '@esbuild/win32-x64@0.27.7':
     optional: true
 
+  '@freedomofpress/crypto-browser@0.1.7(@noble/curves@1.9.7)':
+    dependencies:
+      '@noble/curves': 1.9.7
+
   '@freedomofpress/crypto-browser@0.1.7(@noble/curves@2.2.0)':
     dependencies:
       '@noble/curves': 2.2.0
@@ -1584,6 +1599,12 @@ snapshots:
       '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@2.2.0)
       '@freedomofpress/tuf-browser': 0.1.11(@noble/curves@2.2.0)
       '@noble/curves': 2.2.0
+
+  '@freedomofpress/tuf-browser@0.1.11(@noble/curves@1.9.7)':
+    dependencies:
+      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@1.9.7)
+    transitivePeerDependencies:
+      - '@noble/curves'
 
   '@freedomofpress/tuf-browser@0.1.11(@noble/curves@2.2.0)':
     dependencies:
@@ -1687,9 +1708,17 @@ snapshots:
     dependencies:
       '@noble/hashes': 1.3.2
 
+  '@noble/curves@1.9.7':
+    dependencies:
+      '@noble/hashes': 1.8.0
+
   '@noble/curves@2.2.0':
     dependencies:
       '@noble/hashes': 2.2.0
+
+  '@noble/curves@2.4.0':
+    dependencies:
+      '@noble/hashes': 2.4.0
 
   '@noble/hashes@1.3.1': {}
 
@@ -1698,6 +1727,8 @@ snapshots:
   '@noble/hashes@1.8.0': {}
 
   '@noble/hashes@2.2.0': {}
+
+  '@noble/hashes@2.4.0': {}
 
   '@noble/post-quantum@0.6.1':
     dependencies:
@@ -1843,32 +1874,32 @@ snapshots:
 
   '@scure/base@1.1.1': {}
 
-  '@scure/base@2.2.0': {}
+  '@scure/base@2.4.0': {}
 
   '@scure/bip32@1.3.1':
     dependencies:
       '@noble/curves': 1.1.0
-      '@noble/hashes': 1.3.1
+      '@noble/hashes': 1.3.2
       '@scure/base': 1.1.1
 
-  '@scure/bip32@2.2.0':
+  '@scure/bip32@2.4.0':
     dependencies:
-      '@noble/curves': 2.2.0
-      '@noble/hashes': 2.2.0
-      '@scure/base': 2.2.0
+      '@noble/curves': 2.4.0
+      '@noble/hashes': 2.4.0
+      '@scure/base': 2.4.0
 
   '@scure/bip39@1.2.1':
     dependencies:
-      '@noble/hashes': 1.3.1
+      '@noble/hashes': 1.3.2
       '@scure/base': 1.1.1
 
   '@standard-schema/spec@1.1.0': {}
 
-  '@tinfoilsh/verifier@1.2.1(@noble/curves@2.2.0)':
+  '@tinfoilsh/verifier@1.2.1(@noble/curves@1.9.7)':
     dependencies:
-      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@2.2.0)
+      '@freedomofpress/crypto-browser': 0.1.7(@noble/curves@1.9.7)
       '@freedomofpress/sigstore-browser': 0.1.14
-      '@freedomofpress/tuf-browser': 0.1.11(@noble/curves@2.2.0)
+      '@freedomofpress/tuf-browser': 0.1.11(@noble/curves@1.9.7)
     transitivePeerDependencies:
       - '@noble/curves'
 
@@ -2509,11 +2540,11 @@ snapshots:
     dependencies:
       any-promise: 1.3.0
 
-  tinfoil@1.2.1(@noble/curves@2.2.0)(zod@4.4.3):
+  tinfoil@1.2.1(@noble/curves@1.9.7)(zod@4.4.3):
     dependencies:
       '@ai-sdk/openai-compatible': 3.0.43(zod@4.4.3)
       '@freedomofpress/sigstore-browser': 0.1.14
-      '@tinfoilsh/verifier': 1.2.1(@noble/curves@2.2.0)
+      '@tinfoilsh/verifier': 1.2.1(@noble/curves@1.9.7)
       '@types/ws': 8.18.1
       ehbp: 0.3.2
       openai: 6.49.0(ws@8.21.0)(zod@4.4.3)

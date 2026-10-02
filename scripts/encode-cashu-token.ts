@@ -1,4 +1,4 @@
-import { getEncodedTokenV4 } from "@cashu/cashu-ts";
+import { getEncodedToken, Amount } from "@cashu/cashu-ts";
 
 interface TokenInput {
   mint: string;
@@ -20,8 +20,18 @@ function main(): void {
   }
 
   try {
-    const token: TokenInput = JSON.parse(args[0]);
-    const encoded = getEncodedTokenV4(token as Parameters<typeof getEncodedTokenV4>[0]);
+    const parsed: TokenInput = JSON.parse(args[0]);
+    const token = {
+      mint: parsed.mint,
+      unit: parsed.unit,
+      proofs: parsed.proofs.map((proof) => ({
+        id: proof.id,
+        amount: Amount.from(proof.amount),
+        secret: proof.secret,
+        C: proof.C,
+      })),
+    };
+    const encoded = getEncodedToken(token);
     console.log(encoded);
   } catch (error) {
     console.error("Failed to encode token:", error);

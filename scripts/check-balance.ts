@@ -124,9 +124,9 @@ async function main(): Promise<void> {
       token: string
     ): Promise<{ success: boolean; amount: number; unit: "sat" | "msat" }> {
       await runWalletCommand(["receive", "cashu", token]);
-      const decoded = getDecodedToken(token);
+      const decoded = getDecodedToken(token, []);
       const amount = decoded?.proofs?.reduce(
-        (sum, proof) => sum + proof.amount,
+        (sum, proof) => sum + proof.amount.toNumber(),
         0
       );
       const unit = decoded?.unit === "msat" ? "msat" : "sat";
