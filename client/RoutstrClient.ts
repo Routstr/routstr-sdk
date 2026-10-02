@@ -955,9 +955,9 @@ export class RoutstrClient {
     selectedModel: Model,
     requestedModelId?: string
   ): string {
-    return requestedModelId
-      ? canonicalizeModelId(requestedModelId)
-      : canonicalIdForModel(selectedModel);
+    return requestedModelId !== undefined
+      ? canonicalizeModelId(requestedModelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined)
+      : canonicalIdForModel(selectedModel, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
   }
 
   /**
@@ -1541,7 +1541,32 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Status ${status} (${status === 429 ? "rate limited" : "auth/server error"}), attempting refund for ${baseUrl}, mode=${this.mode}`
       );
-      if (this.mode === "apikeys") {
+      if (this.mode === "apikeys" && unknownPathError) {
+        // Recovery is best-effort for a bad request path. A broken refund
+        // route must not replace the original 404; retain failed credentials
+        // for a later sweep and never turn this into provider failover.
+        recoveryAttempted = true;
+        try {
+          const refundResult = await this.balanceManager.refundApiKey({
+            mintUrl,
+            baseUrl,
+            apiKey: token,
+            forceRefund: true,
+          });
+          recoverySucceeded = refundResult.success;
+          if (!refundResult.success) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: API key recovery failed for unknown path; preserving original 404 and leaving key for sweep`
+            );
+          }
+        } catch {
+          this._log(
+            "WARN",
+            `[RoutstrClient] _handleErrorResponse: API key recovery threw for unknown path; preserving original 404 and leaving key for sweep`
+          );
+        }
+      } else if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key=${REDACTED_CREDENTIAL}`

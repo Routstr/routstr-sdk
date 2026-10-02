@@ -137,19 +137,19 @@ describe("_getCooldownScope", () => {
 
   it("keys the scope by the requested model id, not the provider-native id", () => {
     const { client } = createClient();
-    const native = { ...model, id: "claude-opus-5-5" } as Model;
+    const native = { ...model, id: "z-ai-glm-5-3" } as Model;
     const scope = (client as any)._getCooldownScope(
       404,
       { raw: true },
       native,
       undefined,
-      "claude-opus-5.5"
+      "glm-5.3"
     );
-    expect(scope).toEqual({ modelId: "claude-opus-5.5" });
+    expect(scope).toEqual({ modelId: "glm-5.3" });
     // Without a requested id, the native id is canonicalized instead.
     expect(
       (client as any)._getCooldownScope(404, { raw: true }, native)
-    ).toEqual({ modelId: "claude-opus-5.5" });
+    ).toEqual({ modelId: "glm-5.3" });
   });
 
   it("scopes a network error (status -1) provider-wide", () => {

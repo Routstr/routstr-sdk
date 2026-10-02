@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProviderManager } from "../../client/ProviderManager";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { isUnknownPathError, parseCoreError } from "../../core/errorTypes";
+import { MODEL_ID_MAPPINGS, canonicalizeModelId, modelIdVariants, findModelForId } from "../../core/modelMappings";
 import type { Model, SdkLogger } from "../../core/types";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { SdkStore } from "../../storage/store";
@@ -55,6 +56,7 @@ const catalog = (): Record<string, Model[]> => ({
 const discovery = (models = catalog()): DiscoveryAdapter =>
   ({
     getCachedModels: () => models,
+    getModelIdMappings: () => ({ [NATIVE]: REQUESTED }),
     getDisabledProviders: () => [],
     getCachedMints: () => ({}),
     getCachedProviderInfo: () => ({}),
@@ -70,8 +72,8 @@ const logger: SdkLogger = {
   },
 };
 
-function setup(models = catalog()) {
-  const manager = new ProviderManager(discovery(models), undefined, logger);
+function setup(models = catalog(), registry = discovery(models)) {
+  const manager = new ProviderManager(registry, undefined, logger);
   const wallet = {
     getBalances: async () => ({}),
     getMintUnits: () => ({}),
@@ -84,7 +86,7 @@ function setup(models = catalog()) {
     removeApiKey: vi.fn(),
     getApiKeyDistribution: () => [],
   } as unknown as StorageAdapter;
-  const client = new RoutstrClient(wallet, storage, discovery(models), "max", "apikeys", {
+  const client = new RoutstrClient(wallet, storage, registry, "max", "apikeys", {
     providerManager: manager,
     logger,
   });
@@ -327,6 +329,44 @@ describe("unknown-path 404 is not a model failure", () => {
     expect(manager.getProviderPriceRankingForModel(REQUESTED)[0].baseUrl).toBe(CYPHER);
   });
 
+  it.each(["failed", "thrown"] as const)(
+    "preserves the unknown-path 404 when API key recovery is %s",
+    async (failure) => {
+      const { client, manager } = setup();
+      const refund = vi.mocked(client.getBalanceManager().refundApiKey);
+      if (failure === "failed") {
+        refund.mockResolvedValue({
+          success: false,
+          message: "Refund endpoint not found",
+          status: 404,
+        } as any);
+      } else {
+        refund.mockRejectedValue(new Error("Refund endpoint unavailable"));
+      }
+      const fetchMock = vi.fn(async () => new Response(pathNotFoundBody, {
+        status: 404,
+        statusText: "Not Found",
+        headers: { "content-type": "application/json" },
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      const markFailed = vi.spyOn(manager, "markFailed");
+      const findNext = vi.spyOn(manager, "findNextBestProvider");
+      const removeApiKey = vi.spyOn((client as any).storageAdapter, "removeApiKey");
+
+      const response = await route(client);
+
+      expect(response.status).toBe(404);
+      expect(response.statusText).toBe("Not Found");
+      expect(response.headers.get("content-type")).toBe("application/json");
+      expect(await response.text()).toBe(pathNotFoundBody);
+      expect(refund).toHaveBeenCalledOnce();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(markFailed).not.toHaveBeenCalled();
+      expect(findNext).not.toHaveBeenCalled();
+      expect(removeApiKey).not.toHaveBeenCalled();
+    }
+  );
+
   it("still fails over on a 404 that means the model is missing on the node", async () => {
     const { client, manager } = setup();
     const fetchMock = vi.fn(async (url: string) =>
@@ -342,5 +382,121 @@ describe("unknown-path 404 is not a model failure", () => {
     expect(response.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(markFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("active Nostr mappings, not static fallback", () => {
+  const native = "nostr-only-variant";
+  const canonical = "nostr-only-model";
+  const models = {
+    [CYPHER]: [entry(native, 1)],
+    [REDSH1FT]: [entry(native, 9), entry(canonical, 2)],
+    [PPQ]: [entry(canonical, 3)],
+  };
+
+  it("uses a snapshot-only mapping for full failover, strikes and canonical-entry choice", async () => {
+    expect(MODEL_ID_MAPPINGS[native]).toBeUndefined();
+    const registry = discovery(models);
+    registry.getModelIdMappings = () => ({ [native]: canonical });
+    const { client, manager } = setup(models, registry);
+    const lookup = vi.spyOn(manager, "getModelForProvider");
+    const strikes = vi.spyOn(manager, "markFailed");
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      seen.push(JSON.parse(init.body as string).model);
+      return url.startsWith(PPQ)
+        ? Response.json({ ok: true }) : modelNotFound();
+    }));
+    const request = () => client.routeRequest({
+      path: "/v1/messages", method: "POST", body: { model: native },
+      modelId: native, baseUrl: CYPHER, mintUrl: MINT,
+    });
+    expect((await request()).status).toBe(200);
+    expect(seen).toEqual([native, canonical, canonical]);
+    expect(lookup).toHaveBeenCalledWith(REDSH1FT, canonical);
+    expect(strikes.mock.calls.map((call) => call[2])).toEqual([canonical, canonical]);
+    expect((await request()).status).toBe(200);
+    expect(manager.isOnCooldown(CYPHER, canonical)).toBe(true);
+    expect(manager.isOnCooldown(CYPHER, native)).toBe(true);
+    expect(manager.getProviderPriceRankingForModel(native).map((p) => p.baseUrl)).toEqual([PPQ]);
+    manager.removeFromCooldown(CYPHER, native);
+    expect(manager.isOnCooldown(CYPHER, canonical)).toBe(false);
+  });
+
+  it("supports mappings through an alias when the native id itself is unmapped", async () => {
+    const registry = discovery({
+      [CYPHER]: [entry("unmapped-provider-native", 1, { alias_ids: [native] })],
+      [PPQ]: [entry(canonical, 2)],
+    });
+    registry.getModelIdMappings = () => ({ [native]: canonical });
+    const { client, manager } = setup(models, registry);
+    const strike = vi.spyOn(manager, "markFailed");
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      url.startsWith(CYPHER) ? modelNotFound() : Response.json({ ok: true })
+    ));
+    const request = () => client.routeRequest({
+      path: "/v1/messages", method: "POST", body: { model: canonical },
+      modelId: canonical, baseUrl: CYPHER, mintUrl: MINT,
+    });
+    expect((await request()).status).toBe(200);
+    expect((await request()).status).toBe(200);
+    expect(strike.mock.calls.every((call) => call[2] === canonical)).toBe(true);
+    expect(manager.getProviderPriceRankingForModel(canonical).map((p) => p.baseUrl)).toEqual([PPQ]);
+  });
+
+  it("an empty signed snapshot disables fallback; null or a missing getter enables it", () => {
+    const fallbackNative = "z-ai-glm-5-3";
+    const fallbackCanonical = "glm-5.3";
+    const registry = discovery({ [CYPHER]: [entry(fallbackNative, 1)], [PPQ]: [entry(fallbackCanonical, 2)] });
+    registry.getModelIdMappings = () => ({});
+    const manager = new ProviderManager(registry, undefined, logger);
+    expect(manager.canonicalizeModelId(fallbackNative)).toBe(fallbackNative);
+    expect(manager.findNextBestProvider(fallbackNative, CYPHER)).toBeNull();
+    manager.markFailed(CYPHER, "one", fallbackNative);
+    manager.markFailed(CYPHER, "two", fallbackNative);
+    expect(manager.isOnCooldown(CYPHER, fallbackCanonical)).toBe(false);
+    registry.getModelIdMappings = () => null;
+    expect(manager.canonicalizeModelId(fallbackNative)).toBe(fallbackCanonical);
+    expect(manager.isOnCooldown(CYPHER, fallbackCanonical)).toBe(true);
+    expect(manager.findNextBestProvider(fallbackNative, CYPHER)).toBe(PPQ);
+    delete (registry as Partial<DiscoveryAdapter>).getModelIdMappings;
+    expect(manager.canonicalizeModelId(fallbackNative)).toBe(fallbackCanonical);
+  });
+
+  it("rekeys strikes when a snapshot arrives after the first failure", () => {
+    const registry = discovery(models);
+    let snapshot: Record<string, string> | null = null;
+    registry.getModelIdMappings = () => snapshot;
+    const manager = new ProviderManager(registry, undefined, logger);
+    manager.markFailed(CYPHER, "first", native);
+    snapshot = { [native]: canonical };
+    manager.markFailed(CYPHER, "second", canonical);
+    expect(manager.isOnCooldown(CYPHER, native)).toBe(true);
+    expect(manager.isOnCooldown(CYPHER, canonical)).toBe(true);
+  });
+
+  it("hydrates and removes legacy native-id persisted entries with snapshot-only mappings", () => {
+    const registry = discovery(models);
+    registry.getModelIdMappings = () => ({ [native]: canonical });
+    const remove = vi.fn();
+    const state = {
+      failedProviders: [], lastFailed: {},
+      providersOnCooldown: [{ baseUrl: CYPHER, modelId: native, timestamp: Date.now() }],
+      removeProviderFromCooldown: remove,
+    };
+    const manager = new ProviderManager(registry, { getState: () => state } as unknown as SdkStore, logger);
+    expect(manager.isOnCooldown(CYPHER, canonical)).toBe(true);
+    manager.removeFromCooldown(CYPHER, canonical);
+    expect(remove).toHaveBeenCalledWith(CYPHER, native, undefined);
+    expect(manager.isOnCooldown(CYPHER, native)).toBe(false);
+  });
+
+  it("helpers consistently honor an explicit snapshot including an empty one", () => {
+    const mappings = { [native]: canonical };
+    expect(canonicalizeModelId(native, mappings)).toBe(canonical);
+    expect(modelIdVariants(native, mappings)).toEqual([canonical, native]);
+    expect(findModelForId([entry(canonical, 1)], native, mappings)?.id).toBe(canonical);
+    expect(canonicalizeModelId("z-ai-glm-5-3", {})).toBe("z-ai-glm-5-3");
   });
 });

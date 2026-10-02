@@ -321,7 +321,7 @@ export async function resolveRequestContext(
     baseUrl,
     mintUrl,
     selectedModel,
-    requestedModelId: canonicalizeModelId(modelId),
+    requestedModelId: canonicalizeModelId(modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined),
     modelPath,
   };
 }

@@ -17,6 +17,8 @@ import {
   canonicalizeModelId,
   findModelForId,
   modelIdVariants,
+  MODEL_ID_MAPPINGS,
+  type ModelIdMappings,
 } from "../core/modelMappings";
 import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
@@ -667,9 +669,8 @@ export interface CooldownEntry {
 
 /**
  * Map key for a cooldown entry: `baseUrl` for provider-scoped entries,
- * `baseUrl::<canonical modelId>` for model-scoped entries (the id goes
- * through canonicalizeModelId, so "claude-opus-5-5" and "claude-opus-5.5"
- * share one key),
+ * `baseUrl::<canonical modelId>` for model-scoped entries. Callers resolve
+ * the id against the active discovery mapping snapshot before building a key,
  * `baseUrl::path::<canonical path>` for path-scoped entries. (A fourth
  * scope — a path cooled across every node for upstream-wide outages — is a
  * deliberate future extension, not implemented.)
@@ -682,7 +683,7 @@ const cooldownKey = (
   modelPath != null
     ? `${baseUrl}::path::${modelPath}`
     : modelId != null
-      ? `${baseUrl}::${canonicalizeModelId(modelId)}`
+      ? `${baseUrl}::${modelId}`
       : baseUrl;
 
 /**
@@ -715,6 +716,15 @@ export class ProviderManager {
     }
   }
 
+  /** Active signed snapshot; null/missing getter alone enables bootstrap fallback. */
+  getModelIdMappings(): ModelIdMappings {
+    return this.discoveryAdapter.getModelIdMappings?.() ?? MODEL_ID_MAPPINGS;
+  }
+
+  canonicalizeModelId(modelId: string): string {
+    return canonicalizeModelId(modelId, this.getModelIdMappings());
+  }
+
   /**
    * Hydrate in-memory state from persistent store
    */
@@ -741,7 +751,7 @@ export class ProviderManager {
       }
       const modelId =
         entry.modelId !== undefined
-          ? canonicalizeModelId(entry.modelId)
+          ? this.canonicalizeModelId(entry.modelId)
           : undefined;
       const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
       const existing = this.providersOnCoolDown.get(key);
@@ -765,7 +775,14 @@ export class ProviderManager {
     modelPath?: string
   ): void {
     if (!this.store) return;
-    const ids = modelId === undefined ? [undefined] : modelIdVariants(modelId);
+    const ids: Array<string | undefined> = modelId === undefined ? [undefined] : modelIdVariants(modelId, this.getModelIdMappings());
+    for (const entry of this.store.getState().providersOnCooldown) {
+      if (entry.baseUrl === baseUrl && entry.modelPath === modelPath &&
+          entry.modelId !== undefined && modelId !== undefined &&
+          this.canonicalizeModelId(entry.modelId) === modelId && !ids.includes(entry.modelId)) {
+        ids.push(entry.modelId);
+      }
+    }
     for (const id of ids) {
       this.store.getState().removeProviderFromCooldown(baseUrl, id, modelPath);
     }
@@ -784,6 +801,29 @@ export class ProviderManager {
    * cooldown entries remain) so it can be retried
    */
   private cleanupExpiredCooldowns(): void {
+    // Discovery can accept a signed snapshot after this manager was created.
+    // Re-key existing native-id strikes/cooldowns using the active snapshot,
+    // including legacy persisted entries hydrated before mappings arrived.
+    const cooldowns = new Map<string, CooldownEntry>();
+    for (const entry of this.providersOnCoolDown.values()) {
+      const modelId = entry.modelId === undefined
+        ? undefined : this.canonicalizeModelId(entry.modelId);
+      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
+      const previous = cooldowns.get(key);
+      if (!previous || previous.timestamp < entry.timestamp) {
+        cooldowns.set(key, { ...entry, modelId });
+      }
+    }
+    this.providersOnCoolDown = cooldowns;
+    const strikes = new Map<string, number>();
+    for (const [key, timestamp] of this.lastFailed) {
+      const separator = key.lastIndexOf("::");
+      const canonicalKey = separator < 0 || key.includes("::path::")
+        ? key
+        : cooldownKey(key.slice(0, separator), this.canonicalizeModelId(key.slice(separator + 2)));
+      strikes.set(canonicalKey, Math.max(strikes.get(canonicalKey) ?? 0, timestamp));
+    }
+    this.lastFailed = strikes;
     const now = Date.now();
     const expiredProviders = new Set<string>();
     for (const [key, entry] of this.providersOnCoolDown) {
@@ -838,7 +878,7 @@ export class ProviderManager {
    */
   isOnCooldown(baseUrl: string, modelId?: string, modelPath?: string): boolean {
     this.cleanupExpiredCooldowns();
-    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
+    if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
 
     // Provider-wide cooldown blocks all models
     if (this.providersOnCoolDown.has(cooldownKey(baseUrl))) {
@@ -916,7 +956,7 @@ export class ProviderManager {
     this.cleanupExpiredCooldowns();
     // Canonicalize so a native/variant spelling strikes the same scope the
     // ranking checks (e.g. claude-opus-5-5 vs claude-opus-5.5).
-    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
+    if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
     const now = Date.now();
     const key = cooldownKey(baseUrl, modelId, modelPath);
     const lastFailure = this.lastFailed.get(key);
@@ -966,7 +1006,8 @@ export class ProviderManager {
    * entry for the provider is removed.
    */
   removeFromCooldown(baseUrl: string, modelId?: string, modelPath?: string): void {
-    if (modelId !== undefined) modelId = canonicalizeModelId(modelId);
+    this.cleanupExpiredCooldowns();
+    if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
     if (modelId === undefined && modelPath === undefined) {
       for (const [key, entry] of [...this.providersOnCoolDown]) {
         if (entry.baseUrl === baseUrl) {
@@ -1034,7 +1075,7 @@ export class ProviderManager {
     currentBaseUrl: string,
     attemptedProviders: ReadonlySet<string> = new Set()
   ): string | null {
-    modelId = canonicalizeModelId(modelId);
+    modelId = this.canonicalizeModelId(modelId);
     try {
       const torMode = isTorContext();
       const disabledProviders = new Set(
@@ -1071,7 +1112,7 @@ export class ProviderManager {
 
         // Find the model in this provider's list (by native id or a
         // mapped variant/alias of it)
-        const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+        const model = findModelForId(models, modelId, this.getModelIdMappings());
         if (!model) {
           continue;
         }
@@ -1106,12 +1147,12 @@ export class ProviderManager {
     // Canonicalize so a node listing only the canonical spelling is found
     // from a provider-native variant id and vice versa. Both spellings on one
     // node resolve to the canonical entry.
-    modelId = canonicalizeModelId(modelId);
+    modelId = this.canonicalizeModelId(modelId);
     // Get models for this provider
     const models = this.discoveryAdapter.getCachedModels()[normalizeBaseUrl(baseUrl)] || [];
 
     // First try exact or mapped (variant/alias) match
-    const mappedMatch = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+    const mappedMatch = findModelForId(models, modelId, this.getModelIdMappings());
     if (mappedMatch) return mappedMatch;
 
     // Try matching by ID suffix (for backward compatibility with v0.1.x providers)
@@ -1158,7 +1199,7 @@ export class ProviderManager {
       model: Model;
     }>
   > {
-    modelId = canonicalizeModelId(modelId);
+    modelId = this.canonicalizeModelId(modelId);
     const torMode = options.torMode ?? isTorContext();
     const excludedModelPaths = new Set(options.excludeModelPaths ?? []);
     const disabledProviders = new Set(
@@ -1183,8 +1224,8 @@ export class ProviderManager {
         if (!torMode && isOnionUrl(baseUrl)) return null;
         if (this.isOnCooldown(baseUrl, modelId)) return null;
 
-        const model = (allModels[baseUrl] || []).find(
-          (m: Model) => m.id === modelId
+        const model = findModelForId(
+          allModels[baseUrl] || [], modelId, this.getModelIdMappings()
         );
         if (!model) return null;
 
@@ -1250,7 +1291,7 @@ export class ProviderManager {
     model: Model;
     cost: number;
   }> {
-    modelId = canonicalizeModelId(modelId);
+    modelId = this.canonicalizeModelId(modelId);
     const candidates: CandidateProvider[] = [];
     const allProviders = this.discoveryAdapter.getCachedModels();
     const disabledProviders = new Set(
@@ -1264,7 +1305,7 @@ export class ProviderManager {
       if (!torMode && isOnionUrl(baseUrl))
         continue;
 
-      const model = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+      const model = findModelForId(models, modelId, this.getModelIdMappings());
       if (!model) continue;
 
       const cost = model.sats_pricing?.completion ?? 0;
@@ -1281,7 +1322,7 @@ export class ProviderManager {
     modelId: string,
     options: { torMode?: boolean; includeDisabled?: boolean } = {}
   ): ModelProviderPrice[] {
-    modelId = canonicalizeModelId(modelId);
+    modelId = this.canonicalizeModelId(modelId);
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
     const disabledProviders = new Set(this.discoveryAdapter.getDisabledProviders());
@@ -1298,7 +1339,7 @@ export class ProviderManager {
       )
         continue;
 
-      const match = findModelForId(models, modelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+      const match = findModelForId(models, modelId, this.getModelIdMappings());
       if (!match?.sats_pricing) continue;
 
       const prompt = match.sats_pricing.prompt;
