@@ -301,7 +301,7 @@ describe("unknown-path 404 is not a model failure", () => {
     }
   });
 
-  it("gives no cooldown strike, no failover, and forwards the upstream 404", async () => {
+  it("gives no cooldown strike and forwards the last upstream 404 when every node rejects the path", async () => {
     const { client, manager } = setup();
     const fetchMock = vi.fn(
       async () =>
@@ -313,7 +313,8 @@ describe("unknown-path 404 is not a model failure", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     const markFailed = vi.spyOn(manager, "markFailed");
-    const findNext = vi.spyOn(manager, "findNextBestProvider");
+    const refund = vi.mocked(client.getBalanceManager().refundApiKey);
+    const removeApiKey = vi.spyOn((client as any).storageAdapter, "removeApiKey");
 
     for (let i = 0; i < 3; i++) {
       const response = await route(client);
@@ -321,51 +322,42 @@ describe("unknown-path 404 is not a model failure", () => {
       expect(await response.text()).toBe(pathNotFoundBody);
     }
 
-    expect(fetchMock).toHaveBeenCalledTimes(3); // one node per request, never a second
+    expect(fetchMock).toHaveBeenCalledTimes(12); // every node, every request
     expect(markFailed).not.toHaveBeenCalled();
-    expect(findNext).not.toHaveBeenCalled();
+    expect(refund).not.toHaveBeenCalled(); // the node never charged the key
+    expect(removeApiKey).not.toHaveBeenCalled();
     expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(false);
     expect(manager.getProvidersOnCooldown()).toEqual([]);
     expect(manager.getProviderPriceRankingForModel(REQUESTED)[0].baseUrl).toBe(CYPHER);
   });
 
-  it.each(["failed", "thrown"] as const)(
-    "preserves the unknown-path 404 when API key recovery is %s",
-    async (failure) => {
-      const { client, manager } = setup();
-      const refund = vi.mocked(client.getBalanceManager().refundApiKey);
-      if (failure === "failed") {
-        refund.mockResolvedValue({
-          success: false,
-          message: "Refund endpoint not found",
-          status: 404,
-        } as any);
-      } else {
-        refund.mockRejectedValue(new Error("Refund endpoint unavailable"));
-      }
-      const fetchMock = vi.fn(async () => new Response(pathNotFoundBody, {
-        status: 404,
-        statusText: "Not Found",
-        headers: { "content-type": "application/json" },
-      }));
-      vi.stubGlobal("fetch", fetchMock);
-      const markFailed = vi.spyOn(manager, "markFailed");
-      const findNext = vi.spyOn(manager, "findNextBestProvider");
-      const removeApiKey = vi.spyOn((client as any).storageAdapter, "removeApiKey");
+  it("fails over when only some nodes allow the path (allowlist differs by version and config)", async () => {
+    const { client, manager } = setup();
+    const fetchMock = vi.fn(async (url: string) =>
+      url.startsWith(CYPHER)
+        ? new Response(
+            JSON.stringify({ error: { type: "not_found", message: "Path '/v1/messages/count_tokens' not found" } }),
+            { status: 404, headers: { "content-type": "application/json" } }
+          )
+        : new Response('{"input_tokens":3}', { status: 200, headers: { "content-type": "application/json" } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const markFailed = vi.spyOn(manager, "markFailed");
 
-      const response = await route(client);
+    const response = await client.routeRequest({
+      path: "/v1/messages/count_tokens",
+      method: "POST",
+      body: { model: NATIVE, messages: [{ role: "user", content: "hi" }] },
+      baseUrl: CYPHER,
+      mintUrl: MINT,
+      modelId: REQUESTED,
+    });
 
-      expect(response.status).toBe(404);
-      expect(response.statusText).toBe("Not Found");
-      expect(response.headers.get("content-type")).toBe("application/json");
-      expect(await response.text()).toBe(pathNotFoundBody);
-      expect(refund).toHaveBeenCalledOnce();
-      expect(fetchMock).toHaveBeenCalledOnce();
-      expect(markFailed).not.toHaveBeenCalled();
-      expect(findNext).not.toHaveBeenCalled();
-      expect(removeApiKey).not.toHaveBeenCalled();
-    }
-  );
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(markFailed).not.toHaveBeenCalled();
+    expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(false);
+  });
 
   it("still fails over on a 404 that means the model is missing on the node", async () => {
     const { client, manager } = setup();

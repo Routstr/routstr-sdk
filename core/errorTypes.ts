@@ -371,12 +371,14 @@ export function isUpstreamRequestError(
  * Detect a node's "unknown route" 404, e.g.
  * `{"error":{"type":"not_found","message":"Path '/v1/v1/messages' not found"}}`.
  *
- * The request path itself is wrong (typically a client base URL that already
- * ends in /v1), so every node answers identically. It says nothing about the
- * model or the provider: it must not cool anything down and must not fail
- * over. It is deliberately narrow — a 404 meaning "this node does not serve
- * that model/route" (model_not_found, invalid_model_path, plain-text or
- * differently-worded bodies) is NOT matched and keeps its failover behavior.
+ * The node does not allow the request path: either the path is wrong
+ * (typically a client base URL that already ends in /v1) or this node's
+ * allowlist lacks it (it differs by core version and operator config). It
+ * says nothing about the model: it must not cool anything down, and failover
+ * may reach a node that allows the path. It is deliberately narrow — a 404
+ * meaning "this node does not serve that model/route" (model_not_found,
+ * invalid_model_path, plain-text or differently-worded bodies) is NOT matched
+ * and keeps its failover behavior.
  */
 export function isUnknownPathError(
   status: number,
