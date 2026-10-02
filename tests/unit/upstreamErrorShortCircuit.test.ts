@@ -154,7 +154,7 @@ function routeRequest(client: RoutstrClient) {
   });
 }
 
-describe("upstream request errors refund, fail over, and aggregate at exhaustion", () => {
+describe("upstream request errors keep the key, fail over, and aggregate at exhaustion", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -179,7 +179,7 @@ describe("upstream request errors refund, fail over, and aggregate at exhaustion
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       `${baseUrl}v1/messages`, `${nextUrl}v1/messages`, `${thirdUrl}v1/messages`,
     ]);
-    expect(refund).toHaveBeenCalledTimes(3);
+    expect(refund).not.toHaveBeenCalled();
     expect(markFailed).not.toHaveBeenCalled();
     expect(response.status).toBe(422);
     expect((await response.json()).error.errors).toEqual([
@@ -233,12 +233,12 @@ describe("upstream request errors refund, fail over, and aggregate at exhaustion
     expect(response.status).toBe(400);
   });
 
-  it.each([400, 422])("refunds and retries on upstream %i, returning success from the next node", async (status) => {
+  it.each([400, 422])("keeps the key and retries on upstream %i, returning success from the next node", async (status) => {
     const { client, providerManager, refund, spend } = setup();
     const fetchMock = stubFetch({ status, statusText: "Rejected", body: webSearchOptionsBody }, okResponse());
     const response = await routeRequest(client);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(refund).toHaveBeenCalledTimes(1);
+    expect(refund).not.toHaveBeenCalled();
     expect(spend).toHaveBeenCalledTimes(2);
     expect(providerManager.markFailed).not.toHaveBeenCalled();
     expect(response.status).toBe(200);
@@ -249,7 +249,7 @@ describe("upstream request errors refund, fail over, and aggregate at exhaustion
     const fetchMock = stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });
     const response = await routeRequest(client);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(refund).toHaveBeenCalledTimes(2);
+    expect(refund).not.toHaveBeenCalled();
     expect(spend).toHaveBeenCalledTimes(2);
     expect(providerManager.markFailed).not.toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
