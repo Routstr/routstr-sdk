@@ -162,6 +162,10 @@ export async function fetchAIResponse(
     let mintUrl: string;
     let client: FetchAIResponseClient;
     let modelPath: ResolvedContext["modelPath"];
+    // Identity for cooldown/failover: the requested model, not the chosen
+    // provider's native id (undefined for pre-resolved callers, where the
+    // client derives it from the selected model).
+    let requestedModelId: string | undefined;
 
     if (options.selectedModel && options.baseUrl && options.mintUrl && deps.client) {
       // Pre-resolved path (backward-compatible)
@@ -218,6 +222,7 @@ export async function fetchAIResponse(
       mintUrl = resolved.mintUrl;
       client = resolved.client;
       modelPath = resolved.modelPath;
+      requestedModelId = resolved.requestedModelId;
     } else {
       throw new Error(
         "fetchAIResponse requires either (selectedModel + baseUrl + mintUrl + client in deps) or (modelId + discoveryAdapter + walletAdapter + storageAdapter in options)"
@@ -260,7 +265,7 @@ export async function fetchAIResponse(
       headers: requestHeaders,
       baseUrl,
       mintUrl,
-      modelId: selectedModel.id,
+      modelId: requestedModelId ?? selectedModel.id,
       userCacheSecret: options.userCacheSecret,
       signal: options.abortSignal,
       autoModelPath: modelPath
