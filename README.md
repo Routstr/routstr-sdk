@@ -137,3 +137,26 @@ sweep this list.** Applications must call `refundXcashuTokens` or use
 `scripts/refund-all.ts --xcashu`; default script mode handles cached receive tokens
 and API keys. Do not run recovery sweeps concurrently with active payments.
 Alternate-mint top-up retries require successful recovery of the first token.
+
+### Nostr model ID mapping snapshots
+
+Model aliases are resolved using signed kind `38426` events with the `d` tag
+`model-id-mappings`, published by `routstrModelsPubkey` (falling back to
+`routstrPubkey`). Content is a complete snapshot:
+
+```json
+{"mappings":{"provider-native-id":"canonical-model-id"}}
+```
+
+An empty snapshot clears mappings. Invalid snapshots are ignored; bundled
+mappings are used until a valid snapshot is available. Both built-in discovery
+adapters persist the accepted signed event through `StorageDriver`, even without
+SQLite event persistence, and restore its mapping projection on startup. Older
+relay events cannot replace it. Changing the configured author discards the old
+projection and queries the newly configured author.
+
+**Custom adapter migration:** `DiscoveryAdapter` now requires
+`getModelIdMappings`, `setModelIdMappings` (accepting `null` to clear the projection),
+`getModelIdMappingsEvent`, and `setModelIdMappingsEvent`. Persist the signed event
+and retain the parsed projection for synchronous routing. Missing methods produce
+an explicit initialization error rather than silently retaining static mappings.

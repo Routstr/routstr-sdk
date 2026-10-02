@@ -6,7 +6,7 @@
 
 import type { Model, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
-import { canonicalIdForModel } from "../core/modelMappings";
+import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import {
   NoProvidersAvailableError,
@@ -71,7 +71,10 @@ const NOSTR_QUERY_TIMEOUT_MS = 5000;
 const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
 
 /** Kinds whose persisted events are discovery evidence. */
-const DISCOVERY_KINDS = [38421, 38423, 38425];
+const DISCOVERY_KINDS = [38421, 38423, 38425, 38426];
+
+/** Address of the authoritative replaceable model mapping snapshot. */
+const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";
 
 // Deletes are chunked so one pruning pass never builds an unbounded SQL
 // statement; the store read itself is never limited.
@@ -93,17 +96,17 @@ export interface ModelManagerConfig {
   cacheTTL?: number;
   /** Nostr pubkey for routstr review/audit events (kind 38425). Defaults to routstr's key. */
   routstrPubkey?: string;
-  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  /** Nostr pubkey for routstr-21 models (38423) and model ID mappings (38426). Falls back to routstrPubkey. */
   routstrModelsPubkey?: string;
   /** Nostr relay URLs for provider/model discovery.
-   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425).
+   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425, 38426).
    * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
   nostrRelays?: string[];
   /** Optional injectable logger */
   logger?: SdkLogger;
   /** Path to database for persistent Nostr event storage.
    * If provided, events fetched by ModelManager from relays (kinds 38421,
-   * 38423, 38425) are persisted and survive process restarts. The underlying
+   * 38423, 38425, 38426) are persisted and survive process restarts. The underlying
    * EventStore can also be accessed for advanced/manual event management.
    *
    * Runtime-specific SQLite implementations are intentionally not imported by
@@ -173,6 +176,19 @@ export class ModelManager {
     this.eventStoreDbPath = config.eventStoreDbPath;
     this.persistentEventDatabaseFactory = config.persistentEventDatabaseFactory;
     this.eventStore = config.eventStore ?? null;
+
+    for (const method of ["getModelIdMappings", "setModelIdMappings",
+      "getModelIdMappingsEvent", "setModelIdMappingsEvent"] as const) {
+      if (typeof adapter[method] !== "function") {
+        throw new Error(`DiscoveryAdapter must implement ${method} for Nostr model mappings`);
+      }
+    }
+    // The signed event is the source of truth. Discard legacy/unscoped
+    // projections and rebuild only from evidence for the configured author.
+    const saved = adapter.getModelIdMappingsEvent();
+    adapter.setModelIdMappings(saved && this.isModelIdMappingEvent(saved)
+      ? this.parseModelIdMappings(saved) : null);
+
   }
 
   /**
@@ -465,10 +481,10 @@ export class ModelManager {
 
   /**
    * Fetch current events from live Nostr relays for all tracked kinds
-   * (38421 providers, 38425 reviews, 38423 routstr21 models) and persist them
+   * (38421 providers, 38425 reviews, 38423 routstr21 models, 38426 mappings) and persist them
    * into the event store. Existing events are not replaced — new events are
    * merged in. Call this periodically (e.g. every 21 min) to discover new
-   * providers, reviews, and model lists published since the last fetch.
+   * providers, reviews, model lists, and mappings published since the last fetch.
    */
   async refreshNostrEvents(): Promise<void> {
     const eventStore = await this.ensureEventStore();
@@ -500,6 +516,11 @@ export class ModelManager {
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
       true
     );
+
+    // Kind 38426 — authoritative variant -> canonical ID snapshot.
+    // One forced query fetches and applies it; getNostrEvents also returns
+    // previously stored evidence when the relays are temporarily unavailable.
+    await this.fetchModelIdMappings(true);
 
     this.logger.log("refreshNostrEvents: live fetch complete");
 
@@ -556,6 +577,7 @@ export class ModelManager {
           );
           await Promise.all([
             this.fetchRoutstr21Models(forceRefresh),
+            this.fetchModelIdMappings(forceRefresh),
             this.syncReviewedProvidersFromNostr(filteredCachedUrls),
           ]);
           return filteredCachedUrls;
@@ -570,6 +592,9 @@ export class ModelManager {
       // to empty; a broken event store still surfaces via the 38421 query.
       const routstr21Prefetch = this.fetchRoutstr21Models(forceRefresh).catch(
         () => [] as string[]
+      );
+      const mappingsPrefetch = this.fetchModelIdMappings(forceRefresh).catch(
+        () => this.getModelIdMappings()
       );
       // Skip the review query when the adapter cannot store its result,
       // matching the wrapper's early return instead of waiting it out.
@@ -588,7 +613,7 @@ export class ModelManager {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await routstr21Prefetch;
+        await Promise.all([routstr21Prefetch, mappingsPrefetch]);
         this.applyReviewDisables(
           filtered,
           this.providerNodePubkeysByUrl,
@@ -851,6 +876,7 @@ export class ModelManager {
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await Promise.all([
           this.fetchRoutstr21Models(forceRefresh),
+          this.fetchModelIdMappings(forceRefresh),
           this.syncReviewedProvidersFromNostr(
             list,
             this.providerNodePubkeysByUrl,
@@ -1137,6 +1163,9 @@ export class ModelManager {
       throw new NoProvidersAvailableError();
     }
 
+    // Bootstrap refreshes mappings before model grouping. Direct fetchModels
+    // calls use the already-hydrated snapshot (or bundled offline fallback).
+    const mappings = this.getModelIdMappings();
     const bestById = new Map<string, { model: Model; base: string }>();
     const modelsFromAllProviders: Record<string, Model[]> = {};
     // Only network-fetched bases get a new stamp, so cache hits do not
@@ -1192,7 +1221,7 @@ export class ModelManager {
           for (const m of list) {
             // Group by canonical id so providers serving the same model
             // under a mapped variant id or alias fold into one entry.
-            const canonicalId = canonicalIdForModel(m);
+            const canonicalId = canonicalIdForModel(m, mappings);
             const existing = bestById.get(canonicalId);
 
             // Skip models without sats pricing
@@ -1368,6 +1397,91 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  /** Current per-adapter mapping snapshot; offline first runs use the bundled fallback. */
+  getModelIdMappings(): ModelIdMappings {
+    return this.adapter.getModelIdMappings() ?? MODEL_ID_MAPPINGS;
+  }
+
+  /**
+   * Fetch the complete kind 38426 variant -> canonical snapshot. The same
+   * author and relays as kind 38423 are used. An empty object is a valid
+   * replacement; an absent, invalid or unreachable event keeps the last good
+   * snapshot (or the bundled fallback on a fresh install).
+   */
+  async fetchModelIdMappings(forceRefresh: boolean = false): Promise<ModelIdMappings> {
+    const cached = this.adapter.getModelIdMappings() ?? null;
+    const lastUpdate = this.adapter.getModelIdMappingsLastUpdate?.();
+    if (!forceRefresh && cached !== null && lastUpdate != null &&
+        lastUpdate <= Date.now() && Date.now() - lastUpdate <= this.cacheTTL) {
+      return cached;
+    }
+
+    // Hydrate the local event store from driver-backed evidence as well.
+    const saved = this.adapter.getModelIdMappingsEvent();
+    if (saved && this.isModelIdMappingEvent(saved)) {
+      const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
+      store.add(saved);
+    }
+    const events = await this.getNostrEvents(
+      { kinds: [38426], "#d": [MODEL_ID_MAPPINGS_D_TAG], authors: [this.routstrModelsPubkey] },
+      forceRefresh,
+      undefined,
+      event => this.isModelIdMappingEvent(event)
+    );
+    return this.applyModelIdMappingEvents(events);
+  }
+
+  private parseModelIdMappings(event: NostrEvent): ModelIdMappings {
+    const content = JSON.parse(event.content);
+    const mappings = content?.mappings;
+    if (mappings === null || typeof mappings !== "object" || Array.isArray(mappings)) {
+      throw new Error("mappings must be an object");
+    }
+    const entries = Object.entries(mappings);
+    if (entries.length > 10_000) throw new Error("too many mappings");
+    const snapshot = Object.fromEntries(entries) as ModelIdMappings;
+    for (const [variant, canonical] of Object.entries(snapshot)) {
+      if (variant === "__proto__" || variant === "constructor" || variant === "prototype" ||
+          !variant.trim() || typeof canonical !== "string" || !canonical.trim() ||
+          variant === canonical) {
+        throw new Error(`invalid mapping for ${variant}`);
+      }
+    }
+    for (const canonical of Object.values(snapshot)) {
+      if (Object.hasOwn(snapshot, canonical)) throw new Error(`chained mapping at ${canonical}`);
+    }
+    return snapshot;
+  }
+
+  private isModelIdMappingEvent(event: NostrEvent): boolean {
+    if (event.kind !== 38426 || event.pubkey !== this.routstrModelsPubkey ||
+        getReplaceableIdentifier(event) !== MODEL_ID_MAPPINGS_D_TAG ||
+        !this.isNostrEventTrustworthy(event)) return false;
+    try {
+      this.parseModelIdMappings(event);
+      return true;
+    } catch (error) {
+      this.logger.warn("ModelIdMappings: invalid kind 38426 content:", event.id, error);
+      return false;
+    }
+  }
+
+  private applyModelIdMappingEvents(events: NostrEvent[]): ModelIdMappings {
+    // Include the adapter's signed event: SQLite persistence is optional,
+    // but a stale relay must never roll back the accepted snapshot on restart.
+    const saved = this.adapter.getModelIdMappingsEvent();
+    const candidates = saved ? [...events, saved] : events;
+    const event = candidates.filter(e => this.isModelIdMappingEvent(e)).sort(
+      (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id)
+    )[0];
+    if (!event) return this.getModelIdMappings();
+    const snapshot = this.parseModelIdMappings(event);
+    this.adapter.setModelIdMappingsEvent(event);
+    this.adapter.setModelIdMappings(snapshot);
+    this.adapter.setModelIdMappingsLastUpdate?.(Date.now());
+    return snapshot;
   }
 
   /**

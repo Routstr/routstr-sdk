@@ -94,6 +94,10 @@ const createDiscovery = (
   overrides?: Partial<DiscoveryAdapter>
 ): DiscoveryAdapter =>
   ({
+    getModelIdMappings: () => null,
+    setModelIdMappings: () => {},
+    getModelIdMappingsEvent: () => null,
+    setModelIdMappingsEvent: () => {},
     getCachedModels: () => ({}),
     setCachedModels: () => {},
     getCachedMints: () => ({}),

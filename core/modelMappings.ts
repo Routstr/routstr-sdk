@@ -1,7 +1,7 @@
 import type { Model } from "./types";
 
 /**
- * Static variant → canonical model ID mappings.
+ * Bootstrap fallback variant → canonical model ID mappings.
  *
  * Keys are model identifiers as served by a provider's `/v1/models` — either
  * the provider-native `id` or any of its declared `alias_ids`. Values are the
@@ -13,9 +13,9 @@ import type { Model } from "./types";
  * canonical ID. Resolution is single-hop on purpose — a map value must never
  * also be a map key (see tests/unit/modelMappings.test.ts).
  *
- * Update this list when a provider is found serving a canonical model under
- * a non-canonical identifier. Each entry is a claim that the two IDs are the
- * same model; verify before adding.
+ * This snapshot is used until a trusted kind 38426 Nostr snapshot is cached.
+ * Once published, the Nostr snapshot replaces the fallback (including with an
+ * empty mapping). Keep the fallback for offline first runs.
  */
 export const MODEL_ID_MAPPINGS: Record<string, string> = {
   // routstr.cypherpunk.today (verified against its /v1/models catalog)
@@ -39,15 +39,20 @@ export function modelIdentifiers(model: Model): string[] {
   return [model.id, ...(model.alias_ids ?? [])];
 }
 
+export type ModelIdMappings = Record<string, string>;
+
 /**
  * Resolve a provider model entry to its canonical model ID.
  *
  * Priority: native id in the map → any alias in the map → the native id
  * itself (unmapped models keep their own id).
  */
-export function canonicalIdForModel(model: Model): string {
+export function canonicalIdForModel(
+  model: Model,
+  mappings: ModelIdMappings = MODEL_ID_MAPPINGS,
+): string {
   for (const identifier of modelIdentifiers(model)) {
-    const canonical = MODEL_ID_MAPPINGS[identifier];
+    const canonical = Object.hasOwn(mappings, identifier) ? mappings[identifier] : undefined;
     if (canonical) return canonical;
   }
   return model.id;
@@ -66,9 +71,10 @@ export function canonicalIdForModel(model: Model): string {
 export function findModelForId(
   models: Model[],
   requestedId: string,
+  mappings: ModelIdMappings = MODEL_ID_MAPPINGS,
 ): Model | undefined {
   return (
     models.find((m) => m.id === requestedId) ??
-    models.find((m) => canonicalIdForModel(m) === requestedId)
+    models.find((m) => canonicalIdForModel(m, mappings) === requestedId)
   );
 }

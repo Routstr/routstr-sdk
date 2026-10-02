@@ -31,7 +31,11 @@ const makeModel = (overrides?: Partial<Model>): Model =>
 const createDiscovery = (
   overrides?: Partial<DiscoveryAdapter>
 ): DiscoveryAdapter => ({
-  getCachedModels: () => ({}),
+  getModelIdMappings: () => null,
+    setModelIdMappings: () => {},
+    getModelIdMappingsEvent: () => null,
+    setModelIdMappingsEvent: () => {},
+    getCachedModels: () => ({}),
   setCachedModels: () => {},
   getCachedMints: () => ({}),
   setCachedMints: () => {},
@@ -244,6 +248,25 @@ describe("RoutstrClient failover upstream model forwarding", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveRequestContext forced provider with mappings", () => {
+  it("uses the Nostr snapshot for a forced provider rather than the bundled mapping", async () => {
+    const native = makeModel({ id: "nostr-variant" });
+    const modelManager = {
+      getBaseUrls: () => ["https://provider.example/"],
+      getAllCachedModels: () => ({ "https://provider.example/": [native] }),
+    };
+    const resolved = await resolveRequestContext({
+      modelId: "nostr-canonical",
+      forcedProvider: "https://provider.example/",
+      walletAdapter: createWallet({ getActiveMintUrl: () => "https://mint.example" }),
+      storageAdapter: createStorage(),
+      discoveryAdapter: createDiscovery({
+        getModelIdMappings: () => ({ "nostr-variant": "nostr-canonical" }),
+      }),
+      modelManager: modelManager as any,
+    });
+    expect(resolved.selectedModel.id).toBe("nostr-variant");
+  });
+
   it("resolves a canonical id against a mapped provider-native id", async () => {
     const native = makeModel({ id: "z-ai-glm-5-3" });
     const modelManager = {

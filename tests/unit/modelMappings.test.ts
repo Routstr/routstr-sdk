@@ -90,6 +90,14 @@ describe("findModelForId", () => {
     expect(findModelForId(models, "glm-5.3")?.id).toBe("glm-5.3");
   });
 
+  it("honors a replacement snapshot including an empty one", () => {
+    const models = [makeModel({ id: "z-ai-glm-5-3" })];
+    expect(findModelForId(models, "glm-5.3", {})).toBeUndefined();
+    expect(findModelForId(models, "new-canonical", {
+      "z-ai-glm-5-3": "new-canonical",
+    })?.id).toBe("z-ai-glm-5-3");
+  });
+
   it("returns undefined when nothing matches", () => {
     const models = [makeModel({ id: "claude-opus-5" })];
     expect(findModelForId(models, "glm-5.3")).toBeUndefined();
@@ -139,6 +147,7 @@ const createRegistry = (overrides?: Partial<DiscoveryAdapter>) => {
     getBaseUrlsLastUpdate: () => null,
     setBaseUrlsList: () => {},
     setBaseUrlsLastUpdate: () => {},
+    getModelIdMappings: () => ({ "z-ai-glm-5-3": "glm-5.3" }),
     getRoutstr21Models: () => [],
     setRoutstr21Models: () => {},
     getRoutstr21ModelsLastUpdate: () => null,

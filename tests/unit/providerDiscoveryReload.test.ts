@@ -90,7 +90,7 @@ async function scenario(persistEvents = true) {
       save: () => {
         savedEvents = JSON.parse(
           JSON.stringify(
-            eventStore.getTimeline({ kinds: [38421, 38425, 38423] }),
+            eventStore.getTimeline({ kinds: [38421, 38425, 38423, 38426] }),
           ),
         );
       },
@@ -350,7 +350,7 @@ describe("provider discovery across reloads", () => {
     relay.requests = [];
     const reloaded = await open();
     await reloaded.manager.bootstrapProviders();
-    expect(relay.requests.sort()).toEqual([38421, 38425]);
+    expect(relay.requests.sort()).toEqual([38421, 38425, 38426]);
     expect(reloaded.adapter.getDisabledProviders()).toEqual([]);
   });
 

@@ -1,3 +1,4 @@
+import type { NostrEvent } from "applesauce-core/helpers";
 /**
  * Unit tests: fetchModels cache invariant
  *
@@ -40,7 +41,13 @@ const modelsFor = (id: string): Model[] => [
 function makeAdapter(): DiscoveryAdapter {
   let cachedModels: Record<string, Model[]> = {};
   const lastUpdate = new Map<string, number>();
+  let mappings: import("../../core/modelMappings").ModelIdMappings | null = null;
+  let mappingEvent: NostrEvent | null = null;
   return {
+    getModelIdMappings: () => mappings,
+    setModelIdMappings: value => { mappings = value; },
+    getModelIdMappingsEvent: () => mappingEvent,
+    setModelIdMappingsEvent: value => { mappingEvent = value; },
     getCachedModels: () => cachedModels,
     setCachedModels: (models) => {
       cachedModels = models;
@@ -63,6 +70,7 @@ function makeAdapter(): DiscoveryAdapter {
     getBaseUrlsLastUpdate: () => null,
     setBaseUrlsList: () => {},
     setBaseUrlsLastUpdate: () => {},
+    getModelIdMappingsLastUpdate: () => Date.now(),
     getRoutstr21Models: () => [],
     setRoutstr21Models: () => {},
     getRoutstr21ModelsLastUpdate: () => null,

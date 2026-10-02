@@ -66,7 +66,7 @@ export interface FetchOptions {
   forceRefresh?: boolean;
   /** Nostr pubkey for routstr review/audit events (kind 38425) */
   routstrPubkey?: string;
-  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  /** Nostr pubkey for routstr-21 models (38423) and model ID mappings (38426). Falls back to routstrPubkey. */
   routstrModelsPubkey?: string;
   /** Client mode (xcashu or apikeys) */
   mode?: "xcashu" | "apikeys";

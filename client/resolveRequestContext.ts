@@ -75,7 +75,7 @@ export interface ResolveContextInput {
   providerManager?: ProviderManager;
   /** Nostr pubkey for routstr review/audit events (kind 38425). */
   routstrPubkey?: string;
-  /** Nostr pubkey for the routstr-21 model list only (kind 38423). Falls back to routstrPubkey. */
+  /** Nostr pubkey for routstr-21 models (38423) and model ID mappings (38426). Falls back to routstrPubkey. */
   routstrModelsPubkey?: string;
   /** Optional: injectable logger. */
   logger?: SdkLogger;
@@ -189,9 +189,9 @@ export async function resolveRequestContext(
 
     const cachedModels = modelManager.getAllCachedModels();
     const models = cachedModels[normalizedProvider] || [];
-    // Match by native id or a statically mapped variant/alias of it, so a
+    // Match by native id or a mapped variant/alias of it, so a
     // forced provider also serves requests using the canonical id.
-    const match = findModelForId(models, modelId);
+    const match = findModelForId(models, modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined);
     if (!match) {
       throw new Error(
         `Provider ${normalizedProvider} does not offer model: ${modelId}`

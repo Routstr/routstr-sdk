@@ -38,6 +38,9 @@ export interface SdkStorageState {
     createdAt: number;
     tryCount: number;
   }>>;
+  modelIdMappingsEvent: import("applesauce-core/helpers").NostrEvent | null;
+  modelIdMappings: import("../core/modelMappings").ModelIdMappings | null;
+  lastModelIdMappingsUpdate: number | null;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
   cachedReceiveTokens: Array<{

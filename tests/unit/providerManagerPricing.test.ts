@@ -21,6 +21,10 @@ const makeModel = (overrides?: Partial<Model>): Model => ({
 
 const createRegistry = (overrides?: Partial<DiscoveryAdapter>) => {
   const registry: DiscoveryAdapter = {
+    getModelIdMappings: () => null,
+    setModelIdMappings: () => {},
+    getModelIdMappingsEvent: () => null,
+    setModelIdMappingsEvent: () => {},
     getCachedModels: () => ({}),
     setCachedModels: () => {},
     getCachedMints: () => ({}),
