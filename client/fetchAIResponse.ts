@@ -115,6 +115,8 @@ interface FetchAIResponseClient {
     signal?: AbortSignal;
     /** SDK-pinned model path for this request, if any. */
     autoModelPath?: ModelPathPin;
+    /** Caller forced a provider: never fail over to another node. */
+    pinnedProvider?: boolean;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
 }
@@ -162,6 +164,8 @@ export async function fetchAIResponse(
     let mintUrl: string;
     let client: FetchAIResponseClient;
     let modelPath: ResolvedContext["modelPath"];
+    // A caller-forced provider is a pin: failover must not leave it.
+    let pinnedProvider: boolean | undefined;
     // Identity for cooldown/failover: the requested model, not the chosen
     // provider's native id (undefined for pre-resolved callers, where the
     // client derives it from the selected model).
@@ -222,6 +226,7 @@ export async function fetchAIResponse(
       mintUrl = resolved.mintUrl;
       client = resolved.client;
       modelPath = resolved.modelPath;
+      pinnedProvider = resolved.pinnedProvider;
       requestedModelId = resolved.requestedModelId;
     } else {
       throw new Error(
@@ -268,6 +273,7 @@ export async function fetchAIResponse(
       modelId: requestedModelId ?? selectedModel.id,
       userCacheSecret: options.userCacheSecret,
       signal: options.abortSignal,
+      pinnedProvider,
       autoModelPath: modelPath
         ? { selector: modelPath.selector, satsPricing: modelPath.satsPricing }
         : undefined,

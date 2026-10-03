@@ -124,6 +124,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
   modelId: string;
   proxiedBody: Record<string, unknown>;
   modelPath?: ResolvedContext["modelPath"];
+  pinnedProvider?: boolean;
 }> {
   const {
     modelId,
@@ -151,8 +152,14 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
   // DeepSeek model it ranks the whitelisted model-path nodes ("get baseUrl for model
   // path") and returns the selector to pin; every other model — and every
   // request whose caller pinned its own path — resolves exactly as before.
-  const { client: resolvedClient, baseUrl, mintUrl, selectedModel, modelPath } =
-    await resolveRequestContext({
+  const {
+    client: resolvedClient,
+    baseUrl,
+    mintUrl,
+    selectedModel,
+    modelPath,
+    pinnedProvider,
+  } = await resolveRequestContext({
       modelId,
       forcedProvider,
       inputHeaders: headers,
@@ -209,6 +216,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     path,
     headers: effectiveHeaders,
     modelId,
+    pinnedProvider,
     proxiedBody,
     modelPath,
   };
@@ -220,9 +228,17 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<Response> {
-  const { client, baseUrl, mintUrl, path, headers, modelId, proxiedBody, modelPath } =
-    await resolveRouteRequestContext(options);
-
+  const {
+    client,
+    baseUrl,
+    mintUrl,
+    path,
+    headers,
+    modelId,
+    proxiedBody,
+    modelPath,
+    pinnedProvider,
+  } = await resolveRouteRequestContext(options);
 
   try {
     const response = await client.routeRequest({
@@ -234,6 +250,9 @@ export async function routeRequests(
       mintUrl,
       modelId,
       userCacheSecret: options.userCacheSecret,
+      // The forced provider is a pin: it must reach _handleErrorResponse so a
+      // failed request is not silently re-sent to a different node.
+      pinnedProvider,
       autoModelPath: modelPath?.autoPinned
         ? {
             selector: modelPath.selector,
