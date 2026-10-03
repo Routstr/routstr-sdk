@@ -160,3 +160,36 @@ projection and queries the newly configured author.
 `getModelIdMappingsEvent`, and `setModelIdMappingsEvent`. Persist the signed event
 and retain the parsed projection for synchronous routing. Missing methods produce
 an explicit initialization error rather than silently retaining static mappings.
+### Explicit Lightning provider payments
+
+`LightningPayments` is exported from the root and wallet entrypoints. It does not
+pay invoices or change the default Cashu routing/top-up behavior:
+
+```ts
+const lightning = new LightningPayments();
+const invoice = await lightning.createInvoice({
+  baseUrl: providerUrl, amountSats: 100, purpose: "topup", apiKey: "sk-...",
+});
+// Persist invoice.invoice_id and invoice.bolt11 securely BEFORE external payment.
+const status = await lightning.getInvoiceStatus(providerUrl, invoice.invoice_id);
+if (status.status === "paid") {
+  await lightning.acceptPaidInvoice(providerUrl, status, storageAdapter);
+}
+const refund = await lightning.refundToLightning(providerUrl, "sk-...", "alice@example.com");
+```
+
+Use `purpose: "create"` without an API key for first-time funding. Use
+`recoverInvoice(providerUrl, bolt11)` to recover a lost status response. Status
+and recovery credentials can reveal the new API key; treat them as secrets.
+`acceptPaidInvoice` refuses to overwrite a different local provider key and
+refreshes the actual millisat balance instead of adding invoice value locally.
+`refreshKeyBalance` refreshes an existing key after a confirmed payout.
+
+These operations require canonical `sk-` keys (not Cashu bootstrap tokens) for
+top-up/refund and do not retry mutating requests or follow redirects. Unsupported
+v2 endpoints fail explicitly. Persist pending operations in the application and
+coordinate with active requests/refunds/top-ups. An ambiguous payout must remain
+recoverable; do not delete the credential or assume a timeout means funds did not
+move. Refund results preserve provider claim IDs/statuses; `LightningPaymentError`
+preserves the HTTP status and structured detail for reconciliation. The returned
+refund amount is gross debited balance, not necessarily net Lightning proceeds.
