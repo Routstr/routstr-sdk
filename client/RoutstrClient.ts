@@ -178,6 +178,12 @@ export interface RouteRequestParams {
    * Set by the SDK's automatic model-path pinning (see resolveRequestContext).
    */
   autoModelPath?: ModelPathPin;
+  /**
+   * True when the caller forced a provider (see `forcedProvider` in
+   * resolveRequestContext). A forced provider is a pin: the request must
+   * never fail over to a different node.
+   */
+  pinnedProvider?: boolean;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -657,6 +663,7 @@ export class RoutstrClient {
       // _handleErrorResponse spread ...params, so this is the single place
       // it can get lost.
       autoModelPath: params.autoModelPath,
+      pinnedProvider: params.pinnedProvider,
       requestedModelId: modelId,
     });
 
@@ -816,6 +823,8 @@ export class RoutstrClient {
     signal?: AbortSignal;
     /** SDK-pinned model path for this request, if any. */
     autoModelPath?: ModelPathPin;
+    /** Caller forced a provider: never fail over to another node. */
+    pinnedProvider?: boolean;
     /**
      * The model id the caller originally requested. Cooldown keys, failover
      * candidate search and per-provider model lookup are all keyed by this
@@ -1052,6 +1061,8 @@ export class RoutstrClient {
       signal?: AbortSignal;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
+      /** Caller forced a provider: never fail over to another node. */
+      pinnedProvider?: boolean;
       /** The originally requested model id (see _makeRequest). */
       requestedModelId?: string;
       /** (node, canonical path) candidates already attempted in this request. */
@@ -1888,7 +1899,17 @@ export class RoutstrClient {
     let nextModelPathSelector: string | undefined;
     let nextModelPathPricing: ModelPathSatsPricing | undefined;
     let nextTriedModelPaths: string[] | undefined;
-    if (pinnedModelPath) {
+    if (params.pinnedProvider) {
+      // A caller-forced provider is a pin. Re-sending the same prompt to
+      // another node is exactly what the caller asked us not to do, so a
+      // failed request stays put regardless of the error type. (Retries
+      // against the same provider — topups, mint fallback — still happen.)
+      this._log(
+        "DEBUG",
+        `[RoutstrClient] _handleErrorResponse: not failing over, request is pinned to provider ${baseUrl}`
+      );
+      nextProvider = null;
+    } else if (pinnedModelPath) {
       if (!params.autoModelPath) {
         this._log(
           "DEBUG",
