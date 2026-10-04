@@ -1149,8 +1149,6 @@ export class RoutstrClient {
     );
 
     const upstreamRequestError = isUpstreamRequestError(status, parsedError);
-    // A 404 for an unknown PATH (e.g. /v1/v1/messages) is the caller's
-    // mistake, identical on every node: no cooldown, no failover.
     const unknownPathError = isUnknownPathError(status, parsedError);
     const aggregateFailure = upstreamRequestError || status >= 500 ||
       status === 424 || status === 429 || status === -1;
@@ -1693,6 +1691,9 @@ export class RoutstrClient {
         status === 504 ||
         status === 521) &&
       !tryNextProvider &&
+      // The node rejected the path before charging: the key is untouched
+      // and still serves the paths this node allows, so keep it.
+      !unknownPathError &&
       // An upstream 400/422 rejects the request, not the API key: nothing was
       // charged, so the key keeps its balance for the next request.
       !(this.mode === "apikeys" && upstreamRequestError)
@@ -1701,32 +1702,7 @@ export class RoutstrClient {
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Status ${status} (${status === 429 ? "rate limited" : "auth/server error"}), attempting refund for ${baseUrl}, mode=${this.mode}`
       );
-      if (this.mode === "apikeys" && unknownPathError) {
-        // Recovery is best-effort for a bad request path. A broken refund
-        // route must not replace the original 404; retain failed credentials
-        // for a later sweep and never turn this into provider failover.
-        recoveryAttempted = true;
-        try {
-          const refundResult = await this.balanceManager.refundApiKey({
-            mintUrl,
-            baseUrl,
-            apiKey: token,
-            forceRefund: true,
-          });
-          recoverySucceeded = refundResult.success;
-          if (!refundResult.success) {
-            this._log(
-              "WARN",
-              `[RoutstrClient] _handleErrorResponse: API key recovery failed for unknown path; preserving original 404 and leaving key for sweep`
-            );
-          }
-        } catch {
-          this._log(
-            "WARN",
-            `[RoutstrClient] _handleErrorResponse: API key recovery threw for unknown path; preserving original 404 and leaving key for sweep`
-          );
-        }
-      } else if (this.mode === "apikeys") {
+      if (this.mode === "apikeys") {
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
@@ -1871,10 +1847,8 @@ export class RoutstrClient {
       );
     }
 
-    // Unknown-path 404: payment recovery above has already run. Every node
-    // would 404 the same way, so hand the upstream response back verbatim
-    // instead of failing over or aggregating it into all_providers_failed.
-    if (unknownPathError) {
+    // Unknown-path 404 with no model to fail over on: return it verbatim.
+    if (unknownPathError && !selectedModel) {
       const response = this._upstreamErrorResponse(upstream, responseBody, baseUrl);
       if (response) {
         this._log(
@@ -2249,6 +2223,17 @@ export class RoutstrClient {
       response.headers.delete("x-routstr-error-scope");
       (response as any).passthrough = true;
       return response;
+    }
+
+    // Unknown-path 404 from the last node tried. The path allowlist differs
+    // per node (core version, PROXY_EXTRA_ALLOWED_PATHS), so failover ran
+    // first; when no node serves the path, return its 404 verbatim.
+    if (unknownPathError) {
+      const response = this._upstreamErrorResponse(upstream, responseBody, baseUrl);
+      if (response) {
+        (response as any).passthrough = true;
+        return response;
+      }
     }
 
     throw new FailoverError(

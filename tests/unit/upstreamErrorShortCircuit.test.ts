@@ -317,6 +317,31 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(removeXcashuToken).not.toHaveBeenCalled();
   });
 
+  it("fails an X-Cashu unknown-path 404 over without a strike, keeping an unredeemed token", async () => {
+    const { client, removeXcashuToken, providerManager, spend } = setup("xcashu");
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat", message: "mint unavailable" });
+    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    const fetchMock = stubFetch(
+      {
+        status: 404,
+        statusText: "Not Found",
+        body: JSON.stringify({ error: { type: "not_found", message: "Path '/v1/messages' not found", code: 404 } }),
+        headers: { "x-cashu": "cashu-refund" },
+      },
+      okResponse()
+    );
+
+    const response = await routeRequest(client);
+
+    expect(response.status).toBe(200);
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([`${baseUrl}v1/messages`, `${nextUrl}v1/messages`]);
+    expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
+    expect(cache).toHaveBeenCalledExactlyOnceWith("cashu-refund");
+    expect(removeXcashuToken).not.toHaveBeenCalled();
+    expect(spend).toHaveBeenCalledTimes(2);
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+  });
+
   it("does not inspect or finalize a passthrough event-stream error", async () => {
     const { client, finalize } = setup();
     const body = "data: error\n\n";
