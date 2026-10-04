@@ -17,7 +17,7 @@ import type {
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { RefundResult, TopUpResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
-import { InsufficientBalanceError } from "../core/errors";
+import { InsufficientBalanceError, ProviderMintBalanceError } from "../core/errors";
 import {
   parseCoreError,
   CoreErrorType,
@@ -82,6 +82,20 @@ export interface ProviderTokenResult {
   error?: string;
   selectedMintUrl?: string;
   amountSpent?: number;
+  /** True when the wallet is funded, but not on a mint this provider accepts. */
+  providerMintsShort?: boolean;
+  /** Provider the token was requested for (when providerMintsShort). */
+  providerBaseUrl?: string;
+  /** Mints the provider advertises as accepted (when providerMintsShort). */
+  acceptedMints?: string[];
+  /** Amount the provider-mint shortfall needed. */
+  requiredAmount?: number;
+  /** Total wallet balance at the time of the shortfall. */
+  availableBalance?: number;
+  /** Largest balance among the provider's accepted mints. */
+  maxMintBalance?: number;
+  /** Mint URL of `maxMintBalance`. */
+  maxMintUrl?: string;
 }
 
 export interface BalanceState {
@@ -574,6 +588,13 @@ export class BalanceManager {
         return {
           success: false,
           message: tokenResult.error || "Unable to create top up token",
+          providerMintsShort: tokenResult.providerMintsShort,
+          providerBaseUrl: tokenResult.providerBaseUrl,
+          acceptedMints: tokenResult.acceptedMints,
+          required: tokenResult.requiredAmount,
+          available: tokenResult.availableBalance,
+          maxMintBalance: tokenResult.maxMintBalance,
+          maxMintUrl: tokenResult.maxMintUrl,
         };
       }
 
@@ -605,10 +626,15 @@ export class BalanceManager {
           this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
         }
 
-        // A foreign-mint swap failure can be retried against the same provider
-        // with another mint it advertises only after successful recovery.
-        // Keep the exclusion local to this
-        // topup operation; fee/amount and unknown mint errors do not qualify.
+        // A foreign-mint swap failure / untrusted source mint can be retried
+        // against the same provider with another mint it advertises only after
+        // the failed token has been successfully recovered. The recovery gate
+        // is deliberate: a failed recovery means the token's fate is unknown
+        // (the proofs may still be in flight), so spending a second token
+        // could double-charge. Recovery failures are covered by provider
+        // failover instead (see RoutstrClient._handleErrorResponse). Keep the
+        // exclusion local to this topup operation; fee/amount and unknown mint
+        // errors do not qualify.
         if (
           recoveredToken &&
           tokenResult.selectedMintUrl &&
@@ -739,14 +765,59 @@ export class BalanceManager {
     if (candidates.length === 0) {
       let maxBalance = 0;
       let maxMintUrl = "";
-      for (const mintUrl in balances) {
-        const balance = balances[mintUrl];
-        const unit = units[mintUrl];
-        const balanceInSats = getBalanceInSats(balance, unit);
+      // Largest balance among the mints this provider will actually accept,
+      // and largest funded balance outside that set. The former gives an
+      // honest provider-scoped message; the latter distinguishes a
+      // provider-mint shortfall from genuine wallet exhaustion.
+      let acceptableMaxBalance = 0;
+      let acceptableMaxMintUrl = "";
+      let fundedOutsideBalance = 0;
+      for (const url in balances) {
+        const balanceInSats = getBalanceInSats(balances[url], units[url]);
         if (balanceInSats > maxBalance) {
           maxBalance = balanceInSats;
-          maxMintUrl = mintUrl;
+          maxMintUrl = url;
         }
+        const accepted = !supportedMintsOnly || providerMints.includes(url);
+        if (accepted) {
+          if (balanceInSats > acceptableMaxBalance) {
+            acceptableMaxBalance = balanceInSats;
+            acceptableMaxMintUrl = url;
+          }
+        } else if (balanceInSats > fundedOutsideBalance) {
+          fundedOutsideBalance = balanceInSats;
+        }
+      }
+
+      // A funded mint outside the provider's advertised set that could cover
+      // the request means this is a provider-mint shortfall, not wallet
+      // exhaustion: another provider may accept that mint.
+      const providerMintsShort =
+        supportedMintsOnly && fundedOutsideBalance >= requiredAmount;
+
+      if (providerMintsShort) {
+        this.logger.error(
+          `createProviderToken: no mint accepted by provider required=${requiredAmount} baseUrl=${baseUrl} accepted=[${providerMints.join(", ")}] fundedOutside=${fundedOutsideBalance} acceptableMax=${acceptableMaxBalance}`
+        );
+        const error = new ProviderMintBalanceError(
+          requiredAmount,
+          totalMintBalance,
+          baseUrl,
+          providerMints,
+          acceptableMaxBalance,
+          acceptableMaxMintUrl
+        );
+        return {
+          success: false,
+          error: error.message,
+          providerMintsShort: true,
+          providerBaseUrl: baseUrl,
+          acceptedMints: providerMints,
+          requiredAmount,
+          availableBalance: totalMintBalance,
+          maxMintBalance: acceptableMaxBalance,
+          maxMintUrl: acceptableMaxMintUrl,
+        };
       }
 
       this.logger.error(`createProviderToken: no candidate mints required=${requiredAmount} totalMint=${totalMintBalance} maxBalance=${maxBalance} maxMint=${maxMintUrl}`);

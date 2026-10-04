@@ -1353,6 +1353,30 @@ describe("ProviderManager", () => {
       vi.unstubAllGlobals();
     });
 
+    it("filters mint-incompatible and explicitly excluded nodes before fetching paths", async () => {
+      const fetch = stubPathsFetch({
+        [NODE_A]: pathsPayload([{path: DEEPSEEK_SELECTOR, completion: 1}]),
+        [NODE_B]: pathsPayload([{path: DEEPSEEK_SELECTOR, completion: 2}]),
+      });
+      const registry = pathRegistry();
+      registry.getCachedMints = () => ({
+        [`${NODE_A}/`]: ["https://mint-a.example"],
+        [`${NODE_B}/`]: ["https://mint-b.example"],
+      });
+      const manager = new ProviderManager(registry);
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID, {
+        acceptableMintUrls: ["https://mint-b.example"],
+      });
+      expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const excluded = await manager.getModelPathProviderRanking(MODEL_ID, {
+        acceptableMintUrls: ["https://mint-b.example"],
+        excludeBaseUrls: new Set([`${NODE_B}/`]),
+      });
+      expect(excluded).toEqual([]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
     it("ranks whitelisted nodes by per-route completion price", async () => {
       stubPathsFetch({
         [NODE_A]: pathsPayload([

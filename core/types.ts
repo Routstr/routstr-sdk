@@ -136,6 +136,16 @@ export interface SpendResult {
     available: number;
     maxMintBalance: number;
     maxMintUrl: string;
+    /**
+     * True when the wallet has funds, but none on a mint the provider
+     * accepts (or its accepted mints cannot cover the amount). Callers must
+     * fail over rather than report total wallet exhaustion.
+     */
+    providerMintsShort?: boolean;
+    /** Provider whose advertised mints the wallet cannot fund. */
+    providerBaseUrl?: string;
+    /** Mints the provider advertises as accepted. */
+    acceptedMints?: string[];
   };
 }
 
@@ -169,6 +179,24 @@ export interface TopUpResult {
   recoveredToken?: boolean;
   /** Structured routstr-core error when the provider returned one. */
   parsedError?: import("./errorTypes").ParsedCoreError;
+  /**
+   * True when the top-up could not be funded because the target provider
+   * accepts none of the wallet's funded mints. Distinct from wallet
+   * exhaustion: the caller should try a provider that accepts a funded mint.
+   */
+  providerMintsShort?: boolean;
+  /** Provider the top-up was aimed at (when providerMintsShort). */
+  providerBaseUrl?: string;
+  /** Mints the target provider accepts (when providerMintsShort). */
+  acceptedMints?: string[];
+  /** Amount the provider-mint shortfall needed (when providerMintsShort). */
+  required?: number;
+  /** Total wallet balance available (when providerMintsShort). */
+  available?: number;
+  /** Largest balance among the provider's accepted mints. */
+  maxMintBalance?: number;
+  /** Mint URL of `maxMintBalance`. */
+  maxMintUrl?: string;
 }
 
 /**

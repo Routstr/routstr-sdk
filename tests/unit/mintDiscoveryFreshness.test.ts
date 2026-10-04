@@ -111,4 +111,30 @@ describe("MintDiscovery freshness", () => {
     // A is fresh in the in-memory clock; B failed and must be retried.
     expect(urls).toEqual([`${PROVIDER_B}v1/info`]);
   });
+
+  it("preserves known restrictions and info when a forced refresh fails", async () => {
+    const adapter = makeAdapter();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(infoResponse())
+      .mockRejectedValueOnce(new Error("fetch failed")));
+    const discovery = new MintDiscovery(adapter, {logger: silentLogger});
+    await discovery.discoverMints([PROVIDER_A]);
+    const before = adapter.getCachedProviderInfo();
+    await discovery.discoverMints([PROVIDER_A], {forceRefresh: true});
+    expect(adapter.getCachedMints()[PROVIDER_A]).toEqual(["https://mint.example.com"]);
+    expect(adapter.getCachedProviderInfo()).toEqual(before);
+  });
+
+  it("merges partial refreshes and accepts successful changed advertisements", async () => {
+    const adapter = makeAdapter();
+    adapter.setCachedMints({[PROVIDER_B]: ["https://mint-b.example"]});
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(infoResponse())
+      .mockResolvedValueOnce(Response.json({mints: []})));
+    const discovery = new MintDiscovery(adapter, {logger: silentLogger});
+    await discovery.discoverMints([PROVIDER_A]);
+    expect(adapter.getCachedMints()[PROVIDER_B]).toEqual(["https://mint-b.example"]);
+    await discovery.discoverMints([PROVIDER_A], {forceRefresh: true});
+    expect(adapter.getCachedMints()[PROVIDER_A]).toEqual([]);
+    expect(adapter.getCachedMints()[PROVIDER_B]).toEqual(["https://mint-b.example"]);
+  });
+
 });
