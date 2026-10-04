@@ -1,8 +1,7 @@
 name: Publish
 
-# Publishes @routstr/sdk to npm whenever a GitHub Release is published
-# (e.g. the "v0.4.8" release). Uses npm Trusted Publishing (OIDC) — no
-# NPM_TOKEN secret is stored anywhere.
+# Publishes @routstr/sdk to npm whenever a v* tag is pushed (e.g. v0.4.9).
+# Uses npm Trusted Publishing (OIDC) — no NPM_TOKEN secret is stored anywhere.
 #
 # One-time setup on npm:
 #   npm trust github @routstr/sdk \
@@ -10,16 +9,17 @@ name: Publish
 #     --repo Routstr/routstr-sdk \
 #     --allow-publish
 #
-# Then: bump package.json, commit, tag (vX.Y.Z), push tag, publish a GitHub
-# Release -> this workflow builds, tests, verifies the tag, and publishes.
+# Then: bump package.json, commit, tag (vX.Y.Z), push the tag -> this workflow
+# builds, tests, verifies the tag, and publishes to npm.
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish (e.g. v0.4.8)"
+        description: "Existing tag to publish (e.g. v0.4.9)"
         required: true
 
 permissions:
@@ -41,8 +41,8 @@ jobs:
       - name: Resolve tag
         id: ref
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
