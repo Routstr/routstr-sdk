@@ -27,6 +27,41 @@ export class InsufficientBalanceError extends Error {
   }
 }
 
+/**
+ * Error thrown when the wallet holds funds, but none on a mint the target
+ * provider accepts (or its accepted mints cannot cover the amount).
+ *
+ * Distinct from `InsufficientBalanceError` because a different provider may
+ * accept a mint that is funded: callers should fail over rather than treat
+ * this as total wallet exhaustion. It still extends
+ * `InsufficientBalanceError` so a genuine exhaustion (no provider can be
+ * funded) keeps the public 402 contract.
+ */
+export class ProviderMintBalanceError extends InsufficientBalanceError {
+  constructor(
+    required: number,
+    available: number,
+    public providerBaseUrl: string,
+    public acceptedMints: string[],
+    maxMintBalance: number = 0,
+    maxMintUrl: string = ""
+  ) {
+    const mintList =
+      acceptedMints.length > 0 ? acceptedMints.join(", ") : "none advertised";
+    super(
+      required,
+      available,
+      maxMintBalance,
+      maxMintUrl,
+      `No funded mint accepted by ${providerBaseUrl}: need ${required} sats on one of: ${mintList}` +
+        (maxMintBalance > 0
+          ? ` (largest accepted mint balance: ${maxMintBalance} sats from ${maxMintUrl})`
+          : "")
+    );
+    this.name = "ProviderMintBalanceError";
+  }
+}
+
 /** Wire-level detail of an upstream error response, preserved so callers can forward it. */
 export interface UpstreamEnvelope {
   status: number;

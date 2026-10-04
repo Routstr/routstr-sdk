@@ -30,6 +30,7 @@ import {
   ProviderError,
   FailoverError,
   InsufficientBalanceError,
+  ProviderMintBalanceError,
   TokenAlreadySpentError,
   MintError,
   InvalidTokenError,
@@ -351,7 +352,7 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
-    const prepared = await this._prepareRoutedRequest(params);
+    const prepared = await this._prepareRoutedRequestWithMintFailover(params);
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
@@ -405,6 +406,49 @@ export class RoutstrClient {
 
     await runFinalize();
     return prepared.response;
+  }
+
+  /**
+   * Run the initial deposit, failing over to another provider when the
+   * wallet cannot fund any mint the selected provider accepts.
+   *
+   * The post-key 402 path already fails over; without this the very first
+   * deposit (no key yet) hard-failed with a 402 even though another provider
+   * accepted a funded mint.
+   */
+  private async _prepareRoutedRequestWithMintFailover(
+    params: RouteRequestParams
+  ): Promise<Awaited<ReturnType<RoutstrClient["_prepareRoutedRequest"]>>> {
+    let current = params;
+    const attempted = new Set<string>();
+    for (;;) {
+      try {
+        return await this._prepareRoutedRequest(current);
+      } catch (error) {
+        if (!(error instanceof ProviderMintBalanceError)) throw error;
+        attempted.add(current.baseUrl);
+        if (!current.modelId) throw error;
+        const fundedMints = Object.entries(
+          await this.walletAdapter.getBalances()
+        )
+          .filter(([, balance]) => typeof balance === "number" && balance > 0)
+          .map(([mintUrl]) =>
+            mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl
+          );
+        const nextProvider = this._findNextBestProvider(
+          current.modelId,
+          current.baseUrl,
+          attempted,
+          fundedMints
+        );
+        if (!nextProvider || attempted.has(nextProvider)) throw error;
+        this._log(
+          "WARN",
+          `[RoutstrClient] routeRequest: provider-mint shortfall on ${current.baseUrl}; failing over to ${nextProvider}`
+        );
+        current = { ...current, baseUrl: nextProvider };
+      }
+    }
   }
 
   private async _prepareRoutedRequest(params: RouteRequestParams): Promise<{
@@ -961,6 +1005,32 @@ export class RoutstrClient {
   }
 
   /**
+   * Mint-aware failover candidate search. Omits the mint option entirely
+   * when the wallet has no funded mints, so providers are never filtered on
+   * an empty set (and callers/tests observe the plain three-argument call).
+   */
+  private _findNextBestProvider(
+    modelId: string,
+    currentBaseUrl: string,
+    attempted: ReadonlySet<string>,
+    fundedMints: string[]
+  ): string | null {
+    if (fundedMints.length === 0) {
+      return this.providerManager.findNextBestProvider(
+        modelId,
+        currentBaseUrl,
+        attempted
+      );
+    }
+    return this.providerManager.findNextBestProvider(
+      modelId,
+      currentBaseUrl,
+      attempted,
+      { acceptableMintUrls: fundedMints }
+    );
+  }
+
+  /**
    * Handle error responses with failover
    */
   private async _handleErrorResponse(
@@ -1015,6 +1085,17 @@ export class RoutstrClient {
     let recoverySucceeded = false;
     // Thrown only once no other provider is left to try.
     let insufficientBalance: InsufficientBalanceError | undefined;
+    // A provider-mint shortfall is retryable: another provider may accept a
+    // mint this one does not. Deferred so it surfaces (as a 402) only when
+    // every provider is exhausted, never mid-failover.
+    let providerMintBalance: ProviderMintBalanceError | undefined;
+    // routstr-core's own API-key balance error authorizes a top-up. It is a
+    // local wallet condition, so the provider must not be cooled down for it.
+    const localWalletShortfall =
+      this.mode === "apikeys" &&
+      status === 402 &&
+      parsedError.type === CoreErrorType.INSUFFICIENT_QUOTA &&
+      parsedError.code === CoreErrorCode.INSUFFICIENT_BALANCE;
 
     this._log(
       "DEBUG",
@@ -1366,13 +1447,39 @@ export class RoutstrClient {
 
           if (!topupResult.success) {
             const message = topupResult.message || "";
-            if (message.includes("Insufficient balance")) {
-              const needMatch = message.match(/need (\d+)/);
-              const haveMatch = message.match(/have (\d+)/);
+            if (topupResult.providerMintsShort) {
+              // The wallet is funded, but not on a mint this provider
+              // accepts. Fail over to a provider that does; only surface
+              // this (as a 402) if every provider is exhausted.
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: provider-mint shortfall for ${baseUrl}; trying next provider`
+              );
+              providerMintBalance = new ProviderMintBalanceError(
+                topupResult.required ?? params.requiredSats,
+                topupResult.available ?? 0,
+                topupResult.providerBaseUrl ?? baseUrl,
+                topupResult.acceptedMints ?? [],
+                topupResult.maxMintBalance ?? 0,
+                topupResult.maxMintUrl ?? ""
+              );
+              tryNextProvider = true;
+            } else if (message.includes("Insufficient balance")) {
+              // Parse decimals and the largest-mint hint so the final 402
+              // JSON reports the real shortfall instead of 0/"".
+              const needMatch = message.match(/need ([\d.]+)/);
+              const haveMatch = message.match(/have ([\d.]+)/);
+              const maxMintMatch = message.match(
+                /Largest mint balance: ([\d.]+) sats from (\S+)/
+              );
               const required = needMatch
-                ? parseInt(needMatch[1], 10)
+                ? parseFloat(needMatch[1])
                 : params.requiredSats;
-              const available = haveMatch ? parseInt(haveMatch[1], 10) : 0;
+              const available = haveMatch ? parseFloat(haveMatch[1]) : 0;
+              const maxMintBalance = maxMintMatch
+                ? parseFloat(maxMintMatch[1])
+                : 0;
+              const maxMintUrl = maxMintMatch ? maxMintMatch[2] : "";
               this._log(
                 "DEBUG",
                 `[RoutstrClient] _handleErrorResponse: Insufficient balance, need=${required}, have=${available}; trying next provider`
@@ -1381,8 +1488,8 @@ export class RoutstrClient {
               insufficientBalance = new InsufficientBalanceError(
                 required,
                 available,
-                0,
-                "",
+                maxMintBalance,
+                maxMintUrl,
                 message
               );
               tryNextProvider = true;
@@ -1699,7 +1806,7 @@ export class RoutstrClient {
       pinnedModelPath,
       params.requestedModelId
     );
-    if (!upstreamRequestError && !unknownPathError) {
+    if (!upstreamRequestError && !unknownPathError && !localWalletShortfall) {
       this.providerManager.markFailed(
         baseUrl,
         failReason,
@@ -1766,6 +1873,17 @@ export class RoutstrClient {
       selectedModel,
       params.requestedModelId
     );
+    // Funded mints the wallet can spend from. Used to prefer a failover
+    // target that accepts one, so we do not bounce off a node whose mints
+    // the wallet cannot fund.
+    const fundedMintUrlsForFailover = Object.entries(
+      await this.walletAdapter.getBalances()
+    )
+      .filter(([, balance]) => typeof balance === "number" && balance > 0)
+      .map(([mintUrl]) =>
+        mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl
+      );
+
     let nextProvider: string | null;
     let nextModelPathSelector: string | undefined;
     let nextModelPathPricing: ModelPathSatsPricing | undefined;
@@ -1810,10 +1928,11 @@ export class RoutstrClient {
         }
       }
     } else {
-      nextProvider = this.providerManager.findNextBestProvider(
+      nextProvider = this._findNextBestProvider(
         failoverModelId,
         baseUrl,
-        failures.attemptedProviders
+        failures.attemptedProviders,
+        fundedMintUrlsForFailover
       );
     }
 
@@ -1822,140 +1941,183 @@ export class RoutstrClient {
     }
 
     if (nextProvider) {
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${failoverModelId}`
-      );
-      // Get new model for this provider
-      const newModel =
-        (await this.providerManager.getModelForProvider(
-          nextProvider,
-          failoverModelId
-        )) ?? selectedModel;
+      // Candidate mints the wallet can fund; a provider that accepts none of
+      // them cannot be funded even though it serves the model.
+      const attemptedForSpend = new Set(failures.attemptedProviders);
+      let spendResult:
+        | Awaited<ReturnType<RoutstrClient["_spendToken"]>>
+        | undefined;
+      let newModel: Model = selectedModel;
+      let newRequiredSats = params.requiredSats;
 
-      const messagesForPricing = Array.isArray(
-        (body as { messages?: unknown })?.messages
-      )
-        ? ((body as { messages?: unknown }).messages as any[])
-        : [];
-
-      const newRequiredSats =
-        this.providerManager.getRequiredSatsForModel(
-          newModel,
-          messagesForPricing,
-          params.maxTokens,
-          body && typeof body === "object"
-            ? (body as Record<string, unknown>)
-            : undefined,
-          nextModelPathPricing
-        );
-
-      if (params.tinfoilEnabled) {
+      while (nextProvider) {
         this._log(
           "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Attesting Tinfoil failover provider ${nextProvider} before spend`
+          `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${failoverModelId}`
         );
-        await prepareTinfoilClient({ baseUrl: nextProvider });
+        // Get new model for this provider
+        newModel =
+          (await this.providerManager.getModelForProvider(
+            nextProvider,
+            failoverModelId
+          )) ?? selectedModel;
+
+        const messagesForPricing = Array.isArray(
+          (body as { messages?: unknown })?.messages
+        )
+          ? ((body as { messages?: unknown }).messages as any[])
+          : [];
+
+        newRequiredSats =
+          this.providerManager.getRequiredSatsForModel(
+            newModel,
+            messagesForPricing,
+            params.maxTokens,
+            body && typeof body === "object"
+              ? (body as Record<string, unknown>)
+              : undefined,
+            nextModelPathPricing
+          );
+
+        if (params.tinfoilEnabled) {
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Attesting Tinfoil failover provider ${nextProvider} before spend`
+          );
+          await prepareTinfoilClient({ baseUrl: nextProvider });
+        }
+
+        this._log(
+          "DEBUG",
+          `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
+        );
+        // Mint exclusions are scoped to a provider attempt. A different
+        // provider may successfully handle the same mint, so do not carry the
+        // previous provider's rejection into cross-provider failover.
+        try {
+          spendResult = await this._spendToken({
+            mintUrl,
+            amount: newRequiredSats,
+            baseUrl: nextProvider,
+          });
+          break;
+        } catch (error) {
+          if (error instanceof ProviderMintBalanceError) {
+            // The wallet cannot fund any mint this provider accepts. Keep
+            // failing over to a provider that accepts a funded mint (fail
+            // open when its mint list is unknown). A caller-pinned request
+            // must not switch providers.
+            if (pinnedModelPath) throw error;
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: provider-mint shortfall on ${nextProvider}; trying another provider`
+            );
+            providerMintBalance = providerMintBalance ?? error;
+            attemptedForSpend.add(nextProvider);
+            nextProvider = this._findNextBestProvider(
+              failoverModelId,
+              baseUrl,
+              attemptedForSpend,
+              fundedMintUrlsForFailover
+            );
+            if (nextProvider && attemptedForSpend.has(nextProvider)) {
+              nextProvider = null;
+            }
+            continue;
+          }
+          if (parsedError.type === CoreErrorType.MINT_ERROR) {
+            throw new MintError({
+              baseUrl,
+              statusCode: status,
+              mintUrl: params.selectedMintUrl || mintUrl,
+              code: parsedError.code,
+              parsedError,
+              requestId: resolvedRequestId,
+            });
+          }
+          if (handledRedemptionError) {
+            throw this._createRedemptionError({
+              parsedError,
+              baseUrl,
+              status,
+              mintUrl: params.selectedMintUrl || mintUrl,
+              requestId: resolvedRequestId,
+              recoveryAttempted,
+              recoverySucceeded,
+            });
+          }
+          throw error;
+        }
       }
 
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _handleErrorResponse: Creating new token for failover provider ${nextProvider}, required sats: ${newRequiredSats}`
-      );
-      // Mint exclusions are scoped to a provider attempt. A different
-      // provider may successfully handle the same mint, so do not carry the
-      // previous provider's rejection into cross-provider failover.
-      let spendResult: Awaited<ReturnType<RoutstrClient["_spendToken"]>>;
-      try {
-        spendResult = await this._spendToken({
-          mintUrl,
-          amount: newRequiredSats,
-          baseUrl: nextProvider,
+      if (spendResult?.token) {
+        // Retry with new provider (reset retry count). Attach the balance that
+        // was observed before the retry request so callers do not have to query
+        // after the provider may already have charged the request.
+        // The failover target may serve the model under a different native id
+        // (static mapping), so forward newModel.id, not the original body model.
+        const bodyObj =
+          body && typeof body === "object"
+            ? (body as Record<string, unknown>)
+            : undefined;
+        const retryBody =
+          bodyObj && typeof bodyObj.model === "string"
+            ? { ...bodyObj, model: newModel.id }
+            : body;
+        // An auto-pinned request swaps its selector for one the new node
+        // advertised; the failed node's selector is never forwarded.
+        const retryBaseHeaders = { ...params.baseHeaders };
+        if (nextModelPathSelector !== undefined) {
+          retryBaseHeaders[MODEL_PATH_HEADER] = nextModelPathSelector;
+        }
+        const retryResponse = await this._makeRequest({
+          ...params,
+          path,
+          method,
+          body: retryBody,
+          baseUrl: nextProvider!,
+          baseHeaders: retryBaseHeaders,
+          selectedModel: newModel,
+          token: spendResult.token!,
+          selectedMintUrl: spendResult.selectedMintUrl,
+          excludeMints: undefined,
+          triedModelPaths: nextTriedModelPaths ?? params.triedModelPaths,
+          requiredSats: newRequiredSats,
+          autoModelPath:
+            nextModelPathSelector !== undefined
+              ? {
+                  selector: nextModelPathSelector,
+                  satsPricing: nextModelPathPricing,
+                }
+              : undefined,
+          headers: this._withAuthAndTinfoilHeaders(
+            retryBaseHeaders,
+            spendResult.token!,
+            params.tinfoilEnabled,
+            newModel.id
+          ),
+          retryCount: 0,
         });
-      } catch (error) {
-        if (parsedError.type === CoreErrorType.MINT_ERROR) {
-          throw new MintError({
-            baseUrl,
-            statusCode: status,
-            mintUrl: params.selectedMintUrl || mintUrl,
-            code: parsedError.code,
-            parsedError,
-            requestId: resolvedRequestId,
-          });
-        }
-        if (handledRedemptionError) {
-          throw this._createRedemptionError({
-            parsedError,
-            baseUrl,
-            status,
-            mintUrl: params.selectedMintUrl || mintUrl,
-            requestId: resolvedRequestId,
-            recoveryAttempted,
-            recoverySucceeded,
-          });
-        }
-        throw error;
+        (retryResponse as any).initialTokenBalanceInSats =
+          spendResult.tokenBalanceUnit === "msat"
+            ? spendResult.tokenBalance / 1000
+            : spendResult.tokenBalance;
+        (retryResponse as any).initialTokenBalanceUnknown =
+          spendResult.tokenBalanceUnknown;
+        return retryResponse;
       }
-
-      // Retry with new provider (reset retry count). Attach the balance that
-      // was observed before the retry request so callers do not have to query
-      // after the provider may already have charged the request.
-      // The failover target may serve the model under a different native id
-      // (static mapping), so forward newModel.id, not the original body model.
-      const bodyObj =
-        body && typeof body === "object"
-          ? (body as Record<string, unknown>)
-          : undefined;
-      const retryBody =
-        bodyObj && typeof bodyObj.model === "string"
-          ? { ...bodyObj, model: newModel.id }
-          : body;
-      // An auto-pinned request swaps its selector for one the new node
-      // advertised; the failed node's selector is never forwarded.
-      const retryBaseHeaders = { ...params.baseHeaders };
-      if (nextModelPathSelector !== undefined) {
-        retryBaseHeaders[MODEL_PATH_HEADER] = nextModelPathSelector;
-      }
-      const retryResponse = await this._makeRequest({
-        ...params,
-        path,
-        method,
-        body: retryBody,
-        baseUrl: nextProvider,
-        baseHeaders: retryBaseHeaders,
-        selectedModel: newModel,
-        token: spendResult.token!,
-        selectedMintUrl: spendResult.selectedMintUrl,
-        excludeMints: undefined,
-        triedModelPaths: nextTriedModelPaths ?? params.triedModelPaths,
-        requiredSats: newRequiredSats,
-        autoModelPath:
-          nextModelPathSelector !== undefined
-            ? {
-                selector: nextModelPathSelector,
-                satsPricing: nextModelPathPricing,
-              }
-            : undefined,
-        headers: this._withAuthAndTinfoilHeaders(
-          retryBaseHeaders,
-          spendResult.token!,
-          params.tinfoilEnabled,
-          newModel.id
-        ),
-        retryCount: 0,
-      });
-      (retryResponse as any).initialTokenBalanceInSats =
-        spendResult.tokenBalanceUnit === "msat"
-          ? spendResult.tokenBalance / 1000
-          : spendResult.tokenBalance;
-      (retryResponse as any).initialTokenBalanceUnknown =
-        spendResult.tokenBalanceUnknown;
-      return retryResponse;
+      // No provider left that the wallet can fund. Fall through to the
+      // exhaustion handling below, which surfaces the deferred
+      // provider-mint / insufficient-balance error.
     }
 
     // No more providers to try. If the root cause was a specific core error
     // type (e.g. token_already_spent), surface that instead of a generic
     // FailoverError so callers can branch on the specific failure.
+    // A provider-mint shortfall that survived every provider is genuine
+    // exhaustion from this request's perspective: surface the honest 402.
+    if (providerMintBalance) throw providerMintBalance;
+
     if (insufficientBalance) throw insufficientBalance;
 
     if (parsedError.type === CoreErrorType.TOKEN_ALREADY_SPENT) {

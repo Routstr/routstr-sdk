@@ -13,7 +13,7 @@
 import type { WalletAdapter, StorageAdapter } from "./interfaces";
 import type { SpendResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
-import { InsufficientBalanceError } from "../core/errors";
+import { InsufficientBalanceError, ProviderMintBalanceError } from "../core/errors";
 import {
   CoreErrorType,
   isHandledRedemptionError,
@@ -265,6 +265,16 @@ export class CashuSpender {
         }
 
         if (result.errorDetails) {
+          if (result.errorDetails.providerMintsShort) {
+            throw new ProviderMintBalanceError(
+              result.errorDetails.required,
+              result.errorDetails.available,
+              result.errorDetails.providerBaseUrl ?? baseUrl,
+              result.errorDetails.acceptedMints ?? [],
+              result.errorDetails.maxMintBalance,
+              result.errorDetails.maxMintUrl
+            );
+          }
           throw new InsufficientBalanceError(
             result.errorDetails.required,
             result.errorDetails.available,
@@ -387,6 +397,29 @@ export class CashuSpender {
       });
 
       if (!tokenResult.success || !tokenResult.token) {
+        if (tokenResult.providerMintsShort) {
+          // The wallet has funds, but not on a mint this provider accepts.
+          // Surface a distinct signal so routing fails over to a provider
+          // that does accept a funded mint instead of reporting exhaustion.
+          return {
+            token: null,
+            status: "failed",
+            balance: 0,
+            error:
+              tokenResult.error ||
+              "No funded mint accepted by provider",
+            errorDetails: {
+              required: adjustedAmount,
+              available: totalAvailableBalance,
+              maxMintBalance: tokenResult.maxMintBalance ?? 0,
+              maxMintUrl: tokenResult.maxMintUrl ?? "",
+              providerMintsShort: true,
+              providerBaseUrl: tokenResult.providerBaseUrl,
+              acceptedMints: tokenResult.acceptedMints,
+            },
+          };
+        }
+
         if ((tokenResult.error || "").includes("Insufficient balance")) {
           return this._createInsufficientBalanceError(
             adjustedAmount,

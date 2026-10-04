@@ -290,4 +290,108 @@ describe("RoutstrClient 402 top-up validation", () => {
       handle402(client, localInsufficientBalanceBody)
     ).rejects.toBeInstanceOf(InsufficientBalanceError);
   });
+
+  it("fails over when the top-up cannot fund any mint the provider accepts", async () => {
+    const NEXT_URL = "https://next.example.com/";
+    const { client, providerManager } = createClient(NEXT_URL);
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 20_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    vi.spyOn(balanceManager, "topUp").mockResolvedValue({
+      success: false,
+      providerMintsShort: true,
+      providerBaseUrl: BASE_URL,
+      acceptedMints: ["https://mint.accepted.example"],
+      required: 100,
+      available: 20,
+      maxMintBalance: 0,
+      maxMintUrl: "",
+      message: "No funded mint accepted by provider",
+    });
+    const spend = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "tok-next",
+      tokenBalance: 1000,
+      tokenReserved: 0,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+      selectedMintUrl: "https://mint.accepted.example",
+    });
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(
+      new Response("ok", { status: 200 })
+    );
+
+    const response = await handle402(client, localInsufficientBalanceBody);
+
+    expect(response.status).toBe(200);
+    expect(spend).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: NEXT_URL })
+    );
+    // A local wallet condition must not cool the provider down.
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an honest provider-mint 402 only after every provider is exhausted", async () => {
+    const { client, providerManager } = createClient();
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 20_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    vi.spyOn(balanceManager, "topUp").mockResolvedValue({
+      success: false,
+      providerMintsShort: true,
+      providerBaseUrl: BASE_URL,
+      acceptedMints: ["https://mint.accepted.example"],
+      required: 100,
+      available: 20,
+      maxMintBalance: 5,
+      maxMintUrl: "https://mint.accepted.example",
+      message: "No funded mint accepted by provider",
+    });
+
+    await expect(
+      handle402(client, localInsufficientBalanceBody)
+    ).rejects.toMatchObject({
+      name: "ProviderMintBalanceError",
+      required: 100,
+      available: 20,
+      maxMintBalance: 5,
+      maxMintUrl: "https://mint.accepted.example",
+      acceptedMints: ["https://mint.accepted.example"],
+    });
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+  });
+
+  it("parses decimal balances and the largest-mint hint for a true wallet 402", async () => {
+    const { client, providerManager } = createClient();
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 20_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    vi.spyOn(balanceManager, "topUp").mockResolvedValue({
+      success: false,
+      message:
+        "Insufficient balance: need 100.5 sats, have 20.25 sats available. Largest mint balance: 15.75 sats from https://mint.small.example",
+    });
+
+    await expect(
+      handle402(client, localInsufficientBalanceBody)
+    ).rejects.toMatchObject({
+      name: "InsufficientBalanceError",
+      required: 100.5,
+      available: 20.25,
+      maxMintBalance: 15.75,
+      maxMintUrl: "https://mint.small.example",
+    });
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+  });
 });

@@ -174,6 +174,36 @@ export async function resolveRequestContext(
     providedProviderManager ??
     new ProviderManager(discoveryAdapter, sdkStore, logger);
 
+  // ── Wallet-funded mints (for mint-aware provider selection) ─────────
+  // Provider selection must not land on the cheapest node that accepts
+  // none of the mints the wallet can actually spend from: the request would
+  // hard-fail (or pay for a round trip) even though another node accepts a
+  // funded mint. When the mint cache is cold every provider is acceptable,
+  // so behavior is unchanged until discovery populates it.
+  const normalizeMint = (mintUrl: string): string =>
+    mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl;
+  const walletBalances = await walletAdapter.getBalances();
+  const fundedMints = Object.entries(walletBalances)
+    .filter(([, balance]) => typeof balance === "number" && balance > 0)
+    .map(([mintUrl]) => normalizeMint(mintUrl));
+  const fundedMintSet = new Set(fundedMints);
+  const providerAcceptsAnyFundedMint = (candidateBaseUrl: string): boolean => {
+    const cached =
+      discoveryAdapter.getCachedMints()[candidateBaseUrl] ||
+      discoveryAdapter.getCachedMints()[
+        candidateBaseUrl.endsWith("/")
+          ? candidateBaseUrl
+          : `${candidateBaseUrl}/`
+      ] ||
+      [];
+    if (cached.length === 0) return true;
+    return cached.some((mint) => fundedMintSet.has(normalizeMint(mint)));
+  };
+  const pickAcceptableProvider = <T extends { baseUrl: string }>(
+    list: T[]
+  ): T | undefined =>
+    list.find((entry) => providerAcceptsAnyFundedMint(entry.baseUrl));
+
   // ── Select provider + model ─────────────────────────────────────────
   let baseUrl: string;
   let selectedModel: Model;
@@ -249,7 +279,7 @@ export async function resolveRequestContext(
       { torMode }
     );
     if (ranking.length > 0) {
-      const best = ranking[0];
+      const best = pickAcceptableProvider(ranking) ?? ranking[0];
       baseUrl = best.baseUrl;
       selectedModel = best.model;
       modelPath = {
@@ -265,8 +295,9 @@ export async function resolveRequestContext(
       if (fallback.length === 0) {
         throw new Error(`No providers found for model: ${modelId}`);
       }
-      baseUrl = fallback[0].baseUrl;
-      selectedModel = fallback[0].model;
+      const fallbackBest = pickAcceptableProvider(fallback) ?? fallback[0];
+      baseUrl = fallbackBest.baseUrl;
+      selectedModel = fallbackBest.model;
     }
   } else {
     const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
@@ -276,17 +307,30 @@ export async function resolveRequestContext(
     if (ranking.length === 0) {
       throw new Error(`No providers found for model: ${modelId}`);
     }
-    const cheapest = ranking[0];
+    // Cheapest-first among providers that accept a funded mint (fail open
+    // when the mint cache is empty).
+    const cheapest = pickAcceptableProvider(ranking) ?? ranking[0];
     baseUrl = cheapest.baseUrl;
     selectedModel = cheapest.model;
   }
 
   // ── Mint resolution ─────────────────────────────────────────────────
-  const providerMints = discoveryAdapter.getCachedMints()[baseUrl] || [];
+  const providerMints = (
+    discoveryAdapter.getCachedMints()[baseUrl] || []
+  ).map(normalizeMint);
+  const activeMint = walletAdapter.getActiveMintUrl();
+  const mintAcceptedByProvider = (mintUrl: string): boolean =>
+    providerMints.length === 0 || providerMints.includes(normalizeMint(mintUrl));
   const mintUrl =
-    walletAdapter.getActiveMintUrl() ||
+    (activeMint &&
+    fundedMintSet.has(normalizeMint(activeMint)) &&
+    mintAcceptedByProvider(activeMint)
+      ? activeMint
+      : undefined) ||
+    fundedMints.find((mint) => mintAcceptedByProvider(mint)) ||
+    activeMint ||
     providerMints[0] ||
-    Object.keys(await walletAdapter.getBalances())[0];
+    Object.keys(walletBalances)[0];
 
   if (!mintUrl) {
     throw new Error("No mint configured in wallet");

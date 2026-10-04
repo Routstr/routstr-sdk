@@ -57,6 +57,19 @@ const fetchProviderInfo = async (
       ...adapter.getCachedProviderInfo(),
       [normalized]: info,
     });
+    // `/v1/info` also advertises the mints the provider accepts. Keep the
+    // mint cache in sync here so consumers that only fetched provider info
+    // still see the advertised mint list (and never spend a rejected mint).
+    const advertisedMints = Array.isArray(info?.mints) ? info.mints : [];
+    if (advertisedMints.length > 0) {
+      const normalizedMints = advertisedMints.map((mint) =>
+        mint.endsWith("/") ? mint.slice(0, -1) : mint,
+      );
+      adapter.setCachedMints({
+        ...adapter.getCachedMints(),
+        [normalized]: normalizedMints,
+      });
+    }
     return info;
   } catch (error) {
     logger.warn(`Failed to fetch provider info from ${normalized}:`, error);
@@ -1073,7 +1086,8 @@ export class ProviderManager {
   findNextBestProvider(
     modelId: string,
     currentBaseUrl: string,
-    attemptedProviders: ReadonlySet<string> = new Set()
+    attemptedProviders: ReadonlySet<string> = new Set(),
+    options: { acceptableMintUrls?: string[] } = {}
   ): string | null {
     modelId = this.canonicalizeModelId(modelId);
     try {
@@ -1081,6 +1095,12 @@ export class ProviderManager {
       const disabledProviders = new Set(
         this.discoveryAdapter.getDisabledProviders()
       );
+
+      // When the caller knows which mints the wallet can fund, prefer a
+      // provider that accepts at least one of them. Providers with no
+      // cached mint list are left in play (fail open) so a cold cache never
+      // blocks failover.
+      const acceptableMints = options.acceptableMintUrls ?? [];
 
       // Get all providers with their models
       const allProviders = this.discoveryAdapter.getCachedModels();
@@ -1103,6 +1123,20 @@ export class ProviderManager {
         }
         if (this.isOnCooldown(baseUrl, modelId)) {
           continue;
+        }
+
+        // Skip a provider that advertises a mint list disjoint from the
+        // wallet's funded mints: spending there cannot succeed. An empty
+        // cached list means "unknown", so keep it (fail open).
+        if (acceptableMints.length > 0) {
+          const providerMints =
+            this.discoveryAdapter.getCachedMints()[baseUrl] || [];
+          if (
+            providerMints.length > 0 &&
+            !providerMints.some((mint) => acceptableMints.includes(mint))
+          ) {
+            continue;
+          }
         }
 
         // Skip onion URLs if not in Tor mode
@@ -1401,6 +1435,21 @@ export class ProviderManager {
       return true;
     }
     return providerMints.includes(mintUrl);
+  }
+
+  /**
+   * Check whether a provider accepts at least one of the given mints.
+   *
+   * Fails open (returns true) when either side is unknown: a provider with
+   * no cached mint list, or an empty candidate list. Callers use this to
+   * rank/select providers without ever excluding one on missing data.
+   */
+  providerAcceptsAnyMint(baseUrl: string, mintUrls: string[]): boolean {
+    const providerMints =
+      this.discoveryAdapter.getCachedMints()[normalizeBaseUrl(baseUrl)] || [];
+    if (providerMints.length === 0) return true;
+    if (mintUrls.length === 0) return true;
+    return providerMints.some((mint) => mintUrls.includes(mint));
   }
 
   /**
