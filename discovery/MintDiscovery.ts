@@ -123,7 +123,8 @@ export class MintDiscovery {
     // Handle results
     for (const result of results) {
       if (result.status === "fulfilled") {
-        const { base, mints, info } = result.value;
+        const { success, base, mints, info } = result.value;
+        if (!success) continue;
         mintsFromAllProviders[base] = mints;
         if (info) {
           infoFromAllProviders[base] = info;
@@ -133,17 +134,20 @@ export class MintDiscovery {
       }
     }
 
-    // Cache all results
+    // Merge into the latest cache: transient failures must not erase known
+    // restrictions, and concurrent provider-info writes must not be lost.
+    const mergedMints = { ...this.adapter.getCachedMints(), ...mintsFromAllProviders };
+    const mergedInfo = { ...this.adapter.getCachedProviderInfo(), ...infoFromAllProviders };
     try {
-      this.adapter.setCachedMints(mintsFromAllProviders);
-      this.adapter.setCachedProviderInfo(infoFromAllProviders);
+      this.adapter.setCachedMints(mergedMints);
+      this.adapter.setCachedProviderInfo(mergedInfo);
     } catch (error) {
       this.logger.error("Error caching mint discovery results:", error);
     }
 
     return {
-      mintsFromProviders: mintsFromAllProviders,
-      infoFromProviders: infoFromAllProviders,
+      mintsFromProviders: mergedMints,
+      infoFromProviders: mergedInfo,
     };
   }
 

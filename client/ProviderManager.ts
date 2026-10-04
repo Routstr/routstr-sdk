@@ -1218,6 +1218,8 @@ export class ProviderManager {
     options: {
       torMode?: boolean;
       excludeBaseUrl?: string;
+      excludeBaseUrls?: ReadonlySet<string>;
+      acceptableMintUrls?: string[];
       /**
        * Candidate keys (see modelPathCandidateKey) already attempted in
        * this request. One strike does not cool a route down, so the caller
@@ -1248,6 +1250,11 @@ export class ProviderManager {
         if (options.excludeBaseUrl && baseUrl === options.excludeBaseUrl) {
           return null;
         }
+        if (options.excludeBaseUrls?.has(baseUrl)) return null;
+        if (
+          options.acceptableMintUrls &&
+          !this.providerAcceptsAnyMint(baseUrl, options.acceptableMintUrls)
+        ) return null;
         if (disabledProviders.has(baseUrl)) return null;
         // Enforce the transport invariant both ways (same as
         // getProviderPriceRankingForModel): Tor mode is onion-only, clearnet

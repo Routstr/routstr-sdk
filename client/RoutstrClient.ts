@@ -427,11 +427,16 @@ export class RoutstrClient {
   ): Promise<Awaited<ReturnType<RoutstrClient["_prepareRoutedRequest"]>>> {
     let current = params;
     const attempted = new Set<string>();
+    const triedModelPaths = new Set<string>();
     for (;;) {
       try {
         return await this._prepareRoutedRequest(current);
       } catch (error) {
         if (!(error instanceof ProviderMintBalanceError)) throw error;
+        const selector = this._findModelPathHeader(current.headers ?? {});
+        if (current.pinnedProvider || (selector && !current.autoModelPath)) {
+          throw error;
+        }
         attempted.add(current.baseUrl);
         if (!current.modelId) throw error;
         const fundedMints = Object.entries(
@@ -441,6 +446,36 @@ export class RoutstrClient {
           .map(([mintUrl]) =>
             mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl
           );
+        if (current.autoModelPath) {
+          triedModelPaths.add(modelPathCandidateKey(
+            current.baseUrl, current.autoModelPath.selector
+          ));
+          const [next] = await this.providerManager.getModelPathProviderRanking(
+            current.modelId,
+            {
+              excludeBaseUrls: attempted,
+              excludeModelPaths: triedModelPaths,
+              acceptableMintUrls: fundedMints,
+            }
+          );
+          const nextSelector = next?.selectors[0];
+          if (!next || !nextSelector) throw error;
+          const headers = Object.fromEntries(
+            Object.entries(current.headers ?? {}).filter(
+              ([name]) => name.toLowerCase() !== MODEL_PATH_HEADER
+            )
+          );
+          current = {
+            ...current,
+            baseUrl: next.baseUrl,
+            headers: { ...headers, [MODEL_PATH_HEADER]: nextSelector },
+            autoModelPath: {
+              selector: nextSelector,
+              satsPricing: next.satsPricing[0] ?? undefined,
+            },
+          };
+          continue;
+        }
         const nextProvider = this._findNextBestProvider(
           current.modelId,
           current.baseUrl,
@@ -1934,7 +1969,9 @@ export class RoutstrClient {
             failoverModelId,
             {
               excludeModelPaths: triedModelPaths,
-              ...(providerWideFailure ? { excludeBaseUrl: baseUrl } : {}),
+              ...((providerWideFailure || providerMintBalance)
+                ? { excludeBaseUrl: baseUrl } : {}),
+              acceptableMintUrls: fundedMintUrlsForFailover,
             }
           );
         const next = ranking[0];
@@ -2028,13 +2065,35 @@ export class RoutstrClient {
             // failing over to a provider that accepts a funded mint (fail
             // open when its mint list is unknown). A caller-pinned request
             // must not switch providers.
-            if (pinnedModelPath) throw error;
+            if (params.pinnedProvider || (pinnedModelPath && !params.autoModelPath)) {
+              throw error;
+            }
             this._log(
               "WARN",
               `[RoutstrClient] _handleErrorResponse: provider-mint shortfall on ${nextProvider}; trying another provider`
             );
             providerMintBalance = providerMintBalance ?? error;
             attemptedForSpend.add(nextProvider);
+            if (params.autoModelPath) {
+              const tried = new Set(nextTriedModelPaths ?? []);
+              if (nextModelPathSelector) {
+                tried.add(modelPathCandidateKey(nextProvider, nextModelPathSelector));
+              }
+              // All routes on this node share its unfundable accepted mints.
+              const [next] = await this.providerManager.getModelPathProviderRanking(
+                failoverModelId,
+                {
+                  excludeBaseUrls: attemptedForSpend,
+                  excludeModelPaths: tried,
+                  acceptableMintUrls: fundedMintUrlsForFailover,
+                }
+              );
+              nextProvider = next?.baseUrl ?? null;
+              nextModelPathSelector = next?.selectors[0];
+              nextModelPathPricing = next?.satsPricing[0] ?? undefined;
+              nextTriedModelPaths = [...tried];
+              continue;
+            }
             nextProvider = this._findNextBestProvider(
               failoverModelId,
               baseUrl,

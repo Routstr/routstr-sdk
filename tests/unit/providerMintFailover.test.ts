@@ -204,4 +204,64 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
       }
     );
   });
+
+  it.each([
+    { headers: { "X-Routstr-Model-Path": "caller-selector" } },
+    { pinnedProvider: true },
+  ])("keeps caller pins on their node during deposit shortfall: %j", async (pin) => {
+    const { client, providerManager } = createClient(() => NEXT_URL);
+    vi.spyOn(client as any, "_spendToken").mockRejectedValue(
+      new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A])
+    );
+    const request = vi.spyOn(client as any, "_makeRequest");
+    await expect(client.routeRequest({ ...routeParams, ...pin } as any))
+      .rejects.toBeInstanceOf(ProviderMintBalanceError);
+    expect(request).not.toHaveBeenCalled();
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+  });
+
+  it("re-resolves an automatic selector and pricing on initial-deposit failover", async () => {
+    const { client, providerManager } = createClient(() => NEXT_URL);
+    const pricing = { prompt: 7, completion: 8 };
+    providerManager.getModelPathProviderRanking = vi.fn(async () => [{
+      baseUrl: NEXT_URL, model, selectors: ["next-selector"], satsPricing: [pricing],
+    }]);
+    vi.spyOn(client as any, "_spendToken").mockImplementation(async ({baseUrl}: any) => {
+      if (baseUrl === BASE_URL) throw new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A]);
+      return spendResultFor(MINT_B);
+    });
+    const request = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(
+      Response.json({ok: true})
+    );
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
+    await client.routeRequest({
+      ...routeParams,
+      headers: { "X-Routstr-Model-Path": "old-selector" },
+      autoModelPath: { selector: "old-selector", satsPricing: {prompt: 1, completion: 1} },
+    } as any);
+    expect(providerManager.getModelPathProviderRanking).toHaveBeenCalledWith(
+      model.id, expect.objectContaining({
+        excludeBaseUrls: new Set([BASE_URL]), acceptableMintUrls: [MINT_B],
+      })
+    );
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: NEXT_URL,
+      baseHeaders: expect.objectContaining({"x-routstr-model-path": "next-selector"}),
+      autoModelPath: {selector: "next-selector", satsPricing: pricing},
+    }));
+    expect(providerManager.getRequiredSatsForModel.mock.calls.at(-1)[4]).toEqual(pricing);
+  });
+
+  it("exhausts automatic paths without falling back to ordinary provider routing", async () => {
+    const { client, providerManager } = createClient(() => NEXT_URL);
+    providerManager.getModelPathProviderRanking = vi.fn(async () => []);
+    vi.spyOn(client as any, "_spendToken").mockRejectedValue(
+      new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A])
+    );
+    await expect(client.routeRequest({
+      ...routeParams, autoModelPath: {selector: "old-selector"},
+    } as any)).rejects.toBeInstanceOf(ProviderMintBalanceError);
+    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+  });
+
 });

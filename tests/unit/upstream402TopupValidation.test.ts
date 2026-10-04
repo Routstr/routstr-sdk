@@ -394,4 +394,40 @@ describe("RoutstrClient 402 top-up validation", () => {
     });
     expect(providerManager.markFailed).not.toHaveBeenCalled();
   });
+
+  it("continues automatic path failover past an unfundable candidate", async () => {
+    const { client, providerManager } = createClient();
+    const next = "https://next.example/";
+    const last = "https://last.example/";
+    providerManager.getModelPathProviderRanking = vi.fn()
+      .mockResolvedValueOnce([{baseUrl: next, selectors: ["next-path"], satsPricing: [null], model}])
+      .mockResolvedValueOnce([{baseUrl: last, selectors: ["last-path"], satsPricing: [{prompt: 2, completion: 3}], model}]);
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 20_000, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
+    vi.spyOn(client.getBalanceManager(), "topUp").mockResolvedValue({
+      success: false, providerMintsShort: true, required: 100,
+      acceptedMints: [MINT_URL], providerBaseUrl: BASE_URL,
+    });
+    vi.spyOn(client as any, "_spendToken").mockImplementation(async ({baseUrl}: any) => {
+      if (baseUrl === next) {
+        const {ProviderMintBalanceError} = await import("../../core/errors");
+        throw new ProviderMintBalanceError(100, 500, next, [MINT_URL]);
+      }
+      return {token: "last-key", tokenBalance: 100, tokenBalanceUnit: "sat"};
+    });
+    const request = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(Response.json({ok: true}));
+    const response = await (client as any)._handleErrorResponse({
+      ...params,
+      baseHeaders: {"x-routstr-model-path": "old-path"},
+      autoModelPath: {selector: "old-path"},
+    }, API_KEY, 402, "req-402", undefined, localInsufficientBalanceBody, 0);
+    expect(response.status).toBe(200);
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: last, baseHeaders: {"x-routstr-model-path": "last-path"},
+      autoModelPath: {selector: "last-path", satsPricing: {prompt: 2, completion: 3}},
+    }));
+    expect(providerManager.getModelPathProviderRanking.mock.calls[1][1].excludeBaseUrls.has(next)).toBe(true);
+  });
+
 });
