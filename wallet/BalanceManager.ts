@@ -23,6 +23,7 @@ import {
   CoreErrorType,
   isHandledRedemptionError,
   isKeyNotFoundError,
+  isNoBalanceToRefundError,
   shouldFailoverToAnotherMint,
   type ParsedCoreError,
 } from "../core/errorTypes";
@@ -274,15 +275,33 @@ export class BalanceManager {
     }
 
     let fetchResult:
-      | { success: boolean; token?: string; requestId?: string; error?: string; status?: number; parsedError?: ParsedCoreError; keyNotFound?: boolean }
+      | {
+          success: boolean;
+          token?: string;
+          requestId?: string;
+          error?: string;
+          status?: number;
+          parsedError?: ParsedCoreError;
+          keyNotFound?: boolean;
+          noBalance?: boolean;
+        }
       | undefined;
 
     try {
       fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
-      if (fetchResult.error === "No balance to refund") {
-        this.logger.log(`refundApiKey: provider says no balance for ${baseUrl}; removing API key`);
-        this.storageAdapter.removeApiKey(baseUrl);
+      // The provider proved this key holds nothing and that no payout was ever
+      // made for it, so the stored key is dead weight: keeping it means every
+      // refund sweep re-reads the same 400 forever.
+      if (fetchResult.noBalance) {
+        this.logger.log(
+          `refundApiKey: provider says no balance for ${baseUrl}; removing API key`
+        );
+        // Never delete a key that replaced this one while the request was in
+        // flight — same guard as the token_already_spent / key_not_found paths.
+        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
         return { success: true, message: "No balance to refund, key cleaned up" };
       }
 
@@ -386,7 +405,11 @@ export class BalanceManager {
           : receiveResult.amount * 1000;
 
       if (receiveResult.success) {
-        this.storageAdapter.removeApiKey(baseUrl);
+        // The refunded key is spent; a replacement stored while the request
+        // was in flight is not.
+        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
       } else {
         this.logger.warn(
           `refundApiKey: receive failed for ${baseUrl}; keeping API key. message=${receiveResult.message ?? "none"}`
@@ -422,6 +445,12 @@ export class BalanceManager {
     parsedError?: ParsedCoreError;
     /** True when the provider replied 401 key_not_found. */
     keyNotFound?: boolean;
+    /**
+     * True when the provider replied that the key holds nothing to refund,
+     * either as the structured `no_balance_to_refund` code or as the bare
+     * `"No balance to refund"` detail older nodes send.
+     */
+    noBalance?: boolean;
   }> {
     if (!baseUrl) {
       return {
@@ -500,6 +529,9 @@ export class BalanceManager {
           // A 401 key_not_found on a refund is a deterministic signal that the
           // key is dead and should be purged.
           keyNotFound: isKeyNotFoundError(parsedError),
+          // A 400 "No balance to refund" is the only refund refusal that
+          // proves nothing is left on the key, so the caller can drop it.
+          noBalance: isNoBalanceToRefundError(parsedError),
         };
       }
 

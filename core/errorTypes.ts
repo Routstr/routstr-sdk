@@ -75,6 +75,15 @@ export const CoreErrorCode = {
   INVALID_API_KEY: "invalid_api_key",
   /** A well-formed API key that the node has no record of */
   KEY_NOT_FOUND: "key_not_found",
+  /**
+   * The refunded key holds nothing and no payout was ever made for it — the
+   * stored key is dead weight and can be dropped.
+   */
+  NO_BALANCE_TO_REFUND: "no_balance_to_refund",
+  /** The key's balance is below the mint unit's granularity: dust */
+  BALANCE_TOO_SMALL_TO_REFUND: "balance_too_small_to_refund",
+  /** A refund is already in flight for this key (transient, keep the key) */
+  REFUND_ONGOING_REQUESTS: "refund_ongoing_requests",
   /** The API key's available balance is below the request requirement */
   INSUFFICIENT_BALANCE: "insufficient_balance",
   /** A configured spending cap was reached; adding funds will not fix it */
@@ -281,6 +290,31 @@ export function isKeyNotFoundError(parsed: ParsedCoreError): boolean {
     parsed.status === 401 &&
     (parsed.code === CoreErrorCode.KEY_NOT_FOUND ||
       (parsed.message?.includes("Key not found") ?? false))
+  );
+}
+
+/** The bare `detail` string older nodes use for an empty refund. */
+const LEGACY_NO_BALANCE_TO_REFUND = "No balance to refund";
+
+/**
+ * The refunded key holds nothing, so there is nothing left to reclaim.
+ *
+ * routstr-core answers this with a structured `no_balance_to_refund` code
+ * (routstr-core#805). Nodes deployed before that reply with a bare-string
+ * `detail` and no code at all, which is why the message is matched too — and
+ * why it must match *exactly*. The neighbouring refusals share its 400 status:
+ * "Cannot refund key. There are ongoing requests for this api key." is a
+ * transient race whose balance is still on the key, and "Balance too small to
+ * refund" is dust that no retry can pay out. Reading either as a dead key
+ * would throw away a live balance.
+ */
+export function isNoBalanceToRefundError(parsed: ParsedCoreError): boolean {
+  if (parsed.code === CoreErrorCode.NO_BALANCE_TO_REFUND) return true;
+
+  return (
+    parsed.status === 400 &&
+    !parsed.code &&
+    parsed.message?.trim() === LEGACY_NO_BALANCE_TO_REFUND
   );
 }
 

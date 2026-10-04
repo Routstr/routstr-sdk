@@ -1,6 +1,7 @@
 import { getEncodedToken } from "@cashu/cashu-ts";
 import { describe, expect, it } from "vitest";
 import { CashuSpender } from "../../wallet/CashuSpender";
+import { BalanceManager } from "../../wallet/BalanceManager";
 import { InsufficientBalanceError } from "../../core";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 
@@ -153,5 +154,75 @@ describe("cached receive recovery", () => {
       { token: "good", success: true }, { token: "bad", success: false },
     ]);
     expect(cached.map((entry) => entry.token)).toEqual(["bad", "new"]);
+  });
+});
+
+describe("CashuSpender refund sweep", () => {
+  const Provider = "https://llm.satsandsports.cash/";
+
+  it("drops a key the provider proves empty instead of re-sweeping it forever", async () => {
+    const apiKeys = new Map([
+      [Provider, { key: "sk-empty", balance: 0, lastUsed: null as number | null }],
+    ]);
+    const touched: string[] = [];
+    const storage = createStorage({
+      getApiKeyDistribution: () =>
+        [...apiKeys.entries()].map(([baseUrl, entry]) => ({
+          baseUrl,
+          amount: entry.balance,
+        })),
+      getApiKey: (baseUrl) => apiKeys.get(baseUrl) ?? null,
+      removeApiKey: (baseUrl) => {
+        apiKeys.delete(baseUrl);
+      },
+      touchApiKeyLastUsed: (baseUrl) => {
+        touched.push(baseUrl);
+      },
+    });
+    const balanceManager = new BalanceManager(createWallet(), storage);
+    const spender = new CashuSpender(
+      createWallet(),
+      storage,
+      undefined,
+      balanceManager
+    );
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/wallet/refund")) {
+        // Pre-routstr-core#805 body: a bare detail string with no code.
+        return new Response(
+          JSON.stringify({
+            detail: "No balance to refund",
+            request_id: "req-no-balance",
+          }),
+          {
+            status: 400,
+            statusText: "Bad Request",
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+      return new Response(
+        JSON.stringify({ balance: 0, reserved: 0, api_key: "sk-empty" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      const results = await spender.refundProviders(
+        "https://mint.example.com"
+      );
+
+      expect(results).toEqual([{ baseUrl: Provider, success: true }]);
+      // The dead key is gone, so the next sweep has nothing to retry...
+      expect(apiKeys.has(Provider)).toBe(false);
+      // ...and it is no longer rate-limited via lastUsed, which is what made
+      // the bug self-perpetuating: one 400 every five minutes, forever.
+      expect(touched).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
