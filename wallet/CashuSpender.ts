@@ -902,7 +902,15 @@ export class CashuSpender {
         });
 
         if (refundResult.success) {
-          this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
+          // refundApiKey() already removed the key it refunded; this covers the
+          // dead-key outcomes it treats as success. A replacement stored while
+          // the refund was in flight must survive the sweep.
+          const currentEntry = this.storageAdapter.getApiKey(
+            apiKeyEntry.baseUrl
+          );
+          if (currentEntry && currentEntry.key === refreshedEntry.key) {
+            this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
+          }
         } else {
           const currentEntry = this.storageAdapter.getApiKey(
             apiKeyEntry.baseUrl

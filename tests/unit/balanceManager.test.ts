@@ -955,3 +955,163 @@ describe("BalanceManager non-JSON error responses", () => {
     }
   });
 });
+
+describe("BalanceManager empty-refund cleanup", () => {
+  // The node from the bug report, kept verbatim so the wire shape stays real.
+  const Provider = "https://llm.satsandsports.cash/";
+
+  const seededStorage = () =>
+    createStatefulStorage({
+      apiKeys: { [Provider]: { key: "sk-empty", balance: 0, lastUsed: null } },
+    });
+
+  /** Fixed response for every request, mimicking a provider endpoint. */
+  const mockResponse = (status: number, statusText: string, body: string) =>
+    (async () =>
+      new Response(body, {
+        status,
+        statusText,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof globalThis.fetch;
+
+  it("drops the key when the node replies with the structured no_balance_to_refund code", async () => {
+    const storage = seededStorage();
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockResponse(
+      400,
+      "Bad Request",
+      JSON.stringify({
+        detail: {
+          error: {
+            message: "No balance to refund",
+            type: "invalid_request_error",
+            code: "no_balance_to_refund",
+          },
+        },
+        request_id: "req-no-balance",
+      })
+    );
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-empty",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.message).toBe("No balance to refund, key cleaned up");
+      expect(storage.getApiKey(Provider)).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("drops the key when a deployed node replies with the bare detail string", async () => {
+    const storage = seededStorage();
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockResponse(
+      400,
+      "Bad Request",
+      JSON.stringify({
+        detail: "No balance to refund",
+        request_id: "59cc5abf-8c89-4b35-a608-c7c7da072ba0",
+      })
+    );
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-empty",
+      });
+
+      expect(result.success).toBe(true);
+      expect(storage.getApiKey(Provider)).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("keeps the key when the refusal is the transient ongoing-requests race", async () => {
+    const storage = seededStorage();
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockResponse(
+      400,
+      "Bad Request",
+      JSON.stringify({
+        detail:
+          "Cannot refund key. There are ongoing requests for this api key.",
+      })
+    );
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-empty",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("ongoing requests for this api key");
+      // The balance is still on the key; a later sweep must be able to reclaim it.
+      expect(storage.getApiKey(Provider)?.key).toBe("sk-empty");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("keeps the key when the refusal is the dust refusal", async () => {
+    const storage = seededStorage();
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockResponse(
+      400,
+      "Bad Request",
+      JSON.stringify({ detail: "Balance too small to refund" })
+    );
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-empty",
+      });
+
+      expect(result.success).toBe(false);
+      expect(storage.getApiKey(Provider)?.key).toBe("sk-empty");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("never drops a replacement key stored while the refund was in flight", async () => {
+    const storage = seededStorage();
+    const manager = new BalanceManager(createWallet(), storage);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      // A new key lands for this provider while the refund is in flight.
+      storage.setApiKey(Provider, "sk-replacement");
+      return new Response(JSON.stringify({ detail: "No balance to refund" }), {
+        status: 400,
+        statusText: "Bad Request",
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      const result = await manager.refundApiKey({
+        mintUrl: "https://mint.example.com",
+        baseUrl: Provider,
+        apiKey: "sk-empty",
+      });
+
+      expect(result.success).toBe(true);
+      expect(storage.getApiKey(Provider)?.key).toBe("sk-replacement");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

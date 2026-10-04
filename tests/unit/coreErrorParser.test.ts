@@ -3,6 +3,7 @@ import {
   parseCoreError,
   isCoreErrorType,
   isKeyNotFoundError,
+  isNoBalanceToRefundError,
   shouldFailoverToAnotherMint,
   summarizeCoreError,
   CoreErrorType,
@@ -347,6 +348,71 @@ describe("CoreErrorCode constants", () => {
     expect(CoreErrorCode.CASHU_MINT_UNREACHABLE).toBe("cashu_mint_unreachable");
     expect(CoreErrorCode.INVALID_API_KEY).toBe("invalid_api_key");
     expect(CoreErrorCode.KEY_NOT_FOUND).toBe("key_not_found");
+    expect(CoreErrorCode.NO_BALANCE_TO_REFUND).toBe("no_balance_to_refund");
+    expect(CoreErrorCode.BALANCE_TOO_SMALL_TO_REFUND).toBe(
+      "balance_too_small_to_refund"
+    );
+    expect(CoreErrorCode.REFUND_ONGOING_REQUESTS).toBe(
+      "refund_ongoing_requests"
+    );
+  });
+});
+
+describe("isNoBalanceToRefundError", () => {
+  it("matches the structured no_balance_to_refund code", () => {
+    const body = JSON.stringify({
+      detail: {
+        error: {
+          message: "No balance to refund",
+          type: "invalid_request_error",
+          code: "no_balance_to_refund",
+        },
+      },
+      request_id: "req-no-balance",
+    });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(true);
+  });
+
+  it("matches a reworded message that carries the code", () => {
+    const body = JSON.stringify({
+      detail: {
+        error: { message: "Nothing left on this key.", code: "no_balance_to_refund" },
+      },
+    });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(true);
+  });
+
+  it("still matches the bare-detail body deployed nodes send", () => {
+    // Exact envelope from a live node, pre routstr-core#805.
+    const body = JSON.stringify({
+      detail: "No balance to refund",
+      request_id: "59cc5abf-8c89-4b35-a608-c7c7da072ba0",
+    });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(true);
+  });
+
+  it("does not match the transient ongoing-requests refusal", () => {
+    const body = JSON.stringify({
+      detail: "Cannot refund key. There are ongoing requests for this api key.",
+    });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(false);
+  });
+
+  it("does not match the dust refusal", () => {
+    const body = JSON.stringify({ detail: "Balance too small to refund" });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(false);
+  });
+
+  it("does not match the same message on a non-400 status", () => {
+    const body = JSON.stringify({ detail: "No balance to refund" });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 502))).toBe(false);
+  });
+
+  it("does not match a message that merely contains the phrase", () => {
+    const body = JSON.stringify({
+      detail: "No balance to refund was possible for this mint",
+    });
+    expect(isNoBalanceToRefundError(parseCoreError(body, 400))).toBe(false);
   });
 });
 
