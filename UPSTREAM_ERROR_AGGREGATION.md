@@ -2,8 +2,10 @@
 
 Upstream 400/422 rejections now use normal payment recovery/refund and failover,
 without applying a provider cooldown. Ordinary node failover excludes all nodes
-already attempted within that request. Caller-pinned selectors remain pinned;
-auto-pinned selectors retain their existing route-aware traversal.
+already attempted within that request. Caller-pinned selectors and
+caller-forced providers (`forcedProvider`) remain pinned — neither is ever
+re-sent to a different node; auto-pinned selectors retain their existing
+route-aware traversal.
 
 If every eligible attempt fails, the SDK returns JSON by default:
 

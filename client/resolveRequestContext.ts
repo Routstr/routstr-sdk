@@ -109,6 +109,11 @@ export interface ResolvedContext {
     satsPricing?: ModelPathSatsPricing;
     autoPinned: true;
   };
+  /**
+   * True when the caller forced a provider (see `forcedProvider`). A forced
+   * provider is a pin: failover must never move the request to another node.
+   */
+  pinnedProvider?: boolean;
 }
 
 /**
@@ -178,8 +183,10 @@ export async function resolveRequestContext(
   let baseUrl: string;
   let selectedModel: Model;
   let modelPath: ResolvedContext["modelPath"];
+  let pinnedProvider = false;
 
   if (forcedProvider) {
+    pinnedProvider = true;
     const normalizedProvider = forcedProvider.endsWith("/")
       ? forcedProvider
       : `${forcedProvider}/`;
@@ -323,5 +330,6 @@ export async function resolveRequestContext(
     selectedModel,
     requestedModelId: canonicalizeModelId(modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined),
     modelPath,
+    pinnedProvider,
   };
 }
