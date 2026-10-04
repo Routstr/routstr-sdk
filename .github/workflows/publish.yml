@@ -1,0 +1,104 @@
+name: Publish
+
+# Publishes @routstr/sdk to npm whenever a GitHub Release is published
+# (e.g. the "v0.4.8" release). Uses npm Trusted Publishing (OIDC) — no
+# NPM_TOKEN secret is stored anywhere.
+#
+# One-time setup on npm:
+#   npm trust github @routstr/sdk \
+#     --file publish.yml \
+#     --repo Routstr/routstr-sdk \
+#     --allow-publish
+#
+# Then: bump package.json, commit, tag (vX.Y.Z), push tag, publish a GitHub
+# Release -> this workflow builds, tests, verifies the tag, and publishes.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v0.4.8)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish @routstr/sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # required for npm trusted publishing + provenance
+    steps:
+      - name: Resolve tag
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Trusted publishing requires npm >= 11.5.1; Node 22 ships npm 10.x.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test:sdk
+
+      - name: Verify tag and check npm
+        id: check
+        env:
+          TAG: ${{ steps.ref.outputs.tag }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${TAG#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $TAG does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "@routstr/sdk@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::@routstr/sdk@$PKG_VERSION is already published to npm — skipping publish"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "Will publish @routstr/sdk@$PKG_VERSION"
+          fi
+
+      - name: Publish to npm
+        if: steps.check.outputs.already_published != 'true'
+        run: npm publish --access public --provenance
