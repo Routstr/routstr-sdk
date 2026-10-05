@@ -115,14 +115,17 @@ export class CashuSpender {
     ]);
   }
 
-  /** Retry cached tokens; only successful receives are removed from storage. */
+  /**
+   * Retry cached tokens; remove each once received or once the mint reports
+   * it already spent.
+   */
   async recoverCachedReceiveTokens(): Promise<
     { token: string; success: boolean }[]
   > {
     const results: { token: string; success: boolean }[] = [];
     for (const entry of this.storageAdapter.getCachedReceiveTokens()) {
       const result = await this.receiveToken(entry.token);
-      if (result.success) {
+      if (result.success || /already spent/i.test(result.message ?? "")) {
         // Re-read so tokens cached during the receive are not overwritten.
         this.storageAdapter.setCachedReceiveTokens(
           this.storageAdapter
