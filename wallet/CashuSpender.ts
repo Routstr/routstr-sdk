@@ -733,6 +733,21 @@ export class CashuSpender {
               "DEBUG",
               `[CashuSpender] refundXcashuTokens: Successfully refunded xcashu token for ${baseUrl}, amount=${receiveResult.amount}`
             );
+          } else if (/already spent/i.test(receiveResult.message ?? "")) {
+            // The provider hands back a refund that was already received (e.g.
+            // a parked copy recovered earlier). It can never be received again,
+            // so stop retrying it and stop counting it as held.
+            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: receiveResult.message,
+            });
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: refund from ${baseUrl} is already spent; removing its xcashu token`
+            );
           } else {
             // Refund failed - increment tryCount
             const currentTryCount = xcashuToken.tryCount ?? 0;

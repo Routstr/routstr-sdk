@@ -519,4 +519,32 @@ describe("CashuSpender.refundXcashuTokens — spent xcashu token", () => {
     // No retry bookkeeping for a permanently-spent token.
     expect(updateTryCount).not.toHaveBeenCalled();
   });
+
+  it("drops the token when the refund the provider returns was already received", async () => {
+    // A parked copy of the refund was recovered earlier; the provider keeps
+    // handing back that same refund, whose proofs the mint now reports spent.
+    const token = "cashu_original_xcashu_token";
+    const { storage, removedXcashu } = createStorage({
+      getXcashuTokens: () => ({ [BASE_URL]: [{ token, tryCount: 30 }] }),
+      getXcashuTokensForBaseUrl: () => [{ token, tryCount: 30 }],
+    });
+    const updateTryCount = vi.spyOn(storage, "updateXcashuTokenTryCount");
+    const balanceManager = {
+      fetchRefundToken: vi.fn().mockResolvedValue({ success: true, token: "cashu_refund_token" }),
+    } as any;
+    const spender = new CashuSpender(
+      createWallet({
+        receiveToken: async () => ({ success: false, amount: 95, unit: "sat", message: "proofs already spent" }),
+      }),
+      storage,
+      createDiscovery(),
+      balanceManager
+    );
+
+    const results = await spender.refundXcashuTokens(MINT_URL);
+
+    expect(results).toEqual([{ baseUrl: BASE_URL, token, success: false, error: "proofs already spent" }]);
+    expect(removedXcashu).toEqual([[BASE_URL, token]]);
+    expect(updateTryCount).not.toHaveBeenCalled();
+  });
 });
