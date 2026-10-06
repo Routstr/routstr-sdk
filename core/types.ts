@@ -305,3 +305,26 @@ export interface MintDiscoveryResult {
   mintsFromProviders: Record<string, string[]>;
   infoFromProviders: Record<string, ProviderInfo>;
 }
+
+/**
+ * Result of TLSN upstream verification for a request (see TlsnVerifier).
+ *
+ * - "verified": the node made the exact request the SDK sent to the upstream
+ *   host the SDK itself dialed, and the response the SDK received is
+ *   byte/event-sequence identical to what that server returned in the proven
+ *   TLS session.
+ * - "mismatch": a proof was produced but the disclosed transcript does not
+ *   match what the SDK sent/received — a fraud signal against the node.
+ * - "unavailable": verification could not be completed (node doesn't support
+ *   it, protocol/transport failure, policy rejection).
+ */
+export type UpstreamVerification =
+  | {
+      status: "verified";
+      upstreamHost: string;
+      upstreamModel?: string;
+      /** Milliseconds spent in the post-session proof verification. */
+      proofMs?: number;
+    }
+  | { status: "mismatch"; reason: string; upstreamHost?: string }
+  | { status: "unavailable"; reason: string };

@@ -47,3 +47,4 @@ routstr.sqlite-wal
 *.sqlite-shm
 *.sqlite-wal
 REVIEW-handle-core-error-codes.md
+dist/

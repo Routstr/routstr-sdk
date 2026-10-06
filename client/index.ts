@@ -6,6 +6,7 @@ export * from "./sse";
 export * from "./TinfoilSecure";
 export * from "./TinfoilCacheSecret";
 export * from "./usage";
+export * from "./tlsn";
 export { fetchAIResponse } from "./fetchAIResponse";
 export type { FetchAIResponseDeps, FetchOptions } from "./fetchAIResponse";
 export { resolveRequestContext } from "./resolveRequestContext";

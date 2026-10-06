@@ -11,8 +11,10 @@
  * Extracted from utils/apiUtils.ts
  */
 
-import type { SdkLogger, TopUpResult } from "../core/types";
+import type { SdkLogger, TopUpResult, UpstreamVerification } from "../core/types";
 import type { Model } from "../core/types";
+import type { TlsnVerifierBackend } from "./tlsn";
+import { TlsnVerifier, type PendingVerificationHandle } from "./tlsn";
 import { consoleLogger } from "../core/types";
 import type {
   WalletAdapter,
@@ -184,6 +186,29 @@ export interface RouteRequestParams {
    * never fail over to a different node.
    */
   pinnedProvider?: boolean;
+  /**
+   * Opt into TLSN upstream verification (proxy mode). The SDK runs a tlsn
+   * verifier against the node's proverd and attaches the result to the
+   * response as `(response as any).upstreamVerification` — a promise of
+   * `UpstreamVerification` (post-hoc for SSE: resolves after [DONE]).
+   */
+  verify?: "tlsn";
+  /** Per-request TLSN overrides (fall back to client-level `tlsn` config). */
+  tlsnOptions?: TlsnRequestOptions;
+}
+
+/** TLSN options, request-level or client-level. */
+export interface TlsnRequestOptions {
+  /** ws(s) URL of the node's proverd mux endpoint (from the model listing's
+   *  `tlsn.proverd_ws`). Required for verification to run. */
+  proverWsUrl?: string;
+  /** Upstream hosts acceptable for this model (from the model listing's
+   *  `tlsn.upstream_hosts`). */
+  upstreamHostAllowlist?: string[];
+  /** Channel-C dial target override (tests, Tor bridges). */
+  dialTo?: { hostname: string; port: number };
+  /** Model-mapping normalization: sdk-facing id → upstream id. */
+  modelMapping?: Record<string, string>;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -227,6 +252,12 @@ export interface RoutstrClientConfig {
    * (e.g. inside a routstrd data directory).
    */
   tinfoilCacheSecretPath?: string;
+  /**
+   * Client-level TLSN verification defaults: the verifier backend (native
+   * binary by default under Bun) and the node's proverd endpoint/policy.
+   * Per-request `tlsnOptions` take precedence.
+   */
+  tlsn?: TlsnRequestOptions & { backend?: TlsnVerifierBackend };
 }
 
 export class RoutstrClient {
@@ -242,6 +273,7 @@ export class RoutstrClient {
   private requestResponseLogSink?: RequestResponseLogSink;
   private userCacheSecret?: string;
   private tinfoilCacheSecretPath?: string;
+  private tlsnConfig?: RoutstrClientConfig["tlsn"];
 
   /** In-flight topup promises keyed by `${baseUrl}:${apiKey}`. Concurrent
    *  callers — proactive spin-offs and 402 handlers alike — share a single
@@ -278,6 +310,7 @@ export class RoutstrClient {
     this.requestResponseLogSink = options.requestResponseLogSink;
     this.userCacheSecret = options.userCacheSecret;
     this.tinfoilCacheSecretPath = options.tinfoilCacheSecretPath;
+    this.tlsnConfig = options.tlsn;
     // Use provided ProviderManager or create a new one
     this.providerManager =
       options.providerManager ??
@@ -362,6 +395,46 @@ export class RoutstrClient {
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
+
+    // ─── TLSN: attach the verification promise ───
+    // Post-hoc by design (the proof only exists after the response ends);
+    // never blocks delivery.
+    if (params.verify === "tlsn" && prepared.tlsnSession) {
+      const unavailable = (reason: string): Promise<UpstreamVerification> =>
+        Promise.resolve({ status: "unavailable", reason });
+      let verification: Promise<UpstreamVerification>;
+      if ("error" in prepared.tlsnSession) {
+        verification = unavailable(prepared.tlsnSession.error);
+      } else if (prepared.baseUrlUsed !== params.baseUrl) {
+        // Failover: the verifier was bound to the original node's proverd;
+        // a response from a different node cannot be verified by it.
+        verification = unavailable("provider failover: verification bound to the original node");
+        prepared.tlsnSession.handle.cancel();
+      } else {
+        const { handle } = prepared.tlsnSession;
+        if (isSSE) {
+          verification = prepared.usagePromise
+            .catch(() => ({}))
+            .then(() =>
+              handle.complete(
+                new TextEncoder().encode(prepared.tlsnSseChunks.join(""))
+              )
+            );
+        } else {
+          verification = prepared.response
+            .clone()
+            .arrayBuffer()
+            .then((buf) => handle.complete(new Uint8Array(buf)))
+            .catch((error) => ({
+              status: "unavailable",
+              reason: error instanceof Error ? error.message : String(error),
+            }));
+        }
+      }
+      // Avoid unhandled rejections for callers that ignore the result.
+      verification.catch(() => {});
+      (prepared.response as any).upstreamVerification = verification;
+    }
 
     // Error payment recovery is handled in _handleErrorResponse. There is no
     // successful usage to account for; keep finalization off passthrough errors.
@@ -506,6 +579,18 @@ export class RoutstrClient {
       capturedUsage?: UsageTrackingData;
       capturedResponseId?: string;
     }>;
+    tlsnSession?:
+      | {
+          handle: PendingVerificationHandle;
+          expected: {
+            method: string;
+            path: string;
+            jsonBody?: Record<string, unknown>;
+          };
+        }
+      | { error: string };
+    /** Raw SSE text chunks (only accumulated when TLSN verify is active). */
+    tlsnSseChunks: string[];
   }> {
     const {
       path: requestPath,
@@ -675,6 +760,78 @@ export class RoutstrClient {
       modelId
     );
 
+    // ─── TLSN verified mode: start the verifier BEFORE the API call ───
+    // The verifier dials the node's proverd (channel B) and the upstream
+    // itself (channel C); the prover only starts once routstr-core receives
+    // the request carrying these headers, so begin() must not be awaited
+    // to relay-readiness here.
+    let tlsnSession:
+      | {
+          handle: PendingVerificationHandle;
+          expected: {
+            method: string;
+            path: string;
+            jsonBody?: Record<string, unknown>;
+          };
+        }
+      | { error: string }
+      | undefined;
+    if (params.verify === "tlsn") {
+      const sessionId = crypto.randomUUID();
+      finalHeaders["x-routstr-verify"] = "tlsn-proxy";
+      finalHeaders["x-routstr-tlsn-session"] = sessionId;
+      const proverWsUrl =
+        params.tlsnOptions?.proverWsUrl ?? this.tlsnConfig?.proverWsUrl;
+      if (!proverWsUrl) {
+        this._log(
+          "WARN",
+          "[RoutstrClient] verify: tlsn requested but no proverWsUrl configured (client tlsn config or tlsnOptions)"
+        );
+        tlsnSession = { error: "no proverWsUrl configured" };
+      } else {
+        try {
+          const verifier = new TlsnVerifier({ backend: this.tlsnConfig?.backend });
+          const handle = await verifier.begin({
+            proverWsUrl,
+            sessionId,
+            upstreamHostAllowlist:
+              params.tlsnOptions?.upstreamHostAllowlist ??
+              this.tlsnConfig?.upstreamHostAllowlist,
+            dialTo: params.tlsnOptions?.dialTo ?? this.tlsnConfig?.dialTo,
+            expected: {
+              method,
+              path: requestPath,
+              jsonBody:
+                requestBody && typeof requestBody === "object"
+                  ? (requestBody as Record<string, unknown>)
+                  : undefined,
+            },
+            modelMapping: params.tlsnOptions?.modelMapping,
+          });
+          tlsnSession = {
+            handle,
+            expected: {
+              method,
+              path: requestPath,
+              jsonBody:
+                requestBody && typeof requestBody === "object"
+                  ? (requestBody as Record<string, unknown>)
+                  : undefined,
+            },
+          };
+        } catch (error) {
+          this._log(
+            "WARN",
+            "[RoutstrClient] tlsn verifier begin failed:",
+            error
+          );
+          tlsnSession = {
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+    }
+
     const response = await this._makeRequest({
       path: requestPath,
       method,
@@ -726,6 +883,8 @@ export class RoutstrClient {
     let processedResponse = response;
     let capturedUsage: UsageTrackingData | undefined;
     let capturedResponseId: string | undefined;
+    // TLSN: raw SSE text chunks for the comparator (verified mode).
+    const tlsnSseChunks: string[] = [];
     let usagePromise: Promise<{
       capturedUsage?: UsageTrackingData;
       capturedResponseId?: string;
@@ -767,6 +926,7 @@ export class RoutstrClient {
         },
         {
           onRawChunk: (_chunk, sequence, text) => {
+            if (tlsnSession) tlsnSseChunks.push(text);
             void this.requestResponseLogSink?.logResponseChunk?.(
               requestResponseLogId,
               sequence,
@@ -796,6 +956,8 @@ export class RoutstrClient {
       capturedResponseId,
       clientApiKey,
       usagePromise,
+      tlsnSession,
+      tlsnSseChunks,
     };
   }
 
