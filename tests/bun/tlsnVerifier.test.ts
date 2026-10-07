@@ -9,27 +9,41 @@
  * response tamper → mismatch, host policy → unavailable.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 
 import { NativeVerifierBackend, TlsnVerifier, WasmWorkerBackend } from "../../client/tlsn";
 
-const PROVABLE_AI = join(__dirname, "..", "..", "..");
-const PROVERD_BIN = join(PROVABLE_AI, "proverd/target/debug/proverd");
-const MOCK_BIN = join(PROVABLE_AI, "proverd/target/debug/examples/mock_upstream");
-const ROOT_CA_DER = join(
-  PROVABLE_AI,
-  "tlsn/crates/server-fixture/certs/src/tls/root_ca_cert.der"
-);
-const ROOT_CA_PEM = join(
-  PROVABLE_AI,
-  "tlsn/crates/server-fixture/certs/src/tls/root_ca.crt"
-);
+// Binary/fixture locations: environment first, then the development layout
+// this rail was built in (the provable-ai lab). The e2e harness sets these.
+const LAB = process.env.TLSN_LAB_DIR ?? join(__dirname, "..", "..", "..", "..", "provable-ai");
+const PROVERD_BIN = process.env.PROVERD_BIN ?? join(LAB, "proverd/target/debug/proverd");
+const MOCK_BIN =
+  process.env.MOCK_UPSTREAM_BIN ?? join(LAB, "proverd/target/debug/examples/mock_upstream");
+const ROOT_CA_DER =
+  process.env.TLSN_FIXTURE_CA_DER ??
+  join(LAB, "tlsn/crates/server-fixture/certs/src/tls/root_ca_cert.der");
+const ROOT_CA_PEM =
+  process.env.TLSN_FIXTURE_CA_PEM ??
+  join(LAB, "tlsn/crates/server-fixture/certs/src/tls/root_ca.crt");
 const SERVER_DOMAIN = "test-server.io";
 const AUTH_TOKEN = "random_auth_token";
 const USE_WASM = process.env.TLSN_TEST_WASM === "1";
+const VERIFIER_BIN =
+  process.env.TLSN_VERIFIER_BIN ?? join(LAB, "proverd/target/debug/tlsn-verifier");
+
+// These tests drive real proverd/mock-upstream binaries. Skip (loudly) when
+// they are not built rather than failing with a confusing error.
+const MISSING_BINARIES = [
+  PROVERD_BIN,
+  MOCK_BIN,
+  ...(USE_WASM ? [ROOT_CA_DER] : [VERIFIER_BIN]),
+].filter((p) => !existsSync(p));
+if (MISSING_BINARIES.length > 0) {
+  console.warn(`[tlsnVerifier] skipping: missing binaries ${MISSING_BINARIES.join(", ")}`);
+}
 
 const CHAT_BODY = {
   model: "gpt-mock",
@@ -63,7 +77,11 @@ async function waitReady(url: string, timeoutMs = 10_000): Promise<void> {
 }
 
 beforeAll(async () => {
-  rootCerts = [Array.from(new Uint8Array(await Bun.file(ROOT_CA_DER).arrayBuffer()))];
+  // DER roots are only consumed by the wasm backend; tolerate their absence
+  // for the native backend (which takes the PEM path instead).
+  rootCerts = existsSync(ROOT_CA_DER)
+    ? [Array.from(new Uint8Array(await Bun.file(ROOT_CA_DER).arrayBuffer()))]
+    : [];
 
   const mock = Bun.spawn([MOCK_BIN, "--port", "0"], {
     stdout: "pipe",
@@ -161,7 +179,7 @@ async function runVerifiedSession(
   return handle.complete(responseBody);
 }
 
-describe(`TlsnVerifier proxy-tls e2e (${USE_WASM ? "wasm" : "native"} backend)`, () => {
+describe.skipIf(MISSING_BINARIES.length > 0)(`TlsnVerifier proxy-tls e2e (${USE_WASM ? "wasm" : "native"} backend)`, () => {
   test(
     "non-streaming chat completion verifies",
     async () => {

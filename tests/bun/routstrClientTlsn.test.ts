@@ -10,6 +10,7 @@
  * non-streaming and SSE — plus a tampered node response → mismatch.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 
@@ -18,15 +19,24 @@ import { NativeVerifierBackend } from "../../client/tlsn";
 import type { Model } from "../../core/types";
 import type { UpstreamVerification } from "../../core/types";
 
-const PROVABLE_AI = join(__dirname, "..", "..", "..");
-const PROVERD_BIN = join(PROVABLE_AI, "proverd/target/debug/proverd");
-const MOCK_BIN = join(PROVABLE_AI, "proverd/target/debug/examples/mock_upstream");
-const ROOT_CA_PEM = join(
-  PROVABLE_AI,
-  "tlsn/crates/server-fixture/certs/src/tls/root_ca.crt"
-);
+// Binary/fixture locations: environment first, then the development layout
+// this rail was built in (the provable-ai lab). The e2e harness sets these.
+const LAB = process.env.TLSN_LAB_DIR ?? join(__dirname, "..", "..", "..", "..", "provable-ai");
+const PROVERD_BIN = process.env.PROVERD_BIN ?? join(LAB, "proverd/target/debug/proverd");
+const MOCK_BIN =
+  process.env.MOCK_UPSTREAM_BIN ?? join(LAB, "proverd/target/debug/examples/mock_upstream");
+const ROOT_CA_PEM =
+  process.env.TLSN_FIXTURE_CA_PEM ??
+  join(LAB, "tlsn/crates/server-fixture/certs/src/tls/root_ca.crt");
 const SERVER_DOMAIN = "test-server.io";
 const AUTH_TOKEN = "random_auth_token";
+const VERIFIER_BIN =
+  process.env.TLSN_VERIFIER_BIN ?? join(LAB, "proverd/target/debug/tlsn-verifier");
+
+const MISSING_BINARIES = [PROVERD_BIN, MOCK_BIN, VERIFIER_BIN].filter((p) => !existsSync(p));
+if (MISSING_BINARIES.length > 0) {
+  console.warn(`[routstrClientTlsn] skipping: missing binaries ${MISSING_BINARIES.join(", ")}`);
+}
 
 const CHAT_BODY = {
   model: "gpt-mock",
@@ -178,7 +188,7 @@ function routeParams(body: Record<string, unknown>) {
   };
 }
 
-describe("RoutstrClient verify:tlsn wiring", () => {
+describe.skipIf(MISSING_BINARIES.length > 0)("RoutstrClient verify:tlsn wiring", () => {
   test(
     "non-streaming: headers reach the node, verification attaches and verifies",
     async () => {
