@@ -14,7 +14,7 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
-import { canonicalizeModelId, findModelForId } from "../core/modelMappings";
+import { canonicalizeModelId, findModelForId, type ModelIdMappings } from "../core/modelMappings";
 import {
   RoutstrClient,
   type DebugLevel,
@@ -36,6 +36,20 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
   return (
     !!headers &&
     Object.keys(headers).some((name) => name.toLowerCase() === MODEL_PATH_HEADER)
+  );
+}
+
+/**
+ * True when a requested model id names the auto-selected model in any
+ * spelling: the canonical id, a case variant of it, or a mapped variant such
+ * as "deepseek-v4-1-flash" (see MODEL_ID_MAPPINGS). Without canonicalizing
+ * first, asking for the mapped spelling silently disabled auto model-path
+ * selection while still routing to the same model.
+ */
+function isAutoModelPathModel(id: string, mappings?: ModelIdMappings): boolean {
+  return (
+    canonicalizeModelId(id.trim().toLowerCase(), mappings).toLowerCase() ===
+    DEEPSEEK_AUTO_MODEL_ID
   );
 }
 
@@ -251,14 +265,24 @@ export async function resolveRequestContext(
       autoModelPath === true &&
       !hasModelPathHeader(inputHeaders) &&
       typeof modelId === "string" &&
-      modelId.trim().toLowerCase() === DEEPSEEK_AUTO_MODEL_ID &&
+      isAutoModelPathModel(
+        modelId,
+        discoveryAdapter.getModelIdMappings?.() ?? undefined
+      ) &&
       DEEPSEEK_AUTO_NODE_URLS.some((nodeUrl) =>
         sameNode(nodeUrl, normalizedProvider)
       )
     ) {
       const nodePaths = await getNodeModelPaths(normalizedProvider);
       const resolved = nodePaths
-        ? resolveDeepSeekModelPathSelectors(nodePaths, modelId)
+        ? resolveDeepSeekModelPathSelectors(
+            nodePaths,
+            canonicalizeModelId(
+              modelId,
+              discoveryAdapter.getModelIdMappings?.() ?? undefined
+            ),
+            discoveryAdapter.getModelIdMappings?.() ?? undefined
+          )
         : null;
       const index = resolved?.selectors.findIndex(
         (s): s is string => s !== null
@@ -275,7 +299,10 @@ export async function resolveRequestContext(
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
-    modelId.trim().toLowerCase() === DEEPSEEK_AUTO_MODEL_ID
+    isAutoModelPathModel(
+      modelId,
+      discoveryAdapter.getModelIdMappings?.() ?? undefined
+    )
   ) {
     // "Get baseUrl for model path": rank the whitelisted auto-selection
     // nodes by their per-route price and pin the best candidate's selector.

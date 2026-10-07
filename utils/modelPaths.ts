@@ -17,6 +17,7 @@
  */
 
 import type { ModelSatsPricing } from "../core/types";
+import { modelIdVariants, type ModelIdMappings } from "../core/modelMappings";
 import { normalizeProviderUrl } from "./torUtils";
 
 /** The only request header the SDK forwards upstream on routed requests. */
@@ -102,7 +103,18 @@ export interface NodeModelPathEntry {
 
 /** The subset of GET /v1/models/paths the SDK consumes. */
 export interface NodeModelPaths {
-  data: Array<{ id: string; paths: NodeModelPathEntry[] }>;
+  data: Array<{
+    id: string;
+    paths: NodeModelPathEntry[];
+    /**
+     * Other ids the node itself declares for this same model. Kept because a
+     * node may file one model under several spellings — and the mapping
+     * snapshot that links them (MODEL_ID_MAPPINGS) is replaced wholesale by a
+     * trusted kind 38426 event, so it is not a stable contract. Empty when the
+     * node declares none.
+     */
+    alias_ids: string[];
+  }>;
   updatedAt: number | null;
 }
 
@@ -143,7 +155,7 @@ export function parseModelPathsPayload(payload: unknown): NodeModelPaths | null 
   if (!payload || typeof payload !== "object") return null;
   const data = (payload as Record<string, unknown>).data;
   if (!Array.isArray(data)) return null;
-  const models: Array<{ id: string; paths: NodeModelPathEntry[] }> = [];
+  const models: NodeModelPaths["data"] = [];
   for (const entry of data) {
     if (!entry || typeof entry !== "object") continue;
     const record = entry as Record<string, unknown>;
@@ -162,7 +174,14 @@ export function parseModelPathsPayload(payload: unknown): NodeModelPaths | null 
       const model = parsePathMetadata(entry.model);
       paths.push(model ? { path, model } : { path });
     }
-    models.push({ id, paths });
+    const rawAliases = record.alias_ids;
+    const alias_ids = Array.isArray(rawAliases)
+      ? rawAliases.filter(
+          (alias): alias is string =>
+            typeof alias === "string" && alias.length > 0
+        )
+      : [];
+    models.push({ id, paths, alias_ids });
   }
   if (models.length === 0) return null;
   const updatedAt = (payload as Record<string, unknown>).updated_at;
@@ -347,32 +366,85 @@ export interface DeepSeekModelPathSelectors {
 }
 
 /**
+ * Every spelling under which one node may file a model: the requested id's
+ * mapped variants (see modelIdVariants) plus any alias_ids the entries
+ * themselves declare, closed transitively so an alias naming another entry's
+ * id is followed.
+ *
+ * A node can list the same model as separate entries — e.g. the canonical
+ * `deepseek-v4.1-flash` and its mapped variant `deepseek-v4-1-flash`, each
+ * with a different path list — so the complete route set only appears when
+ * the spellings are considered together. Entries that share no spelling with
+ * the requested model never contribute.
+ */
+function modelSpellings(
+  nodePaths: NodeModelPaths,
+  modelId: string,
+  mappings?: ModelIdMappings
+): Set<string> {
+  const spellings = new Set(
+    modelIdVariants(modelId, mappings).map((id) => id.toLowerCase())
+  );
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const entry of nodePaths.data) {
+      const ids = [entry.id, ...entry.alias_ids];
+      if (!ids.some((id) => spellings.has(id.toLowerCase()))) continue;
+      for (const id of ids) {
+        const key = id.toLowerCase();
+        if (!spellings.has(key)) {
+          spellings.add(key);
+          grew = true;
+        }
+      }
+    }
+  }
+  return spellings;
+}
+
+/**
  * Resolve the whitelisted DeepSeek selectors from a node's /v1/models/paths
  * payload, in whitelist preference order. Advertised path strings are used
  * verbatim: they carry the exact model id (and, on older nodes, the node's
- * provider id), so the node is guaranteed to accept them. Returns null when
- * the node does not list the model.
+ * provider id), so the node is guaranteed to accept them.
+ *
+ * Paths are gathered across every spelling the node files the model under
+ * (see modelSpellings), so a route advertised only under a mapped variant —
+ * the node's own alias_ids, or a spelling linked by MODEL_ID_MAPPINGS — is
+ * still found. Returns null when the node lists the model under none of them.
  */
 export function resolveDeepSeekModelPathSelectors(
   nodePaths: NodeModelPaths,
-  modelId: string
+  modelId: string,
+  mappings?: ModelIdMappings
 ): DeepSeekModelPathSelectors | null {
-  const entry = nodePaths.data.find(
-    (m) => m.id.toLowerCase() === modelId.toLowerCase()
+  const spellings = modelSpellings(nodePaths, modelId, mappings);
+  const matching = nodePaths.data.filter((m) =>
+    spellings.has(m.id.toLowerCase())
   );
-  if (!entry) return null;
+  if (matching.length === 0) return null;
+  // The requested spelling wins a contested route, then payload order: a node
+  // listing both spellings must never have its canonical path list shadowed by
+  // a variant entry.
+  const requested = modelId.toLowerCase();
+  const ordered = [
+    ...matching.filter((m) => m.id.toLowerCase() === requested),
+    ...matching.filter((m) => m.id.toLowerCase() !== requested),
+  ];
   const selectors: Array<string | null> = DEEPSEEK_MODEL_PATH_WHITELIST.map(
     () => null
   );
   const satsPricing: Array<NodeModelPathMetadata["sats_pricing"] | null> =
     DEEPSEEK_MODEL_PATH_WHITELIST.map(() => null);
-  for (const { path, model } of entry.paths) {
-    const route = whitelistedDeepSeekRoute(path);
-    if (!route) continue;
-    const index = DEEPSEEK_MODEL_PATH_WHITELIST.indexOf(route);
-    if (index >= 0 && selectors[index] === null) {
-      selectors[index] = path;
-      satsPricing[index] = model?.sats_pricing ?? null;
+  for (const entry of ordered) {
+    for (const { path, model } of entry.paths) {
+      const route = whitelistedDeepSeekRoute(path);
+      if (!route) continue;
+      const index = DEEPSEEK_MODEL_PATH_WHITELIST.indexOf(route);
+      if (index >= 0 && selectors[index] === null) {
+        selectors[index] = path;
+        satsPricing[index] = model?.sats_pricing ?? null;
+      }
     }
   }
   return { selectors, satsPricing };
