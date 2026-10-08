@@ -63,10 +63,13 @@ export interface SdkStorageState {
   /** Providers currently on cooldown. Entries with `modelPath` cool down only
    * that upstream route on the provider; entries with `modelId` only cool down
    * that model; entries with neither cool down the whole provider. */
+  /** Consecutive model/path failures, retained after cooldown expiry. */
+  modelFailureStreaks: Array<{ baseUrl: string; modelId?: string; modelPath?: string; failureStreak: number }>;
   providersOnCooldown: Array<{
     baseUrl: string;
     modelId?: string;
     modelPath?: string;
     timestamp: number;
+    cooldownUntil?: number;
   }>;
 }

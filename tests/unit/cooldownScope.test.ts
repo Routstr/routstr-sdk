@@ -322,7 +322,7 @@ describe("ProviderManager empty-string modelId edge", () => {
     expect(manager.isOnCooldown(BASE_URL)).toBe(false);
     expect(manager.isOnCooldown(BASE_URL, "other-model")).toBe(false);
     expect(manager.getProvidersOnCooldown()).toEqual([
-      { baseUrl: BASE_URL, modelId: "", timestamp: expect.any(Number) },
+      { baseUrl: BASE_URL, modelId: "", modelPath: undefined, timestamp: expect.any(Number), cooldownUntil: expect.any(Number) },
     ]);
   });
 

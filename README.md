@@ -87,6 +87,24 @@ const client = new RoutstrClient(
 const currentMode = client.getMode(); // Returns the active mode
 ```
 
+## Exponential model cooldowns
+
+Model/provider and pinned upstream-path/provider failures immediately trigger a
+10-second cooldown. Consecutive failures double the duration (10, 20, 40, 80,
+160, 320 seconds), capped at 10 minutes. Expiry allows another attempt but keeps
+the failure streak; a successful model HTTP response resets only its matching
+scope. Streaming responses count as successful when their HTTP headers arrive;
+midstream errors do not currently affect streaks.
+
+Streaks and cooldown deadlines persist with the SDK store. Older stored cooldowns
+retain their original 210-second expiry. Provider-wide network/mint failures keep
+the existing two-strike, 210-second policy. Errors excluded from cooldown tracking
+remain excluded.
+
+For direct `ProviderManager` users, `recordSuccess()` resets the exact scope.
+`removeFromCooldown()` and `clearCooldowns()` only unblock attempts; use
+`clearFailureHistory()` to reset failure streaks without removing active cooldowns.
+
 ## Tests
 
 SDK unit tests live in `sdk/__tests__` and are run with Vitest.
