@@ -210,6 +210,11 @@ export class ModelManager {
    * nodes are down for days at a time, so "still down" is not news: only a
    * transition (newly failed, reason changed, recovered) earns a raw line, and
    * the steady state collapses into one summary per pass.
+   *
+   * Best-effort under concurrency: two overlapping passes on one instance can
+   * both read the pre-pass state, which re-reports the current outage set once
+   * and reports no false recovery. Only log volume is affected, so this is not
+   * worth locking for.
    */
   private providerFailures = new Map<string, ProviderFailure>();
 
@@ -1435,7 +1440,9 @@ export class ModelManager {
    * newly fails (or starts failing differently) still gets its own warning, so
    * anything alertable stays greppable and no detail is lost; a provider that
    * is merely still down only advances a counter. The full per-provider detail
-   * stays at `debug` for loggers that filter by level.
+   * stays at `debug` for loggers that filter by level, so the suppression
+   * applies to consumers that inject one: `consoleLogger`, the default when no
+   * logger is injected, prints `debug` like everything else.
    */
   private reportProviderFailures(
     outcomes: ProviderFetchOutcome[],
