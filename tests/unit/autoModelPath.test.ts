@@ -177,6 +177,73 @@ describe("resolveRequestContext model-path selection", () => {
     });
   });
 
+  it("auto-pins when the request names the model by a mapped spelling", async () => {
+    // "deepseek-v4-1-flash" maps to deepseek-v4.1-flash. The gate used to
+    // compare the raw requested id, so this request silently lost auto-pinning
+    // while still routing to the same model.
+    stubPathsFetch({
+      [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0004 }]),
+    });
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+
+    const ctx = await resolveRequestContext({
+      modelId: "deepseek-v4-1-flash",
+      autoModelPath: true,
+      ...deps,
+    });
+
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toEqual({
+      selector: DEEPSEEK_SELECTOR,
+      satsPricing: { prompt: 0.001, completion: 0.0004, max_cost: 700 },
+      autoPinned: true,
+    });
+  });
+
+  it("auto-pins a route advertised only under a mapped spelling", async () => {
+    // The node files the model under the variant spelling alone and puts the
+    // whitelisted route there. Resolution must still find it, otherwise the
+    // node drops out of model-path ranking entirely.
+    const VARIANT_DEEPSEEK_SELECTOR =
+      "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash&endpoint=deepseek";
+    stubPathsFetch({
+      [NODE_A]: {
+        data: [
+          {
+            id: "deepseek-v4-1-flash",
+            paths: [
+              {
+                path: VARIANT_DEEPSEEK_SELECTOR,
+                model: {
+                  sats_pricing: {
+                    prompt: 0.001,
+                    completion: 0.0004,
+                    max_cost: 700,
+                  },
+                },
+              },
+            ],
+          },
+        ],
+        updated_at: null,
+      },
+    });
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+
+    const ctx = await resolveRequestContext({
+      modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true,
+      ...deps,
+    });
+
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toEqual({
+      selector: VARIANT_DEEPSEEK_SELECTOR,
+      satsPricing: { prompt: 0.001, completion: 0.0004, max_cost: 700 },
+      autoPinned: true,
+    });
+  });
+
   it("pins the forced node's own selector when the caller forces a whitelisted node", async () => {
     const fetchMock = stubPathsFetch({
       [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.0013 }]),

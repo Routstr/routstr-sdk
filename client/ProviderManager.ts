@@ -1422,7 +1422,11 @@ export class ProviderManager {
 
         const nodePaths = await getNodeModelPaths(baseUrl);
         if (!nodePaths) return null;
-        const resolved = resolveDeepSeekModelPathSelectors(nodePaths, modelId);
+        const resolved = resolveDeepSeekModelPathSelectors(
+          nodePaths,
+          modelId,
+          this.getModelIdMappings()
+        );
         if (!resolved) return null;
 
         // Whitelist order, dropping routes this node has on path-scoped
