@@ -104,7 +104,7 @@ describe("exponential scoped cooldowns", () => {
     mappings = { native: "canonical" };
     pm.markFailed(provider, undefined, "canonical");
     expect(pm.getProvidersOnCooldown()[0]).toMatchObject({ modelId: "canonical", cooldownUntil: Date.now() + 20_000 });
-    expect(store.getState().modelFailureStreaks).toEqual([{ baseUrl: provider, modelId: "canonical", modelPath: undefined, failureStreak: 2 }]);
+    expect(store.getState().modelFailureStreaks).toEqual([{ baseUrl: provider, modelId: "canonical", modelPath: undefined, failureStreak: 2, failedAt: expect.any(Number) }]);
     pm.recordSuccess(provider, "native");
     pm.markFailed(provider, undefined, "canonical");
     expect(pm.getProvidersOnCooldown()[0].cooldownUntil).toBe(Date.now() + 10_000);

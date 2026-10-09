@@ -64,7 +64,14 @@ export interface SdkStorageState {
    * that upstream route on the provider; entries with `modelId` only cool down
    * that model; entries with neither cool down the whole provider. */
   /** Consecutive model/path failures, retained after cooldown expiry. */
-  modelFailureStreaks: Array<{ baseUrl: string; modelId?: string; modelPath?: string; failureStreak: number }>;
+  modelFailureStreaks: Array<{
+    baseUrl: string;
+    modelId?: string;
+    modelPath?: string;
+    failureStreak: number;
+    /** Last failure for this scope; older entries are forgotten. */
+    failedAt?: number;
+  }>;
   providersOnCooldown: Array<{
     baseUrl: string;
     modelId?: string;

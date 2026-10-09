@@ -687,6 +687,8 @@ interface FailureStreak {
   modelId?: string;
   modelPath?: string;
   failureStreak: number;
+  /** When this scope last failed; forgotten streaks are pruned by age. */
+  failedAt?: number;
 }
 
 /**
@@ -717,9 +719,28 @@ export class ProviderManager {
   private lastFailed = new Map<string, number>();
   /** Cooldown entries keyed by cooldownKey(baseUrl, modelId) */
   private failureStreaks = new Map<string, FailureStreak>();
+  /** Discovery snapshot the streak map was last re-keyed against */
+  private streakMappingSnapshot: ModelIdMappings | null = null;
+  /** Last time the streak map was swept; see STREAK_SWEEP_INTERVAL_MS */
+  private lastStreakSweepAt = 0;
   private providersOnCoolDown = new Map<string, CooldownEntry>();
   /** Cooldown duration in milliseconds (210 seconds) */
   private static readonly COOLDOWN_DURATION_MS = 210 * 1000;
+  /**
+   * A scope that has not failed for this long is forgotten and starts over at
+   * the first-failure cooldown. Streaks outlive their cooldowns by design, so
+   * nothing else would ever remove one: without this the map grows for the
+   * whole life of the client and every cooldown check pays for it. Must stay
+   * well above the maximum cooldown (10 minutes) so a scope keeps its streak
+   * across its own cooldown window.
+   */
+  private static readonly STREAK_RETENTION_MS = 6 * 60 * 60 * 1000;
+  /**
+   * How often forgotten streaks are swept. Re-keying against the discovery
+   * mapping snapshot is cheap to detect but costs a full pass over the map,
+   * so it runs on this interval or when the snapshot itself is replaced.
+   */
+  private static readonly STREAK_SWEEP_INTERVAL_MS = 60 * 1000;
   /** Optional persistent store for failure tracking */
   private store: SdkStore | null = null;
   /** Instance ID for debugging */
@@ -767,9 +788,12 @@ export class ProviderManager {
       const key = cooldownKey(baseUrl, modelId, entry.modelPath);
       const previous = this.failureStreaks.get(key);
       if (!previous || previous.failureStreak < entry.failureStreak) {
-        this.failureStreaks.set(key, { ...entry, baseUrl, modelId });
+        // Entries written before streaks carried a timestamp get a fresh
+        // retention window rather than being dropped on sight.
+        this.failureStreaks.set(key, { ...entry, baseUrl, modelId, failedAt: entry.failedAt ?? Date.now() });
       }
     }
+    this.streakMappingSnapshot = this.getModelIdMappings();
 
     // Hydrate all entries; normal cleanup releases expired providers too.
     // Entries persisted before model ids were canonicalized may carry a
@@ -851,18 +875,6 @@ export class ProviderManager {
       }
     }
     this.providersOnCoolDown = cooldowns;
-    const streaks = new Map<string, FailureStreak>();
-    for (const entry of this.failureStreaks.values()) {
-      const modelId = entry.modelId === undefined ? undefined : this.canonicalizeModelId(entry.modelId);
-      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
-      const previous = streaks.get(key);
-      // Aliases represent the same scope; keep the highest known streak.
-      if (!previous || previous.failureStreak < entry.failureStreak) streaks.set(key, { ...entry, modelId });
-    }
-    if (JSON.stringify([...streaks]) !== JSON.stringify([...this.failureStreaks])) {
-      this.failureStreaks = streaks;
-      this.persistFailureStreaks();
-    }
 
     const strikes = new Map<string, number>();
     for (const [key, timestamp] of this.lastFailed) {
@@ -893,6 +905,8 @@ export class ProviderManager {
         this.lastFailed.delete(key);
       }
     }
+
+    this.sweepFailureStreaks(now);
 
     // Remove providers from failedProviders once they have no active
     // cooldown entries left, so they can be retried
@@ -1029,7 +1043,7 @@ export class ProviderManager {
 
     if (modelId !== undefined || modelPath !== undefined) {
       const failureStreak = Math.min((this.failureStreaks.get(key)?.failureStreak ?? 0) + 1, Number.MAX_SAFE_INTEGER);
-      this.failureStreaks.set(key, { baseUrl, modelId, modelPath, failureStreak });
+      this.failureStreaks.set(key, { baseUrl, modelId, modelPath, failureStreak, failedAt: now });
       this.persistFailureStreaks();
       const cooldownUntil = now + Math.min(10_000 * 2 ** Math.min(failureStreak - 1, 6), 600_000);
       this.providersOnCoolDown.set(key, { baseUrl, modelId, modelPath, timestamp: now, cooldownUntil });
@@ -1091,6 +1105,55 @@ export class ProviderManager {
     }
   }
 
+  /**
+   * Re-key streaks against the active discovery snapshot and drop scopes that
+   * have not failed for STREAK_RETENTION_MS. Guarded twice so the common call
+   * is O(1): the pass only runs when the mapping snapshot was replaced or the
+   * sweep interval elapsed. Nothing is written unless the pass changed
+   * something.
+   */
+  private sweepFailureStreaks(now: number): void {
+    const mappings = this.getModelIdMappings();
+    if (
+      mappings === this.streakMappingSnapshot &&
+      now - this.lastStreakSweepAt < ProviderManager.STREAK_SWEEP_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.streakMappingSnapshot = mappings;
+    this.lastStreakSweepAt = now;
+
+    const cutoff = now - ProviderManager.STREAK_RETENTION_MS;
+    const streaks = new Map<string, FailureStreak>();
+    let changed = false;
+    for (const [previousKey, entry] of this.failureStreaks) {
+      const failedAt = entry.failedAt ?? now;
+      if (failedAt <= cutoff) {
+        changed = true;
+        continue;
+      }
+      const modelId =
+        entry.modelId === undefined
+          ? undefined
+          : this.canonicalizeModelId(entry.modelId);
+      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
+      const previous = streaks.get(key);
+      if (previous) {
+        // Aliases are one scope: keep the longest streak and its latest
+        // failure.
+        changed = true;
+        previous.failureStreak = Math.max(previous.failureStreak, entry.failureStreak);
+        previous.failedAt = Math.max(previous.failedAt ?? failedAt, failedAt);
+        continue;
+      }
+      streaks.set(key, { ...entry, modelId, failedAt });
+      if (key !== previousKey || modelId !== entry.modelId) changed = true;
+    }
+    if (!changed) return;
+    this.failureStreaks = streaks;
+    this.persistFailureStreaks();
+  }
+
   private persistFailureStreaks(): void {
     this.store?.getState().setModelFailureStreaks?.([...this.failureStreaks.values()]);
   }
@@ -1102,17 +1165,23 @@ export class ProviderManager {
     this.cleanupExpiredCooldowns();
     if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
     const key = cooldownKey(baseUrl, modelId, modelPath);
-    this.failureStreaks.delete(key);
+    const hadStreak = this.failureStreaks.delete(key);
     this.lastFailed.delete(key);
-    this.providersOnCoolDown.delete(key);
-    this.persistFailureStreaks();
-    this.removeStoredCooldown(baseUrl, modelId, modelPath);
+    const hadCooldown = this.providersOnCoolDown.delete(key);
+    // recordSuccess fires on every successful request, so only write through
+    // when this success actually cleared something; an unconditional persist
+    // would rewrite the whole streak/cooldown arrays per request.
+    if (hadStreak) this.persistFailureStreaks();
+    if (hadCooldown) this.removeStoredCooldown(baseUrl, modelId, modelPath);
     if (modelId === undefined && modelPath === undefined) {
       const lastFailed = { ...this.store?.getState().lastFailed };
       delete lastFailed[baseUrl];
       this.store?.getState().setLastFailed(lastFailed);
     }
-    if (![...this.providersOnCoolDown.values()].some((entry) => entry.baseUrl === baseUrl)) {
+    if (
+      this.failedProviders.has(baseUrl) &&
+      ![...this.providersOnCoolDown.values()].some((entry) => entry.baseUrl === baseUrl)
+    ) {
       this.failedProviders.delete(baseUrl);
       this.store?.getState().removeFailedProvider(baseUrl);
     }
