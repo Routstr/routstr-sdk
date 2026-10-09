@@ -55,6 +55,8 @@ export interface ResolveContextInput {
    * it covers. A model with no policy entry routes as before.
    */
   autoModelPath?: boolean;
+  /** Only providers advertising `confidential_upstream` for the model. */
+  requireConfidential?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching. */
@@ -136,6 +138,7 @@ export async function resolveRequestContext(
     forcedProvider,
     inputHeaders,
     autoModelPath = false,
+    requireConfidential = false,
     walletAdapter,
     storageAdapter,
     discoveryAdapter,
@@ -250,6 +253,11 @@ export async function resolveRequestContext(
         `Provider ${normalizedProvider} does not offer model: ${modelId}`
       );
     }
+    if (requireConfidential && !match.confidential_upstream) {
+      throw new Error(
+        `Provider ${normalizedProvider} does not offer model ${modelId} confidentially`
+      );
+    }
     baseUrl = normalizedProvider;
     selectedModel = match;
 
@@ -305,6 +313,7 @@ export async function resolveRequestContext(
       }
     }
   } else if (
+    !requireConfidential &&
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
@@ -344,13 +353,19 @@ export async function resolveRequestContext(
   } else {
     // Ranked on a warm basket: a continuing session is billed mostly at the
     // cache rate, which is what the route should be chosen on.
-    const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
-      torMode,
-      includeDisabled: false,
-      basket: WARM_COST_BASKET,
-    });
+    const ranking = providerManager
+      .getProviderPriceRankingForModel(modelId, {
+        torMode,
+        includeDisabled: false,
+        basket: WARM_COST_BASKET,
+      })
+      .filter((p) => !requireConfidential || Boolean(p.model.confidential_upstream));
     if (ranking.length === 0) {
-      throw new Error(`No providers found for model: ${modelId}`);
+      throw new Error(
+        requireConfidential
+          ? `No provider offers model ${modelId} confidentially`
+          : `No providers found for model: ${modelId}`
+      );
     }
     // Cheapest-first among providers that accept a funded mint (fail open
     // when the mint cache is empty).
