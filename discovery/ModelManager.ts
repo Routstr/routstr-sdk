@@ -9,6 +9,12 @@ import { consoleLogger } from "../core/types";
 import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import {
+  classifyProviderFailure,
+  diffProviderOutage,
+  type ProviderFailure,
+  type ProviderOutcome,
+} from "./providerOutageReport";
+import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
@@ -153,6 +159,19 @@ export class ModelManager {
   private eventStoreInitPromise: Promise<EventStore | null> | null = null;
   private readonly eventStoreDbPath?: string;
   private readonly persistentEventDatabaseFactory?: PersistentEventDatabaseFactory;
+  /**
+   * Provider failures from the previous fetch pass, keyed by base URL.
+   * A refresh runs on a fixed cadence against a provider set where the same
+   * nodes are down for days at a time, so "still down" is not news: only a
+   * transition (newly failed, reason changed, recovered) earns a raw line, and
+   * the steady state collapses into one summary per pass.
+   *
+   * Best-effort under concurrency: two overlapping passes on one instance can
+   * both read the pre-pass state, which re-reports the current outage set once
+   * and reports no false recovery. Only log volume is affected, so this is not
+   * worth locking for.
+   */
+  private providerFailures = new Map<string, ProviderFailure>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -522,11 +541,13 @@ export class ModelManager {
     // previously stored evidence when the relays are temporarily unavailable.
     await this.fetchModelIdMappings(true);
 
-    this.logger.log("refreshNostrEvents: live fetch complete");
+    // Per-scheduled-pass chatter: the caller reports the pass outcome, so the
+    // phase markers stay at `debug` rather than re-printing every 21 minutes.
+    this.logger.debug("refreshNostrEvents: live fetch complete");
 
     const pruned = await this.pruneSupersededDiscoveryEvents();
     if (pruned > 0) {
-      this.logger.log(
+      this.logger.debug(
         `refreshNostrEvents: pruned ${pruned} superseded discovery event(s)`
       );
     }
@@ -1163,6 +1184,8 @@ export class ModelManager {
       throw new NoProvidersAvailableError();
     }
 
+    const startedAt = Date.now();
+
     // Bootstrap refreshes mappings before model grouping. Direct fetchModels
     // calls use the already-hydrated snapshot (or bundled offline fallback).
     const mappings = this.getModelIdMappings();
@@ -1243,20 +1266,26 @@ export class ModelManager {
 
         emitProgress();
 
-        return { success: true, base, list };
+        return { base };
       } catch (error) {
-        if (this.isProviderDownError(error)) {
-          this.logger.warn(`Provider ${base} is down right now.`);
-        } else {
-          this.logger.warn(`Provider ${base} unreachable: ${(error as Error).message}`);
-        }
         // No stamp on failure, or the provider is served as "offers
         // nothing" until the TTL expires; last known models keep serving.
-        return { success: false, base };
+        // The raw error text is kept, but reporting is deferred to the end of
+        // the pass so a node that has been down for days cannot re-print its
+        // error line on every refresh. See reportProviderFailures().
+        return { base, failure: classifyProviderFailure(error) };
       }
     });
 
-    await Promise.allSettled(fetchPromises);
+    const settled = await Promise.allSettled(fetchPromises);
+    this.reportProviderFailures(
+      settled.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : []
+      ),
+      freshlyFetched,
+      baseUrls.length,
+      Date.now() - startedAt
+    );
 
     // Cache all provider results, pruning stale entries for providers
     // that are no longer in the current baseUrls (e.g. their Nostr event
@@ -1308,16 +1337,35 @@ export class ModelManager {
     return list;
   }
 
-  private isProviderDownError(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    const msg = error.message.toLowerCase();
-    if (msg.includes("fetch failed")) return true;
-    if (msg.includes("429")) return true;
-    if (msg.includes("502")) return true;
-    if (msg.includes("503")) return true;
-    if (msg.includes("504")) return true;
-    const cause = error.cause as { code?: string } | undefined;
-    return cause?.code === "ENOTFOUND";
+  /**
+   * Report reachability for one fetch pass as state transitions plus a single
+   * summary, instead of one line per provider per pass. The diff itself lives
+   * in `providerOutageReport.ts`; this only emits the lines it returns.
+   *
+   * The per-provider detail is at `debug`, so suppression applies to consumers
+   * that inject a level-filtering logger: `consoleLogger`, the default when no
+   * logger is injected, prints `debug` like everything else.
+   */
+  private reportProviderFailures(
+    outcomes: ProviderOutcome[],
+    freshlyFetched: Set<string>,
+    total: number,
+    elapsedMs: number
+  ): void {
+    const report = diffProviderOutage(
+      this.providerFailures,
+      outcomes,
+      freshlyFetched,
+      total,
+      elapsedMs
+    );
+    this.providerFailures = report.failures;
+
+    for (const line of report.lines) {
+      if (line.level === "warn") this.logger.warn(line.message);
+      else if (line.level === "info") this.logger.log(line.message);
+      else this.logger.debug(line.message);
+    }
   }
 
   /**
