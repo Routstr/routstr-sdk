@@ -23,6 +23,7 @@ export const SDK_STORAGE_KEYS = {
   CLIENT_IDS: "client_ids",
   FAILED_PROVIDERS: "failed_providers",
   LAST_FAILED: "last_failed",
+  MODEL_FAILURE_STREAKS: "model_failure_streaks",
   PROVIDERS_ON_COOLDOWN: "providers_on_cooldown",
 } as const;
 

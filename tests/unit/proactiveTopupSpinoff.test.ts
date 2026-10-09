@@ -98,6 +98,7 @@ function createClient(
     ...storageOverrides,
   } as StorageAdapter;
   const providerManager = {
+    recordSuccess: vi.fn(),
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([BASE_URL]),
     findNextBestProvider: vi.fn(() => null),

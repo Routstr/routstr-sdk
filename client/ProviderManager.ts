@@ -678,6 +678,17 @@ export interface CooldownEntry {
    */
   modelPath?: string;
   timestamp: number;
+  /** Absolute expiry; legacy entries use timestamp + 210 seconds. */
+  cooldownUntil?: number;
+}
+
+interface FailureStreak {
+  baseUrl: string;
+  modelId?: string;
+  modelPath?: string;
+  failureStreak: number;
+  /** When this scope last failed; forgotten streaks are pruned by age. */
+  failedAt?: number;
 }
 
 /**
@@ -707,9 +718,29 @@ export class ProviderManager {
   /** Track when each scope (provider URL or baseUrl::modelId) last failed */
   private lastFailed = new Map<string, number>();
   /** Cooldown entries keyed by cooldownKey(baseUrl, modelId) */
+  private failureStreaks = new Map<string, FailureStreak>();
+  /** Discovery snapshot the streak map was last re-keyed against */
+  private streakMappingSnapshot: ModelIdMappings | null = null;
+  /** Last time the streak map was swept; see STREAK_SWEEP_INTERVAL_MS */
+  private lastStreakSweepAt = 0;
   private providersOnCoolDown = new Map<string, CooldownEntry>();
   /** Cooldown duration in milliseconds (210 seconds) */
   private static readonly COOLDOWN_DURATION_MS = 210 * 1000;
+  /**
+   * A scope that has not failed for this long is forgotten and starts over at
+   * the first-failure cooldown. Streaks outlive their cooldowns by design, so
+   * nothing else would ever remove one: without this the map grows for the
+   * whole life of the client and every cooldown check pays for it. Must stay
+   * well above the maximum cooldown (10 minutes) so a scope keeps its streak
+   * across its own cooldown window.
+   */
+  private static readonly STREAK_RETENTION_MS = 6 * 60 * 60 * 1000;
+  /**
+   * How often forgotten streaks are swept. Re-keying against the discovery
+   * mapping snapshot is cheap to detect but costs a full pass over the map,
+   * so it runs on this interval or when the snapshot itself is replaced.
+   */
+  private static readonly STREAK_SWEEP_INTERVAL_MS = 60 * 1000;
   /** Optional persistent store for failure tracking */
   private store: SdkStore | null = null;
   /** Instance ID for debugging */
@@ -751,31 +782,42 @@ export class ProviderManager {
     // Hydrate lastFailed
     this.lastFailed = new Map(Object.entries(state.lastFailed));
 
-    // Hydrate providersOnCooldown (filter out expired)
-    const now = Date.now();
+    for (const entry of state.modelFailureStreaks ?? []) {
+      const modelId = entry.modelId === undefined ? undefined : this.canonicalizeModelId(entry.modelId);
+      const baseUrl = normalizeBaseUrl(entry.baseUrl);
+      const key = cooldownKey(baseUrl, modelId, entry.modelPath);
+      const previous = this.failureStreaks.get(key);
+      if (!previous || previous.failureStreak < entry.failureStreak) {
+        // Entries written before streaks carried a timestamp get a fresh
+        // retention window rather than being dropped on sight.
+        this.failureStreaks.set(key, { ...entry, baseUrl, modelId, failedAt: entry.failedAt ?? Date.now() });
+      }
+    }
+    this.streakMappingSnapshot = this.getModelIdMappings();
+
+    // Hydrate all entries; normal cleanup releases expired providers too.
     // Entries persisted before model ids were canonicalized may carry a
     // variant spelling; they are re-keyed (and re-labelled) canonically so a
     // legacy "claude-opus-5-5" entry still blocks "claude-opus-5.5". If a
     // legacy and a canonical entry collide, the newer timestamp wins.
     this.providersOnCoolDown = new Map();
     for (const entry of state.providersOnCooldown) {
-      if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
-        continue;
-      }
       const modelId =
         entry.modelId !== undefined
           ? this.canonicalizeModelId(entry.modelId)
           : undefined;
-      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
+      const key = cooldownKey(normalizeBaseUrl(entry.baseUrl), modelId, entry.modelPath);
       const existing = this.providersOnCoolDown.get(key);
       if (existing && existing.timestamp >= entry.timestamp) continue;
       this.providersOnCoolDown.set(key, {
-        baseUrl: entry.baseUrl,
+        baseUrl: normalizeBaseUrl(entry.baseUrl),
         modelId,
         modelPath: entry.modelPath,
         timestamp: entry.timestamp,
+        cooldownUntil: entry.cooldownUntil,
       });
     }
+    this.cleanupExpiredCooldowns();
   }
 
   /**
@@ -788,6 +830,11 @@ export class ProviderManager {
     modelPath?: string
   ): void {
     if (!this.store) return;
+    if (modelPath !== undefined) {
+      // A path key is provider + path, independent of its model label.
+      this.store.getState().removeProviderFromCooldown(baseUrl, modelId, modelPath);
+      return;
+    }
     const ids: Array<string | undefined> = modelId === undefined ? [undefined] : modelIdVariants(modelId, this.getModelIdMappings());
     for (const entry of this.store.getState().providersOnCooldown) {
       if (entry.baseUrl === baseUrl && entry.modelPath === modelPath &&
@@ -828,6 +875,7 @@ export class ProviderManager {
       }
     }
     this.providersOnCoolDown = cooldowns;
+
     const strikes = new Map<string, number>();
     for (const [key, timestamp] of this.lastFailed) {
       const separator = key.lastIndexOf("::");
@@ -840,7 +888,7 @@ export class ProviderManager {
     const now = Date.now();
     const expiredProviders = new Set<string>();
     for (const [key, entry] of this.providersOnCoolDown) {
-      if (now - entry.timestamp >= ProviderManager.COOLDOWN_DURATION_MS) {
+      if (now >= (entry.cooldownUntil ?? entry.timestamp + ProviderManager.COOLDOWN_DURATION_MS)) {
         this.providersOnCoolDown.delete(key);
         expiredProviders.add(entry.baseUrl);
         // Persist the removal of this exact entry (other entries for the
@@ -857,6 +905,8 @@ export class ProviderManager {
         this.lastFailed.delete(key);
       }
     }
+
+    this.sweepFailureStreaks(now);
 
     // Remove providers from failedProviders once they have no active
     // cooldown entries left, so they can be retried
@@ -890,6 +940,7 @@ export class ProviderManager {
    * provider as a whole is unavailable.
    */
   isOnCooldown(baseUrl: string, modelId?: string, modelPath?: string): boolean {
+    baseUrl = normalizeBaseUrl(baseUrl);
     this.cleanupExpiredCooldowns();
     if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
 
@@ -951,8 +1002,9 @@ export class ProviderManager {
    * Mark a provider (optionally a specific model or model path on it) as
    * failed
    *
-   * If the same scope fails twice within the cooldown window, that scope is
-   * added to cooldown:
+   * Model/path failures immediately cool down for 10 seconds, doubling on
+   * consecutive failures up to 10 minutes. Provider-wide failures retain
+   * the legacy two-strike, 210-second policy:
    * - With `modelPath`: only that upstream route is cooled down on the
    *   provider (the canonical path identity, see canonicalModelPath).
    * - With `modelId` only: only that model is cooled down on the provider.
@@ -964,6 +1016,7 @@ export class ProviderManager {
     modelId?: string,
     modelPath?: string
   ): void {
+    baseUrl = normalizeBaseUrl(baseUrl);
     // Drop expired entries first so a stale entry can't suppress a fresh
     // second-strike cooldown for the same scope
     this.cleanupExpiredCooldowns();
@@ -986,6 +1039,16 @@ export class ProviderManager {
         this.store.getState().setLastFailedTimestamp(baseUrl, now);
       }
       this.store.getState().addFailedProvider(baseUrl);
+    }
+
+    if (modelId !== undefined || modelPath !== undefined) {
+      const failureStreak = Math.min((this.failureStreaks.get(key)?.failureStreak ?? 0) + 1, Number.MAX_SAFE_INTEGER);
+      this.failureStreaks.set(key, { baseUrl, modelId, modelPath, failureStreak, failedAt: now });
+      this.persistFailureStreaks();
+      const cooldownUntil = now + Math.min(10_000 * 2 ** Math.min(failureStreak - 1, 6), 600_000);
+      this.providersOnCoolDown.set(key, { baseUrl, modelId, modelPath, timestamp: now, cooldownUntil });
+      this.store?.getState().addProviderOnCooldown(baseUrl, now, modelId, modelPath, cooldownUntil);
+      return;
     }
 
     // Check if this is a second failure within the cooldown window
@@ -1012,13 +1075,15 @@ export class ProviderManager {
   }
 
   /**
-   * Remove a provider from cooldown (e.g., after successful request)
+   * Manually unblock a provider without resetting failure history.
+   * Use recordSuccess to reset the exact successful scope.
    *
    * With `modelPath`, only that path's cooldown entry is removed; with
    * `modelId` only, only that model's entry; without either, every cooldown
    * entry for the provider is removed.
    */
   removeFromCooldown(baseUrl: string, modelId?: string, modelPath?: string): void {
+    baseUrl = normalizeBaseUrl(baseUrl);
     this.cleanupExpiredCooldowns();
     if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
     if (modelId === undefined && modelPath === undefined) {
@@ -1041,6 +1106,88 @@ export class ProviderManager {
   }
 
   /**
+   * Re-key streaks against the active discovery snapshot and drop scopes that
+   * have not failed for STREAK_RETENTION_MS. Guarded twice so the common call
+   * is O(1): the pass only runs when the mapping snapshot was replaced or the
+   * sweep interval elapsed. Nothing is written unless the pass changed
+   * something.
+   */
+  private sweepFailureStreaks(now: number): void {
+    const mappings = this.getModelIdMappings();
+    if (
+      mappings === this.streakMappingSnapshot &&
+      now - this.lastStreakSweepAt < ProviderManager.STREAK_SWEEP_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.streakMappingSnapshot = mappings;
+    this.lastStreakSweepAt = now;
+
+    const cutoff = now - ProviderManager.STREAK_RETENTION_MS;
+    const streaks = new Map<string, FailureStreak>();
+    let changed = false;
+    for (const [previousKey, entry] of this.failureStreaks) {
+      const failedAt = entry.failedAt ?? now;
+      if (failedAt <= cutoff) {
+        changed = true;
+        continue;
+      }
+      const modelId =
+        entry.modelId === undefined
+          ? undefined
+          : this.canonicalizeModelId(entry.modelId);
+      const key = cooldownKey(entry.baseUrl, modelId, entry.modelPath);
+      const previous = streaks.get(key);
+      if (previous) {
+        // Aliases are one scope: keep the longest streak and its latest
+        // failure.
+        changed = true;
+        previous.failureStreak = Math.max(previous.failureStreak, entry.failureStreak);
+        previous.failedAt = Math.max(previous.failedAt ?? failedAt, failedAt);
+        continue;
+      }
+      streaks.set(key, { ...entry, modelId, failedAt });
+      if (key !== previousKey || modelId !== entry.modelId) changed = true;
+    }
+    if (!changed) return;
+    this.failureStreaks = streaks;
+    this.persistFailureStreaks();
+  }
+
+  private persistFailureStreaks(): void {
+    this.store?.getState().setModelFailureStreaks?.([...this.failureStreaks.values()]);
+  }
+
+  /** Reset only the successful scope. An unscoped success resets provider-wide
+   * history only; it never clears model/path streaks on the same provider. */
+  recordSuccess(baseUrl: string, modelId?: string, modelPath?: string): void {
+    baseUrl = normalizeBaseUrl(baseUrl);
+    this.cleanupExpiredCooldowns();
+    if (modelId !== undefined) modelId = this.canonicalizeModelId(modelId);
+    const key = cooldownKey(baseUrl, modelId, modelPath);
+    const hadStreak = this.failureStreaks.delete(key);
+    this.lastFailed.delete(key);
+    const hadCooldown = this.providersOnCoolDown.delete(key);
+    // recordSuccess fires on every successful request, so only write through
+    // when this success actually cleared something; an unconditional persist
+    // would rewrite the whole streak/cooldown arrays per request.
+    if (hadStreak) this.persistFailureStreaks();
+    if (hadCooldown) this.removeStoredCooldown(baseUrl, modelId, modelPath);
+    if (modelId === undefined && modelPath === undefined) {
+      const lastFailed = { ...this.store?.getState().lastFailed };
+      delete lastFailed[baseUrl];
+      this.store?.getState().setLastFailed(lastFailed);
+    }
+    if (
+      this.failedProviders.has(baseUrl) &&
+      ![...this.providersOnCoolDown.values()].some((entry) => entry.baseUrl === baseUrl)
+    ) {
+      this.failedProviders.delete(baseUrl);
+      this.store?.getState().removeFailedProvider(baseUrl);
+    }
+  }
+
+  /**
    * Clear all cooldown tracking
    */
   clearCooldowns(): void {
@@ -1052,10 +1199,13 @@ export class ProviderManager {
   }
 
   /**
-   * Clear all failure tracking (lastFailed timestamps)
+   * Clear all failure tracking (timestamps and consecutive scoped streaks).
+   * Active cooldowns are left intact.
    */
   clearFailureHistory(): void {
     this.lastFailed.clear();
+    this.failureStreaks.clear();
+    this.persistFailureStreaks();
     // Persist to store
     if (this.store) {
       this.store.getState().setLastFailed({});
@@ -1222,8 +1372,8 @@ export class ProviderManager {
       acceptableMintUrls?: string[];
       /**
        * Candidate keys (see modelPathCandidateKey) already attempted in
-       * this request. One strike does not cool a route down, so the caller
-       * must exclude them itself to avoid revisiting dead routes.
+       * this request. Request-local exclusions preserve failover progress
+       * independently of cooldown expiry or failure-policy exclusions.
        */
       excludeModelPaths?: Iterable<string>;
     } = {}
@@ -1285,7 +1435,11 @@ export class ProviderManager {
           const selector = resolved.selectors[i];
           if (!selector) continue;
           const pathId = canonicalModelPath(selector);
-          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
+          // An attempted route may have just earned its first cooldown.
+          // Keep it for this request's node-ranking price anchor, but the
+          // request-local exclusion below still prevents selecting it again.
+          const alreadyAttempted = excludedModelPaths.has(modelPathCandidateKey(baseUrl, selector));
+          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId) && !alreadyAttempted) continue;
           available.push({ selector, pricing: resolved.satsPricing[i] ?? null });
         }
         if (available.length === 0) return null;

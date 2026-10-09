@@ -967,6 +967,28 @@ export class RoutstrClient {
         );
       }
 
+      // Only a successful model invocation proves this exact scope recovered.
+      // Metadata/payment requests must not reset inference failure history.
+      // HTTP success counts immediately, including SSE headers; stream errors
+      // after this point are outside request-level cooldown tracking.
+      if (
+        params.selectedModel &&
+        method.toUpperCase() === "POST" &&
+        body &&
+        typeof body === "object" &&
+        typeof (body as Record<string, unknown>).model === "string"
+      ) {
+        const modelId = this._canonicalRequestModelId(
+          params.selectedModel,
+          params.requestedModelId
+        );
+        const pinnedModelPath = this._findModelPathHeader(params.baseHeaders);
+        const modelPath = pinnedModelPath
+          ? canonicalModelPath(pinnedModelPath) ?? undefined
+          : undefined;
+        this.providerManager.recordSuccess(baseUrl, modelId, modelPath);
+      }
+
       if (!contentType.includes("text/event-stream")) {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
       }

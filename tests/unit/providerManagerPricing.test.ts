@@ -841,7 +841,7 @@ describe("ProviderManager", () => {
       vi.useRealTimers();
     });
 
-    it("model-scoped strikes do not cross-contaminate: one failure per model does not trigger cooldown", () => {
+    it("model-scoped strikes do not cross-contaminate: one failure per model starts independent cooldowns", () => {
       const manager = new ProviderManager(registry());
 
       const now = Date.now();
@@ -850,14 +850,14 @@ describe("ProviderManager", () => {
       vi.setSystemTime(now + 1_000);
       manager.markFailed("https://alpha.example.com/", undefined, "claude-3");
 
-      // Two failures on the same provider but different models: no cooldown
+      // Each model starts its own first-failure cooldown
       expect(manager.isOnCooldown("https://alpha.example.com/", "gpt-4o-mini")).toBe(
-        false
+        true
       );
       expect(manager.isOnCooldown("https://alpha.example.com/", "claude-3")).toBe(
-        false
+        true
       );
-      expect(manager.getProvidersOnCooldown()).toHaveLength(0);
+      expect(manager.getProvidersOnCooldown()).toHaveLength(2);
 
       vi.useRealTimers();
     });
@@ -1057,10 +1057,8 @@ describe("ProviderManager", () => {
       vi.setSystemTime(t0 + 1_000);
       manager.markFailed(P);
 
-      // Model-scoped cooldown for gpt-4o-mini created at t0+101s (expires t0+311s)
-      vi.setSystemTime(t0 + 100_000);
-      manager.markFailed(P, undefined, "gpt-4o-mini");
-      vi.setSystemTime(t0 + 101_000);
+      // First model cooldown created just before provider-wide expiry.
+      vi.setSystemTime(t0 + 205_000);
       manager.markFailed(P, undefined, "gpt-4o-mini");
 
       expect(state.providersOnCooldown).toHaveLength(2);
@@ -1137,31 +1135,18 @@ describe("ProviderManager", () => {
       vi.useRealTimers();
     });
     
-    it("model- and path-scoped failures on the same model track separate strikes", () => {
+    it("model- and path-scoped failures retain independent streaks", () => {
       const manager = new ProviderManager(registry());
       const P = "https://alpha.example.com/";
-
       const now = Date.now();
-      // One model-scoped failure + one path-scoped failure: no cooldown yet,
-      // because strikes are counted per scope.
       vi.setSystemTime(now);
       manager.markFailed(P, undefined, "deepseek-v4.1-flash");
-      vi.setSystemTime(now + 1_000);
       manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
-
-      expect(manager.isOnCooldown(P, "deepseek-v4.1-flash")).toBe(false);
-      expect(
-        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
-      ).toBe(false);
-
-      // A second path-scoped failure completes the path's two-strike cooldown
-      vi.setSystemTime(now + 2_000);
+      expect(manager.getProvidersOnCooldown().map((entry) => entry.cooldownUntil)).toEqual([now + 10_000, now + 10_000]);
+      vi.setSystemTime(now + 10_000);
       manager.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
-      expect(
-        manager.isOnCooldown(P, "deepseek-v4.1-flash", DEEPSEEK_PATH)
-      ).toBe(true);
       expect(manager.isOnCooldown(P, "deepseek-v4.1-flash")).toBe(false);
-
+      expect(manager.getProvidersOnCooldown()[0].cooldownUntil).toBe(now + 30_000);
       vi.useRealTimers();
     });
 
@@ -1256,15 +1241,14 @@ describe("ProviderManager", () => {
       vi.setSystemTime(now);
       const first = new ProviderManager(registry(), store);
       first.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
-      vi.setSystemTime(now + 1_000);
-      first.markFailed(P, undefined, "deepseek-v4.1-flash", DEEPSEEK_PATH);
+
 
       expect(state.providersOnCooldown).toEqual([
         {
           baseUrl: P,
           modelId: "deepseek-v4.1-flash",
           modelPath: DEEPSEEK_PATH,
-          timestamp: now + 1_000,
+          timestamp: now,
         },
       ]);
 

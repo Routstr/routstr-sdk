@@ -44,6 +44,7 @@ function setup() {
     getApiKeyDistribution: () => [],
   } as unknown as StorageAdapter;
   const providerManager = {
+    recordSuccess: vi.fn(),
     markFailed: vi.fn(), getFailedProviders: () => new Set([baseUrl]),
     findNextBestProvider: vi.fn(() => undefined),
     getModelForProvider: vi.fn(async () => model),

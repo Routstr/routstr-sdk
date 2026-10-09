@@ -146,7 +146,7 @@ describe("ProviderManager canonicalizes model ids", () => {
     expect(manager.getProviderPriceRankingForModel(REQUESTED)[0].baseUrl).toBe(CYPHER);
 
     manager.markFailed(CYPHER, "one", NATIVE);
-    expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(false); // one strike
+    expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(true); // first scoped strike immediately cools down
     manager.markFailed(CYPHER, "two", NATIVE);
 
     expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(true);
@@ -264,7 +264,7 @@ describe("failover and cooldown across a mixed-spelling fleet", () => {
     ]);
   });
 
-  it("two failed requests cool the aliased node down so the ranking skips it", async () => {
+  it("one failed request cools the aliased node down so the ranking skips it", async () => {
     const { client, manager } = setup();
     vi.stubGlobal(
       "fetch",
@@ -275,11 +275,9 @@ describe("failover and cooldown across a mixed-spelling fleet", () => {
       )
     );
 
-    // Each request starts on cypherpunk (as ranking #1 would), fails, and
-    // fails over to a node that answers.
+    // A request starts on cypherpunk, fails, and fails over to a healthy node.
     expect((await route(client)).status).toBe(200);
-    expect(manager.getProviderPriceRankingForModel(REQUESTED)[0].baseUrl).toBe(CYPHER);
-    expect((await route(client)).status).toBe(200);
+    expect(manager.getProviderPriceRankingForModel(REQUESTED)[0].baseUrl).toBe(REDSH1FT);
 
     expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(true);
     expect(manager.getProviderPriceRankingForModel(REQUESTED).map((r) => r.baseUrl)).toEqual([REDSH1FT, OTRTA, PPQ]);

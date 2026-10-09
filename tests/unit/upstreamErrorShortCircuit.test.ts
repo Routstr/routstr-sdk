@@ -65,6 +65,7 @@ function setup(mode: "apikeys" | "xcashu" = "apikeys") {
     getApiKeyDistribution: () => [],
   } as unknown as StorageAdapter;
   const providerManager = {
+    recordSuccess: vi.fn(),
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([baseUrl]),
     findNextBestProvider: vi.fn((_model, current, attempted) => current === baseUrl && !attempted?.has(nextUrl) ? nextUrl : null),
