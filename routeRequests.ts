@@ -7,6 +7,7 @@ import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecyc
  * provider based on model pricing, with automatic Cashu token handling.
  */
 
+import type { ConfidentialRequestOptions } from "./client/confidential/transport";
 import type { Model, Message, SdkLogger } from "./core/types";
 import type { DiscoveryAdapter } from "./discovery/interfaces";
 import type {
@@ -64,6 +65,11 @@ export interface RouteRequestOptions {
   userCacheSecret?: string;
   /** Optional: force a specific provider base URL */
   forcedProvider?: string;
+  /**
+   * Optional: run the request as a confidential-upstream session (node-only).
+   * Only nodes that advertise `confidential_upstream` for the model are used.
+   */
+  confidential?: ConfidentialRequestOptions;
   /** Wallet adapter for Cashu operations */
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching */
@@ -164,6 +170,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
   } = await resolveRequestContext({
       modelId,
       forcedProvider,
+      requireConfidential: Boolean(options.confidential),
       inputHeaders: headers,
       autoModelPath: options.autoModelPath,
       walletAdapter,
@@ -260,6 +267,7 @@ export async function routeRequests(
       mintUrl,
       modelId,
       userCacheSecret: options.userCacheSecret,
+      confidential: options.confidential,
       // The forced provider is a pin: it must reach _handleErrorResponse so a
       // failed request is not silently re-sent to a different node.
       pinnedProvider,
