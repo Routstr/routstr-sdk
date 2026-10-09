@@ -9,6 +9,12 @@ import { consoleLogger } from "../core/types";
 import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import {
+  classifyProviderFailure,
+  diffProviderOutage,
+  type ProviderFailure,
+  type ProviderOutcome,
+} from "./providerOutageReport";
+import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
@@ -127,57 +133,6 @@ export interface BootstrapOptions {
   onEventsFound?: (count: number) => void;
   /** Fires as each new provider base URL is discovered. */
   onProvider?: (baseUrl: string) => void;
-}
-
-/**
- * A provider's failure in one fetch pass, normalized for a bounded one-line
- * summary. `detail` is what goes in parentheses after the host (`530`,
- * `timeout`, `connect`, ...); `message` is the untouched error text kept for
- * the raw per-provider line.
- */
-interface ProviderFailure {
-  detail: string;
-  message: string;
-  /** Reads as "down" (retryable upstream) rather than "unreachable". */
-  isDown: boolean;
-  /** Consecutive failed passes, so a long outage can be aged in one line. */
-  passesFailed: number;
-}
-
-/** Outcome of one provider's slot in a `fetchModels` pass. */
-interface ProviderFetchOutcome {
-  success: boolean;
-  base: string;
-  list?: Model[];
-  failure?: Omit<ProviderFailure, "passesFailed">;
-}
-
-/** Hosts named inline in a pass summary before it collapses to "+N more". */
-const SUMMARY_PROVIDER_LIMIT = 6;
-
-/**
- * Host-only provider label: the scheme and path are identical across the
- * routstr fleet, so the host is the shortest stable identifier in a log line.
- */
-function providerHost(baseUrl: string): string {
-  try {
-    return new URL(baseUrl).host;
-  } catch {
-    return baseUrl;
-  }
-}
-
-/** Join labels, naming at most `SUMMARY_PROVIDER_LIMIT` before "+N more". */
-function formatProviderList(labels: string[]): string {
-  const shown = labels.slice(0, SUMMARY_PROVIDER_LIMIT);
-  const hidden = labels.length - shown.length;
-  return hidden > 0
-    ? `${shown.join(", ")}, +${hidden} more`
-    : shown.join(", ");
-}
-
-function formatDuration(elapsedMs: number): string {
-  return `${(elapsedMs / 1000).toFixed(1)}s`;
 }
 
 /**
@@ -1311,18 +1266,14 @@ export class ModelManager {
 
         emitProgress();
 
-        return { success: true, base, list };
+        return { base };
       } catch (error) {
         // No stamp on failure, or the provider is served as "offers
         // nothing" until the TTL expires; last known models keep serving.
         // The raw error text is kept, but reporting is deferred to the end of
         // the pass so a node that has been down for days cannot re-print its
         // error line on every refresh. See reportProviderFailures().
-        return {
-          success: false,
-          base,
-          failure: this.classifyProviderFailure(error),
-        };
+        return { base, failure: classifyProviderFailure(error) };
       }
     });
 
@@ -1386,160 +1337,35 @@ export class ModelManager {
     return list;
   }
 
-  private isProviderDownError(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    const msg = error.message.toLowerCase();
-    if (msg.includes("fetch failed")) return true;
-    if (msg.includes("429")) return true;
-    if (msg.includes("502")) return true;
-    if (msg.includes("503")) return true;
-    if (msg.includes("504")) return true;
-    const cause = error.cause as { code?: string } | undefined;
-    return cause?.code === "ENOTFOUND";
-  }
-
-  /**
-   * Bucket a provider fetch error so passes can be summarized in one line
-   * rather than by message. The buckets are the ones an operator acts on
-   * differently: an HTTP status means the node is up but rejecting, a timeout
-   * means it is slow, `connect` means it is not listening.
-   */
-  private classifyProviderFailure(
-    error: unknown
-  ): Omit<ProviderFailure, "passesFailed"> {
-    const message = error instanceof Error ? error.message : String(error);
-    const isDown = this.isProviderDownError(error);
-
-    const status = /Failed to fetch models:\s*(\d+)/.exec(message);
-    if (status) return { detail: status[1], message, isDown };
-
-    const lower = message.toLowerCase();
-    if (
-      lower.includes("timed out") ||
-      lower.includes("timeout") ||
-      lower.includes("abort")
-    ) {
-      return { detail: "timeout", message, isDown };
-    }
-    if (
-      lower.includes("unable to connect") ||
-      lower.includes("typo") ||
-      lower.includes("connection refused")
-    ) {
-      return { detail: "connect", message, isDown };
-    }
-    return { detail: isDown ? "down" : "error", message, isDown };
-  }
-
   /**
    * Report reachability for one fetch pass as state transitions plus a single
-   * summary, instead of one line per provider per pass.
+   * summary, instead of one line per provider per pass. The diff itself lives
+   * in `providerOutageReport.ts`; this only emits the lines it returns.
    *
-   * The provider set is mostly stable, so most failures are repeats: printing
-   * them every 21 minutes buries everything else in the log. A provider that
-   * newly fails (or starts failing differently) still gets its own warning, so
-   * anything alertable stays greppable and no detail is lost; a provider that
-   * is merely still down only advances a counter. The full per-provider detail
-   * stays at `debug` for loggers that filter by level, so the suppression
-   * applies to consumers that inject one: `consoleLogger`, the default when no
+   * The per-provider detail is at `debug`, so suppression applies to consumers
+   * that inject a level-filtering logger: `consoleLogger`, the default when no
    * logger is injected, prints `debug` like everything else.
    */
   private reportProviderFailures(
-    outcomes: ProviderFetchOutcome[],
+    outcomes: ProviderOutcome[],
     freshlyFetched: Set<string>,
     total: number,
     elapsedMs: number
   ): void {
-    const failures = new Map<string, ProviderFailure>();
-    let newlyFailed = 0;
-
-    for (const outcome of outcomes) {
-      if (outcome.success || !outcome.failure) continue;
-      const previous = this.providerFailures.get(outcome.base);
-      const passesFailed = (previous?.passesFailed ?? 0) + 1;
-      failures.set(outcome.base, { ...outcome.failure, passesFailed });
-
-      if (!previous || previous.message !== outcome.failure.message) {
-        newlyFailed++;
-        this.logger.warn(
-          outcome.failure.isDown
-            ? `Provider ${outcome.base} is down right now.`
-            : `Provider ${outcome.base} unreachable: ${outcome.failure.message}`
-        );
-      } else {
-        this.logger.debug(
-          `Provider ${outcome.base} still unreachable ` +
-            `(${passesFailed} consecutive failed pass(es)): ${outcome.failure.message}`
-        );
-      }
-    }
-
-    // Only a provider we actually hit over the network this pass can be
-    // declared recovered: one dropped from the provider set was never checked,
-    // and one served from cache was not re-validated. A failed fetch never
-    // writes a freshness stamp, so a previously-failed provider is always
-    // retried while it remains in the set.
-    const retried = new Set([...freshlyFetched, ...failures.keys()]);
-    const recovered: string[] = [];
-    for (const base of this.providerFailures.keys()) {
-      if (!failures.has(base) && retried.has(base)) recovered.push(base);
-    }
-
-    this.providerFailures = failures;
-
-    if (failures.size === 0 && recovered.length === 0) {
-      this.logger.debug(
-        `Model refresh: all ${total} provider(s) ok in ${formatDuration(elapsedMs)}`
-      );
-      return;
-    }
-
-    const ok = outcomes.filter((outcome) => outcome.success).length;
-    this.logger.log(
-      this.formatFetchSummary({
-        total,
-        ok,
-        failures,
-        newlyFailed,
-        recovered,
-        elapsedMs,
-      })
+    const report = diffProviderOutage(
+      this.providerFailures,
+      outcomes,
+      freshlyFetched,
+      total,
+      elapsedMs
     );
-  }
+    this.providerFailures = report.failures;
 
-  /** One bounded line: counts first, then at most `SUMMARY_PROVIDER_LIMIT`
-   * named hosts, so a 26-provider outage cannot produce a 26-line flood or an
-   * arbitrarily long line. */
-  private formatFetchSummary(input: {
-    total: number;
-    ok: number;
-    failures: Map<string, ProviderFailure>;
-    newlyFailed: number;
-    recovered: string[];
-    elapsedMs: number;
-  }): string {
-    const { total, ok, failures, newlyFailed, recovered, elapsedMs } = input;
-    const parts = [`${ok}/${total} providers ok`];
-
-    if (failures.size > 0) {
-      parts.push(
-        `${failures.size} unavailable ` +
-          `(${newlyFailed} new, ${failures.size - newlyFailed} unchanged)`
-      );
+    for (const line of report.lines) {
+      if (line.level === "warn") this.logger.warn(line.message);
+      else if (line.level === "info") this.logger.log(line.message);
+      else this.logger.debug(line.message);
     }
-    if (recovered.length > 0) {
-      parts.push(`recovered: ${formatProviderList(recovered.map(providerHost))}`);
-    }
-
-    const down = Array.from(failures, ([base, failure]) =>
-      `${providerHost(base)}(${failure.detail})`
-    );
-    const summary =
-      `Model refresh: ${parts.join(", ")} in ${formatDuration(elapsedMs)}`;
-
-    return down.length > 0
-      ? `${summary} — ${formatProviderList(down)}`
-      : summary;
   }
 
   /**
