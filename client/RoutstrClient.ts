@@ -69,6 +69,10 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
+import type {
+  ConfidentialFetchParams,
+  ConfidentialRequestOptions,
+} from "./confidential/transport";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -155,6 +159,64 @@ export interface ModelPathPin {
   satsPricing?: ModelPathSatsPricing;
 }
 
+// The confidential transport is Node/Bun-only (it spawns the prover and uses
+// node:fs); the node/bun entrypoints register it, so the browser-safe bundle
+// never imports it. The registry lives on globalThis because each entrypoint
+// is a separate bundle with its own copy of this module.
+type ConfidentialTransport = (params: ConfidentialFetchParams) => Promise<Response>;
+const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
+
+export function setConfidentialTransport(transport: ConfidentialTransport): void {
+  (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_TRANSPORT] = transport;
+}
+
+function requireConfidentialTransport(): ConfidentialTransport {
+  const confidentialTransport = (globalThis as Record<symbol, unknown>)[
+    CONFIDENTIAL_TRANSPORT
+  ] as ConfidentialTransport | undefined;
+  if (!confidentialTransport) {
+    throw new Error(
+      "confidential requests need the @routstr/sdk node or bun entrypoint"
+    );
+  }
+  return confidentialTransport;
+}
+
+/** The one endpoint a confidential session implements (see the transport). */
+function isConfidentialEndpoint(method: string, path: string): boolean {
+  return (
+    method.toUpperCase() === "POST" &&
+    /(^|\/)chat\/completions\/?$/.test(path.split("?")[0] ?? "")
+  );
+}
+
+/**
+ * A confidential node cannot read the prompt, so it reserves a full-context
+ * prompt plus the pinned completion cap; deposit for that (5% margin, capped
+ * at the model's envelope like the plain estimate).
+ */
+function confidentialRequiredSats(
+  model: Model,
+  maxTokens: number | undefined
+): number | undefined {
+  const sp = model.sats_pricing as
+    | {
+        max_cost?: number;
+        max_prompt_cost?: number;
+        max_completion_cost?: number;
+        completion?: number;
+        request?: number;
+      }
+    | undefined;
+  if (!sp || typeof sp.max_cost !== "number") return undefined;
+  const prompt = sp.max_prompt_cost ?? sp.max_cost;
+  const completion =
+    maxTokens !== undefined && sp.completion
+      ? sp.completion * maxTokens
+      : (sp.max_completion_cost ?? 0);
+  return Math.min(sp.max_cost, (prompt + completion + (sp.request ?? 0)) * 1.05);
+}
+
 export interface RouteRequestParams {
   path: string;
   method: string;
@@ -184,6 +246,12 @@ export interface RouteRequestParams {
    * never fail over to a different node.
    */
   pinnedProvider?: boolean;
+  /**
+   * Run the request as a confidential-upstream session (the node relays TLS
+   * to the provider and never sees the prompt or response) instead of a
+   * plain HTTP request. Node-only (Bun/Node entrypoints).
+   */
+  confidential?: ConfidentialRequestOptions;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -358,6 +426,13 @@ export class RoutstrClient {
    * requests and get responses back.
    */
   async routeRequest(params: RouteRequestParams): Promise<Response> {
+    // Refuse before any credential or deposit: the confidential transport
+    // only speaks chat completions, and must never fall back to plaintext.
+    if (params.confidential && !isConfidentialEndpoint(params.method, params.path)) {
+      throw new Error(
+        `confidential mode supports only POST /v1/chat/completions, not ${params.method} ${params.path}`
+      );
+    }
     const prepared = await this._prepareRoutedRequestWithMintFailover(params);
     const contentType =
       prepared.response.headers.get("content-type") || "";
@@ -377,6 +452,13 @@ export class RoutstrClient {
     // available (the clone-and-read path inside `_trackResponseUsage` handles
     // JSON bodies without consuming the client-facing copy).
     const runFinalize = async (): Promise<number> => {
+      // A confidential response settles on the node after its body ends
+      // (usage proof + charge); balance accounting must read it afterwards.
+      // A failed settlement check already errored the response stream; the
+      // balance is still re-read, since the node may have charged.
+      await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
+        this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
+      });
       const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
       const usage = capturedUsage ?? prepared.capturedUsage;
       const requestId = capturedResponseId ?? prepared.capturedResponseId;
@@ -561,13 +643,22 @@ export class RoutstrClient {
           }
         );
 
-        requiredSats = this.providerManager.getRequiredSatsForModel(
-          selectedModel,
-          requestMessages,
-          requestMaxTokens,
-          requestBodyForPricing,
-          params.autoModelPath?.satsPricing
-        );
+        requiredSats = params.confidential
+          ? confidentialRequiredSats(selectedModel, requestMaxTokens) ??
+            this.providerManager.getRequiredSatsForModel(
+              selectedModel,
+              [],
+              requestMaxTokens,
+              { model: selectedModel.id, max_tokens: requestMaxTokens },
+              params.autoModelPath?.satsPricing
+            )
+          : this.providerManager.getRequiredSatsForModel(
+              selectedModel,
+              requestMessages,
+              requestMaxTokens,
+              requestBodyForPricing,
+              params.autoModelPath?.satsPricing
+            );
       }
     }
 
@@ -700,6 +791,7 @@ export class RoutstrClient {
       autoModelPath: params.autoModelPath,
       pinnedProvider: params.pinnedProvider,
       requestedModelId: modelId,
+      confidential: params.confidential,
     });
 
     let tokenBalanceInSats =
@@ -850,6 +942,8 @@ export class RoutstrClient {
     retryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /** Run the request as a confidential-upstream session. */
+    confidential?: ConfidentialRequestOptions;
     /** Secret scoping Tinfoil's prompt cache for this request. */
     userCacheSecret?: string;
     /** File path for the persisted default secret (client-level). */
@@ -895,7 +989,18 @@ export class RoutstrClient {
       // Request headers contain bearer credentials / x-cashu tokens. The
       // request-response sink has its own header redaction; do not log raw headers.
 
-      const response = tinfoilEnabled
+      const response = params.confidential
+        ? await requireConfidentialTransport()({
+            baseUrl,
+            body,
+            bearer: token,
+            options: params.confidential,
+            method,
+            path,
+            returnChange: this.mode === "xcashu",
+            signal,
+          })
+        : tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
             {
               baseUrl,

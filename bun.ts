@@ -9,6 +9,14 @@ export {
   type BunSqliteUsageTrackingDriverOptions,
 } from "./storage/usageTracking/bunSqlite";
 
+// Confidential-upstream client: Bun/node-only (node:crypto, spawned cu-prover,
+// vendored @reclaimprotocol/tls fork). Never exported from the browser-safe
+// default entrypoint.
+export * from "./client/confidential";
+import { fetchConfidential as _fetchConfidential } from "./client/confidential";
+import { setConfidentialTransport as _setConfidentialTransport } from "./client/RoutstrClient";
+_setConfidentialTransport(_fetchConfidential);
+
 import {
   ModelManager as BrowserSafeModelManager,
   type ModelManagerConfig,

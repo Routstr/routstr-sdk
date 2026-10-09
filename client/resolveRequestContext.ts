@@ -63,6 +63,8 @@ export interface ResolveContextInput {
   inputHeaders?: Record<string, string>;
   /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; caller-supplied path headers still work. */
   autoModelPath?: boolean;
+  /** Only providers advertising `confidential_upstream` for the model. */
+  requireConfidential?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching. */
@@ -144,6 +146,7 @@ export async function resolveRequestContext(
     forcedProvider,
     inputHeaders,
     autoModelPath = false,
+    requireConfidential = false,
     walletAdapter,
     storageAdapter,
     discoveryAdapter,
@@ -255,6 +258,11 @@ export async function resolveRequestContext(
         `Provider ${normalizedProvider} does not offer model: ${modelId}`
       );
     }
+    if (requireConfidential && !match.confidential_upstream) {
+      throw new Error(
+        `Provider ${normalizedProvider} does not offer model ${modelId} confidentially`
+      );
+    }
     baseUrl = normalizedProvider;
     selectedModel = match;
 
@@ -296,6 +304,7 @@ export async function resolveRequestContext(
       }
     }
   } else if (
+    !requireConfidential &&
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
@@ -334,12 +343,18 @@ export async function resolveRequestContext(
       selectedModel = fallbackBest.model;
     }
   } else {
-    const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
-      torMode,
-      includeDisabled: false,
-    });
+    const ranking = providerManager
+      .getProviderPriceRankingForModel(modelId, {
+        torMode,
+        includeDisabled: false,
+      })
+      .filter((p) => !requireConfidential || Boolean(p.model.confidential_upstream));
     if (ranking.length === 0) {
-      throw new Error(`No providers found for model: ${modelId}`);
+      throw new Error(
+        requireConfidential
+          ? `No provider offers model ${modelId} confidentially`
+          : `No providers found for model: ${modelId}`
+      );
     }
     // Cheapest-first among providers that accept a funded mint (fail open
     // when the mint cache is empty).

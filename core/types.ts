@@ -118,6 +118,8 @@ export interface Model {
    * provider IDs to canonical routstr21 model IDs. See core/modelMappings.ts.
    */
   alias_ids?: string[];
+  /** Present when the node serves this model in confidential-upstream mode. */
+  confidential_upstream?: { v: number; offer_url: string };
 }
 
 /**
