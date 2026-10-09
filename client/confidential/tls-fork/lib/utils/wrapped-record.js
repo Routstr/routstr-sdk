@@ -1,0 +1,192 @@
+import { crypto } from "../crypto/index.js";
+import { AUTH_TAG_BYTE_LENGTH, SUPPORTED_CIPHER_SUITE_MAP } from "./constants.js";
+import { areUint8ArraysEqualConstantTime, concatenateUint8Arrays, generateIV, isSymmetricCipher, packRecordSequence, padTls, toHexStringWithWhitespace, uint8ArrayToDataView, unpadTls } from "./generics.js";
+import { packPacketHeader } from "./packets.js";
+const AUTH_CIPHER_LENGTH = 12;
+export async function decryptWrappedRecord(encryptedData, opts) {
+    if (!('recordHeader' in opts)) {
+        throw new Error('recordHeader is required for decrypt');
+    }
+    const { key, recordNumber, cipherSuite, } = opts;
+    const { cipher, hashLength } = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
+    return isSymmetricCipher(cipher)
+        ? doCipherDecrypt(cipher)
+        : doAuthCipherDecrypt(cipher);
+    async function doCipherDecrypt(cipher) {
+        const iv = encryptedData.slice(0, 16);
+        const ciphertext = encryptedData.slice(16);
+        let plaintextAndMac = await crypto.decrypt(cipher, {
+            key,
+            iv,
+            data: ciphertext,
+        });
+        plaintextAndMac = unpadTls(plaintextAndMac);
+        plaintextAndMac = plaintextAndMac.slice(0, -1);
+        const mac = plaintextAndMac.slice(-hashLength);
+        const plaintext = plaintextAndMac.slice(0, -hashLength);
+        const macComputed = await computeMacTls12(plaintext, opts);
+        // FORK PATCH (TLS-06): constant-time MAC comparison.
+        if (!areUint8ArraysEqualConstantTime(mac, macComputed)) {
+            throw new Error(`MAC mismatch: expected ${toHexStringWithWhitespace(macComputed)}, got ${toHexStringWithWhitespace(mac)}`);
+        }
+        return { plaintext, iv };
+    }
+    async function doAuthCipherDecrypt(cipher) {
+        let iv = opts.iv;
+        const recordIvLength = AUTH_CIPHER_LENGTH - iv.length;
+        if (recordIvLength) {
+            // const recordIv = new Uint8Array(recordIvLength)
+            // const seqNumberView = uint8ArrayToDataView(recordIv)
+            // seqNumberView.setUint32(recordIvLength - 4, recordNumber)
+            const recordIv = encryptedData.slice(0, recordIvLength);
+            encryptedData = encryptedData.slice(recordIvLength);
+            iv = concatenateUint8Arrays([
+                iv,
+                recordIv
+            ]);
+        }
+        else if (
+        // use IV generation alg for TLS 1.3
+        // and ChaCha20-Poly1305
+        (opts.version === 'TLS1_3'
+            || cipher === 'CHACHA20-POLY1305') && typeof recordNumber !== 'undefined') {
+            iv = generateIV(iv, recordNumber);
+        }
+        const authTag = encryptedData.slice(-AUTH_TAG_BYTE_LENGTH);
+        encryptedData = encryptedData.slice(0, -AUTH_TAG_BYTE_LENGTH);
+        const aead = getAead(encryptedData.length, opts);
+        const { plaintext } = await crypto.authenticatedDecrypt(cipher, {
+            key,
+            iv,
+            data: encryptedData,
+            aead,
+            authTag,
+        });
+        if (plaintext.length !== encryptedData.length) {
+            throw new Error('Decrypted length does not match encrypted length');
+        }
+        return { plaintext, iv };
+    }
+}
+export async function encryptWrappedRecord(plaintext, opts) {
+    const { key, recordNumber, cipherSuite, } = opts;
+    const { cipher } = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
+    let iv = opts.iv;
+    return isSymmetricCipher(cipher)
+        ? doSymmetricEncrypt(cipher)
+        : doAuthSymmetricEncrypt(cipher);
+    async function doAuthSymmetricEncrypt(cipher) {
+        const aead = getAead(plaintext.length, opts);
+        // record IV is the record number as a 64-bit big-endian integer
+        const recordIvLength = AUTH_CIPHER_LENGTH - iv.length;
+        let recordIv;
+        let completeIv = iv;
+        if (recordIvLength && typeof recordNumber !== 'undefined') {
+            // FORK PATCH (TLS-05): full 64-bit sequence number.
+            const seq = packRecordSequence(recordNumber);
+            recordIv = new Uint8Array(recordIvLength);
+            recordIv.set(seq.slice(Math.max(0, 8 - recordIvLength)), Math.max(0, recordIvLength - 8));
+            completeIv = concatenateUint8Arrays([
+                iv,
+                recordIv
+            ]);
+        }
+        else if (
+        // use IV generation alg for TLS 1.3
+        // and ChaCha20-Poly1305
+        (opts.version === 'TLS1_3'
+            || cipher === 'CHACHA20-POLY1305')
+            && typeof recordNumber !== 'undefined') {
+            completeIv = generateIV(completeIv, recordNumber);
+        }
+        const enc = await crypto.authenticatedEncrypt(cipher, {
+            key,
+            iv: completeIv,
+            data: plaintext,
+            aead,
+        });
+        if (recordIv) {
+            enc.ciphertext = concatenateUint8Arrays([
+                recordIv,
+                enc.ciphertext,
+            ]);
+        }
+        return {
+            ciphertext: concatenateUint8Arrays([
+                enc.ciphertext,
+                enc.authTag,
+            ]),
+            iv: completeIv
+        };
+    }
+    async function doSymmetricEncrypt(cipher) {
+        const blockSize = 16;
+        iv = padBytes(opts.iv, 16).slice(0, 16);
+        const mac = await computeMacTls12(plaintext, opts);
+        const completeData = concatenateUint8Arrays([
+            plaintext,
+            mac,
+        ]);
+        // add TLS's special padding :(
+        const padded = padTls(completeData, blockSize);
+        const result = await crypto.encrypt(cipher, { key, iv, data: padded });
+        return {
+            ciphertext: concatenateUint8Arrays([
+                iv,
+                result
+            ]),
+            iv,
+        };
+    }
+    function padBytes(arr, len) {
+        const returnVal = new Uint8Array(len);
+        returnVal.set(arr, len - arr.length);
+        return returnVal;
+    }
+}
+function getAead(plaintextLength, opts) {
+    const isTls13 = opts.version === 'TLS1_3';
+    let aead;
+    if (isTls13) {
+        const dataLen = plaintextLength + AUTH_TAG_BYTE_LENGTH;
+        const recordHeader = 'recordHeaderOpts' in opts
+            ? packPacketHeader(dataLen, opts.recordHeaderOpts)
+            : replaceRecordHeaderLen(opts.recordHeader, dataLen);
+        aead = recordHeader;
+    }
+    else {
+        aead = getTls12Header(plaintextLength, opts);
+    }
+    return aead;
+}
+function getTls12Header(plaintextLength, opts) {
+    const { recordNumber } = opts;
+    const recordHeader = 'recordHeaderOpts' in opts
+        ? packPacketHeader(plaintextLength, opts.recordHeaderOpts)
+        : replaceRecordHeaderLen(opts.recordHeader, plaintextLength);
+    // FORK PATCH (TLS-05): full 64-bit sequence number.
+    const seqNumberBytes = packRecordSequence(recordNumber || 0);
+    return concatenateUint8Arrays([
+        seqNumberBytes,
+        recordHeader,
+    ]);
+}
+async function computeMacTls12(plaintext, opts) {
+    const { macKey, cipherSuite } = opts;
+    if (!macKey) {
+        throw new Error('macKey is required for non-AEAD cipher');
+    }
+    const { hashAlgorithm } = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
+    const dataToSign = concatenateUint8Arrays([
+        getTls12Header(plaintext.length, opts),
+        plaintext,
+    ]);
+    const mac = await crypto.hmac(hashAlgorithm, macKey, dataToSign);
+    return mac;
+}
+function replaceRecordHeaderLen(header, newLength) {
+    const newRecordHeader = new Uint8Array(header);
+    const dataView = uint8ArrayToDataView(newRecordHeader);
+    dataView.setUint16(3, newLength);
+    return newRecordHeader;
+}
