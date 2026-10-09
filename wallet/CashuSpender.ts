@@ -115,14 +115,17 @@ export class CashuSpender {
     ]);
   }
 
-  /** Retry cached tokens; only successful receives are removed from storage. */
+  /**
+   * Retry cached tokens; remove each once received or once the mint reports
+   * it already spent.
+   */
   async recoverCachedReceiveTokens(): Promise<
     { token: string; success: boolean }[]
   > {
     const results: { token: string; success: boolean }[] = [];
     for (const entry of this.storageAdapter.getCachedReceiveTokens()) {
       const result = await this.receiveToken(entry.token);
-      if (result.success) {
+      if (result.success || /already spent/i.test(result.message ?? "")) {
         // Re-read so tokens cached during the receive are not overwritten.
         this.storageAdapter.setCachedReceiveTokens(
           this.storageAdapter
@@ -732,6 +735,21 @@ export class CashuSpender {
             this._log(
               "DEBUG",
               `[CashuSpender] refundXcashuTokens: Successfully refunded xcashu token for ${baseUrl}, amount=${receiveResult.amount}`
+            );
+          } else if (/already spent/i.test(receiveResult.message ?? "")) {
+            // The provider hands back a refund that was already received (e.g.
+            // a parked copy recovered earlier). It can never be received again,
+            // so stop retrying it and stop counting it as held.
+            this.storageAdapter.removeXcashuToken(baseUrl, xcashuToken.token);
+            results.push({
+              baseUrl,
+              token: xcashuToken.token,
+              success: false,
+              error: receiveResult.message,
+            });
+            this._log(
+              "WARN",
+              `[CashuSpender] refundXcashuTokens: refund from ${baseUrl} is already spent; removing its xcashu token`
             );
           } else {
             // Refund failed - increment tryCount

@@ -155,6 +155,22 @@ describe("cached receive recovery", () => {
     ]);
     expect(cached.map((entry) => entry.token)).toEqual(["bad", "new"]);
   });
+
+  it("removes a token the mint reports already spent", async () => {
+    let cached = ["spent", "unreachable"].map((token) => ({ token, amount: 10, unit: "sat" as const, createdAt: 1 }));
+    const spender = new CashuSpender(createWallet({
+      receiveToken: async (token) => {
+        throw new Error(token === "spent" ? "Token Already Spent" : "mint unavailable");
+      },
+    }), createStorage({
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (entries) => { cached = entries.map((entry) => ({ ...entry, createdAt: entry.createdAt ?? 1 })); },
+    }));
+    expect(await spender.recoverCachedReceiveTokens()).toEqual([
+      { token: "spent", success: false }, { token: "unreachable", success: false },
+    ]);
+    expect(cached.map((entry) => entry.token)).toEqual(["unreachable"]);
+  });
 });
 
 describe("CashuSpender refund sweep", () => {
