@@ -604,6 +604,17 @@ export class RoutstrClient {
     // Never spread incoming headers: Authorization, X-Cashu, cookies, etc. belong
     // to the caller, not the upstream payment connection.
     const baseHeaders = this._buildBaseHeaders();
+    // Without these headers, Venice silently falls back to plaintext inference.
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      const lower = name.toLowerCase();
+      if (
+        lower === "x-venice-tee-client-pub-key" ||
+        lower === "x-venice-tee-model-pub-key" ||
+        lower === "x-venice-tee-signing-algo"
+      ) {
+        baseHeaders[lower] = value;
+      }
+    }
     const modelPathSelector = this._findModelPathHeader(headers);
     if (modelPathSelector) {
       baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
