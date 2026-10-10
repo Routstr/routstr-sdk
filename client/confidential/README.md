@@ -47,6 +47,46 @@ The session follows the verified offer's `v`:
   anchor from its own 2PC output; π_C2S/π_C3S anchor on h1/h2. Receipts are
   checked exactly as in v1.
 
+## Pre-warming (v2)
+
+Most of a cold v2 request is the 2PC preprocessing (about 21 MB each way,
+roughly 25 s on a home uplink). Everything after the joint key share takes
+about 2 s: the online 2PC, the handshake, π_NK, the body and π_C2S. A session
+can be **armed** ahead of a request: `arm()` connects, sends the setup (the
+node reserves funds), runs the 2PC preprocessing and the key share, and stops
+before the ClientHello. `claim(body)` runs the rest. The sidecar dials the
+provider only when the ClientHello arrives, and keeps an armed session for up
+to 600 s from setup. `run()` is `arm()` followed by `claim()`. v1 sessions are
+never pooled.
+
+Pass `confidential.prewarm` (`{}` = the defaults) to let `fetchConfidential`
+keep a process-wide pool (`prewarm.ts`). It only reacts to traffic:
+
+| Rule | Behaviour | Default |
+|---|---|---|
+| Pool key | (node, model, `max_tokens`, credential). `max_tokens` must match exactly because the suffix pins it | |
+| No traffic, no arming | Nothing is armed at startup; a key with no request within `activityWindowMs` keeps no armed sessions | 10 min |
+| `target(K)` | 1 while K is active; 2 after ≥ `burstCount` requests within `burstWindowMs`; at least the peak number of overlapping requests in the window; capped at `maxPerKey` | 3 in 5 min; max 3 |
+| Global cap | `maxTotal` armed sessions, most recently active keys first | 4 |
+| Arms | one in flight at a time (`maxConcurrentArms`). None starts while a cold request is still in its own preprocessing. Replenishing runs off the request path: after a warm claim, at a response head, at completion, and on a 15 s tick that runs only while some key has state | 1 |
+| Body length | an armed session with length L serves any body ≤ L. The body is padded with spaces before the pinned suffix (valid JSON, and the suffix is still its own final record). L = max of the last `historySize` pinned bodies × `headroom`, rounded up to a power of two, between `minBucket` and `maxBucket`. A larger body goes cold and raises L, and smaller armed sessions are replaced | 20, ×1.25, 4 KiB to 8 MiB |
+| Retire | close at `maxAgeMs` from setup (the node and sidecar end a session at 600 s); when K goes idle, close its sessions at once (the node releases each reservation, no charge) | 480 s |
+| Claim | the oldest healthy armed session that fits. If none is ready, an arm in progress is taken rather than starting a second preprocessing. If it fails before the credential record is released, the request runs on a fresh cold session. It is never retried after that point | |
+| Failures | a failed arm backs the key off, `backoffBaseMs` doubling up to `backoffMaxMs` | 30 s to 10 min |
+| Funds | each armed session holds a reservation on the credential: a full-context prompt plus `max_tokens` at the offer rates. A key arms only after one of its requests has settled (the receipt's `reserved_msats` is the estimate R), and only while `/v1/balance/info` shows an available balance ≥ `fundsHeadroom` × R: the new arm plus one cold request | ×2 |
+
+Pooling is skipped for one-off Cashu bearers (`returnChange`, xcashu mode)
+and for v1 offers. The response carries `x-routstr-confidential-prewarmed:
+1|0`. Pool events are logged at info level (`[confidential-prewarm]` arming,
+armed, claim, retire, backoff) through `prewarm.log` (default
+`console.info`). Logs never contain credentials. `closeConfidentialPrewarm()`
+closes every armed session, for example on shutdown.
+
+Available-balance accounting: while sessions are armed, the node's
+`balance/info` reports the balance minus their reservations, so a client
+that tops up to cover one request may top up earlier than without
+pre-warming. Closing the pool releases the reservations.
+
 ## What is checked
 
 - The node's offer: Schnorr signature, pinned node key, protocol version and a
@@ -78,6 +118,7 @@ stdout control channel and are never logged.
 | `transport.ts` | the transport: offer check, pinned body, session, streamed `Response`, SSE→JSON for non-stream callers |
 | `session.ts` | one session: handshake through the relay, π_C1/π_N/π_C2/π_C3 (v1) or 2PC/π_NK/π_C2S/π_C3S (v2), receipt check |
 | `twopc.ts` | `cu-2pc` runner (v2): stdio frame codec, websocket bridge |
+| `prewarm.ts` | traffic-driven pool of armed v2 sessions, body-length buckets and padding |
 | `offer.ts`, `hosts.ts`, `canonical.ts` | signed offer verification, trusted-host wildcards, Schnorr/canonical JSON |
 | `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned suffix and π_N statement, receipt checks, proof-parameter checks, key-schedule material, `cu-prover` runner |
 | `tls-fork/` | vendored `@reclaimprotocol/tls@0.1.4` (MIT) with the patches in `FORK-NOTES.md` |

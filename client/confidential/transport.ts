@@ -23,6 +23,15 @@ import { fetchConfidentialOffer, verifyConfidentialOffer, type VerifiedOffer } f
 import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import { canonicalSuffix, HOP_BY_HOP_HEADERS } from "./suffix";
+import {
+  endsWith,
+  padPinnedBody,
+  PrewarmPool,
+  type ArmHandle,
+  type PoolKeyInfo,
+  type PrewarmOptions,
+  type RequestTicket,
+} from "./prewarm";
 
 export interface ConfidentialRequestOptions {
   /** Upstream TLS hostnames the client trusts (exact or wildcard). */
@@ -40,6 +49,92 @@ export interface ConfidentialRequestOptions {
   twoPcPath?: string;
   /** Evidence directory for per-session artifacts. */
   runsDir?: string;
+  /**
+   * Traffic-driven pre-warming of protocol v2 sessions (see `prewarm.ts`).
+   * Off unless set; `{}` enables it with the defaults. Not used for one-off
+   * Cashu bearers (`returnChange`) or v1 offers.
+   */
+  prewarm?: PrewarmOptions;
+}
+
+/** The process-wide pre-warm pool (created on first use). */
+let pool: PrewarmPool<ConfidentialSession, ConfidentialRequestOptions> | undefined;
+
+function prewarmPool(options: PrewarmOptions): PrewarmPool<ConfidentialSession, ConfidentialRequestOptions> {
+  if (!pool) {
+    pool = new PrewarmPool<ConfidentialSession, ConfidentialRequestOptions>(options, {
+      arm: armPooledSession,
+      availableMsats: availableBalance,
+    });
+  } else pool.configure(options);
+  return pool;
+}
+
+/** Close every pre-warmed session (the node releases their reservations). */
+export function closeConfidentialPrewarm(): void {
+  pool?.close();
+  pool = undefined;
+}
+
+/** Pool state, for status pages and tests. */
+export function confidentialPrewarmSnapshot(): ReturnType<PrewarmPool<ConfidentialSession>["snapshot"]> {
+  return pool?.snapshot() ?? [];
+}
+
+function armPooledSession(
+  info: PoolKeyInfo,
+  options: ConfidentialRequestOptions,
+  bodyLength: number,
+): ArmHandle<ConfidentialSession> {
+  let session: ConfidentialSession | undefined;
+  let cancelled = false;
+  const ready = (async () => {
+    const offer = await verifiedOffer(info.baseUrl, options);
+    if (offer.v !== 2) throw new ConfidentialError("offer_malformed", "pre-warm needs a protocol v2 offer");
+    if (!(info.model in offer.price_list)) {
+      throw new ConfidentialError("offer_malformed", `node no longer serves ${info.model} confidentially`);
+    }
+    if (cancelled) throw new ConfidentialError("session_rejected", "pre-warm cancelled");
+    session = new ConfidentialSession({
+      baseUrl: info.baseUrl,
+      offer,
+      auth: info.bearer,
+      model: info.model,
+      maxTokens: info.maxTokens,
+      bodyLength,
+      prover: new CuProverBackend({ binaryPath: options.proverPath }),
+      twoPcPath: options.twoPcPath,
+      runsDir: options.runsDir,
+      // The sidecar allows 180 s of preprocessing; a pooled arm is not
+      // waited on by a request, so give it the full window.
+      timeouts: { twoPcKeyShare: 175_000 },
+    });
+    await session.open();
+    await session.arm();
+    return session;
+  })();
+  ready.catch(() => session?.close());
+  return {
+    ready,
+    cancel: () => {
+      cancelled = true;
+      session?.close();
+    },
+  };
+}
+
+/** The credential's spendable balance on the node (msats), via the normal balance endpoint. */
+async function availableBalance(info: PoolKeyInfo): Promise<number | undefined> {
+  try {
+    const res = await fetch(`${info.baseUrl.replace(/\/$/, "")}/v1/balance/info`, {
+      headers: { Authorization: `Bearer ${info.bearer}` },
+    });
+    if (!res.ok) return undefined;
+    const j = (await res.json()) as { balance?: unknown };
+    return typeof j.balance === "number" ? j.balance : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Request keys the pinned suffix sets; they never come from the caller. */
@@ -256,17 +351,38 @@ async function fetchConfidentialOnce(
   const body = buildPinnedBody(request, model, maxTokens);
   const wantStream = request.stream === true;
 
-  const session = new ConfidentialSession({
-    baseUrl,
-    offer,
-    auth: params.bearer,
-    model,
-    maxTokens,
-    bodyLength: body.length,
-    prover: new CuProverBackend({ binaryPath: options.proverPath }),
-    twoPcPath: options.twoPcPath,
-    runsDir: options.runsDir,
-  });
+  const coldSession = () =>
+    new ConfidentialSession({
+      baseUrl,
+      offer,
+      auth: params.bearer,
+      model,
+      maxTokens,
+      bodyLength: body.length,
+      prover: new CuProverBackend({ binaryPath: options.proverPath }),
+      twoPcPath: options.twoPcPath,
+      runsDir: options.runsDir,
+    });
+
+  // Pre-warm: v2 only, a stable credential only (a one-off Cashu bearer is
+  // spent per request), and a body that ends with the pinned suffix.
+  const suffix = canonicalSuffix(model, maxTokens);
+  const usePool =
+    options.prewarm !== undefined &&
+    options.prewarm.enabled !== false &&
+    !params.returnChange &&
+    offer.v === 2 &&
+    endsWith(body, new TextEncoder().encode(suffix));
+  const ticket: RequestTicket<ConfidentialSession> | undefined = usePool
+    ? prewarmPool(options.prewarm!).begin(
+        { baseUrl: baseUrl.replace(/\/$/, ""), model, maxTokens, bearer: params.bearer },
+        options,
+        body.length,
+      )
+    : undefined;
+  const lease = ticket?.take();
+  let session: ConfidentialSession = lease ? (undefined as never) : coldSession();
+  let prewarmed = false;
 
   const stream = new TransformStream<Uint8Array, Uint8Array>();
   const writer = stream.writable.getWriter();
@@ -274,26 +390,75 @@ async function fetchConfidentialOnce(
   let resolveHead!: (h: Head) => void;
   const headP = new Promise<Head>((r) => (resolveHead = r));
   const chunks: Uint8Array[] = [];
-  session.setResponseHandlers(
-    (h) => resolveHead(h),
-    (chunk) => {
-      if (wantStream && chunk.length) void writer.write(chunk).catch(() => {});
-      else if (chunk.length) chunks.push(chunk);
-    },
-  );
+  const attach = (s: ConfidentialSession) =>
+    s.setResponseHandlers(
+      (h) => {
+        ticket?.head();
+        resolveHead(h);
+      },
+      (chunk) => {
+        if (wantStream && chunk.length) void writer.write(chunk).catch(() => {});
+        else if (chunk.length) chunks.push(chunk);
+      },
+    );
+  if (!lease) attach(session);
   const onAbort = () => {
-    session.close();
+    session?.close();
     const reason = params.signal?.reason ?? new DOMException("aborted", "AbortError");
     void writer.abort(reason).catch(() => {});
   };
   if (params.signal?.aborted) onAbort();
   params.signal?.addEventListener("abort", onAbort, { once: true });
 
+  const runCold = (): Promise<ConfidentialSessionResult> => {
+    ticket?.cold();
+    return session.run(body);
+  };
+  const runWarm = async (): Promise<ConfidentialSessionResult> => {
+    let warm: ConfidentialSession;
+    try {
+      warm = await lease!.session;
+    } catch (error) {
+      // The arm we waited for failed: nothing was sent, go cold.
+      ticket!.log(`claimed arm failed (${errorText(error)}); falling back to a cold session`);
+      session = coldSession();
+      attach(session);
+      return runCold();
+    }
+    if (params.signal?.aborted) {
+      warm.close();
+      throw params.signal.reason ?? new DOMException("aborted", "AbortError");
+    }
+    session = warm;
+    attach(session);
+    prewarmed = true;
+    ticket!.warm();
+    try {
+      return await warm.claim(padPinnedBody(body, warm.bodyLength, suffix));
+    } catch (error) {
+      // Before the credential record is released nothing reached the
+      // provider: retry once on a fresh cold session. Never after.
+      if (warm.bodyReleased || params.signal?.aborted) throw error;
+      ticket!.log(
+        `pre-warmed sid=${warm.sid.slice(0, 8)} failed before release (${errorText(error)}); falling back to a cold session`,
+      );
+      warm.close();
+      prewarmed = false;
+      session = coldSession();
+      attach(session);
+      return runCold();
+    }
+  };
+
   // The whole session, including settlement and its checks.
-  const runP = session.run(body).finally(() => {
-    session.close();
+  const runP = (lease ? runWarm() : runCold()).finally(() => {
+    session?.close();
     params.signal?.removeEventListener("abort", onAbort);
   });
+  runP.then(
+    (r) => ticket?.end(typeof r.receipt.reserved_msats === "number" ? r.receipt.reserved_msats : undefined),
+    () => ticket?.end(),
+  );
   let head: Head;
   try {
     head = await Promise.race([
@@ -307,7 +472,7 @@ async function fetchConfidentialOnce(
       })),
     ]);
   } catch (error) {
-    session.close();
+    session?.close();
     void writer.abort(error).catch(() => {});
     if (error instanceof SessionRejectedError && isOfferExpired(error)) {
       offerCache.delete(baseUrl.replace(/\/$/, ""));
@@ -346,6 +511,7 @@ async function fetchConfidentialOnce(
   }
   headers.set("x-routstr-verify", "confidential");
   headers.set("x-routstr-confidential-sid", session.sid);
+  if (usePool) headers.set("x-routstr-confidential-prewarmed", prewarmed ? "1" : "0");
   const ok = head.status < 400 && /event-stream/i.test(head.headers["content-type"] ?? "");
   if (wantStream) {
     response = new Response(stream.readable, { status: head.status, headers });
@@ -384,6 +550,10 @@ async function withdrawBalance(baseUrl: string, bearer: string): Promise<string 
   } catch {
     return undefined;
   }
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function concat(parts: Uint8Array[]): Uint8Array {
