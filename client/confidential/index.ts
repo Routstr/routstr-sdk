@@ -131,7 +131,24 @@ export {
 
 
 export {
+  PrewarmPool,
+  PREWARM_DEFAULTS,
+  chooseBucket,
+  padPinnedBody,
+  poolKey,
+  type PrewarmOptions,
+  type PrewarmDeps,
+  type PoolKeyInfo,
+  type ArmHandle,
+  type ArmedSessionLike,
+  type Lease,
+  type RequestTicket,
+} from "./prewarm";
+
+export {
   fetchConfidential,
+  closeConfidentialPrewarm,
+  confidentialPrewarmSnapshot,
   buildPinnedBody,
   aggregateChatCompletionSse,
   type ConfidentialFetchParams,
