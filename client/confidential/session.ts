@@ -282,6 +282,22 @@ class Bus {
   }
 }
 
+/**
+ * Rejects after `ms` without progress (`last()` = time of the last progress),
+ * for waits that last as long as the provider streams.
+ */
+function idleTimeout(ms: number, what: string, last: () => number, stop: Promise<unknown>): Promise<never> {
+  return new Promise((_, rej) => {
+    const timer = setInterval(() => {
+      if (Date.now() - last() > ms) {
+        clearInterval(timer);
+        rej(new ConfidentialTimeoutError(`timeout waiting for ${what} (no response data for ${Math.round(ms / 1000)} s)`));
+      }
+    }, 1000);
+    stop.finally(() => clearInterval(timer)).catch(() => {});
+  });
+}
+
 function timeout(ms: number, what: string): Promise<never> {
   return new Promise((_, rej) =>
     setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${what}`)), ms),
@@ -396,6 +412,8 @@ export class ConfidentialSession {
   private tRecordStart = 0;
   private tHeadWritten = 0;
   private tBodyWrite = 0;
+  /** Last response record received (for the idle timeout while it streams). */
+  private tLastData = 0;
   private ttft = 0;
   private prepared = false;
   private armed = false;
@@ -599,6 +617,7 @@ export class ConfidentialSession {
       },
       onRead: () => {},
       onApplicationData: (rec: Uint8Array) => {
+        this.tLastData = Date.now();
         if (!this.ttft) this.ttft = Date.now();
         this.responseChunks.push(rec);
         this.responseBytes = concat(this.responseBytes, rec);
@@ -988,10 +1007,13 @@ export class ConfidentialSession {
         (e: unknown) => this.event({ ev: "pi_c2_fail", err: String(e) }),
       );
 
+    // The node attests after the provider closes the response, so this wait
+    // lasts as long as the answer streams: time out only on silence.
+    const attP = this.bus.wait("attestation");
     const attMsg = await Promise.race([
-      this.bus.wait("attestation"),
+      attP,
       this.errP,
-      timeout(this.timeouts.attestation, "attestation"),
+      idleTimeout(this.timeouts.attestation, "attestation", () => Math.max(this.tLastData, this.tBodyWrite), attP),
     ]);
     const att = attMsg as { a?: unknown; a_json?: string; sig?: string; sig_scheme?: string };
     if (this.expectedPubkey && this.ready.pubkey !== this.expectedPubkey) {
