@@ -60,6 +60,8 @@ export {
   verifyConfidentialOffer,
   validateOfferShape,
   offerSignedPayload,
+  offerSessionFeeMsat,
+  offerAbandonFeeMsat,
   verifyOfferSignature,
   supportedVersion,
   type ConfidentialOffer,
@@ -123,6 +125,8 @@ export {
 
 export {
   verifyReceipt,
+  maxChargeMsats,
+  feeOnlyChargeOk,
   type ReceiptVerificationInput,
   type ReceiptVerificationResult,
 } from "./receipt";

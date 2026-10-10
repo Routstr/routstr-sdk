@@ -30,7 +30,18 @@ import {
   verifyOfferSignature,
   supportedVersion,
 } from "../../client/confidential/offer";
-import { parseSignedReceipt, verifyReceipt } from "../../client/confidential/receipt";
+import {
+  feeOnlyChargeOk,
+  maxChargeMsats,
+  parseSignedReceipt,
+  verifyReceipt,
+} from "../../client/confidential/receipt";
+import {
+  offerAbandonFeeMsat,
+  offerSessionFeeMsat,
+  validateOfferShape,
+} from "../../client/confidential/offer";
+import { confidentialRequiredSats } from "../../client/RoutstrClient";
 import {
   aggregateChatCompletionSse,
   buildPinnedBody,
@@ -418,6 +429,61 @@ describe("receipt verification", () => {
     expect(res.costWithinOffer).toBe(false);
   });
 
+  it("allows the signed session fee on top of the usage, never more", () => {
+    // 10 msats of usage at the (already surcharged) signed rates + 2000 fee.
+    const priceEntry = { in: 1000, out: 1000 };
+    expect(maxChargeMsats(priceEntry, ownUsage.usage, 2000)).toBe(2010);
+    const ok = verifyReceipt({
+      receipt: { ...base, cost_msats: 2010, session_fee_msat: 2000 } as never,
+      ownUsage,
+      priceEntry,
+      sessionFeeMsat: 2000,
+    });
+    expect(ok.costWithinOffer).toBe(true);
+    const over = verifyReceipt({
+      receipt: { ...base, cost_msats: 2011, session_fee_msat: 2000 } as never,
+      ownUsage,
+      priceEntry,
+      sessionFeeMsat: 2000,
+    });
+    expect(over.costWithinOffer).toBe(false);
+    // Without a signed fee the same charge is refused.
+    const noFee = verifyReceipt({ receipt: { ...base, cost_msats: 2010 } as never, ownUsage, priceEntry });
+    expect(noFee.costWithinOffer).toBe(false);
+    // A receipt naming a larger fee than the signed one is refused.
+    const bigger = verifyReceipt({
+      receipt: { ...base, cost_msats: 10, session_fee_msat: 5000 } as never,
+      ownUsage,
+      priceEntry,
+      sessionFeeMsat: 2000,
+    });
+    expect(bigger.costWithinOffer).toBe(false);
+    // The abandon fee never applies to a completed request.
+    const abandonCharged = verifyReceipt({
+      receipt: { ...base, cost_msats: 10_010, session_fee_msat: 2000, abandon_fee_msat: 10_000 } as never,
+      ownUsage,
+      priceEntry,
+      sessionFeeMsat: 2000,
+      abandonFeeMsat: 10_000,
+    });
+    expect(abandonCharged.costWithinOffer).toBe(false);
+    const biggerAbandon = verifyReceipt({
+      receipt: { ...base, cost_msats: 10, abandon_fee_msat: 20_000 } as never,
+      ownUsage,
+      priceEntry,
+      sessionFeeMsat: 2000,
+      abandonFeeMsat: 10_000,
+    });
+    expect(biggerAbandon.costWithinOffer).toBe(false);
+  });
+
+  it("allows at most the fee for a charge without usage (4xx/503, abandoned)", () => {
+    expect(feeOnlyChargeOk(0, 0)).toBe(true);
+    expect(feeOnlyChargeOk(1, 0)).toBe(false);
+    expect(feeOnlyChargeOk(2000, 2000)).toBe(true);
+    expect(feeOnlyChargeOk(2001, 2000)).toBe(false);
+  });
+
   it("flags a usage mismatch", () => {
     const receipt = {
       ...base,
@@ -656,5 +722,67 @@ describe("security regressions", () => {
       // A different skip than ours.
       expect(() => checkPiC3Params(params(tail, 5), ownC3)).toThrow(SessionProtocolError);
     });
+  });
+});
+
+describe("confidential session fee and surcharge in the offer", () => {
+  const shape = {
+    v: 2,
+    upstream_host: "api.venice.ai",
+    notary_pubkey: "ab".repeat(32),
+    max_tokens_cap: 4096,
+    key_length: 42,
+    head_template: "POST /",
+    suffix_keys: [],
+    price_list: {},
+  };
+
+  it("accepts absent or valid pricing fields and reads the fee", () => {
+    validateOfferShape({ ...shape });
+    validateOfferShape({ ...shape, session_fee_msat: 2000, abandon_fee_msat: 10000, rate_surcharge_pct: 20 });
+    expect(offerSessionFeeMsat({})).toBe(0);
+    expect(offerSessionFeeMsat({ session_fee_msat: 2000 })).toBe(2000);
+    // The abandon fee is never below the session fee.
+    expect(offerAbandonFeeMsat({})).toBe(0);
+    expect(offerAbandonFeeMsat({ session_fee_msat: 2000 })).toBe(2000);
+    expect(offerAbandonFeeMsat({ session_fee_msat: 2000, abandon_fee_msat: 10000 })).toBe(10000);
+    expect(offerAbandonFeeMsat({ session_fee_msat: 2000, abandon_fee_msat: 500 })).toBe(2000);
+  });
+
+  it("rejects malformed pricing fields", () => {
+    for (const bad of [-1, 1.5, "2000", Number.NaN]) {
+      expect(() => validateOfferShape({ ...shape, session_fee_msat: bad })).toThrow();
+    }
+    for (const bad of [-1, 2.5, "10"]) {
+      expect(() => validateOfferShape({ ...shape, abandon_fee_msat: bad })).toThrow();
+    }
+    for (const bad of [-1, "20", Number.POSITIVE_INFINITY]) {
+      expect(() => validateOfferShape({ ...shape, rate_surcharge_pct: bad })).toThrow();
+    }
+  });
+});
+
+describe("confidential deposit sizing", () => {
+  const model = (cu?: Record<string, unknown>) =>
+    ({
+      id: "m",
+      sats_pricing: { max_cost: 1000, max_prompt_cost: 900, completion: 0.1, request: 0 },
+      ...(cu ? { confidential_upstream: { v: 2, offer_url: "x", ...cu } } : {}),
+    }) as never;
+
+  it("is unchanged without a fee or surcharge", () => {
+    expect(confidentialRequiredSats(model(), 100)).toBeCloseTo(Math.min(1000, 910 * 1.05));
+    expect(confidentialRequiredSats(model({}), 100)).toBeCloseTo(Math.min(1000, 910 * 1.05));
+  });
+
+  it("adds the surcharge and the larger of the session and abandon fees", () => {
+    const base = Math.min(1000, 910 * 1.05);
+    expect(confidentialRequiredSats(model({ rate_surcharge_pct: 20, session_fee_msat: 2000 }), 100)).toBeCloseTo(
+      base * 1.2 + 2,
+    );
+    expect(confidentialRequiredSats(model({ session_fee_msat: 1500 }), 100)).toBeCloseTo(base + 2);
+    expect(
+      confidentialRequiredSats(model({ session_fee_msat: 2000, abandon_fee_msat: 10_000 }), 100),
+    ).toBeCloseTo(base + 10);
   });
 });
