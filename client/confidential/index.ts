@@ -116,6 +116,12 @@ export {
 } from "./twopc";
 
 export {
+  ProofChannel,
+  type ProofChannelOptions,
+  type ProofChannelResult,
+} from "./zkchan";
+
+export {
   verifyReceipt,
   type ReceiptVerificationInput,
   type ReceiptVerificationResult,
