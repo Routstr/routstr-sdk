@@ -44,6 +44,16 @@ export {
 } from "./canonical";
 
 export {
+  checkPiC1Params,
+  checkPiC2Params,
+  checkPiC3Params,
+  checkPiNKParams,
+  checkPiC2SParams,
+  checkPiC3SParams,
+  type SessionValues,
+} from "./params";
+
+export {
   CONFIDENTIAL_VERSION_MIN,
   CONFIDENTIAL_VERSION_MAX,
   fetchConfidentialOffer,
@@ -91,6 +101,19 @@ export {
   type ProverBackendOptions,
   type ZkJob,
 } from "./prover";
+
+export {
+  TwoPcSession,
+  TwoPcFrameDecoder,
+  encodeTwoPcFrame,
+  resolveTwoPcPath,
+  CU_2PC_ENV_VARS,
+  type TwoPcOptions,
+  type TwoPcFrame,
+  type TwoPcHandshakeSecrets,
+  type TwoPcApplicationSecrets,
+  type TwoPcTiming,
+} from "./twopc";
 
 export {
   verifyReceipt,

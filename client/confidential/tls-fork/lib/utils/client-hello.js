@@ -10,7 +10,7 @@ const COMPRESSION_MODE = new Uint8Array([0x01, 0x00]);
 const RENEGOTIATION_INFO = new Uint8Array([0xff, 0x01, 0x00, 0x01, 0x00]);
 export async function packClientHello({ host, sessionId = crypto.randomBytes(32), random = crypto.randomBytes(32), keysToShare, psk, cipherSuites, supportedProtocolVersions = Object
     .keys(TLS_PROTOCOL_VERSION_MAP), signatureAlgorithms = Object
-    .keys(SUPPORTED_SIGNATURE_ALGS_MAP), applicationLayerProtocols = [] }) {
+    .keys(SUPPORTED_SIGNATURE_ALGS_MAP), applicationLayerProtocols = [], omitPskModes = false }) {
     // generate random & sessionId if not provided
     const packedSessionId = packWithLength(sessionId).slice(1);
     const cipherSuiteList = (cipherSuites || Object.keys(SUPPORTED_CIPHER_SUITE_MAP)).map(cipherSuite => SUPPORTED_CIPHER_SUITE_MAP[cipherSuite].identifier);
@@ -22,7 +22,9 @@ export async function packClientHello({ host, sessionId = crypto.randomBytes(32)
         packSessionTicketExtension(),
         packVersionsExtension(supportedProtocolVersions),
         packSignatureAlgorithmsExtension(signatureAlgorithms),
-        packPresharedKeyModeExtension(),
+        // FORK PATCH (v2): omitPskModes drops psk_key_exchange_modes, so the
+        // server issues no session tickets (RFC 8446 §4.6.1).
+        ...(omitPskModes ? [] : [packPresharedKeyModeExtension()]),
         await packKeyShareExtension(keysToShare),
     ];
     if (psk) {

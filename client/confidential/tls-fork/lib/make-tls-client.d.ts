@@ -1,5 +1,5 @@
 import type { TLSClientOptions, TLSHandshakeOptions, TLSKeyType, TLSPacketWithType, TLSSessionTicket } from './types/index.js';
-export declare function makeTLSClient({ host, verifyServerCertificate, rootCAs, logger: _logger, cipherSuites, namedCurves, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, fetchCertificateBytes, write, onRead, onApplicationData, onSessionTicket, onTlsEnd, onHandshake, onRecvCertificates }: TLSClientOptions): {
+export declare function makeTLSClient({ host, verifyServerCertificate, rootCAs, logger: _logger, cipherSuites, namedCurves, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, fetchCertificateBytes, write, onRead, onApplicationData, onSessionTicket, onTlsEnd, onHandshake, onRecvCertificates, external }: TLSClientOptions): {
     getMetadata(): {
         cipherSuite: "TLS_CHACHA20_POLY1305_SHA256" | "TLS_AES_256_GCM_SHA384" | "TLS_AES_128_GCM_SHA256" | "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" | "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" | "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" | "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" | "TLS_RSA_WITH_AES_128_GCM_SHA256" | "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" | "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" | "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA" | "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA" | undefined;
         keyType: TLSKeyType | undefined;
@@ -40,6 +40,11 @@ export declare function makeTLSClient({ host, verifyServerCertificate, rootCAs, 
      */
     getSessionId(): Uint8Array<ArrayBufferLike>;
     isHandshakeDone(): boolean;
+    /** FORK PATCH (v2): transcript hashes passed to the external hooks */
+    getTranscriptHashes(): {
+        thSH?: Uint8Array;
+        thSF?: Uint8Array;
+    };
     getPskFromTicket(ticket: TLSSessionTicket): Promise<{
         identity: Uint8Array<ArrayBufferLike>;
         ticketAge: number;

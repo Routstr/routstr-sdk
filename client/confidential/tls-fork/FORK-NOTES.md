@@ -43,6 +43,38 @@ directly to the compiled `lib/` files and marked in-source with `// FORK PATCH`.
    `advice.c_ap_1 === fork.getKeys().clientSecret` on every run, cross-checking the
    fork against `cu-crypto` at runtime (and the fixtures cross-check it offline).
 
+## Protocol v2 hook: external key schedule
+
+Marked `// FORK PATCH (v2)` (`lib/make-tls-client.js`, `lib/utils/client-hello.js`,
+types in `lib/types/tls.d.ts`, `lib/make-tls-client.d.ts`, `lib/utils/client-hello.d.ts`).
+Mirrored byte for byte from the reference client (`crypto/client/vendor/tls`).
+Opt-in via the `external` option; without it the client behaves exactly as
+before (protocol v1). Used by `session.ts` for v2 offers (docs/TWOPC-DESIGN.md).
+
+```ts
+external: {
+  keyShare: Uint8Array,  // 65-byte uncompressed P-256 point (a_C + a_N)·G
+  onServerHello(serverShare: Uint8Array /*65 B*/, thSH: Uint8Array): Promise<{ clientHs, serverHs }>,
+  onServerFinished(thSF: Uint8Array): Promise<{ serverAp0, clientAp1 }>,
+}
+```
+
+- ClientHello: one cipher suite (default `TLS_AES_128_GCM_SHA256`; any other
+  configuration than one TLS 1.3 SHA-256 suite, TLS 1.3 only, throws),
+  `supported_groups` = [secp256r1], one key share (the given point, checked on
+  the curve), no `pre_shared_key`/`early_data`, and no `psk_key_exchange_modes`
+  (so the server sends no NewSessionTicket). A PSK in `startHandshake` throws.
+- ServerHello: a HelloRetryRequest (HRR random) is rejected; the server must
+  pick TLS 1.3, secp256r1 and no PSK. No ECDHE is computed: `onServerHello`
+  gets the server share and th_SH = SHA-256(CH‖SH), and c_hs/s_hs are installed.
+- The server flight is verified as before (chain, hostname, CertificateVerify,
+  server Finished under s_hs); the client Finished is sent under c_hs; then
+  `onServerFinished(th_SF)` (th_SF = SHA-256(CH‖…‖server Finished)) and the
+  client installs s_ap_0 (read, seq 0) and c_ap_1 (write, seq 0), then fires
+  `onHandshake`. HS/MS are never computed locally (`getHandshakeSecrets().masterSecret`
+  is `undefined`); client certificates are refused.
+- `getTranscriptHashes()` returns `{ thSH, thSF }`.
+
 ## Security patches (TLS-01 … TLS-10)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
