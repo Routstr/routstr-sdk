@@ -66,8 +66,8 @@ keep a process-wide pool (`prewarm.ts`). It only reacts to traffic:
 |---|---|---|
 | Pool key | (node, model, `max_tokens`, credential). `max_tokens` must match exactly because the suffix pins it | |
 | No traffic, no arming | Nothing is armed at startup; a key with no request within `activityWindowMs` keeps no armed sessions | 10 min |
-| `target(K)` | 1 while K is active; 2 after ≥ `burstCount` requests within `burstWindowMs`; at least the peak number of overlapping requests in the window; capped at `maxPerKey` | 3 in 5 min; max 3 |
-| Global cap | `maxTotal` armed sessions, most recently active keys first | 4 |
+| `target(K)` | 1 while K is active; 2 after ≥ `burstCount` requests within `burstWindowMs`; at least the peak number of overlapping requests in the window; capped at `maxPerKey` | 3 in 5 min; max 2 |
+| Global cap | `maxTotal` armed sessions, most recently active keys first (keep below the node's unused-sessions-per-address limit, default 3) | 2 |
 | Arms | one in flight at a time (`maxConcurrentArms`). None starts while a cold request is still in its own preprocessing. Replenishing runs off the request path: after a warm claim, at a response head, at completion, and on a 15 s tick that runs only while some key has state | 1 |
 | Body length | an armed session with length L serves any body ≤ L. The body is padded with spaces before the pinned suffix (valid JSON, and the suffix is still its own final record). L = max of the last `historySize` pinned bodies × `headroom`, rounded up to a power of two, between `minBucket` and `maxBucket`. A larger body goes cold and raises L, and smaller armed sessions are replaced | 20, ×1.25, 4 KiB to 8 MiB |
 | Retire | close at `maxAgeMs` from setup (the node and sidecar end a session at 600 s); when K goes idle, close its sessions at once (the node releases each reservation, no charge) | 480 s |
