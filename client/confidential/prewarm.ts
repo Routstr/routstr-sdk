@@ -52,7 +52,7 @@
  *   least its `session_fee_msat`), so every armed session that is never
  *   claimed costs that fee. A key is armed only while its abandon fee
  *   (learned from the receipt, and checked again against the fresh offer
- *   before each arm) is at most `maxSessionFeeMsat` (default 20000 msats; 0 =
+ *   before each arm) is at most `maxSessionFeeMsat` (default 5000 msats; 0 =
  *   never arm a node that charges one), and such keys keep at most
  *   `maxArmedWithFee` (1) armed sessions in total. Abandon fees paid for
  *   sessions retired unused are logged and counted (`unusedFeeMsats`).
@@ -114,7 +114,7 @@ export const PREWARM_DEFAULTS = {
   tickMs: 15_000,
   fundsHeadroom: 2,
   maxConcurrentArms: 1,
-  maxSessionFeeMsat: 20000,
+  maxSessionFeeMsat: 5000,
   maxArmedWithFee: 1,
 };
 
