@@ -57,6 +57,7 @@ import {
 } from "./params";
 import { CuProverBackend } from "./prover";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
+import { ProofChannel } from "./zkchan";
 import { parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
@@ -130,6 +131,12 @@ export interface ConfidentialSessionTimings {
   twoPcPhaseBMs?: number;
   /** v2: per-step 2PC timings and traffic as reported by cu-2pc. */
   twoPcSteps?: TwoPcTiming[];
+  /** v2: per-proof wall time, path (`zkchan` or `per-proof`) and traffic. */
+  proofs?: Record<string, { via: string; ms: number; innerMs?: number; bytesSent?: number; bytesRecv?: number }>;
+  /** v2: proof channel open → both correlation chains preprocessed. */
+  proofChannelReadyMs?: number;
+  /** v2: proof channel setup steps (hello, preprocess) as reported by cu-prover. */
+  proofChannelSteps?: TwoPcTiming[];
   totalMs: number;
 }
 
@@ -177,6 +184,13 @@ export interface ConfidentialSessionOptions {
   twoPcPath?: string;
   /** v2: injectable 2PC backend factory (tests). */
   twoPcFactory?: () => TwoPcSession;
+  /**
+   * v2: run π_NK/π_C2S/π_C3S over a pre-warmed proof channel (OT/VOLE set up
+   * while arming). Default true; false forces the per-proof path.
+   */
+  proofChannel?: boolean;
+  /** v2: injectable proof channel factory (tests). */
+  proofChannelFactory?: () => ProofChannel;
   /** Node pubkey the ready frame must announce (defaults to offer.notary_pubkey). */
   expectedPubkey?: string;
   /** Timeouts (ms). */
@@ -192,6 +206,10 @@ export interface ConfidentialSessionOptions {
     receipt: number;
     twoPcKeyShare: number;
     handshakeV2: number;
+    /** v2: wait for the proof channel's preprocessing before falling back. */
+    proofChannelReady: number;
+    /** v2: one proof on the proof channel. */
+    proof: number;
   }>;
   /** Optional evidence directory; writes client.jsonl/response.txt/receipt.json. */
   runsDir?: string;
@@ -228,6 +246,9 @@ const DEFAULT_TIMEOUTS = {
   twoPcKeyShare: 120_000,
   // v2: the handshake includes both garbled-circuit phases.
   handshakeV2: 45_000,
+  // v2: the proof channel preprocesses alongside the 2PC (a few MB).
+  proofChannelReady: 120_000,
+  proof: 60_000,
 };
 
 class Bus {
@@ -309,6 +330,10 @@ export class ConfidentialSession {
   private readonly twoPcPath?: string;
   private readonly twoPcFactory?: () => TwoPcSession;
   private twoPc?: TwoPcSession;
+  private readonly useProofChannel: boolean;
+  private readonly proofChannelFactory?: () => ProofChannel;
+  private zkChan?: ProofChannel;
+  private proofTimes: NonNullable<ConfidentialSessionTimings["proofs"]> = {};
   private ap?: TwoPcApplicationSecrets;
   private tKeyShare = 0;
   private tPhaseA = 0;
@@ -393,6 +418,8 @@ export class ConfidentialSession {
     this.protocol = options.offer.v;
     this.twoPcPath = options.twoPcPath;
     this.twoPcFactory = options.twoPcFactory;
+    this.useProofChannel = options.proofChannel !== false;
+    this.proofChannelFactory = options.proofChannelFactory;
     this.auth = options.auth;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
@@ -697,6 +724,12 @@ export class ConfidentialSession {
       this.twoPcFactory?.() ?? new TwoPcSession({ binaryPath: this.twoPcPath, proverPath: this.prover.path });
     this.twoPc = twoPc;
     twoPc.start(this.zkUrl("twopc"));
+    if (this.useProofChannel) {
+      // The proofs' OT/VOLE setup runs alongside the 2PC preprocessing; arm
+      // does not wait for it (the first proof does).
+      this.zkChan = this.proofChannelFactory?.() ?? new ProofChannel({ binaryPath: this.prover.path });
+      this.zkChan.start(this.zkUrl("zkchan"));
+    }
     const t0 = Date.now();
     const keyShare = await Promise.race([twoPc.keyShare(this.timeouts.twoPcKeyShare), this.errP]);
     this.tKeyShare = Date.now();
@@ -757,15 +790,46 @@ export class ConfidentialSession {
     }
     // Rebuilt from the *signed* offer, our body length and our hk.
     checkPiNKParams(commit.params, { offer: this.offer, hk: this.ap.hk, bodyLen: this.bodyLength });
-    await this.prover.run(this.zkUrl("pi_nk"), {
-      proof: "pi_nk",
-      role: "verifier",
-      params: commit.params,
-    });
+    await this.proofV2("pi_nk", "verify", commit.params);
     this.event({ ev: "pi_nk_ok" });
     this.tProofsReady = Date.now();
     this.prepared = true;
     this.armed = true;
+  }
+
+  /**
+   * v2: one proof, on the pre-warmed proof channel when it is usable, else
+   * on its own `/zk?proof=…` connection. The fallback is taken only while no
+   * proof has started on the channel: after that a channel failure is a
+   * failed proof (the node aborts the session), never retried elsewhere.
+   */
+  private async proofV2(
+    proof: "pi_nk" | "pi_c2s" | "pi_c3s",
+    cmd: "prove" | "verify",
+    params: unknown,
+    witness?: unknown,
+  ): Promise<void> {
+    const t = Date.now();
+    const ch = this.zkChan;
+    if (ch && (ch.used || (await ch.ready(this.timeouts.proofChannelReady)))) {
+      const m = await ch.run(cmd, proof, params, witness, this.timeouts.proof);
+      this.proofTimes[proof] = {
+        via: "zkchan",
+        ms: Date.now() - t,
+        innerMs: m.ms,
+        bytesSent: m.bytes_sent,
+        bytesRecv: m.bytes_recv,
+      };
+      return;
+    }
+    if (ch) this.event({ ev: "proof_channel_fallback", proof, err: String(ch.failure?.message ?? "") });
+    await this.prover.run(this.zkUrl(proof), {
+      proof,
+      role: cmd === "prove" ? "prover" : "verifier",
+      params,
+      witness,
+    });
+    this.proofTimes[proof] = { via: "per-proof", ms: Date.now() - t };
   }
 
   /** Phase 1, safe to run while arming: π_C1 advice + proof + π_N verification (v1), π_NK (v2). */
@@ -888,14 +952,16 @@ export class ConfidentialSession {
       });
     }
     const c2Name = v2 ? "pi_c2s" : "pi_c2";
-    const c2Promise = this.prover
-      .run(this.zkUrl(c2Name), {
-        proof: c2Name,
-        role: "prover",
-        params: c2params.params,
-        witness: v2 ? { Secret: Array.from(this.ap!.clientAp1) } : { Hs: Array.from(this.hs!) },
-      })
-      .then(
+    const c2Promise = (
+      v2
+        ? this.proofV2("pi_c2s", "prove", c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
+        : this.prover.run(this.zkUrl(c2Name), {
+            proof: c2Name,
+            role: "prover",
+            params: c2params.params,
+            witness: { Hs: Array.from(this.hs!) },
+          })
+    ).then(
         () => this.event({ ev: "pi_c2_ok" }),
         // Handle now (no unhandled rejection while we wait for attestation);
         // the failure is re-raised below before π_C3.
@@ -960,13 +1026,18 @@ export class ConfidentialSession {
       });
     }
     const c3Name = v2 ? "pi_c3s" : "pi_c3";
-    await this.prover.run(this.zkUrl(c3Name), {
-      proof: c3Name,
-      role: "prover",
-      params: c3.params,
-      witness: v2 ? { Secret: Array.from(this.ap!.serverAp0) } : { Hs: Array.from(this.hs!) },
-    });
+    if (v2) {
+      await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
+    } else {
+      await this.prover.run(this.zkUrl(c3Name), {
+        proof: c3Name,
+        role: "prover",
+        params: c3.params,
+        witness: { Hs: Array.from(this.hs!) },
+      });
+    }
     this.twoPc?.close();
+    this.zkChan?.close();
     this.event({ ev: v2 ? "pi_c3s_ok" : "pi_c3_ok" });
 
     const terminal = await Promise.race([
@@ -1059,6 +1130,9 @@ export class ConfidentialSession {
             twoPcPhaseAMs: this.tPhaseA || undefined,
             twoPcPhaseBMs: this.tPhaseB || undefined,
             twoPcSteps: this.twoPc?.timings.slice(),
+            proofs: { ...this.proofTimes },
+            proofChannelReadyMs: this.zkChan?.tReady ? this.zkChan.tReady - this.zkChan.tStart : undefined,
+            proofChannelSteps: this.zkChan?.timings.slice(),
           }
         : {}),
       totalMs: tEnd - tClaim,
@@ -1117,6 +1191,7 @@ export class ConfidentialSession {
 
   close(): void {
     this.twoPc?.close();
+    this.zkChan?.close();
     try {
       this.ws?.close();
     } catch {
