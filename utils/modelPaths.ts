@@ -28,22 +28,43 @@ export interface DeepSeekModelRoute {
   /** Upstream base URL, exactly as the node advertises it in the selector. */
   url: string;
   /**
-   * OpenRouter subprovider endpoint tag. Required on every whitelisted route:
-   * a bare OpenRouter selector would let OpenRouter pick any subprovider
-   * (deepinfra, together, ...), not necessarily a whitelisted one.
+   * OpenRouter subprovider endpoint tag. Required on whitelisted OpenRouter
+   * routes: a bare OpenRouter selector would let OpenRouter pick any
+   * subprovider (deepinfra, together, ...), not necessarily a whitelisted one.
+   * Direct upstreams (the provider's own base URL, e.g. api.ppq.ai) carry no
+   * endpoint tag — the base URL already names the single provider.
    */
   endpoint?: string;
 }
 
 /**
- * The only two upstream routes DeepSeek requests may take, for now, in
- * preference order — both pinned OpenRouter subproviders:
- * 1. DeepSeek's own subprovider on OpenRouter
- * 2. Fireworks' subprovider on OpenRouter
+ * The upstream routes DeepSeek requests may take, in preference order.
+ *
+ * Order is load-bearing: `available[0]` is the default pin and the node's
+ * ranking metric (and the per-route max_cost the deposit gate reserves), so
+ * entries are only ever appended. Inserting ahead of the first entry would
+ * change the default pin, the node ranking and the deposit envelope.
+ *
+ * 1. OpenRouter's deepseek subprovider — default pin
+ * 2. OpenRouter's fireworks subprovider — original failover headroom
+ * 3. api.ppq.ai — direct PPQ
+ * 4. OpenRouter's venice/fp8 subprovider
+ * 5. OpenRouter's wafer subprovider
+ * 6. api.venice.ai — direct Venice
+ * 7. api.fireworks.ai — direct Fireworks
+ *
+ * The direct upstreams are reached through the variant spelling a node files
+ * them under (see resolveDeepSeekModelPathSelectors): `deepseek-v4-1-flash`
+ * for Venice, `accounts/fireworks/models/deepseek-v4p1-flash` for Fireworks.
  */
 export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly DeepSeekModelRoute[] = [
   { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
   { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
+  { url: "https://api.ppq.ai" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "venice/fp8" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "wafer" },
+  { url: "https://api.venice.ai/api/v1" },
+  { url: "https://api.fireworks.ai/inference/v1" },
 ];
 
 /**
@@ -343,7 +364,7 @@ export function whitelistedDeepSeekRoute(
 }
 
 /**
- * True when an x-routstr-model-path selector routes through one of the two
+ * True when an x-routstr-model-path selector routes through one of the
  * whitelisted DeepSeek upstream identities. Only url and endpoint tag are
  * matched.
  */

@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEEPSEEK_MODEL_PATH_WHITELIST,
   parseModelPathsPayload,
   resolveDeepSeekModelPathSelectors,
 } from "../../utils/modelPaths";
+
+/**
+ * One selector slot per whitelisted route; resolution always returns that many
+ * slots (null where the node offers no such route), so expectations check the
+ * pinned prefix and that the remaining slots stay empty rather than hardcoding
+ * the whitelist length.
+ */
+const emptyTail = (selectors: Array<string | null> | undefined): boolean =>
+  (selectors ?? [])
+    .slice(2)
+    .every((s) => s === null);
 
 /**
  * A node may file one model under several spellings — the canonical id and a
@@ -87,10 +99,11 @@ describe("resolveDeepSeekModelPathSelectors across spellings", () => {
       entry(VARIANT, [priced(selector(VARIANT, "fireworks"), 0.002)]),
     ]);
     const resolved = resolveDeepSeekModelPathSelectors(paths, CANONICAL);
-    expect(resolved?.selectors).toEqual([
+    expect(resolved?.selectors.slice(0, 2)).toEqual([
       selector(CANONICAL, "deepseek"),
       selector(VARIANT, "fireworks"),
     ]);
+    expect(emptyTail(resolved?.selectors)).toBe(true);
     // Pricing travels with the path it was advertised next to.
     expect(resolved?.satsPricing[0]?.completion).toBe(0.001);
     expect(resolved?.satsPricing[1]?.completion).toBe(0.002);
@@ -136,10 +149,11 @@ describe("resolveDeepSeekModelPathSelectors across spellings", () => {
       entry("grok-4-6", [selector("grok-4-6", "fireworks")]),
     ]);
     const resolved = resolveDeepSeekModelPathSelectors(paths, CANONICAL);
-    expect(resolved?.selectors).toEqual([
+    expect(resolved?.selectors.slice(0, 2)).toEqual([
       selector(CANONICAL, "deepseek"),
       null,
     ]);
+    expect(emptyTail(resolved?.selectors)).toBe(true);
   });
 
   it("returns null when the node lists none of the spellings", () => {
@@ -153,11 +167,27 @@ describe("resolveDeepSeekModelPathSelectors across spellings", () => {
         VARIANT,
         [
           "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4-1-flash",
-          "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash",
+          "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash&endpoint=deepinfra%2Ffp8",
         ]
       ),
     ]);
     const resolved = resolveDeepSeekModelPathSelectors(paths, CANONICAL);
-    expect(resolved?.selectors).toEqual([null, null]);
+    expect(resolved).not.toBeNull();
+    expect(resolved?.selectors.every((s) => s === null)).toBe(true);
+  });
+
+  it("resolves a whitelisted direct upstream advertised under a variant spelling", () => {
+    // api.venice.ai only ever appears under the dash spelling — the route the
+    // resolver must reach for the direct-upstream whitelist entries to work.
+    const venice =
+      "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash";
+    const veniceIndex = DEEPSEEK_MODEL_PATH_WHITELIST.findIndex(
+      (route) => route.url === "https://api.venice.ai/api/v1"
+    );
+    expect(veniceIndex).toBeGreaterThan(-1);
+    const paths = parse([entry(VARIANT, [priced(venice, 0.003)])]);
+    const resolved = resolveDeepSeekModelPathSelectors(paths, CANONICAL);
+    expect(resolved?.selectors[veniceIndex]).toBe(venice);
+    expect(resolved?.satsPricing[veniceIndex]?.completion).toBe(0.003);
   });
 });

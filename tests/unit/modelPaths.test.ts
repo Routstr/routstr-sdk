@@ -15,16 +15,80 @@ const OPENROUTER_DEEPSEEK_SELECTOR =
   "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepseek";
 const OPENROUTER_FIREWORKS_SELECTOR =
   "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=fireworks";
-// No longer whitelisted: the official DeepSeek API route.
+const OPENROUTER_VENICE_SELECTOR =
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=venice%2Ffp8";
+const OPENROUTER_WAFER_SELECTOR =
+  "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=wafer";
+const PPQ_SELECTOR =
+  "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash";
+// Direct upstreams are advertised under the spelling the node files them as.
+const VENICE_DIRECT_SELECTOR =
+  "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash";
+const FIREWORKS_DIRECT_SELECTOR =
+  "url=https%3A%2F%2Fapi.fireworks.ai%2Finference%2Fv1&model-id=accounts%2Ffireworks%2Fmodels%2Fdeepseek-v4p1-flash";
+// Still not whitelisted: the official DeepSeek API route.
 const OFFICIAL_API_SELECTOR =
   "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash";
 
 describe("DeepSeek model path whitelist", () => {
-  it("contains exactly the two whitelisted routes, in preference order", () => {
+  it("contains the whitelisted routes, in preference order, appended after the OpenRouter pins", () => {
     expect(DEEPSEEK_MODEL_PATH_WHITELIST).toEqual([
       { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
       { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
+      { url: "https://api.ppq.ai" },
+      { url: "https://openrouter.ai/api/v1", endpoint: "venice/fp8" },
+      { url: "https://openrouter.ai/api/v1", endpoint: "wafer" },
+      { url: "https://api.venice.ai/api/v1" },
+      { url: "https://api.fireworks.ai/inference/v1" },
     ]);
+    // The default pin must never move: it is the node ranking metric and the
+    // source of the deposit gate's max_cost envelope.
+    expect(DEEPSEEK_MODEL_PATH_WHITELIST[0]).toEqual({
+      url: "https://openrouter.ai/api/v1",
+      endpoint: "deepseek",
+    });
+  });
+
+  it("builds each appended route byte-exact as the node advertises it", () => {
+    const [
+      ,
+      ,
+      ppqRoute,
+      veniceRoute,
+      waferRoute,
+      veniceDirect,
+      fireworksDirect,
+    ] = DEEPSEEK_MODEL_PATH_WHITELIST;
+    expect(deepSeekModelPath("deepseek-v4.1-flash", ppqRoute)).toBe(PPQ_SELECTOR);
+    expect(deepSeekModelPath("deepseek-v4.1-flash", veniceRoute)).toBe(
+      OPENROUTER_VENICE_SELECTOR
+    );
+    expect(deepSeekModelPath("deepseek-v4.1-flash", waferRoute)).toBe(
+      OPENROUTER_WAFER_SELECTOR
+    );
+    // Direct upstreams carry no endpoint tag; the model-id is the node's
+    // advertised spelling, not the canonical one.
+    expect(deepSeekModelPath("deepseek-v4-1-flash", veniceDirect)).toBe(
+      VENICE_DIRECT_SELECTOR
+    );
+    expect(
+      deepSeekModelPath(
+        "accounts/fireworks/models/deepseek-v4p1-flash",
+        fireworksDirect
+      )
+    ).toBe(FIREWORKS_DIRECT_SELECTOR);
+  });
+
+  it("accepts the appended selectors", () => {
+    for (const selector of [
+      PPQ_SELECTOR,
+      OPENROUTER_VENICE_SELECTOR,
+      OPENROUTER_WAFER_SELECTOR,
+      VENICE_DIRECT_SELECTOR,
+      FIREWORKS_DIRECT_SELECTOR,
+    ]) {
+      expect(isWhitelistedDeepSeekModelPath(selector)).toBe(true);
+    }
   });
 
   it("defaults to OpenRouter's deepseek subprovider and matches the node-advertised selector", () => {
@@ -68,14 +132,8 @@ describe("DeepSeek model path whitelist", () => {
   });
 
   it("rejects non-whitelisted upstreams and OpenRouter subproviders", () => {
-    // The official DeepSeek API route is no longer whitelisted.
+    // The official DeepSeek API route is not whitelisted.
     expect(isWhitelistedDeepSeekModelPath(OFFICIAL_API_SELECTOR)).toBe(false);
-    // PPQ advertises this path for deepseek-v4.1-flash, but is not whitelisted.
-    expect(
-      isWhitelistedDeepSeekModelPath(
-        "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash"
-      )
-    ).toBe(false);
     // A bare OpenRouter selector lets OpenRouter pick any subprovider.
     expect(
       isWhitelistedDeepSeekModelPath(
@@ -92,6 +150,12 @@ describe("DeepSeek model path whitelist", () => {
     expect(
       isWhitelistedDeepSeekModelPath(
         "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash&endpoint=deepseek"
+      )
+    ).toBe(false);
+    // A non-whitelisted subprovider tag on a whitelisted base URL.
+    expect(
+      isWhitelistedDeepSeekModelPath(
+        "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash&endpoint=deepinfra%2Ffp4"
       )
     ).toBe(false);
   });

@@ -1488,7 +1488,8 @@ describe("ProviderManager", () => {
     it("skips nodes that do not offer the model or advertise no whitelisted path", async () => {
       stubPathsFetch({
         [NODE_A]: pathsPayload([
-          { path: "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash" },
+          // The official DeepSeek API route is not whitelisted.
+          { path: "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash" },
         ]),
         [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
       });
