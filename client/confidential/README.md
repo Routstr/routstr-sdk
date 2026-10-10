@@ -70,10 +70,11 @@ keep a process-wide pool (`prewarm.ts`). It only reacts to traffic:
 | Global cap | `maxTotal` armed sessions, most recently active keys first (keep below the node's unused-sessions-per-address limit, default 3) | 2 |
 | Arms | one in flight at a time (`maxConcurrentArms`). None starts while a cold request is still in its own preprocessing. Replenishing runs off the request path: after a warm claim, at a response head, at completion, and on a 15 s tick that runs only while some key has state | 1 |
 | Body length | an armed session with length L serves any body ≤ L. The body is padded with spaces before the pinned suffix (valid JSON, and the suffix is still its own final record). L = max of the last `historySize` pinned bodies × `headroom`, rounded up to a power of two, between `minBucket` and `maxBucket`. A larger body goes cold and raises L, and smaller armed sessions are replaced | 20, ×1.25, 4 KiB to 8 MiB |
-| Retire | close at `maxAgeMs` from setup (the node and sidecar end a session at 600 s); when K goes idle, close its sessions at once (the node releases each reservation, no charge) | 480 s |
+| Retire | close at `maxAgeMs` from setup (the node and sidecar end a session at 600 s); when K goes idle, close its sessions at once (the node releases each reservation; nothing is charged unless it has an abandon fee) | 480 s |
 | Claim | the oldest healthy armed session that fits. If none is ready, an arm in progress is taken rather than starting a second preprocessing. If it fails before the credential record is released, the request runs on a fresh cold session. It is never retried after that point | |
 | Failures | a failed arm backs the key off, `backoffBaseMs` doubling up to `backoffMaxMs` | 30 s to 10 min |
 | Funds | each armed session holds a reservation on the credential: a full-context prompt plus `max_tokens` at the offer rates. A key arms only after one of its requests has settled (the receipt's `reserved_msats` is the estimate R), and only while `/v1/balance/info` shows an available balance ≥ `fundsHeadroom` × R: the new arm plus one cold request | ×2 |
+| Abandon fee | a node may charge a fee for a session that ends without a request reaching the provider (`abandon_fee_msat` in its signed offer, at least `session_fee_msat`), so every armed session that is never used costs that fee. A key whose abandon fee (from the receipt, rechecked against the fresh offer before each arm) exceeds `maxSessionFeeMsat` is never armed (0 = never arm a node that charges one); otherwise such keys hold at most `maxArmedWithFee` armed sessions in total. Abandon fees paid for sessions retired unused are logged (`… abandon fee N msats paid`) and summed in `pool.unusedFeeMsats` | 5000 msats; 1 |
 
 Pooling is skipped for one-off Cashu bearers (`returnChange`, xcashu mode)
 and for v1 offers. The response carries `x-routstr-confidential-prewarmed:
@@ -112,13 +113,28 @@ download-limited link.
   disclose. π_C2/π_C3 reveal one bit to the node, never plaintext.
 - The receipt: required Schnorr signature over the exact signed bytes, this
   session's sid and attestation, the usage equal to the client's own
-  plaintext, and a cost no higher than that usage at the signed offer's rates.
+  plaintext, and a cost no higher than that usage at the signed offer's rates
+  plus the offer's session fee (`maxChargeMsats`); a receipt naming larger
+  fees than the signed ones is refused.
 
 A non-streaming call fails if any check after the response fails; a stream
 ends with an error instead of a clean end. On an upstream HTTP error the node
 learns only the status line and headers (the body stays private); 4xx and
-503 cost nothing. The node reserves a full-context prompt plus the pinned
-completion cap at the offer's rates, so the client deposits for that.
+503 cost nothing beyond the session fee. The node reserves a full-context
+prompt plus the pinned completion cap at the offer's rates, plus the larger of
+its session and abandon fees, so the client deposits for that
+(`confidentialRequiredSats` reads the fees and the surcharge from the model
+listing's `confidential_upstream` field).
+
+**Node pricing.** A node may add a percentage surcharge to its per-token rates
+(already included in the signed `price_list`; `rate_surcharge_pct` states it),
+a `session_fee_msat` added to every completed request (and charged alone for a
+provider refusal, 4xx/503), and an `abandon_fee_msat` (≥ the session fee,
+`offerAbandonFeeMsat`) charged instead for a session that ends without a
+request reaching the provider (set up but never used, aborted). The session
+echoes both signed fees in its setup: the node refuses a setup that does not,
+so older clients are never charged fees they do not check. An abandoned
+session gets no receipt; its charge shows in the balance.
 
 The prover gets its job, including the TLS handshake secret, on stdin; nothing
 is written to disk. The same holds for `cu-2pc`, whose secrets come back on its
