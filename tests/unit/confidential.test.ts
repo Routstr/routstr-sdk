@@ -188,11 +188,14 @@ describe("offer verification + pinning", () => {
   });
 
   it("rejects an unsupported protocol version", () => {
-    const { offer } = signedOffer({ v: 2, min_v: 2, max_v: 2 });
+    const { offer } = signedOffer({ v: 3, min_v: 3, max_v: 3 });
     expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(
       OfferUnsupportedVersionError,
     );
-    expect(supportedVersion({ v: 2, min_v: 2, max_v: 2 } as never)).toBe(false);
+    expect(supportedVersion({ v: 3, min_v: 3, max_v: 3 } as never)).toBe(false);
+    // v2 (two-party handshake) is supported alongside v1.
+    expect(supportedVersion({ v: 2, min_v: 2, max_v: 2 } as never)).toBe(true);
+    expect(supportedVersion({ v: 1, min_v: 1, max_v: 2 } as never)).toBe(true);
   });
 
   it("enforces the trusted-host list when provided", () => {

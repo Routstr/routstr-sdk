@@ -3,11 +3,20 @@
  *
  * C is the TLS 1.3 client of the upstream session through the node's WS relay
  * and holds the only copy of the application traffic secrets. It never sees the
- * credential record. The message flow (identical to the verified prototype):
+ * credential record. The message flow (identical to the verified prototype),
+ * negotiated by the verified offer's `v`:
  *
- *   setup → ready → TLS handshake → hs_secrets (c_hs/s_hs ONLY) → hs_verified
- *   → KU0 → c1_material → π_C1 → c_commit → π_N → ku1 → head_written
- *   → body → body_suffix → π_C2 → attestation → disclose → π_C3 → receipt
+ *   v1: setup → ready → TLS handshake → hs_secrets (c_hs/s_hs ONLY) → hs_verified
+ *       → KU0 → c1_material → π_C1 → c_commit → π_N → ku1 → head_written
+ *       → body → body_suffix → π_C2 → attestation → disclose → π_C3 → receipt
+ *
+ *   v2 (two-party handshake, docs/TWOPC-DESIGN.md): setup → ready(v=2)
+ *       → cu-2pc key share P = P_C + P_N → TLS handshake with the external key
+ *       schedule (P-256; c_hs/s_hs, then s_ap_0/c_ap_1 from the 2PC; no local
+ *       ECDHE, HS or MS) → hs_verified → c_commit → π_NK (we verify)
+ *       → release_head (the node writes epoch 0: credential + KeyUpdate under
+ *       K_0, which we never learn) → head_written → body in epoch 1
+ *       → body_suffix → π_C2S → attestation → disclose → π_C3S → receipt
  *
  * Everything the reference client verifies is verified here: the π_N statement
  * against the locally rebuilt one, the π_C1/π_C2/π_C3 parameters against our
@@ -37,8 +46,17 @@ import {
   sha256,
   type Epoch1Material,
 } from "./advice";
-import { checkPiC1Params, checkPiC2Params, checkPiC3Params, type SessionValues } from "./params";
+import {
+  checkPiC1Params,
+  checkPiC2Params,
+  checkPiC2SParams,
+  checkPiC3Params,
+  checkPiC3SParams,
+  checkPiNKParams,
+  type SessionValues,
+} from "./params";
 import { CuProverBackend } from "./prover";
+import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
@@ -68,6 +86,7 @@ interface TlsHandle {
     | { masterSecret: Uint8Array; clientSecret: Uint8Array; serverSecret: Uint8Array }
     | undefined;
   getHandshakeMessages(): Uint8Array[];
+  getTranscriptHashes(): { thSH?: Uint8Array; thSF?: Uint8Array };
   skipSendSequence(n: number): void;
   updateTrafficKeys(requestUpdateFromServer?: boolean): Promise<void>;
   updateTrafficKeysSilently(
@@ -99,11 +118,18 @@ export interface ConfidentialSessionTimings {
   readyMs?: number;
   handshakeMs?: number;
   ku0Ms?: number;
+  /** v1: c1_material → π_C1 + π_N; v2: c_commit wait + π_NK verification. */
   piC1Ms?: number;
   recordKu1Ms?: number;
   claimToBodyMs?: number;
   upstreamTtftMs?: number;
   armMs?: number;
+  /** v2: preprocessing + joint key share, phase A (handshake secrets), phase B (application secrets). */
+  twoPcKeyShareMs?: number;
+  twoPcPhaseAMs?: number;
+  twoPcPhaseBMs?: number;
+  /** v2: per-step 2PC timings and traffic as reported by cu-2pc. */
+  twoPcSteps?: TwoPcTiming[];
   totalMs: number;
 }
 
@@ -125,6 +151,8 @@ export interface ConfidentialSessionResult {
   totalMs: number;
   timings: ConfidentialSessionTimings;
   proofs: string[];
+  /** Protocol version the session ran (1, or 2 = two-party handshake). */
+  protocol: number;
 }
 
 export interface ConfidentialSessionOptions {
@@ -145,6 +173,10 @@ export interface ConfidentialSessionOptions {
   /** Canonical suffix; defaults to canonicalSuffix(model, maxTokens). */
   suffix?: string;
   prover: CuProverBackend;
+  /** v2: path to cu-2pc (default: CU_2PC_BIN/CU_2PC, then next to cu-prover, then PATH). */
+  twoPcPath?: string;
+  /** v2: injectable 2PC backend factory (tests). */
+  twoPcFactory?: () => TwoPcSession;
   /** Node pubkey the ready frame must announce (defaults to offer.notary_pubkey). */
   expectedPubkey?: string;
   /** Timeouts (ms). */
@@ -158,6 +190,8 @@ export interface ConfidentialSessionOptions {
     zkParams: number;
     attestation: number;
     receipt: number;
+    twoPcKeyShare: number;
+    handshakeV2: number;
   }>;
   /** Optional evidence directory; writes client.jsonl/response.txt/receipt.json. */
   runsDir?: string;
@@ -190,6 +224,10 @@ const DEFAULT_TIMEOUTS = {
   zkParams: 30_000,
   attestation: 60_000,
   receipt: 60_000,
+  // v2: preprocessing (OT setup, garbled circuits) precedes the key share.
+  twoPcKeyShare: 120_000,
+  // v2: the handshake includes both garbled-circuit phases.
+  handshakeV2: 45_000,
 };
 
 class Bus {
@@ -265,7 +303,16 @@ export class ConfidentialSession {
   readonly maxTokens: number;
   readonly bodyLength: number;
   readonly suffix: string;
+  /** Protocol version, from the verified offer (1, or 2 = two-party handshake). */
+  readonly protocol: 1 | 2;
   private readonly prover: CuProverBackend;
+  private readonly twoPcPath?: string;
+  private readonly twoPcFactory?: () => TwoPcSession;
+  private twoPc?: TwoPcSession;
+  private ap?: TwoPcApplicationSecrets;
+  private tKeyShare = 0;
+  private tPhaseA = 0;
+  private tPhaseB = 0;
   private readonly auth: string;
   private readonly expectedPubkey: string;
   private readonly timeouts: typeof DEFAULT_TIMEOUTS;
@@ -332,6 +379,12 @@ export class ConfidentialSession {
     this.bodyLength = options.bodyLength;
     this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
     this.prover = options.prover;
+    if (options.offer.v !== 1 && options.offer.v !== 2) {
+      throw new SessionProtocolError(`unsupported protocol version v=${options.offer.v}`);
+    }
+    this.protocol = options.offer.v;
+    this.twoPcPath = options.twoPcPath;
+    this.twoPcFactory = options.twoPcFactory;
     this.auth = options.auth;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
@@ -358,7 +411,7 @@ export class ConfidentialSession {
   }
 
   private controlUrl(): string {
-    return `${this.wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=${this.offer.v}`;
+    return `${this.wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=${this.protocol}`;
   }
 
   private zkUrl(proof: string): string {
@@ -436,12 +489,24 @@ export class ConfidentialSession {
         });
     };
 
+    // v1 runs its own X25519 handshake; v2 builds the TLS client once the
+    // 2PC has produced the joint key share (armV2).
+    if (this.protocol === 1) this.makeTls();
+    return this.wsReady;
+  }
+
+  private makeTls(external?: {
+    keyShare: Uint8Array;
+    onServerHello(serverShare: Uint8Array, thSH: Uint8Array): Promise<{ clientHs: Uint8Array; serverHs: Uint8Array }>;
+    onServerFinished(thSF: Uint8Array): Promise<{ serverAp0: Uint8Array; clientAp1: Uint8Array }>;
+  }): void {
     this.tls = makeTLSClient({
+      ...(external ? { external } : {}),
       host: this.offer.upstream_host,
       verifyServerCertificate: true,
       cipherSuites: ["TLS_AES_128_GCM_SHA256"],
       supportedProtocolVersions: ["TLS1_3"],
-      namedCurves: ["X25519"],
+      namedCurves: external ? ["SECP256R1"] : ["X25519"],
       applicationLayerProtocols: ["http/1.1"],
       write: (packet: { header: Uint8Array; content: Uint8Array }) => {
         const record = concat(packet.header, packet.content);
@@ -481,7 +546,6 @@ export class ConfidentialSession {
       logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
     } as never) as unknown as TlsHandle;
 
-    return this.wsReady;
   }
 
   private trackServerRecords(bytes: Uint8Array): void {
@@ -510,7 +574,7 @@ export class ConfidentialSession {
 
   /** setup → ready → TLS handshake → hs_verified → KU0. Leaves the session armed. */
   async arm(): Promise<void> {
-    await assertX25519Support();
+    if (this.protocol === 1) await assertX25519Support();
     await this.open();
     const nonceC = hex(cryptoRandom(32));
     const setup: Record<string, unknown> = {
@@ -529,8 +593,9 @@ export class ConfidentialSession {
     this.ready = await this.waitT("ready", this.timeouts.ready);
     this.sid = this.ready.sid;
     this.tReady = Date.now();
-    this.event({ ev: "ready", sid: this.sid, head_len: this.ready.head_len });
+    this.event({ ev: "ready", sid: this.sid, head_len: this.ready.head_len, v: this.ready.v ?? 1 });
 
+    if (this.protocol === 2) return this.armV2();
     this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res));
     await this.tls.startHandshake();
     await Promise.race([this.handshakeP, timeout(this.timeouts.handshake, "handshake")]);
@@ -570,9 +635,78 @@ export class ConfidentialSession {
     this.event({ ev: "ku0_sent" });
   }
 
-  /** Phase 1, safe to run while arming: π_C1 advice + proof + π_N verification. */
+  /**
+   * v2: the 2PC with the node (preprocessing, joint P-256 key share), then a
+   * TLS handshake with no local ECDHE: the fork takes c_hs/s_hs and then
+   * s_ap_0/c_ap_1 from the 2PC hooks. The node verifies the handshake with
+   * c_hs/s_hs (its own 2PC output) and answers hs_verified.
+   */
+  private async armV2(): Promise<void> {
+    if (this.ready.v !== 2) {
+      throw new SessionProtocolError(`node started a v${this.ready.v ?? 1} session for a v2 offer`);
+    }
+    const twoPc =
+      this.twoPcFactory?.() ?? new TwoPcSession({ binaryPath: this.twoPcPath, proverPath: this.prover.path });
+    this.twoPc = twoPc;
+    twoPc.start(this.zkUrl("twopc"));
+    const t0 = Date.now();
+    const keyShare = await Promise.race([twoPc.keyShare(this.timeouts.twoPcKeyShare), this.errP]);
+    this.tKeyShare = Date.now();
+    this.event({ ev: "twopc_key_share", ms: this.tKeyShare - t0 });
+    this.makeTls({
+      keyShare,
+      onServerHello: async (serverShare, thSH) => {
+        this.thSH = thSH;
+        const t = Date.now();
+        const out = await twoPc.handshake(serverShare, thSH);
+        this.tPhaseA = Date.now() - t;
+        return out;
+      },
+      onServerFinished: async (thSF) => {
+        this.thSF = thSF;
+        const t = Date.now();
+        this.ap = await twoPc.application(thSF);
+        this.tPhaseB = Date.now() - t;
+        return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 };
+      },
+    });
+    this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res));
+    await this.tls.startHandshake();
+    await Promise.race([this.handshakeP, this.errP, timeout(this.timeouts.handshakeV2, "handshake")]);
+    if (!this.ap) throw new SessionProtocolError("handshake finished without 2PC application secrets");
+    await this.waitT("hs_verified", this.timeouts.hsVerified);
+    this.tHs = Date.now();
+    this.event({ ev: "hs_verified", twopc_phase_a_ms: this.tPhaseA, twopc_phase_b_ms: this.tPhaseB });
+  }
+
+  /** v2 phase 1: π_NK, the node's head record under K_0 is the published template. */
+  private async prepareProofsV2(): Promise<void> {
+    if (!this.ap) throw new SessionProtocolError("prepareProofs before arm");
+    this.tC1Sent = Date.now();
+    const commit = await this.waitT("c_commit", this.timeouts.cCommit);
+    // The relayed anchors, when present, must be the ones our own 2PC output.
+    for (const k of ["h1", "h2", "hk"] as const) {
+      if (commit[k] !== undefined && commit[k] !== hex(this.ap[k])) {
+        throw new SessionProtocolError(`c_commit: ${k} differs from our 2PC output`);
+      }
+    }
+    // Rebuilt from the *signed* offer, our body length and our hk.
+    checkPiNKParams(commit.params, { offer: this.offer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    await this.prover.run(this.zkUrl("pi_nk"), {
+      proof: "pi_nk",
+      role: "verifier",
+      params: commit.params,
+    });
+    this.event({ ev: "pi_nk_ok" });
+    this.tProofsReady = Date.now();
+    this.prepared = true;
+    this.armed = true;
+  }
+
+  /** Phase 1, safe to run while arming: π_C1 advice + proof + π_N verification (v1), π_NK (v2). */
   async prepareProofs(): Promise<void> {
     if (this.prepared) return;
+    if (this.protocol === 2) return this.prepareProofsV2();
     if (!this.hs || !this.thSH || !this.thSF) {
       throw new SessionProtocolError("prepareProofs before arm");
     }
@@ -638,11 +772,19 @@ export class ConfidentialSession {
       throw new SessionProtocolError("node expects a different pinned suffix than ours");
     }
 
-    // Epoch 1: the client's KeyUpdate is seq 1 (seq 0 is the node's record).
-    this.tls.skipSendSequence(1);
-    const ku1 = await this.tls.updateTrafficKeysSilently(false);
-    this.tRecordStart = Date.now();
-    this.sendText({ type: "ku1", record: hex(concat(ku1.header, ku1.content)) });
+    const v2 = this.protocol === 2;
+    if (v2) {
+      // The node writes epoch 0 (credential record + KeyUpdate under K_0); we
+      // are already keyed for epoch 1 (c_ap_1, seq 0).
+      this.tRecordStart = Date.now();
+      this.sendText({ type: "release_head" });
+    } else {
+      // Epoch 1: the client's KeyUpdate is seq 1 (seq 0 is the node's record).
+      this.tls.skipSendSequence(1);
+      const ku1 = await this.tls.updateTrafficKeysSilently(false);
+      this.tRecordStart = Date.now();
+      this.sendText({ type: "ku1", record: hex(concat(ku1.header, ku1.content)) });
+    }
     await this.waitT("head_written", this.timeouts.headWritten);
     this.tHeadWritten = Date.now();
     this.event({ ev: "head_written" });
@@ -663,18 +805,29 @@ export class ConfidentialSession {
 
     this.sendText({ type: "body_suffix", suffix: hex(new TextEncoder().encode(this.suffix)) });
     const c2params = await this.waitT("zk_params", this.timeouts.zkParams);
-    checkPiC2Params(c2params.params, {
-      session: this.sessionValues!,
-      seq: this.bodyRecords.length - 1,
-      record: this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0),
-      suffix: suffixBytes,
-    });
+    const lastBody = this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0);
+    if (v2) {
+      checkPiC2SParams(c2params.params, {
+        h1: this.ap!.h1,
+        seq: this.bodyRecords.length - 1,
+        record: lastBody,
+        suffix: suffixBytes,
+      });
+    } else {
+      checkPiC2Params(c2params.params, {
+        session: this.sessionValues!,
+        seq: this.bodyRecords.length - 1,
+        record: lastBody,
+        suffix: suffixBytes,
+      });
+    }
+    const c2Name = v2 ? "pi_c2s" : "pi_c2";
     const c2Promise = this.prover
-      .run(this.zkUrl("pi_c2"), {
-        proof: "pi_c2",
+      .run(this.zkUrl(c2Name), {
+        proof: c2Name,
         role: "prover",
         params: c2params.params,
-        witness: { Hs: Array.from(this.hs!) },
+        witness: v2 ? { Secret: Array.from(this.ap!.clientAp1) } : { Hs: Array.from(this.hs!) },
       })
       .then(
         () => this.event({ ev: "pi_c2_ok" }),
@@ -730,19 +883,25 @@ export class ConfidentialSession {
     this.sendText({ type: "disclose", r: hex(r), tail_lens: tailLens, skip });
 
     const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
-    checkPiC3Params(c3.params, {
-      session: this.sessionValues!,
-      serverRecords: this.serverRecords,
-      r,
-      skip,
-    });
-    await this.prover.run(this.zkUrl("pi_c3"), {
-      proof: "pi_c3",
+    if (v2) {
+      checkPiC3SParams(c3.params, { h2: this.ap!.h2, serverRecords: this.serverRecords, r, skip });
+    } else {
+      checkPiC3Params(c3.params, {
+        session: this.sessionValues!,
+        serverRecords: this.serverRecords,
+        r,
+        skip,
+      });
+    }
+    const c3Name = v2 ? "pi_c3s" : "pi_c3";
+    await this.prover.run(this.zkUrl(c3Name), {
+      proof: c3Name,
       role: "prover",
       params: c3.params,
-      witness: { Hs: Array.from(this.hs!) },
+      witness: v2 ? { Secret: Array.from(this.ap!.serverAp0) } : { Hs: Array.from(this.hs!) },
     });
-    this.event({ ev: "pi_c3_ok" });
+    this.twoPc?.close();
+    this.event({ ev: v2 ? "pi_c3s_ok" : "pi_c3_ok" });
 
     const terminal = await Promise.race([
       this.bus.wait("receipt").then((m) => ({ kind: "receipt" as const, m })),
@@ -827,6 +986,14 @@ export class ConfidentialSession {
       recordKu1Ms: this.tRecordStart ? this.tHeadWritten - this.tRecordStart : undefined,
       claimToBodyMs: this.tBodyWrite ? this.tBodyWrite - tClaim : undefined,
       upstreamTtftMs: this.tBodyWrite ? ttftAbs - this.tBodyWrite : undefined,
+      ...(v2
+        ? {
+            twoPcKeyShareMs: this.tKeyShare ? this.tKeyShare - this.tReady : undefined,
+            twoPcPhaseAMs: this.tPhaseA || undefined,
+            twoPcPhaseBMs: this.tPhaseB || undefined,
+            twoPcSteps: this.twoPc?.timings.slice(),
+          }
+        : {}),
       totalMs: tEnd - tClaim,
     };
 
@@ -846,7 +1013,8 @@ export class ConfidentialSession {
       ttftMs: ttftAbs - tClaim,
       totalMs: tEnd - tClaim,
       timings,
-      proofs: ["pi_c1", "pi_n", "pi_c2", "pi_c3"],
+      proofs: v2 ? ["twopc", "pi_nk", "pi_c2s", "pi_c3s"] : ["pi_c1", "pi_n", "pi_c2", "pi_c3"],
+      protocol: this.protocol,
     };
     this.persist(result);
     return result;
@@ -868,6 +1036,7 @@ export class ConfidentialSession {
   }
 
   close(): void {
+    this.twoPc?.close();
     try {
       this.ws?.close();
     } catch {
