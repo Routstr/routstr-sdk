@@ -97,7 +97,8 @@ connection per proof. Options: `proofChannel` (default true), `proofChannelFacto
 `timings.proofs` and `timings.proofChannelReadyMs`. Measured against a production node: warm
 requests reach the first token in about 2–3 s (mostly the provider; about 1 s for a session armed through
 the handshake). Cold ones are dominated by receiving the ~22 MB of 2PC data: seconds on a fast connection,
-about 45–70 s on a slow, download-limited link.
+about 14–16 s from a good home connection (100 Mbit/s down), about 45–70 s on a slow,
+download-limited link.
 
 ## What is checked
 
