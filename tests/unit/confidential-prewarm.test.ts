@@ -12,6 +12,7 @@ import {
   type ArmedSessionLike,
   type PoolKeyInfo,
   type PrewarmOptions,
+  PREWARM_DEFAULTS,
 } from "../../client/confidential/prewarm";
 import { buildPinnedBody } from "../../client/confidential/transport";
 import { canonicalSuffix } from "../../client/confidential/suffix";
@@ -364,7 +365,7 @@ describe("pre-warm with a node abandon fee", () => {
   });
 
   it("arms at most one session when the node charges an acceptable fee", async () => {
-    const h = harness({}, 1e12, 2000);
+    const h = harness({ maxArmedWithFee: 1 }, 1e12, 2000);
     for (let i = 0; i < 3; i++) {
       await h.request();
       await completeArms(h);
@@ -378,7 +379,7 @@ describe("pre-warm with a node abandon fee", () => {
   });
 
   it("caps fee-charging sessions across keys (maxArmedWithFee)", async () => {
-    const h = harness({ maxTotal: 4 }, 1e12, 2000);
+    const h = harness({ maxTotal: 4, maxArmedWithFee: 1 }, 1e12, 2000);
     await h.request();
     await completeArms(h);
     const other: PoolKeyInfo = { ...h.info, model: "other" };
@@ -420,5 +421,11 @@ describe("pre-warm with a node abandon fee", () => {
     const lease = await h.request();
     expect(lease?.ready).toBe(true);
     expect(h.pool.unusedFeeMsats).toBe(0);
+  });
+
+  it("defaults allow parallel agents: 6 armed per key and in total, also for fee nodes", () => {
+    expect(PREWARM_DEFAULTS.maxPerKey).toBe(6);
+    expect(PREWARM_DEFAULTS.maxTotal).toBe(6);
+    expect(PREWARM_DEFAULTS.maxArmedWithFee).toBe(6);
   });
 });
