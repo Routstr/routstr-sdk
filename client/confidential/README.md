@@ -55,8 +55,10 @@ about 2 s: the online 2PC, the handshake, π_NK, the body and π_C2S. A session
 can be **armed** ahead of a request: `arm()` connects, sends the setup (the
 node reserves funds), runs the 2PC preprocessing and the key share, and stops
 before the ClientHello. `claim(body)` runs the rest. The sidecar dials the
-provider only when the ClientHello arrives, and keeps an armed session for up
-to 600 s from setup. `run()` is `arm()` followed by `claim()`. v1 sessions are
+provider only when the ClientHello arrives. The node ends a session 600 s
+after accepting its websocket (the sidecar's own 600 s limit for an armed
+session starts at setup, a little later), so an armed session must be claimed
+before then. `run()` is `arm()` followed by `claim()`. v1 sessions are
 never pooled.
 
 Pass `confidential.prewarm` (`{}` = the defaults) to let `fetchConfidential`
@@ -70,7 +72,7 @@ keep a process-wide pool (`prewarm.ts`). It only reacts to traffic:
 | Global cap | `maxTotal` armed sessions, most recently active keys first (keep below the node's unused-sessions-per-address limit, default 12) | 6 |
 | Arms | one in flight at a time (`maxConcurrentArms`). None starts while a cold request is still in its own preprocessing. Replenishing runs off the request path: after a warm claim, at a response head, at completion, and on a 15 s tick that runs only while some key has state | 1 |
 | Body length | an armed session with length L serves any body ≤ L. The body is padded with spaces before the pinned suffix (valid JSON, and the suffix is still its own final record). L = max of the last `historySize` pinned bodies × `headroom`, rounded up to a power of two, between `minBucket` and `maxBucket`. A larger body goes cold and raises L, and smaller armed sessions are replaced | 20, ×1.25, 4 KiB to 8 MiB |
-| Retire | close at `maxAgeMs` from setup (the node and sidecar end a session at 600 s); when K goes idle, close its sessions at once (the node releases each reservation; nothing is charged unless it has an abandon fee) | 480 s |
+| Retire | close at `maxAgeMs` from setup (the node ends a session 600 s after its websocket accept); when K goes idle, close its sessions at once (the node releases each reservation; nothing is charged unless it has an abandon fee) | 480 s |
 | Claim | the oldest healthy armed session that fits. If none is ready, an arm in progress is taken rather than starting a second preprocessing. If it fails before the credential record is released, the request runs on a fresh cold session. It is never retried after that point | |
 | Failures | a failed arm backs the key off, `backoffBaseMs` doubling up to `backoffMaxMs` | 30 s to 10 min |
 | Funds | each armed session holds a reservation on the credential: a full-context prompt plus `max_tokens` at the offer rates. A key arms only after one of its requests has settled (the receipt's `reserved_msats` is the estimate R), and only while `/v1/balance/info` shows an available balance ≥ `fundsHeadroom` × R: the new arm plus one cold request | ×2 |
@@ -111,8 +113,14 @@ download-limited link.
   parameter the node sends for π_C1/π_C2/π_C3 (v2: π_C2S/π_C3S) against the client's own records
   (`params.ts`), so the client only proves statements about data it chose to
   disclose. π_C2/π_C3 reveal one bit to the node, never plaintext.
+- The attestation: the sidecar's record of the session (sid, certificate-chain
+  hash, both handshake transcript hashes, record counts and the SHA-256 of all
+  bytes in each direction, the credential-record commitment, the time), signed
+  by the sidecar's per-process Ed25519 key and re-signed by the node's Nostr
+  key. The client requires the node's signature and checks that the sid and
+  both transcript hashes are its own (`checkAttestationBinding`).
 - The receipt: required Schnorr signature over the exact signed bytes, this
-  session's sid and attestation, the usage equal to the client's own
+  session's sid and attestation hash, the usage equal to the client's own
   plaintext, and a cost no higher than that usage at the signed offer's rates
   plus the offer's session fee (`maxChargeMsats`); a receipt naming larger
   fees than the signed ones is refused.
