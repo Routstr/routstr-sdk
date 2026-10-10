@@ -33,6 +33,11 @@ export interface ConfidentialRequestOptions {
   allowUnpinned?: boolean;
   /** `cu-prover` binary (else CU_PROVER_BIN / CU_PROVER / PATH). */
   proverPath?: string;
+  /**
+   * `cu-2pc` binary for protocol v2 offers (else CU_2PC_BIN / CU_2PC, then
+   * next to cu-prover, then PATH).
+   */
+  twoPcPath?: string;
   /** Evidence directory for per-session artifacts. */
   runsDir?: string;
 }
@@ -259,6 +264,7 @@ async function fetchConfidentialOnce(
     maxTokens,
     bodyLength: body.length,
     prover: new CuProverBackend({ binaryPath: options.proverPath }),
+    twoPcPath: options.twoPcPath,
     runsDir: options.runsDir,
   });
 

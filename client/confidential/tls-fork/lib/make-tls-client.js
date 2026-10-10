@@ -16,8 +16,22 @@ import { parseServerHello } from "./utils/parse-server-hello.js";
 import { getPskFromTicket, parseSessionTicket } from "./utils/session-ticket.js";
 import { decryptWrappedRecord, encryptWrappedRecord } from "./utils/wrapped-record.js";
 const RECORD_LENGTH_BYTES = 3;
-export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, logger: _logger, cipherSuites, namedCurves = SUPPORTED_NAMED_CURVES, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, fetchCertificateBytes, write, onRead, onApplicationData, onSessionTicket, onTlsEnd, onHandshake, onRecvCertificates }) {
+// FORK PATCH (v2): server_random of a TLS 1.3 HelloRetryRequest
+// (RFC 8446 §4.1.3, SHA-256("HelloRetryRequest")).
+const HRR_RANDOM = new Uint8Array([
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+]);
+export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, logger: _logger, cipherSuites, namedCurves = SUPPORTED_NAMED_CURVES, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, fetchCertificateBytes, write, onRead, onApplicationData, onSessionTicket, onTlsEnd, onHandshake, onRecvCertificates, external }) {
     const logger = _logger || LOGGER;
+    // FORK PATCH (v2): external (two-party) key schedule. The client holds
+    // no ECDHE scalar: it offers one given secp256r1 key share and the
+    // handshake/application traffic secrets come from the hooks. HS and MS
+    // are never computed locally. Opt-in; without `external` nothing changes.
+    if (external) {
+        ({ cipherSuites, supportedProtocolVersions, namedCurves } = checkExternalOptions(external, { cipherSuites, supportedProtocolVersions }));
+    }
+    let transcriptHashes = {};
     const processor = makeMessageProcessor(logger);
     const { enqueue: enqueueServerPacket } = makeQueue();
     const keyPairs = {};
@@ -153,6 +167,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 switch (type) {
                     case SUPPORTED_RECORD_TYPE_MAP.SERVER_HELLO:
                         logger.trace('received server hello');
+                        // FORK PATCH (v2): reject a HelloRetryRequest
+                        // (a ServerHello with the HRR random) explicitly.
+                        if (external && areUint8ArraysEqualConstantTime(content.slice(2, 34), HRR_RANDOM)) {
+                            throw new Error('HelloRetryRequest is not supported (external key share)');
+                        }
                         const hello = await parseServerHello(content);
                         if (!hello.supportsPsk && earlySecret) {
                             throw new Error('Server does not support PSK');
@@ -166,7 +185,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         setAlpn(hello.extensions?.ALPN);
                         const cipherSuiteData = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
                         logger.debug({ cipherSuite, connTlsVersion, selectedAlpn }, 'processed server hello');
-                        if (hello.publicKeyType && hello.publicKey) {
+                        if (external) {
+                            // FORK PATCH (v2)
+                            await processServerHelloExternal(hello);
+                        }
+                        else if (hello.publicKeyType && hello.publicKey) {
                             await processServerPubKey({
                                 publicKeyType: hello.publicKeyType,
                                 publicKey: hello.publicKey
@@ -428,6 +451,10 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         if (connTlsVersion === 'TLS1_2') {
             await processServerFinishTls12(serverFinish);
         }
+        else if (external) {
+            // FORK PATCH (v2)
+            await processServerFinishExternal(serverFinish);
+        }
         else {
             await processServerFinishTls13(serverFinish);
         }
@@ -484,6 +511,79 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         // once we switch to the provider keys
         recordSendCount = 0;
         recordRecvCount = 0;
+    }
+    // FORK PATCH (v2): handshake secrets from the external key schedule.
+    async function processServerHelloExternal(hello) {
+        const share = hello.extensions?.KEY_SHARE;
+        if (hello.serverTlsVersion !== 'TLS1_3'
+            || hello.publicKeyType !== 'SECP256R1'
+            || !share
+            || share.publicKey.length !== 65
+            || share.publicKey[0] !== 0x04) {
+            throw new Error('external key schedule: server must select TLS 1.3 with a secp256r1 key share');
+        }
+        if (hello.supportsPsk) {
+            throw new Error('external key schedule: server selected a PSK');
+        }
+        keyType = 'SECP256R1';
+        // handshakeMsgs = [ClientHello, ServerHello]
+        const thSH = await crypto.hash('SHA-256', concatenateUint8Arrays(handshakeMsgs));
+        transcriptHashes.thSH = thSH;
+        const { clientHs, serverHs } = await external.onServerHello(share.publicKey.slice(), thSH);
+        keys = await installTls13Secrets(clientHs, serverHs);
+        handshakeSecrets = keys;
+        logger.debug('installed external handshake secrets');
+    }
+    // FORK PATCH (v2): verify the server Finished under s_hs, send the
+    // client Finished under c_hs, then install s_ap_0 (read, seq 0) and
+    // c_ap_1 (write, seq 0). The client never writes in epoch 0.
+    async function processServerFinishExternal(serverFinish) {
+        const thSF = await crypto.hash('SHA-256', concatenateUint8Arrays(handshakeMsgs));
+        transcriptHashes.thSF = thSF;
+        await verifyFinishMessage(serverFinish, {
+            secret: keys.serverSecret,
+            handshakeMessages: handshakeMsgs.slice(0, -1),
+            cipherSuite: cipherSuite
+        });
+        logger.debug('server finish verified');
+        if (clientCertificateRequested) {
+            throw new Error('external key schedule: client certificates are not supported');
+        }
+        const clientFinish = await packFinishMessagePacket({
+            secret: keys.clientSecret,
+            handshakeMessages: handshakeMsgs,
+            cipherSuite: cipherSuite
+        });
+        await writeEncryptedPacket({
+            type: 'WRAPPED_RECORD',
+            data: clientFinish,
+            contentType: 'HANDSHAKE'
+        });
+        handshakeMsgs.push(clientFinish);
+        const { serverAp0, clientAp1 } = await external.onServerFinished(thSF);
+        keys = await installTls13Secrets(clientAp1, serverAp0);
+        recordSendCount = 0;
+        recordRecvCount = 0;
+    }
+    async function installTls13Secrets(clientSecret, serverSecret) {
+        const { hashLength } = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
+        for (const s of [clientSecret, serverSecret]) {
+            if (!(s instanceof Uint8Array) || s.length !== hashLength) {
+                throw new Error('external key schedule: bad traffic secret');
+            }
+        }
+        const c = await deriveTrafficKeysForSide(clientSecret, cipherSuite);
+        const sv = await deriveTrafficKeysForSide(serverSecret, cipherSuite);
+        return {
+            type: 'TLS1_3',
+            masterSecret: undefined,
+            clientSecret,
+            serverSecret,
+            clientEncKey: c.encKey,
+            serverEncKey: sv.encKey,
+            clientIv: c.iv,
+            serverIv: sv.iv,
+        };
     }
     async function processServerPubKey(data) {
         keyType = data.publicKeyType;
@@ -613,6 +713,10 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             }
             return { ...handshakeSecrets };
         },
+        // FORK PATCH (v2): th_SH / th_SF as passed to the external hooks.
+        getTranscriptHashes() {
+            return { ...transcriptHashes };
+        },
         // FORK PATCH: export the raw handshake messages (for th_SH / th_SF).
         getHandshakeMessages() {
             return handshakeMsgs.slice();
@@ -670,9 +774,20 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             sessionId = crypto.randomBytes(32);
             ended = false;
             clientRandom = opts?.random || crypto.randomBytes(32);
+            // FORK PATCH (v2): one given secp256r1 share, no PSK.
+            if (external && opts?.psk) {
+                throw new Error('external key schedule: PSK is not supported');
+            }
+            if (external) {
+                // validates that the point is on the curve
+                await crypto.importKey('P-256', external.keyShare, 'public');
+            }
             const clientHello = await packClientHello({
                 host,
-                keysToShare: await Promise.all(namedCurves
+                omitPskModes: !!external,
+                keysToShare: external
+                    ? [{ type: 'SECP256R1', key: external.keyShare }]
+                    : await Promise.all(namedCurves
                     .map(async (keyType) => {
                     const { keyPair } = await getKeyPair(keyType);
                     return {
@@ -753,4 +868,27 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         },
         end,
     };
+}
+// FORK PATCH (v2): the external key schedule offers exactly one TLS 1.3
+// suite, TLS 1.3 only, and the secp256r1 group only.
+function checkExternalOptions(external, { cipherSuites, supportedProtocolVersions }) {
+    const { keyShare } = external;
+    if (!(keyShare instanceof Uint8Array) || keyShare.length !== 65 || keyShare[0] !== 0x04) {
+        throw new Error('external.keyShare must be a 65-byte uncompressed P-256 point');
+    }
+    if (typeof external.onServerHello !== 'function'
+        || typeof external.onServerFinished !== 'function') {
+        throw new Error('external.onServerHello and external.onServerFinished are required');
+    }
+    cipherSuites ||= ['TLS_AES_128_GCM_SHA256'];
+    if (cipherSuites.length !== 1
+        || cipherSuites[0].includes('_WITH_')
+        || SUPPORTED_CIPHER_SUITE_MAP[cipherSuites[0]]?.hashAlgorithm !== 'SHA-256') {
+        throw new Error('external key schedule needs exactly one TLS 1.3 SHA-256 cipher suite');
+    }
+    supportedProtocolVersions ||= ['TLS1_3'];
+    if (supportedProtocolVersions.length !== 1 || supportedProtocolVersions[0] !== 'TLS1_3') {
+        throw new Error('external key schedule needs TLS 1.3 only');
+    }
+    return { cipherSuites, supportedProtocolVersions, namedCurves: ['SECP256R1'] };
 }
