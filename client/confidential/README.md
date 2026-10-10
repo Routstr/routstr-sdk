@@ -87,6 +87,16 @@ Available-balance accounting: while sessions are armed, the node's
 that tops up to cover one request may top up earlier than without
 pre-warming. Closing the pool releases the reservations.
 
+
+**Proof channel.** Each v2 session (armed or cold) also opens one long-lived proof channel
+(`/zk?proof=zkchan`, `cu-prover --channel`) that pre-generates the OT/VOLE correlations of all three
+proofs while the session is being armed, so on the request path π_NK, π_C2S and π_C3S take tens to a few
+hundred milliseconds instead of seconds. Correlations are fresh per session and used once; a failed proof
+closes the channel. If the channel is unavailable (older node or prover), the session falls back to one
+connection per proof. Options: `proofChannel` (default true), `proofChannelFactory`; timings in
+`timings.proofs` and `timings.proofChannelReadyMs`. Measured on a production node from a home uplink: warm
+requests reach the first token in about 2–3 s (mostly the provider), cold ones in about 35 s.
+
 ## What is checked
 
 - The node's offer: Schnorr signature, pinned node key, protocol version and a
