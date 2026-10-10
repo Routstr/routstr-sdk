@@ -254,11 +254,17 @@ export interface UpstreamUsageEvent {
 }
 
 export function usageEventFromDisclosure(r: Uint8Array): UpstreamUsageEvent | null {
-  const text = Buffer.from(r).toString("utf8");
-  const parts = text.split("data: ");
-  const seg = parts.length >= 2 ? parts[parts.length - 2]! : "{}";
+  // Decode the chunk framing first: an event may be split across HTTP chunks
+  // (the provider or a CDN chunks wherever it likes). Fall back to the raw text
+  // for an unchunked window.
+  const chunks = parseChunks(r);
+  const text = chunks ? Buffer.from(concat(...chunks.map((c) => c.data))).toString("utf8") : Buffer.from(r).toString("utf8");
+  const tail = "data: [DONE]\n\n";
+  const before = text.endsWith(tail) ? text.slice(0, text.length - tail.length) : text;
+  const idx = before.lastIndexOf("data: ");
+  const seg = idx >= 0 ? before.slice(idx + 6) : before;
   try {
-    const parsed = JSON.parse(seg.split("\r\n")[0]!.split("\n\n")[0]!.trim());
+    const parsed = JSON.parse(seg.split("\r\n")[0]!.trim());
     if (typeof parsed?.model !== "string" || !parsed?.usage) return null;
     return parsed as UpstreamUsageEvent;
   } catch {
