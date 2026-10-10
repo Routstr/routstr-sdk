@@ -151,8 +151,10 @@ export class TwoPcSession {
   private decoder = new TwoPcFrameDecoder();
   private waiters = new Map<string, Waiter>();
   private queued = new Map<string, Record<string, unknown>>();
-  private failure: Error | undefined;
+  private failureErr: Error | undefined;
   private closed = false;
+  /** Phase B delivered: the node closing the 2PC socket afterwards is normal. */
+  private done = false;
 
   constructor(options: TwoPcOptions = {}) {
     this.binary = resolveTwoPcPath(options.binaryPath, options.proverPath);
@@ -204,7 +206,9 @@ export class TwoPcSession {
     };
     ws.onerror = () => this.fail(new ProverError("2PC websocket error"));
     ws.onclose = () => {
-      if (this.waiters.size) this.fail(new ProverError("2PC websocket closed"));
+      // Before phase B a closed socket is a failure even with nothing waiting
+      // (an armed session idles between the key share and the handshake).
+      if (!this.closed && !this.done) this.fail(new ProverError("2PC websocket closed"));
     };
   }
 
@@ -256,6 +260,7 @@ export class TwoPcSession {
       this.fail(new ProverError(`cu-2pc: ${String(m.msg ?? "unknown error")}`));
       return;
     }
+    if (ev === "ap") this.done = true;
     const w = this.waiters.get(ev);
     if (w) {
       this.waiters.delete(ev);
@@ -264,14 +269,14 @@ export class TwoPcSession {
   }
 
   private fail(e: Error): void {
-    if (this.failure) return;
-    this.failure = e;
+    if (this.failureErr) return;
+    this.failureErr = e;
     for (const w of this.waiters.values()) w.rej(e);
     this.waiters.clear();
   }
 
   private wait(ev: string, ms: number): Promise<Record<string, unknown>> {
-    if (this.failure) return Promise.reject(this.failure);
+    if (this.failureErr) return Promise.reject(this.failureErr);
     const q = this.queued.get(ev);
     if (q) {
       this.queued.delete(ev);
@@ -296,7 +301,7 @@ export class TwoPcSession {
   }
 
   private command(cmd: Record<string, unknown>): void {
-    if (this.failure) throw this.failure;
+    if (this.failureErr) throw this.failureErr;
     this.writeChild(TWOPC_CHANNEL_CONTROL, new TextEncoder().encode(JSON.stringify(cmd)));
   }
 
@@ -324,6 +329,15 @@ export class TwoPcSession {
       h2: hexField(m, "h2", 32),
       hk: hexField(m, "hk", 32),
     };
+  }
+
+  /** True once the 2PC process or its socket failed. */
+  get failed(): boolean {
+    return this.failureErr !== undefined;
+  }
+
+  get failure(): Error | undefined {
+    return this.failureErr;
   }
 
   close(): void {

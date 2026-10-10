@@ -368,6 +368,14 @@ export class ConfidentialSession {
   private ttft = 0;
   private prepared = false;
   private armed = false;
+  /** v2: setup done and the joint key share is ready (no ClientHello sent yet). */
+  private keyShareReady = false;
+  private armStarted = false;
+  private handshaken = false;
+  /** Set just before release_head/ku1: from then on nothing may be retried. */
+  private released = false;
+  private failure?: Error;
+  private tArmed = 0;
   private finished = false;
   private events: string[] = [];
 
@@ -397,7 +405,42 @@ export class ConfidentialSession {
     this.tStart = Date.now();
     this.wsReady = new Promise<void>((r) => (this.wsResolve = r));
     this.errP = new Promise<never>((_, rej) => (this.errRej = rej));
-    this.errP.catch(() => {});
+    this.errP.catch((e: Error) => {
+      this.failure ??= e;
+    });
+  }
+
+  /**
+   * False once the control socket closed or errored, the node sent an error,
+   * or (v2) the 2PC process or its socket failed. A pooled armed session is
+   * checked before it is claimed.
+   */
+  get healthy(): boolean {
+    return !this.failure && !this.finished && !(this.twoPc?.failed ?? false);
+  }
+
+  /** The first failure seen by this session, if any. */
+  get failureReason(): Error | undefined {
+    return this.failure ?? this.twoPc?.failure;
+  }
+
+  /**
+   * True once the session asked the node to write the credential record
+   * (release_head / ku1): after that a failure must never be retried on
+   * another session (the request may have reached the provider).
+   */
+  get bodyReleased(): boolean {
+    return this.released;
+  }
+
+  /** v2: true while the session is armed (key share ready) and unclaimed. */
+  get isArmed(): boolean {
+    return this.keyShareReady && !this.handshaken;
+  }
+
+  /** Wall-clock time (ms) at which arm() completed, 0 before. */
+  get armedAt(): number {
+    return this.tArmed;
   }
 
   private event(ev: Record<string, unknown>): void {
@@ -572,8 +615,15 @@ export class ConfidentialSession {
     return Promise.race([this.bus.wait(type), this.errP, timeout(ms, type)]);
   }
 
-  /** setup → ready → TLS handshake → hs_verified → KU0. Leaves the session armed. */
+  /**
+   * v1: setup → ready → TLS handshake → hs_verified → KU0.
+   * v2: setup → ready → 2PC preprocessing + joint key share, and stop: the
+   * ClientHello is only sent by claim() (the sidecar dials the provider when
+   * it arrives), so an armed v2 session can wait for a request (pre-warm).
+   */
   async arm(): Promise<void> {
+    if (this.armStarted) throw new SessionProtocolError("arm() called twice");
+    this.armStarted = true;
     if (this.protocol === 1) await assertX25519Support();
     await this.open();
     const nonceC = hex(cryptoRandom(32));
@@ -636,10 +686,8 @@ export class ConfidentialSession {
   }
 
   /**
-   * v2: the 2PC with the node (preprocessing, joint P-256 key share), then a
-   * TLS handshake with no local ECDHE: the fork takes c_hs/s_hs and then
-   * s_ap_0/c_ap_1 from the 2PC hooks. The node verifies the handshake with
-   * c_hs/s_hs (its own 2PC output) and answers hs_verified.
+   * v2 arm: the 2PC with the node (preprocessing, joint P-256 key share). The
+   * TLS client is built with the 2PC hooks but the handshake does not start.
    */
   private async armV2(): Promise<void> {
     if (this.ready.v !== 2) {
@@ -670,6 +718,22 @@ export class ConfidentialSession {
         return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 };
       },
     });
+    this.keyShareReady = true;
+    this.tArmed = Date.now();
+    this.event({ ev: "armed", ms: this.tArmed - this.tStart });
+  }
+
+  /**
+   * v2 claim, step 1: the TLS handshake with no local ECDHE: the fork takes
+   * c_hs/s_hs and then s_ap_0/c_ap_1 from the 2PC hooks. The node verifies
+   * the handshake with c_hs/s_hs (its own 2PC output) and answers hs_verified.
+   */
+  private async handshakeV2(): Promise<void> {
+    if (!this.keyShareReady) throw new SessionProtocolError("handshake before arm");
+    if (this.failure) throw this.failure;
+    const twoPcFailure = this.twoPc?.failure;
+    if (twoPcFailure) throw twoPcFailure;
+    this.handshaken = true;
     this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res));
     await this.tls.startHandshake();
     await Promise.race([this.handshakeP, this.errP, timeout(this.timeouts.handshakeV2, "handshake")]);
@@ -681,6 +745,7 @@ export class ConfidentialSession {
 
   /** v2 phase 1: π_NK, the node's head record under K_0 is the published template. */
   private async prepareProofsV2(): Promise<void> {
+    if (!this.handshaken) await this.handshakeV2();
     if (!this.ap) throw new SessionProtocolError("prepareProofs before arm");
     this.tC1Sent = Date.now();
     const commit = await this.waitT("c_commit", this.timeouts.cCommit);
@@ -773,6 +838,7 @@ export class ConfidentialSession {
     }
 
     const v2 = this.protocol === 2;
+    this.released = true;
     if (v2) {
       // The node writes epoch 0 (credential record + KeyUpdate under K_0); we
       // are already keyed for epoch 1 (c_ap_1, seq 0).
@@ -979,13 +1045,14 @@ export class ConfidentialSession {
     const tEnd = Date.now();
     const ttftAbs = this.ttft || tEnd;
     const timings: ConfidentialSessionTimings = {
-      readyMs: this.tReady ? this.tReady - tClaim : undefined,
+      readyMs: this.tReady && this.tReady >= tClaim ? this.tReady - tClaim : undefined,
       handshakeMs: this.tHs ? this.tHs - this.tReady : undefined,
       ku0Ms: this.tKu0 ? this.tKu0 - this.tHs : undefined,
       piC1Ms: this.tC1Sent ? this.tProofsReady - this.tC1Sent : undefined,
       recordKu1Ms: this.tRecordStart ? this.tHeadWritten - this.tRecordStart : undefined,
       claimToBodyMs: this.tBodyWrite ? this.tBodyWrite - tClaim : undefined,
       upstreamTtftMs: this.tBodyWrite ? ttftAbs - this.tBodyWrite : undefined,
+      armMs: this.tArmed ? this.tArmed - this.tStart : undefined,
       ...(v2
         ? {
             twoPcKeyShareMs: this.tKeyShare ? this.tKeyShare - this.tReady : undefined,
@@ -1020,14 +1087,27 @@ export class ConfidentialSession {
     return result;
   }
 
-  /** Cold path: open → arm → proofs → finish. */
+  /** Cold path: open → arm → claim (proofs → finish). */
   async run(body: Uint8Array): Promise<ConfidentialSessionResult> {
     const tClaim = Date.now();
     await this.open();
     await this.arm();
+    return this.claim(body, tClaim);
+  }
+
+  /**
+   * Serve one request on this session. For an armed v2 session this runs
+   * the handshake (2PC phases A and B), π_NK, the credential record, the
+   * body and settlement; an unarmed session is armed first. `body` must be
+   * exactly `bodyLength` bytes (see `padPinnedBody`).
+   */
+  async claim(body: Uint8Array, tClaim = Date.now()): Promise<ConfidentialSessionResult> {
+    if (!this.armStarted) {
+      await this.open();
+      await this.arm();
+    }
     await this.prepareProofs();
-    const result = await this.finish(body, tClaim);
-    return result;
+    return this.finish(body, tClaim);
   }
 
   /** Abort an armed-but-unclaimed session; the node releases its reservation. */
