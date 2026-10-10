@@ -33,6 +33,7 @@ import {
 import {
   feeOnlyChargeOk,
   maxChargeMsats,
+  checkAttestationBinding,
   parseSignedReceipt,
   verifyReceipt,
 } from "../../client/confidential/receipt";
@@ -652,6 +653,21 @@ describe("security regressions", () => {
     expect(() =>
       parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s1", attestationJson: "{}" }),
     ).toThrow(/attestation/);
+  });
+
+  it("accepts only an attestation naming this session and handshake", () => {
+    const thSH = new Uint8Array(32).fill(7);
+    const thSF = new Uint8Array(32).fill(9);
+    const own = { sid: "s1", thSH, thSF };
+    const att = (o: Record<string, unknown>) =>
+      canonicalJson({ sid: "s1", th_sh: bytesToHex(thSH), th_sf: bytesToHex(thSF), c_commit: null, ...o });
+    expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    expect(() => checkAttestationBinding(att({ sid: "s2" }), own)).toThrow(/not s1/);
+    expect(() => checkAttestationBinding(att({ th_sh: "00".repeat(32) }), own)).toThrow(/handshake/);
+    expect(() => checkAttestationBinding(att({ th_sf: null }), own)).toThrow(/handshake/);
+    expect(() => checkAttestationBinding(att({}), { sid: "s1" })).toThrow(ReceiptVerificationError);
+    expect(() => checkAttestationBinding("null", own)).toThrow(ReceiptVerificationError);
+    expect(() => checkAttestationBinding("{", own)).toThrow(/JSON/);
   });
 
   describe("node-supplied proof parameters", () => {

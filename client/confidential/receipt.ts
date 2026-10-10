@@ -135,3 +135,32 @@ export function parseSignedReceipt(input: {
   }
   return receipt;
 }
+
+/**
+ * The attestation's own fields must name this session: its sid and the two
+ * handshake transcript hashes we computed ourselves. A validly signed
+ * attestation of another session is not evidence about this one.
+ */
+export function checkAttestationBinding(
+  attestationJson: string,
+  own: { sid: string; thSH?: Uint8Array; thSF?: Uint8Array },
+): void {
+  let a: { sid?: unknown; th_sh?: unknown; th_sf?: unknown };
+  try {
+    a = JSON.parse(attestationJson) as typeof a;
+  } catch {
+    throw new ReceiptVerificationError("attestation is not valid JSON");
+  }
+  if (a === null || typeof a !== "object") {
+    throw new ReceiptVerificationError("attestation is not an object");
+  }
+  if (a.sid !== own.sid) {
+    throw new ReceiptVerificationError(`attestation is for session ${String(a.sid)}, not ${own.sid}`);
+  }
+  if (!own.thSH || !own.thSF) {
+    throw new ReceiptVerificationError("no handshake transcript to check the attestation against");
+  }
+  if (a.th_sh !== hex(own.thSH) || a.th_sf !== hex(own.thSF)) {
+    throw new ReceiptVerificationError("attestation names a different TLS handshake");
+  }
+}
