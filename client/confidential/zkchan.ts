@@ -32,7 +32,7 @@ import {
 export interface ProofChannelOptions {
   /** Explicit path to cu-prover. */
   binaryPath?: string;
-  /** Override the preallocated correlation counts (both sides take the max). */
+  /** Override the preallocated correlation counts (the smaller of the two sides' values is used). */
   prealloc?: { nk?: number; cp?: number };
   /** Injectable spawn (tests). */
   spawnImpl?: typeof nodeSpawn;
