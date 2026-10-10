@@ -28,7 +28,7 @@ import {
 
 /** Protocol versions this client speaks. */
 export const CONFIDENTIAL_VERSION_MIN = 1;
-export const CONFIDENTIAL_VERSION_MAX = 1;
+export const CONFIDENTIAL_VERSION_MAX = 2;
 
 export interface ConfidentialPriceEntry {
   /** msats per 1k input tokens. */
