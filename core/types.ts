@@ -161,7 +161,16 @@ export interface Model {
    */
   alias_ids?: string[];
   /** Present when the node serves this model in confidential-upstream mode. */
-  confidential_upstream?: { v: number; offer_url: string };
+  confidential_upstream?: {
+    v: number;
+    offer_url: string;
+    /** Fee on top of a completed confidential request (msats), when charged. */
+    session_fee_msat?: number;
+    /** Fee for a session that ends unused (msats, ≥ session_fee_msat). */
+    abandon_fee_msat?: number;
+    /** Surcharge (percent) on the per-token rates of confidential sessions. */
+    rate_surcharge_pct?: number;
+  };
 }
 
 /**

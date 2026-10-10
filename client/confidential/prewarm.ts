@@ -35,7 +35,8 @@
  * - Retire: a session older than `maxAgeMs` (480 s from setup; the node and
  *   sidecar end a session 600 s after setup) is closed, and replaced only if
  *   K is still active. When K goes idle its armed sessions are closed at once
- *   (the node then releases their reservations; nothing is charged).
+ *   (the node then releases their reservations; nothing is charged unless
+ *   it has an abandon fee, see below).
  * - Failures: a failed arm backs K off (`backoffBaseMs` doubling up to
  *   `backoffMaxMs`). A claimed session that fails before the credential
  *   record is released falls back to a cold session (the transport does
@@ -46,6 +47,15 @@
  *   reservation R), and only while the credential's available balance (the
  *   node's balance minus every reservation, armed sessions included) is at
  *   least `fundsHeadroom` × R (default 2: the new arm plus one cold request).
+ * - Abandon fee: a node may charge a fee for a session that ends without a
+ *   request reaching the provider (the signed offer's `abandon_fee_msat`, at
+ *   least its `session_fee_msat`), so every armed session that is never
+ *   claimed costs that fee. A key is armed only while its abandon fee
+ *   (learned from the receipt, and checked again against the fresh offer
+ *   before each arm) is at most `maxSessionFeeMsat` (default 5000 msats; 0 =
+ *   never arm a node that charges one), and such keys keep at most
+ *   `maxArmedWithFee` (1) armed sessions in total. Abandon fees paid for
+ *   sessions retired unused are logged and counted (`unusedFeeMsats`).
  */
 
 import { createHash } from "node:crypto";
@@ -75,6 +85,14 @@ export interface PrewarmOptions {
   fundsHeadroom?: number;
   /** Concurrent arms across all keys. */
   maxConcurrentArms?: number;
+  /**
+   * Arm only for nodes whose abandon fee (msats; the fee a session that is
+   * never used costs) is at most this. Default 5000; 0 never
+   * arms a node that charges a fee.
+   */
+  maxSessionFeeMsat?: number;
+  /** Armed sessions in total across keys whose node charges an abandon fee. */
+  maxArmedWithFee?: number;
   /** Info-level log sink (never receives secrets). Default: console.info. */
   log?: (message: string) => void;
 }
@@ -96,6 +114,8 @@ export const PREWARM_DEFAULTS = {
   tickMs: 15_000,
   fundsHeadroom: 2,
   maxConcurrentArms: 1,
+  maxSessionFeeMsat: 5000,
+  maxArmedWithFee: 1,
 };
 
 type Config = typeof PREWARM_DEFAULTS & { log: (message: string) => void };
@@ -145,6 +165,8 @@ export interface ArmedSessionLike {
   readonly bodyLength: number;
   readonly healthy: boolean;
   sid: string;
+  /** The abandon fee (msats) the node charges if this session goes unused. */
+  readonly abandonFeeMsat?: number;
   close(): void;
 }
 
@@ -202,6 +224,8 @@ interface KeyState<S extends ArmedSessionLike, C> {
   lastActivity: number;
   entries: Entry<S>[];
   reservationMsats?: number;
+  /** The node's abandon fee for this key (msats), from a receipt or an armed session. */
+  abandonFeeMsat?: number;
   failures: number;
   backoffUntil: number;
   fundsCheck?: Promise<void>;
@@ -224,8 +248,11 @@ export interface RequestTicket<S extends ArmedSessionLike> {
   warm(): void;
   /** The response head arrived: preprocessing is over; replenish. */
   head(): void;
-  /** The request ended (settled or failed). `reservedMsats` from the receipt. */
-  end(reservedMsats?: number): void;
+  /**
+   * The request ended (settled or failed). `reservedMsats` and
+   * `abandonFeeMsat` (the larger of the receipt's abandon and session fees).
+   */
+  end(reservedMsats?: number, abandonFeeMsat?: number): void;
   /** Log a line about this request under the key's label (no secrets). */
   log(message: string): void;
 }
@@ -243,6 +270,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
   private nextId = 1;
   private cancelTimer?: () => void;
   private closed = false;
+  private spentUnusedFeeMsats = 0;
 
   constructor(options: PrewarmOptions, deps: PrewarmDeps<S, C>) {
     this.cfg = PrewarmPool.config(options);
@@ -293,6 +321,11 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     }));
   }
 
+  /** Abandon fees (msats) paid for armed sessions retired without being used. */
+  get unusedFeeMsats(): number {
+    return this.spentUnusedFeeMsats;
+  }
+
   get totalPooled(): number {
     let n = 0;
     for (const k of this.keys.values()) n += k.entries.filter((e) => !e.taken).length;
@@ -309,7 +342,13 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     const burst = k.history.filter((r) => r.t > now - this.cfg.burstWindowMs).length;
     if (burst >= this.cfg.burstCount) t = 2;
     for (const r of recent) t = Math.max(t, r.concurrency);
-    return Math.min(t, this.cfg.maxPerKey);
+    t = Math.min(t, this.cfg.maxPerKey);
+    // Every unused armed session costs the node's abandon fee.
+    if ((k.abandonFeeMsat ?? 0) > 0) {
+      if (k.abandonFeeMsat! > this.cfg.maxSessionFeeMsat) return 0;
+      t = Math.min(t, this.cfg.maxArmedWithFee);
+    }
+    return t;
   }
 
   /** Body length to arm new sessions for K with. */
@@ -385,7 +424,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         this.reconcile();
       },
       log: (message: string) => this.log(`${st.label}: ${message}`),
-      end: (reservedMsats?: number) => {
+      end: (reservedMsats?: number, abandonFeeMsat?: number) => {
         if (ended) return;
         ended = true;
         clearCold();
@@ -393,6 +432,8 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         st.lastActivity = this.now();
         if (typeof reservedMsats === "number" && reservedMsats > 0) {
           st.reservationMsats = Math.max(st.reservationMsats ?? 0, reservedMsats);
+          // A settled receipt states the fee (absent = none).
+          this.learnFee(st, typeof abandonFeeMsat === "number" ? abandonFeeMsat : 0);
         }
         this.reconcile();
       },
@@ -441,10 +482,31 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     }
   }
 
+  private learnFee(k: KeyState<S, C>, feeMsat: number): void {
+    const fee = Number.isFinite(feeMsat) && feeMsat > 0 ? feeMsat : 0;
+    if (fee === (k.abandonFeeMsat ?? 0) && k.abandonFeeMsat !== undefined) return;
+    k.abandonFeeMsat = fee;
+    if (fee > this.cfg.maxSessionFeeMsat) {
+      this.log(
+        `${k.label}: node charges an abandon fee of ${fee} msats > maxSessionFeeMsat ${this.cfg.maxSessionFeeMsat}; not pre-warming`,
+      );
+    } else if (fee > 0) {
+      this.log(
+        `${k.label}: node charges an abandon fee of ${fee} msats for unused sessions; at most ${this.cfg.maxArmedWithFee} armed`,
+      );
+    }
+  }
+
   private retire(k: KeyState<S, C>, e: Entry<S>, reason: string | null): void {
     this.remove(k, e);
+    // The node charges the abandon fee for a session it accepted and that was never used.
+    const fee = e.state === "ready" && !e.taken ? (e.session?.abandonFeeMsat ?? 0) : 0;
+    if (fee > 0) this.spentUnusedFeeMsats += fee;
+    const feeNote = fee > 0 ? `; abandon fee ${fee} msats paid, ${this.spentUnusedFeeMsats} msats on unused sessions so far` : "";
     if (reason) {
-      this.log(`${k.label}: retire ${e.state} session${e.session?.sid ? ` sid=${short(e.session.sid)}` : ""} len=${e.bodyLength} (${reason})`);
+      this.log(`${k.label}: retire ${e.state} session${e.session?.sid ? ` sid=${short(e.session.sid)}` : ""} len=${e.bodyLength} (${reason})${feeNote}`);
+    } else if (feeNote) {
+      this.log(`${k.label}: unused session${e.session?.sid ? ` sid=${short(e.session.sid)}` : ""} gone${feeNote}`);
     }
     try {
       e.handle.cancel();
@@ -466,7 +528,11 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       const target = this.enabled ? this.target(k, now) : 0;
       const pooled = k.entries.filter((e) => !e.taken).sort((a, b) => a.startedAt - b.startedAt);
       if (target === 0 && pooled.length) {
-        for (const e of pooled) this.retire(k, e, "key idle");
+        const why =
+          (k.abandonFeeMsat ?? 0) > this.cfg.maxSessionFeeMsat
+            ? `abandon fee ${k.abandonFeeMsat} msats > maxSessionFeeMsat`
+            : "key idle";
+        for (const e of pooled) this.retire(k, e, why);
         continue;
       }
       const want = this.desiredLength(k);
@@ -480,6 +546,9 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     let arming = 0;
     for (const k of keys) arming += k.entries.filter((e) => e.state === "arming").length;
     const coldPrep = keys.some((k) => k.coldPrep > 0);
+    const feeKey = (k: KeyState<S, C>) => (k.abandonFeeMsat ?? 0) > 0;
+    let pooledWithFee = 0;
+    for (const k of keys) if (feeKey(k)) pooledWithFee += k.entries.filter((e) => !e.taken).length;
     for (const k of keys) {
       const target = this.enabled ? this.target(k, now) : 0;
       const pooled = k.entries.filter((e) => !e.taken).length;
@@ -487,6 +556,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       if (pooled >= target || keyArming) continue;
       if (total >= this.cfg.maxTotal || arming >= this.cfg.maxConcurrentArms || coldPrep) continue;
       if (now < k.backoffUntil) continue;
+      if (feeKey(k) && pooledWithFee >= this.cfg.maxArmedWithFee) continue;
       if (k.reservationMsats === undefined) {
         this.note(k, "await-receipt", `${k.label}: waiting for a settled request before arming (reservation unknown)`);
         continue;
@@ -495,6 +565,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       this.startArm(k, target, pooled);
       total += 1;
       arming += 1;
+      if (feeKey(k)) pooledWithFee += 1;
     }
     if (this.keys.size === 0) this.stopTimer();
     for (const k of keys) {
@@ -561,7 +632,10 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         return;
       }
       entry.startedAt = this.now();
-      this.log(`${k.label}: arming session len=${len} (have ${pooled}, target ${target})`);
+      this.log(
+        `${k.label}: arming session len=${len} (have ${pooled}, target ${target})` +
+          ((k.abandonFeeMsat ?? 0) > 0 ? `; costs the ${k.abandonFeeMsat} msats abandon fee if unused` : ""),
+      );
       try {
         real = this.deps.arm(k.info, k.ctx, len);
       } catch (e) {
@@ -573,6 +647,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       real.ready.then(
         (session) => {
           entry.session = session;
+          if (typeof session.abandonFeeMsat === "number") this.learnFee(k, session.abandonFeeMsat);
           if (cancelled) {
             real!.cancel();
             reject(new Error("pre-warm cancelled"));

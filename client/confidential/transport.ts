@@ -19,13 +19,19 @@
  */
 
 import { ConfidentialError, SessionRejectedError } from "./errors";
-import { fetchConfidentialOffer, verifyConfidentialOffer, type VerifiedOffer } from "./offer";
+import {
+  fetchConfidentialOffer,
+  offerAbandonFeeMsat,
+  verifyConfidentialOffer,
+  type VerifiedOffer,
+} from "./offer";
 import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import { canonicalSuffix, HOP_BY_HOP_HEADERS } from "./suffix";
 import {
   endsWith,
   padPinnedBody,
+  PREWARM_DEFAULTS,
   PrewarmPool,
   type ArmHandle,
   type PoolKeyInfo,
@@ -93,6 +99,15 @@ function armPooledSession(
     if (offer.v !== 2) throw new ConfidentialError("offer_malformed", "pre-warm needs a protocol v2 offer");
     if (!(info.model in offer.price_list)) {
       throw new ConfidentialError("offer_malformed", `node no longer serves ${info.model} confidentially`);
+    }
+    // An armed session that is never used costs the node's abandon fee.
+    const fee = offerAbandonFeeMsat(offer);
+    const maxFee = options.prewarm?.maxSessionFeeMsat ?? PREWARM_DEFAULTS.maxSessionFeeMsat;
+    if (fee > maxFee) {
+      throw new ConfidentialError(
+        "session_rejected",
+        `node abandon fee ${fee} msats exceeds prewarm.maxSessionFeeMsat ${maxFee}; not pre-warming`,
+      );
     }
     if (cancelled) throw new ConfidentialError("session_rejected", "pre-warm cancelled");
     session = new ConfidentialSession({
@@ -456,7 +471,15 @@ async function fetchConfidentialOnce(
     params.signal?.removeEventListener("abort", onAbort);
   });
   runP.then(
-    (r) => ticket?.end(typeof r.receipt.reserved_msats === "number" ? r.receipt.reserved_msats : undefined),
+    (r) =>
+      ticket?.end(
+        typeof r.receipt.reserved_msats === "number" ? r.receipt.reserved_msats : undefined,
+        // What an unused armed session for this key would cost.
+        Math.max(
+          typeof r.receipt.abandon_fee_msat === "number" ? r.receipt.abandon_fee_msat : 0,
+          typeof r.receipt.session_fee_msat === "number" ? r.receipt.session_fee_msat : 0,
+        ),
+      ),
     () => ticket?.end(),
   );
   let head: Head;
