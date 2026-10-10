@@ -1,12 +1,16 @@
 /**
  * Traffic-driven pre-warming of protocol v2 confidential sessions.
  *
- * A v2 session spends most of a cold request in the 2PC preprocessing (~21 MB
- * each way, ~25 s on a home uplink). Everything after the joint key share is
- * fast, and the sidecar lets a session wait in that state ("armed": setup,
- * preprocessing and key share done, no ClientHello yet) for up to 600 s from
- * setup. This pool keeps a few armed sessions for keys that are seeing
- * traffic, so the next request skips the preprocessing.
+ * A v2 session spends most of a cold request in the 2PC preprocessing (node-
+ * only garbling: ~22 MB node→client and ~1.2 MB client→node; seconds on a
+ * good link, median ~4-6 s against the live node, longer on a slow
+ * downlink). Everything after the joint key share is fast, and a session can
+ * wait in that state ("armed": setup, preprocessing and key share done, no
+ * ClientHello yet). The node ends a session 600 s after accepting its
+ * WebSocket (the sidecar's own limit for an armed session, 600 s from setup,
+ * starts later), so an armed session must be claimed well before that. This
+ * pool keeps a few armed sessions for keys that are seeing traffic, so the
+ * next request skips the preprocessing.
  *
  * Policy (all knobs in `PrewarmOptions`):
  *
@@ -33,8 +37,8 @@
  *   `maxBucket` (8 MiB). A request larger than every armed L goes cold and
  *   raises L for later arms; armed sessions smaller than the new L are
  *   replaced.
- * - Retire: a session older than `maxAgeMs` (480 s from setup; the node and
- *   sidecar end a session 600 s after setup) is closed, and replaced only if
+ * - Retire: a session older than `maxAgeMs` (480 s from setup; the node ends
+ *   a session 600 s after its WebSocket accept) is closed, and replaced only if
  *   K is still active. When K goes idle its armed sessions are closed at once
  *   (the node then releases their reservations; nothing is charged unless
  *   it has an abandon fee, see below).
