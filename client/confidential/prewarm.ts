@@ -18,8 +18,9 @@
  * - target(K) = 0 if K had no request in the activity window (and none is in
  *   flight); else 1, raised to 2 if K saw ≥ `burstCount` (3) requests in the
  *   last `burstWindowMs` (5 min), and to the peak number of overlapping
- *   requests seen in the window; capped at `maxPerKey` (3). The sum over all
- *   keys is capped at `maxTotal` (4); most recently active keys go first.
+ *   requests seen in the window; capped at `maxPerKey` (2). The sum over all
+ *   keys is capped at `maxTotal` (2, so that with one live request a client
+ *   stays within the node's default limit of 3 unused sessions per address); most recently active keys go first.
  * - Arms run one at a time (`maxConcurrentArms`, 1): preprocessing is
  *   bandwidth-heavy. None starts while a cold request is still in its own
  *   preprocessing, and replenishing happens off the request path (after a
@@ -83,8 +84,8 @@ export const PREWARM_DEFAULTS = {
   activityWindowMs: 10 * 60_000,
   burstWindowMs: 5 * 60_000,
   burstCount: 3,
-  maxPerKey: 3,
-  maxTotal: 4,
+  maxPerKey: 2,
+  maxTotal: 2,
   maxAgeMs: 480_000,
   historySize: 20,
   minBucket: 4096,
