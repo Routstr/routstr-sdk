@@ -49,8 +49,8 @@ The session follows the verified offer's `v`:
 
 ## Pre-warming (v2)
 
-Most of a cold v2 request is the 2PC preprocessing (about 21 MB each way,
-roughly 25 s on a home uplink). Everything after the joint key share takes
+Most of a cold v2 request is the 2PC preprocessing (about 22 MB from the node
+and 1.2 MB to it; about 7 s on a home link with a 2 Mbit/s uplink). Everything after the joint key share takes
 about 2 s: the online 2PC, the handshake, π_NK, the body and π_C2S. A session
 can be **armed** ahead of a request: `arm()` connects, sends the setup (the
 node reserves funds), runs the 2PC preprocessing and the key share, and stops
@@ -94,8 +94,10 @@ proofs while the session is being armed, so on the request path π_NK, π_C2S an
 hundred milliseconds instead of seconds. Correlations are fresh per session and used once; a failed proof
 closes the channel. If the channel is unavailable (older node or prover), the session falls back to one
 connection per proof. Options: `proofChannel` (default true), `proofChannelFactory`; timings in
-`timings.proofs` and `timings.proofChannelReadyMs`. Measured on a production node from a home uplink: warm
-requests reach the first token in about 2–3 s (mostly the provider), cold ones in about 35 s.
+`timings.proofs` and `timings.proofChannelReadyMs`. Measured against a production node: warm
+requests reach the first token in about 2–3 s (mostly the provider; about 1 s for a session armed through
+the handshake). Cold ones are dominated by receiving the ~22 MB of 2PC data: seconds on a fast connection,
+about 45–70 s on a slow, download-limited link.
 
 ## What is checked
 
