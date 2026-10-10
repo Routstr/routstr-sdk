@@ -104,6 +104,27 @@ export type TLSClientOptions = TLSConnectionOptions & TLSEventHandlers & {
     expectAuthTagInWrappedRecord?: boolean;
     logger?: Logger;
     write(packet: TLSPacket, ctx: TLSPacketContext): Promise<void> | void;
+    /** FORK PATCH (v2): external (two-party) key schedule */
+    external?: TLSExternalKeySchedule;
+};
+/**
+ * FORK PATCH (v2): the client offers `keyShare` (secp256r1 only, TLS 1.3
+ * only, one cipher suite, no PSK) and receives its traffic secrets from
+ * these hooks instead of computing ECDHE, HS or MS itself.
+ */
+export type TLSExternalKeySchedule = {
+    /** 65-byte uncompressed P-256 point (0x04 ‖ X ‖ Y) */
+    keyShare: Uint8Array;
+    /** serverShare: 65-byte P-256 point; thSH = SHA-256(CH ‖ SH) */
+    onServerHello(serverShare: Uint8Array, thSH: Uint8Array): Promise<{
+        clientHs: Uint8Array;
+        serverHs: Uint8Array;
+    }>;
+    /** thSF = SHA-256(CH ‖ … ‖ server Finished); called after the client Finished is sent */
+    onServerFinished(thSF: Uint8Array): Promise<{
+        serverAp0: Uint8Array;
+        clientAp1: Uint8Array;
+    }>;
 };
 export type TLSPresharedKey = {
     identity: Uint8Array;
