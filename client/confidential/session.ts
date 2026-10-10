@@ -58,7 +58,7 @@ import {
 import { CuProverBackend } from "./prover";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
-import { feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt";
+import { checkAttestationBinding, feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
   checkPiNParams,
@@ -1025,6 +1025,7 @@ export class ConfidentialSession {
     const attOk = verifySchnorrSignature(attJson, att.sig, this.ready.pubkey);
     this.event({ ev: "attestation", sig_ok: attOk });
     if (!attOk) throw new ReceiptVerificationError("attestation signature invalid");
+    checkAttestationBinding(attJson, { sid: this.sid, thSH: this.thSH, thSF: this.thSF });
 
     await this.settleFlush();
     // π_C2 must finish before π_C3: the node refuses to settle without it, and
