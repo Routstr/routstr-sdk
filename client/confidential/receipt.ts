@@ -25,13 +25,49 @@ export interface ReceiptVerificationInput {
   ownUsage: UpstreamUsageEvent;
   /** The model's rates from the *signed* offer. */
   priceEntry?: { in: number; out: number };
+  /** The signed offer's session fee (msats); 0 or absent when none. */
+  sessionFeeMsat?: number;
+  /** The signed offer's abandon fee (msats); a receipt may not name more. */
+  abandonFeeMsat?: number;
 }
 
 export interface ReceiptVerificationResult {
   receiptSigOk: boolean;
   usageMatch: boolean;
-  /** cost_msats ≤ usage priced at the signed offer's rates (true if no rates given). */
+  /**
+   * cost_msats ≤ usage priced at the signed offer's rates + the signed session
+   * fee (true if no rates given), and any fee the receipt names is at most the
+   * signed one.
+   */
   costWithinOffer: boolean;
+}
+
+/**
+ * The most a node may charge for a usage at the signed offer's terms:
+ * ceil((in·prompt + out·completion)/1000) + the session fee. The rates already
+ * include any surcharge (the node signs the surcharged price list).
+ */
+export function maxChargeMsats(
+  priceEntry: { in: number; out: number },
+  usage: { prompt_tokens?: number; completion_tokens?: number },
+  sessionFeeMsat = 0,
+): number {
+  return (
+    Math.ceil(
+      (Number(priceEntry.in) * (usage.prompt_tokens ?? 0) +
+        Number(priceEntry.out) * (usage.completion_tokens ?? 0)) /
+        1000,
+    ) + Math.max(0, sessionFeeMsat)
+  );
+}
+
+/**
+ * A charge without usage: at most the given signed fee (the session fee for a
+ * provider refusal, 4xx/503; the abandon fee for a session that ended without
+ * a request reaching the provider).
+ */
+export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 0): boolean {
+  return (costMsats ?? 0) <= Math.max(0, sessionFeeMsat);
 }
 
 export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificationResult {
@@ -47,15 +83,21 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
     rUsage?.usage?.completion_tokens === ownUsage.usage.completion_tokens &&
     receipt.model === ownUsage.model;
 
-  // The node may charge less than its signed rates (cached input), never more.
+  // The node may charge less than its signed terms (cached input), never more.
+  const fee = Math.max(0, input.sessionFeeMsat ?? 0);
   let costWithinOffer = true;
   if (input.priceEntry) {
-    const maxMsats = Math.ceil(
-      (Number(input.priceEntry.in) * (ownUsage.usage.prompt_tokens ?? 0) +
-        Number(input.priceEntry.out) * (ownUsage.usage.completion_tokens ?? 0)) /
-        1000,
-    );
+    const maxMsats = maxChargeMsats(input.priceEntry, ownUsage.usage, fee);
     costWithinOffer = (receipt.cost_msats ?? 0) <= maxMsats;
+  }
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    costWithinOffer = false;
+  }
+  if (
+    typeof receipt.abandon_fee_msat === "number" &&
+    receipt.abandon_fee_msat > Math.max(fee, input.abandonFeeMsat ?? 0)
+  ) {
+    costWithinOffer = false;
   }
   return { receiptSigOk, usageMatch, costWithinOffer };
 }

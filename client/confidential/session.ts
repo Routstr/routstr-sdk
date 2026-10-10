@@ -58,7 +58,7 @@ import {
 import { CuProverBackend } from "./prover";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
-import { parseSignedReceipt, verifyReceipt } from "./receipt";
+import { feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
   checkPiNParams,
@@ -74,7 +74,7 @@ import {
 import { makeTLSClient } from "./tls-fork/lib/index.js";
 import { setCryptoImplementation } from "./tls-fork/lib/crypto/index.js";
 import { webcryptoCrypto } from "./tls-fork/lib/crypto/webcrypto.js";
-import type { VerifiedOffer } from "./offer";
+import { offerAbandonFeeMsat, offerSessionFeeMsat, type VerifiedOffer } from "./offer";
 
 setCryptoImplementation(webcryptoCrypto);
 
@@ -105,8 +105,14 @@ export interface ConfidentialReceipt {
   usage: UpstreamUsageEvent;
   /** Charged to the client's key from the verified usage. */
   cost_msats?: number;
-  /** The node's reservation for this session (the model's maximum cost). */
+  /** The node's reservation for this session (the model's maximum cost + fee). */
   reserved_msats?: number;
+  /** The session fee of the frozen offer (msats), when the node charges one. */
+  session_fee_msat?: number;
+  /** The abandon fee of the frozen offer (msats), when the node charges one. */
+  abandon_fee_msat?: number;
+  /** The rate surcharge (percent) of the frozen offer, when set. */
+  rate_surcharge_pct?: number;
   /** The key's balance after settlement (msats), when known. */
   balance_msats?: number | null;
   notary_pubkey?: string;
@@ -460,6 +466,14 @@ export class ConfidentialSession {
     return this.released;
   }
 
+  /**
+   * The abandon fee (msats) of the offer this session accepted at setup: what
+   * the node charges if this session ends without being used.
+   */
+  get abandonFeeMsat(): number {
+    return offerAbandonFeeMsat(this.offer);
+  }
+
   /** v2: true while the session is armed (key share ready) and unclaimed. */
   get isArmed(): boolean {
     return this.keyShareReady && !this.handshaken;
@@ -664,6 +678,12 @@ export class ConfidentialSession {
     };
     // The node settles at the rates of exactly the offer we verified.
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
+    // Accept that offer's fees explicitly (the node refuses a setup that does
+    // not, so a client unaware of fees is never charged one).
+    const fee = offerSessionFeeMsat(this.offer);
+    const abandonFee = offerAbandonFeeMsat(this.offer);
+    if (fee > 0) setup.session_fee_msat = fee;
+    if (abandonFee > 0) setup.abandon_fee_msat = abandonFee;
     setup.auth = this.auth;
     this.sendText(setup);
 
@@ -1080,9 +1100,13 @@ export class ConfidentialSession {
       // doing any work (4xx, 503) must cost nothing.
       const ru = receipt.usage as unknown as { error_status?: number };
       usageMatch = ru?.error_status === httpEarly.status;
+      // With a session fee, that fee (the node's 2PC work) is all it may charge.
       const unbilled = httpEarly.status === 503 || (httpEarly.status >= 400 && httpEarly.status < 500);
-      if (unbilled && (receipt.cost_msats ?? 0) !== 0) {
-        throw new ReceiptVerificationError(`node charged ${receipt.cost_msats} msats for an unbilled upstream error`);
+      const fee = offerSessionFeeMsat(this.offer);
+      if (unbilled && !feeOnlyChargeOk(receipt.cost_msats, fee)) {
+        throw new ReceiptVerificationError(
+          `node charged ${receipt.cost_msats} msats for an unbilled upstream error (session fee ${fee} msats)`,
+        );
       }
     } else {
       const ownUsage = usageEventFromDisclosure(r);
@@ -1094,11 +1118,14 @@ export class ConfidentialSession {
         pubkey: this.ready.pubkey,
         ownUsage,
         priceEntry: this.offer.price_list[this.model],
+        sessionFeeMsat: offerSessionFeeMsat(this.offer),
+        abandonFeeMsat: offerAbandonFeeMsat(this.offer),
       });
       usageMatch = checked.usageMatch;
       if (!checked.costWithinOffer) {
         throw new ReceiptVerificationError(
-          `receipt cost ${receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates`,
+          `receipt cost ${receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates` +
+            ` plus its session fee (${offerSessionFeeMsat(this.offer)} msats)`,
         );
       }
     }

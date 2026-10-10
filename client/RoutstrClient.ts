@@ -206,9 +206,12 @@ function isConfidentialEndpoint(method: string, path: string): boolean {
 /**
  * A confidential node cannot read the prompt, so it reserves a full-context
  * prompt plus the pinned completion cap; deposit for that (5% margin, capped
- * at the model's envelope like the plain estimate).
+ * at the model's envelope like the plain estimate). A node that prices
+ * confidential sessions (the `confidential_upstream` field of its model
+ * listing) adds its rate surcharge to that, and on top the larger of its
+ * session and abandon fees (the node reserves that much).
  */
-function confidentialRequiredSats(
+export function confidentialRequiredSats(
   model: Model,
   maxTokens: number | undefined
 ): number | undefined {
@@ -227,7 +230,18 @@ function confidentialRequiredSats(
     maxTokens !== undefined && sp.completion
       ? sp.completion * maxTokens
       : (sp.max_completion_cost ?? 0);
-  return Math.min(sp.max_cost, (prompt + completion + (sp.request ?? 0)) * 1.05);
+  const base = Math.min(sp.max_cost, (prompt + completion + (sp.request ?? 0)) * 1.05);
+  const cu = model.confidential_upstream;
+  const pct =
+    typeof cu?.rate_surcharge_pct === "number" &&
+    Number.isFinite(cu.rate_surcharge_pct) &&
+    cu.rate_surcharge_pct > 0
+      ? cu.rate_surcharge_pct
+      : 0;
+  const fee = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+  const feeMsat = Math.max(fee(cu?.session_fee_msat), fee(cu?.abandon_fee_msat));
+  return base * (1 + pct / 100) + Math.ceil(feeMsat / 1000);
 }
 
 export interface RouteRequestParams {
