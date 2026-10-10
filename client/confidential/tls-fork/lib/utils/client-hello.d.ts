@@ -11,8 +11,10 @@ type ClientHelloOptions = TLSHelloBaseOptions & {
     random?: Uint8Array;
     sessionId?: Uint8Array;
     psk?: TLSPresharedKey;
+    /** FORK PATCH (v2): drop psk_key_exchange_modes */
+    omitPskModes?: boolean;
 };
-export declare function packClientHello({ host, sessionId, random, keysToShare, psk, cipherSuites, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols }: ClientHelloOptions): Promise<Uint8Array<ArrayBufferLike>>;
+export declare function packClientHello({ host, sessionId, random, keysToShare, psk, cipherSuites, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, omitPskModes }: ClientHelloOptions): Promise<Uint8Array<ArrayBufferLike>>;
 export declare function computeBinderSuffix(packedHandshakePrefix: Uint8Array, psk: TLSPresharedKey): Promise<Uint8Array<ArrayBufferLike>>;
 /**
  * Packs the preshared key extension; the binder is assumed to be 0
