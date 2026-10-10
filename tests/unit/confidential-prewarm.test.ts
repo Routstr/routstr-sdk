@@ -19,6 +19,7 @@ import { canonicalSuffix } from "../../client/confidential/suffix";
 class FakeSession implements ArmedSessionLike {
   healthy = true;
   closed = false;
+  abandonFeeMsat = 0;
   constructor(
     readonly bodyLength: number,
     public sid: string,
@@ -37,7 +38,7 @@ interface PendingArm {
   cancelled: boolean;
 }
 
-function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12) {
+function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12, feeMsat = 0) {
   let now = 1_000_000;
   const arms: PendingArm[] = [];
   const logs: string[] = [];
@@ -54,6 +55,7 @@ function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12) 
       availableMsats: async () => balance,
       arm: (_info, _ctx, len): ArmHandle<FakeSession> => {
         const session = new FakeSession(len, `sid${++n}`);
+        session.abandonFeeMsat = feeMsat;
         let resolve!: () => void;
         let reject!: (e: Error) => void;
         const ready = new Promise<FakeSession>((res, rej) => {
@@ -92,7 +94,7 @@ function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12) 
         t.warm();
       } else t.cold();
       t.head();
-      t.end(1000);
+      t.end(1000, feeMsat);
       await flush();
       return lease;
     },
@@ -344,5 +346,79 @@ describe("padPinnedBody", () => {
     expect(padPinnedBody(body, body.length, suffix)).toBe(body);
     expect(() => padPinnedBody(body, body.length - 1, suffix)).toThrow();
     expect(() => padPinnedBody(new TextEncoder().encode("{}"), 4096, suffix)).toThrow();
+  });
+});
+
+describe("pre-warm with a node abandon fee", () => {
+  it("defaults off: a node without a fee is pre-warmed as before", async () => {
+    const h = harness({}, 1e12, 0);
+    for (let i = 0; i < 3; i++) {
+      await h.request();
+      await completeArms(h);
+      h.advance(20_000);
+    }
+    h.pool.reconcile();
+    await completeArms(h);
+    expect(h.armed()).toBe(2);
+    expect(h.pool.unusedFeeMsats).toBe(0);
+  });
+
+  it("arms at most one session when the node charges an acceptable fee", async () => {
+    const h = harness({}, 1e12, 2000);
+    for (let i = 0; i < 3; i++) {
+      await h.request();
+      await completeArms(h);
+      h.advance(20_000);
+    }
+    expect(h.pool.snapshot()[0]!.target).toBe(1);
+    h.pool.reconcile();
+    await completeArms(h);
+    expect(h.armed()).toBe(1);
+    expect(h.logs.some((l) => l.includes("abandon fee of 2000 msats"))).toBe(true);
+  });
+
+  it("caps fee-charging sessions across keys (maxArmedWithFee)", async () => {
+    const h = harness({ maxTotal: 4 }, 1e12, 2000);
+    await h.request();
+    await completeArms(h);
+    const other: PoolKeyInfo = { ...h.info, model: "other" };
+    await h.request(1000, other);
+    await completeArms(h);
+    expect(h.armed()).toBe(1);
+  });
+
+  it("never arms when the fee exceeds maxSessionFeeMsat", async () => {
+    const h = harness({ maxSessionFeeMsat: 1000 }, 1e12, 2000);
+    await h.request();
+    await completeArms(h);
+    expect(h.arms).toHaveLength(0);
+    expect(h.pool.snapshot()[0]?.target ?? 0).toBe(0);
+    expect(h.logs.some((l) => l.includes("not pre-warming"))).toBe(true);
+
+    const z = harness({ maxSessionFeeMsat: 0 }, 1e12, 1);
+    await z.request();
+    await completeArms(z);
+    expect(z.arms).toHaveLength(0);
+  });
+
+  it("counts and logs the fee of an armed session retired unused", async () => {
+    const h = harness({ activityWindowMs: 60_000 }, 1e12, 2000);
+    await h.request();
+    await completeArms(h);
+    expect(h.armed()).toBe(1);
+    h.advance(61_000);
+    h.pool.reconcile();
+    expect(h.armed()).toBe(0);
+    expect(h.pool.unusedFeeMsats).toBe(2000);
+    expect(h.logs.some((l) => l.includes("abandon fee 2000 msats paid"))).toBe(true);
+  });
+
+  it("does not count the fee of a claimed session", async () => {
+    const h = harness({ activityWindowMs: 60_000 }, 1e12, 2000);
+    await h.request();
+    await completeArms(h);
+    const lease = await h.request();
+    expect(lease?.ready).toBe(true);
+    expect(h.pool.unusedFeeMsats).toBe(0);
   });
 });
