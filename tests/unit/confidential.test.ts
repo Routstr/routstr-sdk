@@ -478,6 +478,15 @@ describe("receipt verification", () => {
     expect(biggerAbandon.costWithinOffer).toBe(false);
   });
 
+  it("refuses any cost when the signed offer has no rate for the model", () => {
+    // Without a price entry there is no bound to check against: a node that
+    // signs an offer without the served model's rates gets no cost accepted.
+    const res = verifyReceipt({ receipt: { ...base, cost_msats: 1 } as never, ownUsage });
+    expect(res.costWithinOffer).toBe(false);
+    const free = verifyReceipt({ receipt: { ...base, cost_msats: 0 } as never, ownUsage });
+    expect(free.costWithinOffer).toBe(false);
+  });
+
   it("allows at most the fee for a charge without usage (4xx/503, abandoned)", () => {
     expect(feeOnlyChargeOk(0, 0)).toBe(true);
     expect(feeOnlyChargeOk(1, 0)).toBe(false);
@@ -601,6 +610,32 @@ describe("security regressions", () => {
     expect(isConfidentialEndpoint("GET", "/v1/chat/completions")).toBe(false);
   });
 
+  it("pins the announcing key only for an authenticated node URL", async () => {
+    const { offer, pubHex } = signedOffer();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify(offer), { status: 200 })) as typeof fetch;
+    const other = bytesToHex(schnorr.getPublicKey(new Uint8Array(32).fill(3)));
+    try {
+      const call = (baseUrl: string, announced: string[]) =>
+        fetchConfidential({
+          baseUrl,
+          body: { model: "absent" },
+          bearer: "sk-x",
+          options: { trustedHosts: ["*.venice.ai"], nodePubkeysFor: () => announced },
+        });
+      // https and the announcing key: the offer verifies (then the model is refused).
+      await expect(call("https://pin-a.example", [pubHex])).rejects.toThrow(/does not serve/);
+      // Announced by someone else: the signature does not match the pin.
+      await expect(call("https://pin-b.example", [other])).rejects.toThrow(OfferPinMismatchError);
+      // Plain http does not authenticate the server: no pin from the announcement.
+      await expect(call("http://pin-c.example", [pubHex])).rejects.toThrow(OfferUnpinnedError);
+      // Nothing announced: no pin.
+      await expect(call("https://pin-d.example", [])).rejects.toThrow(OfferUnpinnedError);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   it("re-applies the caller's policy to a cached offer", async () => {
     const { offer } = signedOffer();
     const realFetch = globalThis.fetch;
@@ -639,16 +674,28 @@ describe("security regressions", () => {
     expect(ok.cost_msats).toBe(5);
     // Unsigned / wrongly signed.
     expect(() =>
-      parseSignedReceipt({ receiptJson, sig: undefined, pubkey: pubHex, sid: "s1" }),
+      parseSignedReceipt({ receiptJson, sig: undefined, pubkey: pubHex, sid: "s1", attestationJson: aJson }),
     ).toThrow(ReceiptVerificationError);
     const tampered = receiptJson.replace('"cost_msats":5', '"cost_msats":1');
     expect(() =>
-      parseSignedReceipt({ receiptJson: tampered, sig, pubkey: pubHex, sid: "s1" }),
+      parseSignedReceipt({ receiptJson: tampered, sig, pubkey: pubHex, sid: "s1", attestationJson: aJson }),
     ).toThrow(ReceiptVerificationError);
     // A validly signed receipt of another session.
-    expect(() => parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s2" })).toThrow(
-      /not s2/,
-    );
+    expect(() =>
+      parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s2", attestationJson: aJson }),
+    ).toThrow(/not s2/);
+    // A receipt with no attestation hash at all is not bound to anything.
+    const unbound = { sid: "s1", model: "m", cost_msats: 5 };
+    const unboundJson = canonicalJson(unbound);
+    expect(() =>
+      parseSignedReceipt({
+        receiptJson: unboundJson,
+        sig: sign(unboundJson, priv),
+        pubkey: pubHex,
+        sid: "s1",
+        attestationJson: aJson,
+      }),
+    ).toThrow(/attestation/);
     // Bound to a different attestation.
     expect(() =>
       parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s1", attestationJson: "{}" }),
