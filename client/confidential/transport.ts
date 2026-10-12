@@ -12,7 +12,10 @@
  * decrypt (each record is authenticated by TLS). Settlement checks (proofs,
  * receipt signature and binding, usage, cost) finish after the body: a
  * non-streaming call fails if they fail, and a stream ends with an error
- * instead of a clean end. `confidentialSettled` carries the same outcome.
+ * instead of a clean end. A stream's final `data: [DONE]` line is held back
+ * until those checks passed, so a consumer that stops reading at `[DONE]`
+ * still sees the error (the rest of the stream is not delayed).
+ * `confidentialSettled` carries the same outcome.
  *
  * Only `POST …/chat/completions` is supported: the pinned suffix, the head
  * template and the usage proof are all chat-completions specific.
@@ -28,6 +31,7 @@ import {
 import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import { canonicalSuffix, HOP_BY_HOP_HEADERS } from "./suffix";
+import { encryptedNodeTransport } from "./hosts";
 import {
   endsWith,
   padPinnedBody,
@@ -53,6 +57,12 @@ export interface ConfidentialRequestOptions {
   nodePubkeysFor?: (baseUrl: string) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
   /** Dev only: accept an offer signed by a key that is not pinned. */
   allowUnpinned?: boolean;
+  /**
+   * Dev only: run sessions with a plain-http node that is neither loopback
+   * nor an onion service. The node credential (setup `auth`) then travels
+   * over an unencrypted websocket.
+   */
+  allowInsecureTransport?: boolean;
   /** `cu-prover` binary (else CU_PROVER_BIN / CU_PROVER / PATH). */
   proverPath?: string;
   /**
@@ -60,8 +70,18 @@ export interface ConfidentialRequestOptions {
    * next to cu-prover, then PATH).
    */
   twoPcPath?: string;
-  /** Evidence directory for per-session artifacts. */
+  /**
+   * Evidence directory for per-session artifacts (development only). It
+   * receives the decrypted response in plaintext (`<sid>.response.txt`), so
+   * leave it unset for real traffic.
+   */
   runsDir?: string;
+  /**
+   * Hand confidential requests and responses to the client's raw
+   * request/response log sink. Off by default: that sink writes the prompt
+   * and the decrypted response in plaintext.
+   */
+  logPlaintext?: boolean;
   /**
    * Traffic-driven pre-warming of protocol v2 sessions (see `prewarm.ts`).
    * Off unless set; `{}` enables it with the defaults. Not used for one-off
@@ -127,6 +147,7 @@ function armPooledSession(
       prover: new CuProverBackend({ binaryPath: options.proverPath }),
       twoPcPath: options.twoPcPath,
       runsDir: options.runsDir,
+      allowInsecureTransport: options.allowInsecureTransport,
       // The sidecar allows 180 s of preprocessing; a pooled arm is not
       // waited on by a request, so give it the full window.
       timeouts: { twoPcKeyShare: 175_000 },
@@ -204,15 +225,27 @@ async function verifiedOffer(
     trustedHosts: options.trustedHosts,
   };
   const hit = offerCache.get(key);
+  let offer: VerifiedOffer;
   if (!fresh && hit && Date.now() - hit.at < 30_000) {
     // Signature, pin, version and trusted host are checked again for *this*
     // call: a cached offer accepted under a looser policy must not leak.
-    return verifyConfidentialOffer(hit.offer, policy);
+    offer = verifyConfidentialOffer(hit.offer, policy);
+  } else {
+    offer = await fetchConfidentialOffer(key, policy);
+    offerCache.set(key, { offer, at: Date.now() });
   }
-  const offer = await fetchConfidentialOffer(key, policy);
-  offerCache.set(key, { offer, at: Date.now() });
+  // Pinned keys authenticate the offer, not the connection: the session
+  // carries the node credential, which plain http would expose on the wire.
+  if (!options.allowInsecureTransport && !encryptedNodeTransport(baseUrl)) {
+    throw new ConfidentialError(
+      "not_configured",
+      `refusing a confidential session with ${key}: plain http would send the node credential unencrypted ` +
+        "(use an https or onion URL; allowInsecureTransport is for development)",
+    );
+  }
   return offer;
 }
+
 
 /** The one endpoint the confidential transport implements. */
 export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
@@ -413,6 +446,7 @@ async function fetchConfidentialOnce(
       prover: new CuProverBackend({ binaryPath: options.proverPath }),
       twoPcPath: options.twoPcPath,
       runsDir: options.runsDir,
+      allowInsecureTransport: options.allowInsecureTransport,
     });
 
   // Pre-warm: v2 only, a stable credential only (a one-off Cashu bearer is
@@ -444,6 +478,7 @@ async function fetchConfidentialOnce(
   let resolveHead!: (h: Head) => void;
   const headP = new Promise<Head>((r) => (resolveHead = r));
   const chunks: Uint8Array[] = [];
+  const doneHold = new SseDoneHoldback();
   const attach = (s: ConfidentialSession) =>
     s.setResponseHandlers(
       (h) => {
@@ -451,7 +486,10 @@ async function fetchConfidentialOnce(
         resolveHead(h);
       },
       (chunk) => {
-        if (wantStream && chunk.length) void writer.write(chunk).catch(() => {});
+        if (wantStream && chunk.length) {
+          const now = doneHold.push(chunk);
+          if (now.length) void writer.write(now).catch(() => {});
+        }
         else if (chunk.length) chunks.push(chunk);
       },
     );
@@ -497,6 +535,7 @@ async function fetchConfidentialOnce(
       ticket!.log(
         `pre-warmed sid=${warm.sid.slice(0, 8)} failed before release (${errorText(error)}); falling back to a cold session`,
       );
+      ticket!.armedFailed(errorText(error));
       warm.close();
       prewarmed = false;
       session = coldSession();
@@ -562,9 +601,14 @@ async function fetchConfidentialOnce(
     }
     return result;
   });
-  // A stream ends only once settlement verified; a failed check errors it.
+  // A stream ends only once settlement verified (and only then gets its
+  // `[DONE]`); a failed check errors it.
   settled.then(
-    () => void writer.close().catch(() => {}),
+    () => {
+      const rest = doneHold.release();
+      if (rest.length) void writer.write(rest).catch(() => {});
+      void writer.close().catch(() => {});
+    },
     (error) => void writer.abort(error).catch(() => {}),
   );
 
@@ -603,6 +647,77 @@ async function fetchConfidentialOnce(
   (response as unknown as { confidentialSettled: Promise<unknown> }).confidentialSettled =
     settledHandled;
   return response!;
+}
+
+/**
+ * Holds back an SSE stream from its `data: [DONE]` line on. Bytes before it
+ * pass through at once; only a tail that could still become that line (at
+ * most a few bytes) waits for the next chunk.
+ */
+export class SseDoneHoldback {
+  private static readonly MARKERS = ["data: [DONE]", "data:[DONE]"].map((m) => new TextEncoder().encode(m));
+  /** Bytes not yet emitted (a possible marker prefix, or everything from the marker on). */
+  private pending: Uint8Array = new Uint8Array(0);
+  private holding = false;
+  /** The byte before `pending` (a marker counts only at a line start). */
+  private prev = 10;
+
+  /** Add decrypted bytes; returns what may be delivered now. */
+  push(chunk: Uint8Array): Uint8Array {
+    const buf = concat([this.pending, chunk]);
+    if (this.holding) {
+      this.pending = buf;
+      return new Uint8Array(0);
+    }
+    const at = this.findMarker(buf);
+    if (at >= 0) {
+      this.holding = true;
+      this.pending = buf.subarray(at);
+      return this.emit(buf.subarray(0, at));
+    }
+    const keep = this.partialMarkerTail(buf);
+    this.pending = buf.slice(buf.length - keep);
+    return this.emit(buf.subarray(0, buf.length - keep));
+  }
+
+  /** Everything still held, once the stream may end. */
+  release(): Uint8Array {
+    const out = this.pending;
+    this.pending = new Uint8Array(0);
+    this.holding = false;
+    return out;
+  }
+
+  private emit(out: Uint8Array): Uint8Array {
+    if (out.length) this.prev = out[out.length - 1]!;
+    return out;
+  }
+
+  private atLineStart(buf: Uint8Array, i: number): boolean {
+    const b = i === 0 ? this.prev : buf[i - 1]!;
+    return b === 10 || b === 13;
+  }
+
+  private findMarker(buf: Uint8Array): number {
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 0x64 /* d */ || !this.atLineStart(buf, i)) continue;
+      for (const m of SseDoneHoldback.MARKERS) {
+        if (i + m.length <= buf.length && m.every((b, j) => buf[i + j] === b)) return i;
+      }
+    }
+    return -1;
+  }
+
+  /** Length of the longest tail of `buf` that starts a marker at a line start. */
+  private partialMarkerTail(buf: Uint8Array): number {
+    const longest = Math.max(...SseDoneHoldback.MARKERS.map((m) => m.length)) - 1;
+    for (let n = Math.min(longest, buf.length); n > 0; n--) {
+      const i = buf.length - n;
+      if (!this.atLineStart(buf, i)) continue;
+      if (SseDoneHoldback.MARKERS.some((m) => m.subarray(0, n).every((b, j) => buf[i + j] === b))) return n;
+    }
+    return 0;
+  }
 }
 
 /** The existing node refund endpoint: return the bearer's remaining balance. */

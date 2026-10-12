@@ -43,9 +43,13 @@
  *   (the node then releases their reservations; nothing is charged unless
  *   it has an abandon fee, see below).
  * - Failures: a failed arm backs K off (`backoffBaseMs` doubling up to
- *   `backoffMaxMs`). A claimed session that fails before the credential
- *   record is released falls back to a cold session (the transport does
- *   this); never after.
+ *   `backoffMaxMs`). So does an armed session that dies before it is used
+ *   (the node or the network ended it), with its own doubling count that
+ *   only a request served from an armed session resets: a node that keeps
+ *   ending armed sessions would otherwise cost an arm (and any abandon fee)
+ *   per tick. A claimed session that fails before the credential record is
+ *   released falls back to a cold session (the transport does this; it
+ *   counts as a death); never after.
  * - Funds: every armed session holds a reservation on the credential (a
  *   full-context prompt plus max_tokens at the offer rates). A key is armed
  *   only after one of its requests settled (the receipt reports the
@@ -232,6 +236,8 @@ interface KeyState<S extends ArmedSessionLike, C> {
   /** The node's abandon fee for this key (msats), from a receipt or an armed session. */
   abandonFeeMsat?: number;
   failures: number;
+  /** Armed sessions that died before use since the last warm request served. */
+  deaths: number;
   backoffUntil: number;
   fundsCheck?: Promise<void>;
   noted: Set<string>;
@@ -260,6 +266,8 @@ export interface RequestTicket<S extends ArmedSessionLike> {
   end(reservedMsats?: number, abandonFeeMsat?: number): void;
   /** Log a line about this request under the key's label (no secrets). */
   log(message: string): void;
+  /** The claimed armed session failed before it could be used (backs the key off). */
+  armedFailed(reason: string): void;
 }
 
 export function poolKey(info: PoolKeyInfo): string {
@@ -381,6 +389,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         lastActivity: now,
         entries: [],
         failures: 0,
+        deaths: 0,
         backoffUntil: 0,
         noted: new Set(),
       };
@@ -429,6 +438,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         this.reconcile();
       },
       log: (message: string) => this.log(`${st.label}: ${message}`),
+      armedFailed: (reason: string) => this.died(st, `claimed armed session failed before use: ${reason}`),
       end: (reservedMsats?: number, abandonFeeMsat?: number) => {
         if (ended) return;
         ended = true;
@@ -436,6 +446,12 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         st.inFlight = Math.max(0, st.inFlight - 1);
         st.lastActivity = this.now();
         if (typeof reservedMsats === "number" && reservedMsats > 0) {
+          // An armed session served a request to settlement: the node keeps
+          // armed sessions alive, so earlier deaths stop counting.
+          if (rec.warm === true && st.deaths > 0) {
+            st.deaths = 0;
+            st.backoffUntil = 0;
+          }
           st.reservationMsats = Math.max(st.reservationMsats ?? 0, reservedMsats);
           // A settled receipt states the fee (absent = none).
           this.learnFee(st, typeof abandonFeeMsat === "number" ? abandonFeeMsat : 0);
@@ -481,6 +497,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       if (e.state === "ready" && !e.session?.healthy) {
         this.log(`${k.label}: armed session sid=${short(e.session?.sid)} died; dropped`);
         this.retire(k, e, null);
+        this.died(k, `armed session sid=${short(e.session?.sid)} died before use`);
       } else if (now - e.startedAt > this.cfg.maxAgeMs) {
         this.retire(k, e, `age ${Math.round((now - e.startedAt) / 1000)}s > ${Math.round(this.cfg.maxAgeMs / 1000)}s`);
       }
@@ -682,8 +699,16 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
   private backoff(k: KeyState<S, C>, why: string): void {
     k.failures += 1;
     const ms = Math.min(this.cfg.backoffMaxMs, this.cfg.backoffBaseMs * 2 ** (k.failures - 1));
-    k.backoffUntil = this.now() + ms;
+    k.backoffUntil = Math.max(k.backoffUntil, this.now() + ms);
     this.log(`${k.label}: arm failed (${why}); backing off ${Math.round(ms / 1000)}s`);
+  }
+
+  /** An armed session ended before it was used. */
+  private died(k: KeyState<S, C>, why: string): void {
+    k.deaths += 1;
+    const ms = Math.min(this.cfg.backoffMaxMs, this.cfg.backoffBaseMs * 2 ** (k.deaths - 1));
+    k.backoffUntil = Math.max(k.backoffUntil, this.now() + ms);
+    this.log(`${k.label}: ${why}; backing off ${Math.round(ms / 1000)}s`);
   }
 
   private ensureTimer(): void {
