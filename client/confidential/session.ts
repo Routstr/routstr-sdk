@@ -30,8 +30,9 @@
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { verifySchnorrSignature } from "./canonical";
+import { encryptedNodeTransport } from "./hosts";
 import {
   ConfidentialTimeoutError,
   ReceiptVerificationError,
@@ -53,6 +54,8 @@ import {
   checkPiC3Params,
   checkPiC3SParams,
   checkPiNKParams,
+  serverTailEpoch,
+  type ServerPostRecord,
   type SessionValues,
 } from "./params";
 import { CuProverBackend } from "./prover";
@@ -217,17 +220,32 @@ export interface ConfidentialSessionOptions {
     /** v2: one proof on the proof channel. */
     proof: number;
   }>;
-  /** Optional evidence directory; writes client.jsonl/response.txt/receipt.json. */
+  /**
+   * Optional evidence directory (development only); writes
+   * client.jsonl/response.txt/receipt.json. response.txt is the decrypted
+   * response in plaintext.
+   */
   runsDir?: string;
   /** Structured event sink (never logs secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
-  /** Insecure test hook: only ever used by the prototype's loopback probes. */
+  /**
+   * @internal Insecure test hook (protocol v1 probes against a loopback
+   * sidecar): skips the proofs and hands the handshake secret to the node.
+   * Refused unless the process sets `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
+   */
   insecureNoProofs?: boolean;
   /**
-   * Accept an unsigned `usage` frame instead of a node-signed receipt (a
-   * sidecar run without a node, for tests). Off: a receipt must be signed.
+   * @internal Accept an unsigned `usage` frame instead of a node-signed
+   * receipt (a sidecar run without a node, for tests). Refused unless the
+   * process sets `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`. Off: a receipt
+   * must be signed.
    */
   allowUnsignedSettlement?: boolean;
+  /**
+   * Dev only: allow a plain-http node URL that is neither loopback nor an
+   * onion service (the setup's credential then travels unencrypted).
+   */
+  allowInsecureTransport?: boolean;
   /**
    * Streaming hooks. The response is authenticated record by record by the
    * TLS stack (GCM tags under keys only we hold), so body bytes can be handed
@@ -389,13 +407,17 @@ export class ConfidentialSession {
   private responseChunks: Uint8Array[] = [];
   /** Server application-data record payloads, in arrival order (π_C3 check). */
   private serverRecords: Uint8Array[] = [];
-  /** Encrypted server records seen after the handshake, and KeyUpdates among them. */
+  /** Encrypted server records seen after the handshake (π_C3S key epoch). */
   private postHandshake = false;
-  private serverPostRecords = 0;
-  private serverKeyUpdates = 0;
-  /** Post-handshake index of the first record of the current server key epoch. */
-  private serverEpochStart = 0;
+  private serverPost: ServerPostRecord[] = [];
   private serverPending: Uint8Array = new Uint8Array(0);
+  /** Every upstream byte and complete record received (checked against the attestation). */
+  private readonly recvHash = createHash("sha256");
+  private recvRecords = 0;
+  /** The node's head-record commitment, from its c_commit frame. */
+  private cCommitHex?: string;
+  /** SHA-256 of the provider's certificate DERs as sent, concatenated. */
+  private certChainHash?: Uint8Array;
   /** Our epoch-2 (body) records as written (π_C2 check). */
   private epoch2 = false;
   private bodyRecords: Uint8Array[] = [];
@@ -455,6 +477,19 @@ export class ConfidentialSession {
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
     this.runsDir = options.runsDir;
     this.onEvent = options.onEvent;
+    if (!options.allowInsecureTransport && !encryptedNodeTransport(this.baseUrl)) {
+      throw new SessionProtocolError(
+        `refusing plain http to ${this.baseUrl}: the node credential would travel unencrypted`,
+      );
+    }
+    if (
+      (options.insecureNoProofs === true || options.allowUnsignedSettlement === true) &&
+      !insecureTestingEnabled()
+    ) {
+      throw new SessionProtocolError(
+        "insecureNoProofs/allowUnsignedSettlement are test hooks; set ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1 to use them",
+      );
+    }
     this.insecure = options.insecureNoProofs === true;
     this.allowUnsignedSettlement = options.allowUnsignedSettlement === true;
     this.onResponseHead = options.onResponseHead;
@@ -626,11 +661,15 @@ export class ConfidentialSession {
       // sequence numbers from its first record.
       onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
         if (!this.postHandshake || ctx?.type !== "ciphertext") return;
-        const index = this.serverPostRecords++;
-        if (ctx.contentType === "HANDSHAKE" && containsKeyUpdate(rec.content)) {
-          this.serverKeyUpdates += 1;
-          this.serverEpochStart = index + 1;
-        }
+        this.serverPost.push({
+          data: ctx.contentType === "APPLICATION_DATA",
+          keyUpdates: ctx.contentType === "HANDSHAKE" ? countKeyUpdates(rec.content) : 0,
+        });
+      },
+      onRecvCertificates: ({ certificates }: { certificates: { internal: { rawData: ArrayBuffer } }[] }) => {
+        // Called after the fork validated the chain; recorded to check the
+        // attestation's certificate hash.
+        this.certChainHash = sha256(concat(...certificates.map((c) => new Uint8Array(c.internal.rawData))));
       },
       onApplicationData: (rec: Uint8Array) => {
         this.tLastData = Date.now();
@@ -671,10 +710,12 @@ export class ConfidentialSession {
   }
 
   private trackServerRecords(bytes: Uint8Array): void {
+    this.recvHash.update(bytes);
     let buf = concat(this.serverPending, bytes);
     while (buf.length >= 5) {
       const len = (buf[3]! << 8) | buf[4]!;
       if (buf.length < 5 + len) break;
+      this.recvRecords += 1;
       if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len));
       buf = buf.subarray(5 + len);
     }
@@ -840,6 +881,7 @@ export class ConfidentialSession {
     if (!this.ap) throw new SessionProtocolError("prepareProofs before arm");
     this.tC1Sent = Date.now();
     const commit = await this.waitT("c_commit", this.timeouts.cCommit);
+    if (typeof commit.c_commit === "string") this.cCommitHex = commit.c_commit;
     // The relayed anchors, when present, must be the ones our own 2PC output.
     for (const k of ["h1", "h2", "hk"] as const) {
       if (commit[k] !== undefined && commit[k] !== hex(this.ap[k])) {
@@ -942,6 +984,7 @@ export class ConfidentialSession {
       });
       this.event({ ev: "pi_n_ok" });
     }
+    if (typeof commit.c_commit === "string") this.cCommitHex = commit.c_commit;
     this.tProofsReady = Date.now();
     this.prepared = true;
     this.armed = true;
@@ -1044,7 +1087,15 @@ export class ConfidentialSession {
     const attOk = verifySchnorrSignature(attJson, att.sig, this.ready.pubkey);
     this.event({ ev: "attestation", sig_ok: attOk });
     if (!attOk) throw new ReceiptVerificationError("attestation signature invalid");
-    checkAttestationBinding(attJson, { sid: this.sid, thSH: this.thSH, thSF: this.thSF });
+    checkAttestationBinding(attJson, {
+      sid: this.sid,
+      thSH: this.thSH,
+      thSF: this.thSF,
+      cCommit: this.cCommitHex,
+      certChainHash: this.certChainHash,
+      serverRecords: this.recvRecords,
+      recvSha256: new Uint8Array(this.recvHash.copy().digest()),
+    });
 
     await this.settleFlush();
     // π_C2 must finish before π_C3: the node refuses to settle without it, and
@@ -1074,10 +1125,20 @@ export class ConfidentialSession {
       this.responseChunks.map((c) => c.length),
       r.length + skip,
     );
-    const disclose: Record<string, unknown> = { type: "disclose", r: hex(r), tail_lens: tailLens, skip };
-    if (v2 && this.serverKeyUpdates > 0) {
-      disclose.key_updates = this.serverKeyUpdates;
-      disclose.epoch_start = this.serverEpochStart;
+    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
+    if (!v2 && epoch.keyUpdates > 0) {
+      throw new ResponseVerificationError("the server changed keys before the usage event (v1 cannot prove that)");
+    }
+    const disclose: Record<string, unknown> = {
+      type: "disclose",
+      r: hex(r),
+      tail_lens: tailLens,
+      skip,
+      trailing: epoch.trailing,
+    };
+    if (epoch.keyUpdates > 0) {
+      disclose.key_updates = epoch.keyUpdates;
+      disclose.epoch_start = epoch.epochStart;
     }
     this.sendText(disclose);
 
@@ -1085,14 +1146,15 @@ export class ConfidentialSession {
     if (v2) {
       // Wire index of sequence 0 of the covered records' epoch: the records
       // before the post-handshake ones are the encrypted server flight.
-      const handshakeRecords = this.serverRecords.length - this.serverPostRecords;
+      const handshakeRecords = this.serverRecords.length - this.serverPost.length;
       checkPiC3SParams(c3.params, {
         h2: this.ap!.h2,
         serverRecords: this.serverRecords,
         r,
         skip,
-        keyUpdates: this.serverKeyUpdates,
-        epochBase: handshakeRecords >= 0 ? handshakeRecords + this.serverEpochStart : undefined,
+        keyUpdates: epoch.keyUpdates,
+        epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
+        trailing: epoch.trailing,
       });
     } else {
       checkPiC3Params(c3.params, {
@@ -1100,6 +1162,7 @@ export class ConfidentialSession {
         serverRecords: this.serverRecords,
         r,
         skip,
+        trailing: epoch.trailing,
       });
     }
     const c3Name = v2 ? "pi_c3s" : "pi_c3";
@@ -1309,6 +1372,12 @@ export class ConfidentialSession {
   }
 }
 
+/** The process opted into the insecure test hooks explicitly. */
+function insecureTestingEnabled(): boolean {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return env?.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING === "1";
+}
+
 function indexOfCrlfCrlf(b: Uint8Array): number {
   for (let i = 0; i + 3 < b.length; i++) {
     if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
@@ -1316,12 +1385,13 @@ function indexOfCrlfCrlf(b: Uint8Array): number {
   return -1;
 }
 
-/** Whether a decrypted handshake record carries a KeyUpdate message (type 24). */
-function containsKeyUpdate(content: Uint8Array): boolean {
+/** KeyUpdate messages (type 24) in a decrypted handshake record. */
+function countKeyUpdates(content: Uint8Array): number {
+  let n = 0;
   let i = 0;
   while (i + 4 <= content.length) {
-    if (content[i] === 24) return true;
+    if (content[i] === 24) n++;
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!);
   }
-  return false;
+  return n;
 }

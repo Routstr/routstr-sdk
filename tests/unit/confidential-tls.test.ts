@@ -205,6 +205,20 @@ describe("tls-fork certificate path validation (TLS-02)", () => {
     await expect(verify([leaf, inter], root)).rejects.toThrow(/serverAuth/);
   });
 
+  it("rejects a leaf whose keyUsage lacks digitalSignature (TLS-14)", async () => {
+    const leaf = await issue({
+      subject: `CN=${HOST}`,
+      issuer: inter,
+      san: [HOST],
+      keyUsage: keyCertSign,
+      eku: [SERVER_AUTH],
+    });
+    await expect(verify([leaf, inter], root)).rejects.toThrow(/digitalSignature/);
+    // without a keyUsage extension at all the leaf is accepted
+    const noKu = await issue({ subject: `CN=${HOST}`, issuer: inter, san: [HOST], eku: [SERVER_AUTH] });
+    await expect(verify([noKu, inter], root)).resolves.toBeUndefined();
+  });
+
   it("tries other issuer candidates when one fails", async () => {
     // two intermediates with the same name and key id; the first is not a CA
     const keys = (await crypto.subtle.generateKey(ALG, true, ["sign", "verify"])) as CryptoKeyPair;

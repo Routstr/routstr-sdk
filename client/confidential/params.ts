@@ -111,7 +111,7 @@ function checkSuffixWindow(
  */
 export function checkPiC3Params(
   params: unknown,
-  own: { session: SessionValues; serverRecords: Uint8Array[]; r: Uint8Array; skip: number },
+  own: { session: SessionValues; serverRecords: Uint8Array[]; r: Uint8Array; skip: number; trailing?: number },
 ): void {
   const p = (params as { PiC3?: Record<string, any> } | null)?.PiC3;
   if (!p) fail("π_C3", "missing");
@@ -129,6 +129,11 @@ function checkTailRecords(
     /** Server KeyUpdates we saw before the covered records (v2). */
     keyUpdates?: number;
     /**
+     * Records after the covered ones that carry no response bytes (KeyUpdates,
+     * a close_notify); absent: one close_notify-sized record may follow.
+     */
+    trailing?: number;
+    /**
      * Wire index (in `serverRecords`) of sequence 0 of the covered records'
      * key epoch; when given, every record's `seq` must be exactly its offset.
      */
@@ -140,10 +145,14 @@ function checkTailRecords(
   if ((p.key_updates ?? 0) !== (own.keyUpdates ?? 0)) fail(proof, "server key epoch differs from ours");
   const recs = p.records as { seq: number; ct: Bytes }[] | undefined;
   if (!Array.isArray(recs) || recs.length === 0) fail(proof, "no records");
-  // One trailing close_notify-sized record (2 + 1 + 16 bytes) may follow.
   let end = own.serverRecords.length;
-  const lastRec = own.serverRecords[end - 1];
-  if (lastRec && lastRec.length === 19 && recs[recs.length - 1]!.ct?.length !== 3) end -= 1;
+  if (own.trailing !== undefined) {
+    end -= own.trailing;
+  } else {
+    // One trailing close_notify-sized record (2 + 1 + 16 bytes) may follow.
+    const lastRec = own.serverRecords[end - 1];
+    if (lastRec && lastRec.length === 19 && recs[recs.length - 1]!.ct?.length !== 3) end -= 1;
+  }
   const first = Math.max(0, end - recs.length);
   const mine = own.serverRecords.slice(first, end);
   if (mine.length !== recs.length) fail(proof, "more records than we received");
@@ -205,12 +214,52 @@ export function checkPiC3SParams(
     skip: number;
     keyUpdates?: number;
     epochBase?: number;
+    trailing?: number;
   },
 ): void {
   const p = (params as { PiC3S?: Record<string, any> } | null)?.PiC3S;
   if (!p) fail("π_C3S", "missing");
   if (!eq(p.h2, own.h2)) fail("π_C3S", "anchor h2 is not the one from our 2PC");
   checkTailRecords("π_C3S", p, own);
+}
+
+/** A server record after the handshake, as our TLS client decrypted it. */
+export interface ServerPostRecord {
+  /** Application data (response bytes). */
+  data: boolean;
+  /** KeyUpdate messages it carries. */
+  keyUpdates: number;
+}
+
+/**
+ * Where the final `covered` application records sit among the server's
+ * post-handshake records: how many records after them carry no response bytes
+ * (KeyUpdates, a close_notify), and their key epoch: the KeyUpdates before
+ * them and the index of that epoch's first record. A KeyUpdate *after* the
+ * usage event is legal TLS and leaves the covered records' epoch alone.
+ */
+export function serverTailEpoch(
+  records: ServerPostRecord[],
+  covered: number,
+): { trailing: number; keyUpdates: number; epochStart: number } {
+  let end = records.length;
+  while (end > 0 && !records[end - 1]!.data) end--;
+  const first = end - covered;
+  if (covered <= 0 || first < 0) {
+    throw new SessionProtocolError("π_C3S: fewer server records than the disclosure covers");
+  }
+  if (records.slice(first, end).some((r) => !r.data)) {
+    throw new SessionProtocolError("π_C3S: the server changed keys inside the disclosed records");
+  }
+  let keyUpdates = 0;
+  let epochStart = 0;
+  for (let i = 0; i < first; i++) {
+    if (records[i]!.keyUpdates > 0) {
+      keyUpdates += records[i]!.keyUpdates;
+      epochStart = i + 1;
+    }
+  }
+  return { trailing: records.length - end, keyUpdates, epochStart };
 }
 
 /**
