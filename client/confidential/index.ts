@@ -45,13 +45,9 @@ export {
 } from "./canonical";
 
 export {
-  checkPiC1Params,
-  checkPiC2Params,
-  checkPiC3Params,
   checkPiNKParams,
   checkPiC2SParams,
   checkPiC3SParams,
-  type SessionValues,
 } from "./params";
 
 export {
@@ -74,7 +70,6 @@ export {
 export {
   canonicalSuffix,
   buildConfidentialBody,
-  checkPiNParams,
   parseHttpResponse,
   extractUsageDisclosure,
   usageEventFromDisclosure,
@@ -85,17 +80,9 @@ export {
   HOP_BY_HOP_HEADERS,
   type ParsedHttpResponse,
   type UpstreamUsageEvent,
-  type PiNParams,
 } from "./suffix";
 
-export {
-  epoch1Material,
-  concat,
-  hex,
-  fromHex,
-  sha256,
-  type Epoch1Material,
-} from "./advice";
+export { concat, hex, fromHex, sha256 } from "./advice";
 
 export {
   CuProverBackend,

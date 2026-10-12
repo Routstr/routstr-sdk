@@ -4,7 +4,8 @@
  * Covers offer signature verification (good/bad), npub pinning, protocol
  * version negotiation, trusted-host matching, canonical suffix bytes,
  * receipt verification and the confidential transport's body handling. Fixtures are a real
- * offer recorded from the local routstr-core node (branch `confidential-upstream`).
+ * v2 offer recorded from a production node (routstr-core branch `confidential-2pc`) and a
+ * real offer from an older node running the retired protocol v1 (refused).
  */
 
 import { describe, expect, it } from "vitest";
@@ -19,7 +20,6 @@ import {
 } from "../../client/confidential/canonical";
 import {
   canonicalSuffix,
-  checkPiNParams,
   effectiveModelFromText,
   extractUsageDisclosure,
   parseHttpResponse,
@@ -50,7 +50,6 @@ import {
   isConfidentialEndpoint,
   SseDoneHoldback,
 } from "../../client/confidential/transport";
-import { checkPiC2Params, checkPiC3Params } from "../../client/confidential/params";
 import { ReceiptVerificationError } from "../../client/confidential/errors";
 import { ConfidentialSession } from "../../client/confidential/session";
 import {
@@ -66,13 +65,15 @@ import {
   OfferPinMismatchError,
   OfferUnpinnedError,
   OfferUnsupportedVersionError,
-  SessionProtocolError,
   TrustedHostError,
 } from "../../client/confidential/errors";
 
 import offerFixture from "../fixtures/confidential/venice-offer.json";
+import offerFixtureV1 from "../fixtures/confidential/venice-offer-v1.json";
 
 const OFFER = offerFixture as unknown as Record<string, unknown>;
+/** A real offer from a node that still ran the retired protocol v1. */
+const OFFER_V1 = offerFixtureV1 as unknown as Record<string, unknown>;
 
 function makeKey() {
   const priv = new Uint8Array(32).fill(7);
@@ -84,9 +85,9 @@ function makeKey() {
 function signedOffer(overrides: Record<string, unknown> = {}) {
   const { priv, pubHex } = makeKey();
   const offer: Record<string, unknown> = {
-    v: 1,
-    min_v: 1,
-    max_v: 1,
+    v: 2,
+    min_v: 2,
+    max_v: 2,
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
@@ -190,7 +191,7 @@ describe("offer verification + pinning", () => {
       allowUnpinned: true,
       trustedHosts: ["*.venice.ai"],
     });
-    expect(verified.v).toBe(1);
+    expect(verified.v).toBe(2);
   });
 
   it("rejects a bad signature even when pinned", () => {
@@ -209,9 +210,40 @@ describe("offer verification + pinning", () => {
       OfferUnsupportedVersionError,
     );
     expect(supportedVersion({ v: 3, min_v: 3, max_v: 3 } as never)).toBe(false);
-    // v2 (two-party handshake) is supported alongside v1.
+    // Only v2 (two-party handshake) is supported; an offer must run v2.
     expect(supportedVersion({ v: 2, min_v: 2, max_v: 2 } as never)).toBe(true);
-    expect(supportedVersion({ v: 1, min_v: 1, max_v: 2 } as never)).toBe(true);
+    expect(supportedVersion({ v: 2, min_v: 1, max_v: 2 } as never)).toBe(true);
+    expect(supportedVersion({ v: 1, min_v: 1, max_v: 2 } as never)).toBe(false);
+  });
+
+  it("refuses a node that offers only the retired protocol v1", () => {
+    const { offer } = signedOffer({ v: 1, min_v: 1, max_v: 1 });
+    expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(/v1 is retired/);
+    expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(
+      OfferUnsupportedVersionError,
+    );
+    // A real (correctly signed) offer recorded from a v1 node.
+    expect(() =>
+      verifyConfidentialOffer(OFFER_V1, {
+        pinnedPubkey: OFFER_V1.notary_pubkey as string,
+        trustedHosts: ["*.venice.ai"],
+      }),
+    ).toThrow(OfferUnsupportedVersionError);
+  });
+
+  it("refuses to build a session for a v1 offer", () => {
+    expect(
+      () =>
+        new ConfidentialSession({
+          baseUrl: "http://127.0.0.1:8010",
+          offer: { v: 1, notary_pubkey: "00".repeat(32) },
+          auth: "sk-x",
+          model: "m",
+          maxTokens: 10,
+          bodyLength: 100,
+          prover: {},
+        } as never),
+    ).toThrow(/only v2/);
   });
 
   it("rejects an offer whose version lies outside its own min_v..max_v", () => {
@@ -316,62 +348,6 @@ describe("trusted hostname matcher", () => {
     expect(matchHostname("api.eu.example.com", "api.*.example.com")).toBe(true);
     expect(matchHostname("api.example.com", "api.*.example.com")).toBe(false);
     expect(matchHostname("foo.any", "foo.*")).toBe(true);
-  });
-});
-
-describe("π_N statement rebuild", () => {
-  it("accepts the statement the node would build for our body", () => {
-    const keyLen = 4;
-    const tpl = "POST /x HTTP/1.1\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n";
-    const filled = new TextEncoder().encode(
-      tpl.replace("{KEY:4}", "\u0000".repeat(keyLen)).replace("{LEN}", "10"),
-    );
-    const offs: number[] = [];
-    filled.forEach((b, i) => {
-      if (b === 0) offs.push(i);
-    });
-    const n = filled.length + 1;
-    const params = {
-      PiN: {
-        template: Array.from(filled),
-        key_len: keyLen,
-        key_offsets: offs,
-        head_len: filled.length,
-        header: [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff],
-        s: Array.from(new Uint8Array(filled.length + 1).fill(0xaa)),
-        key_alphabet: "[A-Za-z0-9_-]",
-      },
-    };
-    const s = new Uint8Array(filled.length + 1).fill(0xaa);
-    checkPiNParams(params, { offer: { head_template: tpl, key_length: keyLen, key_alphabet: "[A-Za-z0-9_-]" } }, s, 10);
-  });
-
-  it("rejects a statement with a different keystream", () => {
-    const tpl = "POST /x HTTP/1.1\r\nAuthorization: Bearer {KEY:4}\r\n\r\n";
-    const filled = new TextEncoder().encode(tpl.replace("{KEY:4}", "\u0000".repeat(4)));
-    const offs: number[] = [];
-    filled.forEach((b, i) => {
-      if (b === 0) offs.push(i);
-    });
-    const n = filled.length + 1;
-    const params = {
-      PiN: {
-        template: Array.from(filled),
-        key_len: 4,
-        key_offsets: offs,
-        head_len: filled.length,
-        header: [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff],
-        s: Array.from(new Uint8Array(filled.length + 1).fill(1)),
-      },
-    };
-    expect(() =>
-      checkPiNParams(
-        params,
-        { offer: { head_template: tpl, key_length: 4 } },
-        new Uint8Array(filled.length + 1).fill(2),
-        0,
-      ),
-    ).toThrow(SessionProtocolError);
   });
 });
 
@@ -840,75 +816,6 @@ describe("security regressions", () => {
     expect(() => checkAttestationBinding(att({ sha256_recv: "00".repeat(32) }), own)).toThrow(/upstream bytes/);
   });
 
-  describe("node-supplied proof parameters", () => {
-    const session = {
-      clientHs: new Uint8Array(32).fill(1),
-      serverHs: new Uint8Array(32).fill(2),
-      thSH: new Uint8Array(32).fill(3),
-      thSF: new Uint8Array(32).fill(4),
-    };
-    const sessionParams = {
-      client_hs: Array.from(session.clientHs),
-      server_hs: Array.from(session.serverHs),
-      th_sh: Array.from(session.thSH),
-      th_sf: Array.from(session.thSF),
-    };
-    const suffix = utf8ToBytes(',"model":"m","max_tokens":3}');
-    // Header + ciphertext (100 inner bytes) + 16-byte tag.
-    const record = new Uint8Array(5 + 100 + 16).map((_, i) => (i * 7) & 0xff);
-    const ctLen = 100;
-    const w = suffix.length + 14;
-    const honestC2 = {
-      PiC2: {
-        session: sessionParams,
-        seq: 2,
-        ct_window: Array.from(record.subarray(5 + ctLen - w, 5 + ctLen)),
-        off: ctLen - w,
-        w,
-        sel_start: w - 1 - suffix.length,
-        sel_len: suffix.length,
-        expected: Array.from(suffix),
-      },
-    };
-    const own = { session, seq: 2, record, suffix };
-
-    it("accepts a window over our own final record", () => {
-      expect(() => checkPiC2Params(honestC2, own)).not.toThrow();
-    });
-
-    it("rejects a window the node moved onto other plaintext", () => {
-      const moved = structuredClone(honestC2);
-      moved.PiC2.off = 0;
-      moved.PiC2.ct_window = Array.from(record.subarray(5, 5 + w));
-      expect(() => checkPiC2Params(moved, own)).toThrow(SessionProtocolError);
-      const earlier = structuredClone(honestC2);
-      earlier.PiC2.seq = 0;
-      expect(() => checkPiC2Params(earlier, own)).toThrow(SessionProtocolError);
-      const otherSession = structuredClone(honestC2);
-      otherSession.PiC2.session.th_sf = Array.from(new Uint8Array(32));
-      expect(() => checkPiC2Params(otherSession, own)).toThrow(SessionProtocolError);
-    });
-
-    it("π_C3 must cover exactly the final records we received", () => {
-      const recs = [new Uint8Array(60).fill(1), new Uint8Array(80).fill(2), new Uint8Array(70).fill(3)];
-      const r = new Uint8Array(40).fill(9);
-      const params = (records: { seq: number; ct: number[] }[], skip = 0) => ({
-        PiC3: { session: sessionParams, records, expected: Array.from(r), skip },
-      });
-      const tail = [
-        { seq: 1, ct: Array.from(recs[1]!.subarray(0, 64)) },
-        { seq: 2, ct: Array.from(recs[2]!.subarray(0, 54)) },
-      ];
-      const ownC3 = { session, serverRecords: recs, r, skip: 0 };
-      expect(() => checkPiC3Params(params(tail), ownC3)).not.toThrow();
-      // An earlier record (e.g. the request-bearing part of the stream).
-      expect(() =>
-        checkPiC3Params(params([{ seq: 0, ct: Array.from(recs[0]!.subarray(0, 44)) }]), ownC3),
-      ).toThrow(SessionProtocolError);
-      // A different skip than ours.
-      expect(() => checkPiC3Params(params(tail, 5), ownC3)).toThrow(SessionProtocolError);
-    });
-  });
 });
 
 describe("confidential session fee and surcharge in the offer", () => {
@@ -1030,8 +937,7 @@ describe("session construction guards", () => {
     delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
     try {
       expect(() => new ConfidentialSession(opts())).not.toThrow();
-      expect(() => new ConfidentialSession(opts({ insecureNoProofs: true }))).toThrow(/test hooks/);
-      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).toThrow(/test hooks/);
+      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).toThrow(/test hook/);
       process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = "1";
       expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).not.toThrow();
     } finally {
