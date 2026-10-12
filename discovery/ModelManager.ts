@@ -51,13 +51,20 @@ export const DEFAULT_NOSTR_RELAYS = [
   "wss://relay.routstr.com",
 ];
 
-/** Kind 38425 review labels that mark a provider node as OK to route to. */
-const POSITIVE_REVIEW_LABELS = new Set([
+/**
+ * Kind 38425 review labels that enable a provider node by default.
+ *
+ * `sandbox` and other experimental labels are deliberately NOT in this list:
+ * they are opt-in only (see `getUserEnabledReviewLabels`), so a
+ * sandbox-labelled node stays disabled until the user explicitly enables that
+ * label. Review labels are matched case-insensitively.
+ */
+export const DEFAULT_ENABLED_REVIEW_LABELS = [
   "trusted",
   "verified",
   "lgtm",
   "lgtm2",
-]);
+] as const;
 
 /** Kind 38425 review labels that mark a provider node as unsafe to route to. */
 const NEGATIVE_REVIEW_LABELS = new Set([
@@ -66,6 +73,56 @@ const NEGATIVE_REVIEW_LABELS = new Set([
   "blacklisted",
   "removed",
 ]);
+
+/** Review labels are compared case-insensitively and trimmed. */
+const normalizeReviewLabel = (label: string): string =>
+  label.trim().toLowerCase();
+
+/** Normalise, drop empties, and de-duplicate a review label list. */
+const normalizeReviewLabels = (labels: string[]): string[] => [
+  ...new Set(labels.map(normalizeReviewLabel).filter(Boolean)),
+];
+
+/**
+ * Latest label per reviewed node, mirroring the review sync: the newest
+ * `created_at` wins, tie-broken by event id, and a label applies to every
+ * `node` tag on its event. Several review events can cover one node (e.g. an
+ * `lgtm` later reversed to `avoid`), so the newest is authoritative.
+ */
+function latestReviewLabelsByNode(
+  events: NostrEvent[]
+): Map<string, string> {
+  const latestByNode = new Map<string, NostrEvent>();
+
+  for (const event of events) {
+    const label = event.tags
+      .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
+      ?.[1]?.toLowerCase();
+    if (!label) continue;
+
+    for (const tag of event.tags) {
+      if (tag[0] !== "node" || typeof tag[1] !== "string" || !tag[1]) continue;
+      const node = tag[1];
+      const previous = latestByNode.get(node);
+      if (
+        !previous ||
+        event.created_at > previous.created_at ||
+        (event.created_at === previous.created_at && event.id > previous.id)
+      ) {
+        latestByNode.set(node, event);
+      }
+    }
+  }
+
+  const labels = new Map<string, string>();
+  for (const [node, event] of latestByNode) {
+    const label = event.tags
+      .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
+      ?.[1]?.toLowerCase();
+    if (label) labels.set(node, label);
+  }
+  return labels;
+}
 
 // A hanging provider must not hold a fetch pass open indefinitely.
 const PROVIDER_FETCH_TIMEOUT_MS = 10_000;
@@ -133,6 +190,31 @@ export interface BootstrapOptions {
   onEventsFound?: (count: number) => void;
   /** Fires as each new provider base URL is discovered. */
   onProvider?: (baseUrl: string) => void;
+}
+
+/**
+ * Trusted provider/review index over the persisted discovery evidence:
+ * which node pubkeys advertise each provider URL, the stored kind-38425
+ * review events, and each node's latest review label.
+ */
+export interface ProviderReviewIndex {
+  /** Provider base URL -> set of kind-38421 node pubkeys advertising it. */
+  providerNodes: Map<string, Set<string>>;
+  /** Trusted kind-38425 review events from the store (one per reviewed
+   * address; kind 38425 is addressable and keyed by its `d` tag). */
+  reviewEvents: NostrEvent[];
+  /** Reviewed node pubkey -> latest review label (lowercased). */
+  latestLabelByNode: Map<string, string>;
+}
+
+/** Result of resolving review labels to provider base URLs. */
+export interface ReviewLabelMatch {
+  /** Provider base URLs whose latest review label matched a request. */
+  matchedUrls: string[];
+  /** Requested labels that matched at least one provider. */
+  matchedLabels: string[];
+  /** Requested labels that matched no provider. */
+  unmatchedLabels: string[];
 }
 
 /**
@@ -962,6 +1044,143 @@ export class ModelManager {
     return this.applyReviewDisables(baseUrls, providerNodes, reviewLabels);
   }
 
+  /**
+   * Review labels that enable a node by default (`lgtm` and friends).
+   * Exposed so callers never hardcode the default set.
+   */
+  getDefaultEnabledReviewLabels(): string[] {
+    return [...DEFAULT_ENABLED_REVIEW_LABELS];
+  }
+
+  /**
+   * Review labels the user opted into on top of the defaults (e.g. `sandbox`).
+   * Empty until configured: these labels do NOT enable a node by themselves.
+   */
+  getUserEnabledReviewLabels(): string[] {
+    return normalizeReviewLabels(
+      this.adapter.getUserEnabledReviewLabels?.() ?? []
+    );
+  }
+
+  /**
+   * Effective enable labels: {@link getDefaultEnabledReviewLabels} ∪
+   * {@link getUserEnabledReviewLabels}. A node is enabled by the review sync
+   * only when its latest label is in this set (and it is not negatively
+   * labelled).
+   */
+  getEnabledReviewLabels(): string[] {
+    return [
+      ...new Set([
+        ...this.getDefaultEnabledReviewLabels(),
+        ...this.getUserEnabledReviewLabels(),
+      ]),
+    ];
+  }
+
+  /**
+   * Replace the user-enabled review label set. Persisted by the adapter, so an
+   * opt-in such as `sandbox` survives restarts and applies to nodes discovered
+   * later. Returns the normalised, stored list.
+   */
+  setUserEnabledReviewLabels(labels: string[]): string[] {
+    if (!this.adapter.setUserEnabledReviewLabels) {
+      this.logger.warn(
+        "setUserEnabledReviewLabels: adapter does not support user-enabled review labels; ignoring"
+      );
+      return this.getUserEnabledReviewLabels();
+    }
+    const normalized = normalizeReviewLabels(labels);
+    this.adapter.setUserEnabledReviewLabels(normalized);
+    return normalized;
+  }
+
+  /**
+   * Opt a single review label (e.g. `sandbox`) in. Returns the resulting set.
+   */
+  addUserEnabledReviewLabel(label: string): string[] {
+    return this.setUserEnabledReviewLabels([
+      ...this.getUserEnabledReviewLabels(),
+      label,
+    ]);
+  }
+
+  /**
+   * Opt a single review label out. Returns the resulting set. Removing a
+   * default label here has no effect (defaults are always enabled).
+   */
+  removeUserEnabledReviewLabel(label: string): string[] {
+    const target = normalizeReviewLabel(label);
+    return this.setUserEnabledReviewLabels(
+      this.getUserEnabledReviewLabels().filter((entry) => entry !== target)
+    );
+  }
+
+  /**
+   * Provider/review index over the trusted store: provider URL -> advertising
+   * node pubkeys, the stored kind-38425 review events, and each node's latest
+   * label. Built from the same evidence (and trust gates) as the review sync,
+   * so callers do not re-derive provider/review parsing.
+   */
+  async getProviderReviewIndex(
+    forceRefresh: boolean = false
+  ): Promise<ProviderReviewIndex> {
+    const providerNodes = await this.rebuildProviderNodesFromStore(forceRefresh);
+    this.providerNodePubkeysByUrl = providerNodes;
+    const reviewEvents = await this.getNostrEvents(
+      { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
+      forceRefresh
+    );
+    return {
+      providerNodes,
+      reviewEvents,
+      latestLabelByNode: latestReviewLabelsByNode(reviewEvents),
+    };
+  }
+
+  /**
+   * Resolve review labels (e.g. `sandbox`) to the provider base URLs whose
+   * latest review carries them, using the same trusted index as the review
+   * sync. Reports labels that matched nothing so a CLI can warn about typos.
+   */
+  async matchProviderUrlsByLabels(
+    labels: string[],
+    baseUrls: string[] = this.adapter.getBaseUrlsList(),
+    forceRefresh: boolean = false
+  ): Promise<ReviewLabelMatch> {
+    const { providerNodes, latestLabelByNode } =
+      await this.getProviderReviewIndex(forceRefresh);
+
+    const matchedUrls: string[] = [];
+    const matchedLabels: string[] = [];
+    const unmatchedLabels: string[] = [];
+
+    for (const rawLabel of labels) {
+      const label = normalizeReviewLabel(rawLabel);
+      if (!label) continue;
+
+      let labelMatched = false;
+      for (const baseUrl of baseUrls) {
+        const nodePubkeys = providerNodes.get(this.normalizeUrl(baseUrl));
+        if (!nodePubkeys) continue;
+        const hit = Array.from(nodePubkeys).some(
+          (pubkey) => latestLabelByNode.get(pubkey) === label
+        );
+        if (hit) {
+          labelMatched = true;
+          if (!matchedUrls.includes(baseUrl)) matchedUrls.push(baseUrl);
+        }
+      }
+
+      if (labelMatched) {
+        if (!matchedLabels.includes(label)) matchedLabels.push(label);
+      } else if (!unmatchedLabels.includes(label)) {
+        unmatchedLabels.push(label);
+      }
+    }
+
+    return { matchedUrls, matchedLabels, unmatchedLabels };
+  }
+
   // Restore provider identities even when a warm URL cache skipped discovery.
   private async rebuildProviderNodesFromStore(forceRefresh: boolean): Promise<
     Map<string, Set<string>>
@@ -1025,45 +1244,19 @@ export class ModelManager {
   private async fetchReviewLabels(
     forceRefresh: boolean = false
   ): Promise<Map<string, string>> {
-    const latestByNode = new Map<string, NostrEvent>();
-
-    const collectFromEvent = (event: NostrEvent) => {
-      const label = event.tags
-        .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
-        ?.[1]?.toLowerCase();
-
-      if (!label) return;
-
-      // Apply the label to every "node" tag, not just the first.
-      for (const tag of event.tags) {
-        if (tag[0] !== "node" || typeof tag[1] !== "string" || !tag[1])
-          continue;
-        const node = tag[1];
-        const previous = latestByNode.get(node);
-        if (
-          !previous ||
-          event.created_at > previous.created_at ||
-          (event.created_at === previous.created_at && event.id > previous.id)
-        ) {
-          latestByNode.set(node, event);
-        }
-      }
-    };
-
     const events = await this.getNostrEvents(
       { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
       forceRefresh
     );
-    for (const event of events) collectFromEvent(event);
+    return latestReviewLabelsByNode(events);
+  }
 
-    const labels = new Map<string, string>();
-    for (const [node, event] of latestByNode) {
-      const label = event.tags
-        .find((tag) => tag[0] === "t" && typeof tag[1] === "string" && tag[1])
-        ?.[1]?.toLowerCase();
-      if (label) labels.set(node, label);
-    }
-    return labels;
+  /**
+   * Latest review label per reviewed node pubkey. Public read-only view of the
+   * review evidence the enable/disable policy is computed from.
+   */
+  async getReviewLabels(forceRefresh: boolean = false): Promise<Map<string, string>> {
+    return this.fetchReviewLabels(forceRefresh);
   }
 
   /**
@@ -1109,8 +1302,13 @@ export class ModelManager {
       )
     );
 
+    // Defaults (lgtm and friends) plus any labels the user opted into (e.g.
+    // `sandbox`). A label outside this set — including `sandbox` by default —
+    // is treated as unreviewed and leaves the node disabled.
+    const enabledLabels = new Set(this.getEnabledReviewLabels());
+
     const isPositive = (label: string | undefined) =>
-      !!label && POSITIVE_REVIEW_LABELS.has(label);
+      !!label && enabledLabels.has(label);
     const isNegative = (label: string | undefined) =>
       !!label && NEGATIVE_REVIEW_LABELS.has(label);
 
