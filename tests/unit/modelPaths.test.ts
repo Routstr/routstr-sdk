@@ -3,6 +3,7 @@ import {
   MODEL_PATH_HEADER,
   DEEPSEEK_MODEL_PATH_WHITELIST,
   canonicalModelPath,
+  selectorModelId,
   deepSeekModelPath,
   deepSeekModelPathHeaders,
   isWhitelistedDeepSeekModelPath,
@@ -204,5 +205,29 @@ describe("DeepSeek model path whitelist", () => {
     ).toEqual({
       [MODEL_PATH_HEADER]: OPENROUTER_FIREWORKS_SELECTOR,
     });
+  });
+});
+
+describe("selectorModelId", () => {
+  it("returns the selector's model-id spelling, including variant spellings", () => {
+    // The direct Venice route is advertised only under the dash spelling.
+    // The request body must carry exactly this id when the route is pinned,
+    // or the node rejects the pair with 400 invalid_request.
+    expect(selectorModelId(VENICE_DIRECT_SELECTOR)).toBe("deepseek-v4-1-flash");
+    expect(selectorModelId(OPENROUTER_DEEPSEEK_SELECTOR)).toBe(
+      "deepseek-v4.1-flash"
+    );
+    // Endpoint tags and legacy provider-id parameters do not disturb it.
+    expect(
+      selectorModelId(
+        "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&provider-id=1&model-id=deepseek-v4-1-flash"
+      )
+    ).toBe("deepseek-v4-1-flash");
+  });
+
+  it("returns null for malformed selectors", () => {
+    expect(selectorModelId("")).toBeNull();
+    expect(selectorModelId("url=https%3A%2F%2Fapi.ppq.ai")).toBeNull();
+    expect(selectorModelId("model-id=deepseek-v4.1-flash")).toBeNull();
   });
 });

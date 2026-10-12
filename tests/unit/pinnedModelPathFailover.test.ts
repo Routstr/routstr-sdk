@@ -270,6 +270,57 @@ describe("RoutstrClient pinned model-path failover", () => {
     ).toBe(NEXT_SELECTOR);
   });
 
+  it("rewrites the retry body's model to the next node's selector spelling", async () => {
+    // A node may advertise a route only under a variant spelling: the direct
+    // Venice route exists solely as model-id=deepseek-v4-1-flash on
+    // ai.redsh1ft.com while its catalog lists deepseek-v4.1-flash. The node
+    // validates the pair byte for byte (400 invalid_request: "x-routstr-model-path
+    // selects model 'deepseek-v4-1-flash' but the request asks for
+    // 'deepseek-v4.1-flash'"), so the failover retry must carry the selector's
+    // spelling in its body, not the failed hop's.
+    const NEXT_SELECTOR =
+      "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash";
+    const client = makeClient();
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelPathProviderRanking"
+    ).mockResolvedValue([
+      {
+        baseUrl: "https://ai.redsh1ft.com/",
+        selectors: [NEXT_SELECTOR],
+        satsPricing: [null],
+        model: makeModel(),
+      },
+    ]);
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 100,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    const makeRequest = vi
+      .spyOn(client as any, "_makeRequest")
+      .mockResolvedValue(new Response("ok"));
+
+    await (client as any)._handleErrorResponse(
+      {
+        ...errorParams({ "x-routstr-model-path": SELECTOR }),
+        body: { messages: [], model: "deepseek-v4.1-flash" },
+        autoModelPath: { selector: SELECTOR },
+      },
+      TOKEN,
+      404,
+      "req-1",
+      undefined,
+      INVALID_MODEL_PATH_BODY
+    );
+
+    const retry = makeRequest.mock.calls[0][0];
+    expect(retry.body.model).toBe("deepseek-v4-1-flash");
+    expect(retry.baseHeaders["x-routstr-model-path"]).toBe(NEXT_SELECTOR);
+  });
+
   it("surfaces the error when an auto-pinned request has no model-path node left", async () => {
     const client = makeClient();
     vi.spyOn(
@@ -379,6 +430,70 @@ describe("RoutstrClient pinned model-path failover", () => {
         "x-routstr-model-path"
       )
     ).toBe(NEXT_SELECTOR);
+  });
+
+  it("aligns the outbound body's model with the pinned selector's spelling", async () => {
+    // Regression: a pinned route may be advertised under a different spelling
+    // than the catalog entry selection found (the direct Venice route exists
+    // only as deepseek-v4-1-flash while the catalog lists deepseek-v4.1-flash).
+    // The node rejects a disagreeing pair with 400 invalid_request, so the
+    // outbound body must carry the selector's model-id, not selectedModel.id.
+    const client = makeClient();
+    (client as any).walletAdapter.getBalances = async () => ({
+      [MINT_URL]: 500,
+    });
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "cashu_fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 500,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(
+      client as any,
+      "_handlePostResponseBalanceUpdate"
+    ).mockResolvedValue(0);
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelForProvider"
+    ).mockResolvedValue(makeModel());
+
+    const bodies: Array<{ model: unknown; selector: string | null }> = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/chat/completions")) {
+        bodies.push({
+          model: (init?.body ? JSON.parse(String(init.body)) : {}).model,
+          selector:
+            new Headers(init?.headers).get("x-routstr-model-path") ?? null,
+        });
+      }
+      return new Response("ok");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { messages: [], model: "deepseek-v4.1-flash" },
+      headers: {
+        "x-routstr-model-path":
+          "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash",
+      },
+      baseUrl: BASE_URL,
+      mintUrl: MINT_URL,
+      modelId: "deepseek-v4.1-flash",
+    });
+
+    expect(response.status).toBe(200);
+    expect(bodies.length).toBe(1);
+    // The body names the model exactly as the pinned selector does; the
+    // canonical catalog spelling never reaches the upstream.
+    expect(bodies[0]).toEqual({
+      model: "deepseek-v4-1-flash",
+      selector:
+        "url=https%3A%2F%2Fapi.venice.ai%2Fapi%2Fv1&model-id=deepseek-v4-1-flash",
+    });
   });
 
   it("walks the node-major chain and never retries a candidate that failed", async () => {

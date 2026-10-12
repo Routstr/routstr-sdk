@@ -309,6 +309,18 @@ export function deepSeekModelPath(
 }
 
 /**
+ * The model id a selector names, or null when the selector is malformed.
+ * The node validates the request body's model against this id byte for byte:
+ * a selector advertised under a variant spelling (deepseek-v4-1-flash) paired
+ * with a body asking for the canonical one (deepseek-v4.1-flash) is rejected
+ * with 400 invalid_request even though both name the same model, so a pinned
+ * request must carry exactly this spelling in its body.
+ */
+export function selectorModelId(selector: string): string | null {
+  return parseSelector(selector)?.["model-id"] ?? null;
+}
+
+/**
  * Canonical identity of an x-routstr-model-path selector: the stable parts
  * (url, model-id, endpoint tag) re-encoded in fixed order. Two selectors
  * naming the same route — e.g. legacy ones carrying different provider-id
