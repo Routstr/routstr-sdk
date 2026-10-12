@@ -1,32 +1,18 @@
 /**
- * Client-side checks of the proof parameters the node sends for π_C1, π_C2
- * and π_C3 (protocol v1), and π_NK, π_C2S and π_C3S (protocol v2).
+ * Client-side checks of the proof parameters the node sends for π_NK, π_C2S
+ * and π_C3S (protocol v2; protocol v1 and its π_C1/π_C2/π_C3 are retired).
  *
  * The client is the prover and the node chooses the public parameters, so the
  * client only proves statements about data it already agreed to disclose: its
- * own record material (π_C1), its own final body record carrying the pinned
- * suffix (π_C2), and the final server records covering its own disclosure
- * (π_C3). The circuits reveal only an equality bit; these checks make sure the
- * node cannot point even that bit at other plaintext.
+ * own final body record carrying the pinned suffix (π_C2S), and the final
+ * server records covering its own disclosure (π_C3S). The circuits reveal
+ * only an equality bit; these checks make sure the node cannot point even
+ * that bit at other plaintext.
  */
 
 import { SessionProtocolError } from "./errors";
 
-export interface SessionValues {
-  clientHs: Uint8Array;
-  serverHs: Uint8Array;
-  thSH: Uint8Array;
-  thSF: Uint8Array;
-}
-
 type Bytes = ArrayLike<number>;
-
-interface SessionParams {
-  client_hs: Bytes;
-  server_hs: Bytes;
-  th_sh: Bytes;
-  th_sf: Bytes;
-}
 
 function eq(a: Bytes | undefined, b: Bytes): boolean {
   if (!a || a.length !== b.length) return false;
@@ -36,45 +22,6 @@ function eq(a: Bytes | undefined, b: Bytes): boolean {
 
 function fail(proof: string, what: string): never {
   throw new SessionProtocolError(`${proof}: node-supplied parameters rejected (${what})`);
-}
-
-function checkSession(proof: string, s: SessionParams | undefined, own: SessionValues): void {
-  if (
-    !s ||
-    !eq(s.client_hs, own.clientHs) ||
-    !eq(s.server_hs, own.serverHs) ||
-    !eq(s.th_sh, own.thSH) ||
-    !eq(s.th_sf, own.thSF)
-  ) {
-    fail(proof, "session values differ from our handshake");
-  }
-}
-
-/** π_C1: exactly the record material we sent in `c1_material`. */
-export function checkPiC1Params(
-  params: unknown,
-  own: { session: SessionValues; headLen: number; s: Uint8Array; h1: Uint8Array; t0: Uint8Array },
-): void {
-  const p = (params as { PiC1?: Record<string, any> } | null)?.PiC1;
-  if (!p) fail("π_C1", "missing");
-  checkSession("π_C1", p.session, own.session);
-  if (p.head_len !== own.headLen || !eq(p.s, own.s) || !eq(p.h1, own.h1) || !eq(p.t0, own.t0)) {
-    fail("π_C1", "material differs from ours");
-  }
-}
-
-/**
- * π_C2: a window over *our* final body record (`record` = header + payload,
- * as we wrote it), ending at the inner content-type byte, equal to our suffix.
- */
-export function checkPiC2Params(
-  params: unknown,
-  own: { session: SessionValues; seq: number; record: Uint8Array; suffix: Uint8Array },
-): void {
-  const p = (params as { PiC2?: Record<string, any> } | null)?.PiC2;
-  if (!p) fail("π_C2", "missing");
-  checkSession("π_C2", p.session, own.session);
-  checkSuffixWindow("π_C2", p, own);
 }
 
 function checkSuffixWindow(
@@ -98,25 +45,6 @@ function checkSuffixWindow(
   }
   if (!eq(p.ct_window, payload.subarray(off, off + w))) fail(proof, "ciphertext is not ours");
   if (!eq(p.expected, want)) fail(proof, "expected bytes are not our suffix");
-}
-
-/**
- * π_C3: the final server application records, exactly as we received them,
- * covering our disclosure `r` followed by `skip` undisclosed bytes.
- *
- * `serverRecords` are the payloads (ciphertext + tag) of every server
- * application-data record in arrival order. Records are matched from the end
- * of the transcript by content; a wrong `seq` would only make the in-circuit
- * decryption fail, never decrypt anything else.
- */
-export function checkPiC3Params(
-  params: unknown,
-  own: { session: SessionValues; serverRecords: Uint8Array[]; r: Uint8Array; skip: number; trailing?: number },
-): void {
-  const p = (params as { PiC3?: Record<string, any> } | null)?.PiC3;
-  if (!p) fail("π_C3", "missing");
-  checkSession("π_C3", p.session, own.session);
-  checkTailRecords("π_C3", p, own);
 }
 
 function checkTailRecords(
@@ -189,8 +117,7 @@ function checkTailRecords(
 // ---------------------------------------------------------------------------
 // Protocol v2 (two-party handshake, docs/TWOPC-DESIGN.md). The proofs anchor
 // on public hashes of the secrets our 2PC output gave us (h1 = SHA256(c_ap_1),
-// h2 = SHA256(s_ap_0), hk = SHA256(K_0 ‖ IV_0)) instead of handshake values;
-// the windows are checked exactly as in v1.
+// h2 = SHA256(s_ap_0), hk = SHA256(K_0 ‖ IV_0)).
 // ---------------------------------------------------------------------------
 
 /** π_C2S: the end of our own final epoch-1 body record, anchored on our h1. */

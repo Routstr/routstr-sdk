@@ -11,6 +11,10 @@ directly to the compiled `lib/` files and marked in-source with `// FORK PATCH`.
 
 ## Protocol hooks (six, all in `lib/make-tls-client.js`)
 
+> Hooks 1–4 and 6 served the retired protocol v1 (the client ran the handshake
+> alone). The SDK no longer calls them; they stay in the vendored `lib/`
+> unused. Only the v2 hook below and the TLS-xx checks are in use.
+
 1. **Export the TLS 1.3 handshake traffic secrets.**
    `let handshakeSecrets` captures the `secretType: 'hs'` key set in
    `processServerPubKey`; a new `getHandshakeSecrets()` returns it (`masterSecret`
@@ -49,7 +53,7 @@ Marked `// FORK PATCH (v2)` (`lib/make-tls-client.js`, `lib/utils/client-hello.j
 types in `lib/types/tls.d.ts`, `lib/make-tls-client.d.ts`, `lib/utils/client-hello.d.ts`).
 Mirrored byte for byte from the reference client (`crypto/client/vendor/tls`).
 Opt-in via the `external` option; without it the client behaves exactly as
-before (protocol v1). Used by `session.ts` for v2 offers (docs/TWOPC-DESIGN.md).
+before. `session.ts` always uses it (protocol v2, docs/TWOPC-DESIGN.md).
 
 ```ts
 external: {
@@ -125,7 +129,7 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
 - **TLS-08, KeyUpdate** (`make-tls-client.js`). A received KeyUpdate is
   accepted only after the TLS 1.3 handshake, with a 1-byte body of 0 or 1.
   `update_requested` (1) is a protocol error that ends the client. There is no
-  automatic response, because the client's epoch accounting (KU0/KU1) is fixed
+  automatic response, because the session's key epochs are fixed
   by the protocol. With 0, the server keys rotate as before.
 - **TLS-09, AIA** (`verifyCertificateChain`). Issuer certificates are fetched
   from AIA only when the caller passes `fetchCertificateBytes`. By default,
