@@ -559,6 +559,32 @@ import {
   parseHttpResponse as parseHttp,
 } from "../../client/confidential/suffix";
 
+describe("usage disclosure window", () => {
+  const usage = '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2},"model":"m"}';
+  const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+  const chunk = (d: string) => `${Buffer.byteLength(d).toString(16)}\r\n${d}\r\n`;
+
+  it("starts at the usage event's line when the stream ends in one large chunk", () => {
+    const events = Array.from({ length: 400 }, (_, i) => `data: {"choices":[{"delta":{"content":"tok${i}"}}]}\n\n`).join("");
+    const big = chunk(`${events}data: ${usage}\n\ndata: [DONE]\n\n`);
+    const resp = new TextEncoder().encode(`${head}${chunk("data: {}\n\n")}${big}0\r\n\r\n`);
+    const r = extractUsageDisclosure(resp)!;
+    const text = new TextDecoder().decode(r);
+    expect(text.startsWith(`\ndata: ${usage}`)).toBe(true);
+    expect(r.length).toBeLessThan(200);
+    expect(usageEventFromDisclosure(r)?.usage.completion_tokens).toBe(2);
+  });
+
+  it("still uses a chunk boundary when the usage event starts its own chunk", () => {
+    const resp = new TextEncoder().encode(
+      `${head}${chunk("data: {}\n\n")}${chunk(`data: ${usage}\n\n`)}${chunk("data: [DONE]\n\n")}0\r\n\r\n`,
+    );
+    const r = extractUsageDisclosure(resp)!;
+    expect(usageEventFromDisclosure(r)?.model).toBe("m");
+    expect(r.length).toBeLessThan(140);
+  });
+});
+
 describe("HTTP response decoding", () => {
   const enc = (s: string) => new TextEncoder().encode(s);
   const dec = (parts: Uint8Array[]) => parts.map((p) => new TextDecoder().decode(p)).join("");
