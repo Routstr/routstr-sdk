@@ -12,6 +12,8 @@ export interface SdkStorageState {
   disabledProviders: string[];
   manuallyDisabledProviders: string[];
   manuallyEnabledProviders: string[];
+  /** Review labels the user opted into on top of the SDK defaults (e.g. `sandbox`). */
+  userEnabledReviewLabels: string[];
   mintsFromAllProviders: Record<string, string[]>;
   infoFromAllProviders: Record<string, import("../core").ProviderInfo>;
   lastModelsUpdate: Record<string, number>;

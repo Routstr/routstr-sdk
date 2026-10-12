@@ -6,6 +6,7 @@ export const SDK_STORAGE_KEYS = {
   DISABLED_PROVIDERS: "disabled_providers",
   MANUALLY_DISABLED_PROVIDERS: "manually_disabled_providers",
   MANUALLY_ENABLED_PROVIDERS: "manually_enabled_providers",
+  USER_ENABLED_REVIEW_LABELS: "user_enabled_review_labels",
   MINTS_FROM_ALL_PROVIDERS: "mints_from_all_providers",
   INFO_FROM_ALL_PROVIDERS: "info_from_all_providers",
   LAST_MODELS_UPDATE: "lastModelsUpdate",

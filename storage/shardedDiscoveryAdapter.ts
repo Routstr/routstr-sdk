@@ -112,6 +112,7 @@ export const createShardedDiscoveryAdapter = async (
     rawDisabled,
     rawManuallyDisabled,
     rawManuallyEnabled,
+    rawUserEnabledReviewLabels,
     rawBaseUrls,
     lastBaseUrlsUpdate,
     rawModelIdMappingsEvent,
@@ -135,6 +136,7 @@ export const createShardedDiscoveryAdapter = async (
     driver.getItem<string[]>(SDK_STORAGE_KEYS.DISABLED_PROVIDERS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_DISABLED_PROVIDERS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.MANUALLY_ENABLED_PROVIDERS, []),
+    driver.getItem<string[]>(SDK_STORAGE_KEYS.USER_ENABLED_REVIEW_LABELS, []),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.BASE_URLS_LIST, []),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_BASE_URLS_UPDATE, null),
     driver.getItem<import("applesauce-core/helpers").NostrEvent | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, null),
@@ -228,6 +230,11 @@ export const createShardedDiscoveryAdapter = async (
   let _disabledProviders: string[] = rawDisabled.map(normalizeBaseUrl);
   let _manuallyDisabledProviders: string[] = rawManuallyDisabled.map(normalizeBaseUrl);
   let _manuallyEnabledProviders: string[] = rawManuallyEnabled.map(normalizeBaseUrl);
+  let _userEnabledReviewLabels: string[] = [
+    ...new Set(
+      rawUserEnabledReviewLabels.map((label) => label.trim().toLowerCase()).filter(Boolean)
+    ),
+  ];
   let _baseUrlsList: string[] = rawBaseUrls.map(normalizeBaseUrl);
   let _lastBaseUrlsUpdate: number | null = lastBaseUrlsUpdate;
   let _modelIdMappingsEvent = rawModelIdMappingsEvent;
@@ -372,6 +379,18 @@ export const createShardedDiscoveryAdapter = async (
       const normalized = urls.map(normalizeBaseUrl);
       _manuallyEnabledProviders = normalized;
       void driver.setItem(SDK_STORAGE_KEYS.MANUALLY_ENABLED_PROVIDERS, normalized);
+    },
+
+    // -- User-enabled review labels (kv) --
+
+    getUserEnabledReviewLabels: () => _userEnabledReviewLabels,
+
+    setUserEnabledReviewLabels: (labels: string[]) => {
+      const normalized = [
+        ...new Set(labels.map((label) => label.trim().toLowerCase()).filter(Boolean)),
+      ];
+      _userEnabledReviewLabels = normalized;
+      void driver.setItem(SDK_STORAGE_KEYS.USER_ENABLED_REVIEW_LABELS, normalized);
     },
 
     // -- Base URLs (kv) --

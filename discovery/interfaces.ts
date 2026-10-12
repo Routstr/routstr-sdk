@@ -118,6 +118,20 @@ export interface DiscoveryAdapter {
   setManuallyEnabledProviders?(urls: string[]): void;
 
   /**
+   * Get the review labels the user opted into on top of the SDK defaults
+   * (e.g. `sandbox`). Empty when no extra labels are enabled.
+   * @returns Array of review labels (lowercased)
+   */
+  getUserEnabledReviewLabels?(): string[];
+
+  /**
+   * Save the user-enabled review label set. These labels enable a provider
+   * node in the review sync, on top of the default enabled labels.
+   * @param labels Array of review labels
+   */
+  setUserEnabledReviewLabels?(labels: string[]): void;
+
+  /**
    * Get list of configured provider base URLs
    * @returns Array of provider base URLs
    */
