@@ -24,8 +24,13 @@ import { verifyCertificateChain } from "../../client/confidential/tls-fork/lib/u
 import { loadX509FromDer } from "../../client/confidential/tls-fork/lib/utils/x509.js";
 import {
   areUint8ArraysEqualConstantTime,
+  concatenateUint8Arrays,
   generateIV,
 } from "../../client/confidential/tls-fork/lib/utils/generics.js";
+import { deriveTrafficKeysForSide } from "../../client/confidential/tls-fork/lib/utils/decryption-utils.js";
+import { encryptWrappedRecord } from "../../client/confidential/tls-fork/lib/utils/wrapped-record.js";
+import { packFinishMessagePacket } from "../../client/confidential/tls-fork/lib/utils/finish-messages.js";
+import { getSignatureDataTls13 } from "../../client/confidential/tls-fork/lib/utils/parse-certificate.js";
 
 setCryptoImplementation(webcryptoCrypto);
 x509.cryptoProvider.set(globalThis.crypto);
@@ -388,5 +393,287 @@ describe("tls-fork ServerHello checks (TLS-01, TLS-07, TLS-10)", () => {
     await expect(
       client.handleReceivedBytes(new Uint8Array([0x17, 0x03, 0x03, ...u16(garbage.length), ...garbage])),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server flight order and CertificateVerify (TLS-11), record padding (TLS-12)
+//
+// A fake TLS 1.3 server drives the client in its v2 "external" mode, where the
+// handshake traffic secrets are injected (as the 2PC does), so the test picks
+// them and can encrypt the server flight itself. Before TLS-11 a flight of
+// EncryptedExtensions, Certificate, Finished (no CertificateVerify) completed
+// the handshake: whoever knew the ECDHE secret could impersonate the provider.
+
+const SUITE = "TLS_AES_128_GCM_SHA256";
+
+function hsMsg(type: number, body: number[] | Uint8Array): Uint8Array {
+  const b = Array.from(body);
+  return new Uint8Array([type, ...u24(b.length), ...b]);
+}
+
+async function p256Point(): Promise<Uint8Array> {
+  const kp = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  return new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+}
+
+/** ECDSA r‖s (WebCrypto) → DER ECDSA-Sig-Value, as TLS carries it. */
+function derEcdsaSig(raw: Uint8Array): Uint8Array {
+  const int = (b: Uint8Array) => {
+    let i = 0;
+    while (i < b.length - 1 && b[i] === 0) i++;
+    let v = Array.from(b.slice(i));
+    if (v[0] & 0x80) v = [0, ...v];
+    return [0x02, v.length, ...v];
+  };
+  const body = [...int(raw.slice(0, 32)), ...int(raw.slice(32))];
+  return new Uint8Array([0x30, body.length, ...body]);
+}
+
+/** The server side of one handshake: builds and seals the flight under s_hs. */
+class FakeServer {
+  transcript: Uint8Array[] = [];
+  private seq = 0;
+  constructor(
+    private readonly sHs: Uint8Array,
+    clientHello: Uint8Array,
+  ) {
+    this.transcript.push(clientHello);
+  }
+
+  async serverHello(): Promise<Uint8Array> {
+    const exts = [
+      ...ext(0x002b, [0x03, 0x04]),
+      ...ext(0x0033, [0x00, 0x17, ...u16(65), ...Array.from(await p256Point())]),
+    ];
+    const body = [
+      0x03, 0x03,
+      ...Array.from(crypto.getRandomValues(new Uint8Array(32))),
+      0x00,
+      ...u16(0x1301),
+      0x00,
+      ...u16(exts.length),
+      ...exts,
+    ];
+    const msg = hsMsg(0x02, body);
+    this.transcript.push(msg);
+    return new Uint8Array([0x16, 0x03, 0x03, ...u16(msg.length), ...msg]);
+  }
+
+  encryptedExtensions(): Uint8Array {
+    const msg = hsMsg(0x08, [0x00, 0x00]);
+    this.transcript.push(msg);
+    return msg;
+  }
+
+  certificate(chain: Issued[]): Uint8Array {
+    const list: number[] = [];
+    for (const c of chain) {
+      const der = new Uint8Array(c.cert.rawData);
+      list.push(...u24(der.length), ...Array.from(der), 0x00, 0x00);
+    }
+    const msg = hsMsg(0x0b, [0x00, ...u24(list.length), ...list]);
+    this.transcript.push(msg);
+    return msg;
+  }
+
+  async certificateVerify(signer: Issued): Promise<Uint8Array> {
+    const data = await getSignatureDataTls13(this.transcript, SUITE);
+    const raw = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signer.keys.privateKey, data),
+    );
+    const sig = derEcdsaSig(raw);
+    const msg = hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...Array.from(sig)]);
+    this.transcript.push(msg);
+    return msg;
+  }
+
+  async finished(): Promise<Uint8Array> {
+    const msg = (await packFinishMessagePacket({
+      secret: this.sHs,
+      handshakeMessages: this.transcript,
+      cipherSuite: SUITE,
+    })) as Uint8Array;
+    this.transcript.push(msg);
+    return msg;
+  }
+
+  /** One encrypted handshake record; `padding` zero bytes after the type. */
+  async seal(msg: Uint8Array, padding = 0): Promise<Uint8Array> {
+    const { encKey, iv } = await deriveTrafficKeysForSide(this.sHs, SUITE);
+    const plaintext = concatenateUint8Arrays([msg, new Uint8Array([0x16]), new Uint8Array(padding)]);
+    const { ciphertext } = (await encryptWrappedRecord(plaintext, {
+      key: encKey,
+      iv,
+      recordNumber: this.seq++,
+      cipherSuite: SUITE,
+      version: "TLS1_3",
+      recordHeaderOpts: { type: "WRAPPED_RECORD", version: "TLS1_2" },
+    } as never)) as { ciphertext: Uint8Array };
+    return new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext]);
+  }
+}
+
+async function externalClient(root: Issued) {
+  const written: Uint8Array[] = [];
+  const ended: unknown[] = [];
+  let handshakes = 0;
+  const cHs = crypto.getRandomValues(new Uint8Array(32));
+  const sHs = crypto.getRandomValues(new Uint8Array(32));
+  const client = makeTLSClient({
+    host: HOST,
+    rootCAs: [load(root)],
+    cipherSuites: [SUITE],
+    supportedProtocolVersions: ["TLS1_3"],
+    namedCurves: ["SECP256R1"],
+    applicationLayerProtocols: ["http/1.1"],
+    logger: quiet,
+    write: async ({ content }: { content: Uint8Array }) => {
+      written.push(content);
+    },
+    onHandshake: () => {
+      handshakes++;
+    },
+    onTlsEnd: (err?: Error) => {
+      ended.push(err);
+    },
+    external: {
+      keyShare: await p256Point(),
+      onServerHello: async () => ({ clientHs: cHs, serverHs: sHs }),
+      onServerFinished: async () => ({
+        serverAp0: crypto.getRandomValues(new Uint8Array(32)),
+        clientAp1: crypto.getRandomValues(new Uint8Array(32)),
+      }),
+    },
+  } as never);
+  await client.startHandshake();
+  const server = new FakeServer(sHs, written[0]);
+  await client.handleReceivedBytes(await server.serverHello());
+  return {
+    client,
+    server,
+    ended,
+    handshakes: () => handshakes,
+  };
+}
+
+describe("tls-fork server flight (TLS-11, TLS-12)", () => {
+  let root: Issued;
+  let leaf: Issued;
+  let attacker: Issued;
+
+  beforeAll(async () => {
+    root = await issue({ subject: "CN=Test Root", ca: true, keyUsage: keyCertSign | cRLSign });
+    leaf = await issue({
+      subject: `CN=${HOST}`,
+      issuer: root,
+      ca: false,
+      keyUsage: digitalSignature,
+      eku: [SERVER_AUTH],
+      san: [HOST],
+    });
+    // Anyone's own certificate for the host: a valid key, no trust path.
+    attacker = await issue({
+      subject: `CN=${HOST}`,
+      ca: false,
+      keyUsage: digitalSignature,
+      eku: [SERVER_AUTH],
+      san: [HOST],
+    });
+  });
+
+  it("completes a full flight (positive control)", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf)));
+    await client.handleReceivedBytes(await server.seal(await server.finished()));
+    expect(client.hasEnded()).toBe(false);
+    expect(handshakes()).toBe(1);
+  });
+
+  it("rejects a Finished without CertificateVerify", async () => {
+    const { client, server, ended, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await expect(client.handleReceivedBytes(await server.seal(await server.finished()))).rejects.toThrow(
+      /without CertificateVerify/,
+    );
+    expect(client.hasEnded()).toBe(true);
+    expect(ended.length).toBe(1);
+    expect(handshakes()).toBe(0);
+  });
+
+  it("rejects a second Certificate message (the key CertificateVerify is checked against)", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    // The attacker's own certificate after the validated chain; its key
+    // would sign CertificateVerify while `certificatesVerified` stays true.
+    await expect(
+      client.handleReceivedBytes(await server.seal(server.certificate([attacker]))),
+    ).rejects.toThrow(/duplicate Certificate/);
+    expect(client.hasEnded()).toBe(true);
+    expect(handshakes()).toBe(0);
+  });
+
+  it("rejects a CertificateVerify by a key that is not the verified chain's", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await expect(
+      client.handleReceivedBytes(await server.seal(await server.certificateVerify(attacker))),
+    ).rejects.toThrow(/signature verification failed/);
+    expect(handshakes()).toBe(0);
+  });
+
+  it("rejects a Certificate before EncryptedExtensions", async () => {
+    const { client, server } = await externalClient(root);
+    await expect(client.handleReceivedBytes(await server.seal(server.certificate([leaf])))).rejects.toThrow(
+      /before EncryptedExtensions/,
+    );
+  });
+
+  it("rejects handshake messages after the handshake other than tickets and KeyUpdate", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf)));
+    await client.handleReceivedBytes(await server.seal(await server.finished()));
+    expect(handshakes()).toBe(1);
+    // Post-handshake records are under s_ap_0 (random here): seal under it.
+    const keys = client.getKeys() as { serverSecret: Uint8Array } | undefined;
+    const post = new FakeServer(keys!.serverSecret, new Uint8Array());
+    await expect(client.handleReceivedBytes(await post.seal(hsMsg(0x02, [0x03, 0x03])))).rejects.toThrow(
+      /after the handshake/,
+    );
+  });
+
+  it("strips TLS 1.3 record padding before reading the content type (TLS-12)", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions(), 7));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf]), 300));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf), 1));
+    await client.handleReceivedBytes(await server.seal(await server.finished()));
+    expect(client.hasEnded()).toBe(false);
+    expect(handshakes()).toBe(1);
+  });
+
+  it("rejects a record with no content type at all", async () => {
+    const { client, server } = await externalClient(root);
+    const { encKey, iv } = await deriveTrafficKeysForSide(server["sHs" as never] as never, SUITE);
+    const { ciphertext } = (await encryptWrappedRecord(new Uint8Array(8), {
+      key: encKey,
+      iv,
+      recordNumber: 0,
+      cipherSuite: SUITE,
+      version: "TLS1_3",
+      recordHeaderOpts: { type: "WRAPPED_RECORD", version: "TLS1_2" },
+    } as never)) as { ciphertext: Uint8Array };
+    await expect(
+      client.handleReceivedBytes(new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext])),
+    ).rejects.toThrow(/without a content type/);
   });
 });

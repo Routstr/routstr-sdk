@@ -44,6 +44,13 @@ export interface ConfidentialRequestOptions {
   trustedHosts: readonly string[];
   /** Node signing keys (hex or npub) whose offers are accepted. */
   nodePubkeys?: readonly string[];
+  /**
+   * Used only when `nodePubkeys` is not set: the keys that announced this node
+   * URL (e.g. its Nostr provider announcement). Applied only to `https:` and
+   * onion URLs, where the transport authenticates the server that serves the
+   * offer; a plain-http URL with no configured pin is refused.
+   */
+  nodePubkeysFor?: (baseUrl: string) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
   /** Dev only: accept an offer signed by a key that is not pinned. */
   allowUnpinned?: boolean;
   /** `cu-prover` binary (else CU_PROVER_BIN / CU_PROVER / PATH). */
@@ -97,7 +104,7 @@ function armPooledSession(
   const ready = (async () => {
     const offer = await verifiedOffer(info.baseUrl, options);
     if (offer.v !== 2) throw new ConfidentialError("offer_malformed", "pre-warm needs a protocol v2 offer");
-    if (!(info.model in offer.price_list)) {
+    if (!Object.hasOwn(offer.price_list, info.model)) {
       throw new ConfidentialError("offer_malformed", `node no longer serves ${info.model} confidentially`);
     }
     // An armed session that is never used costs the node's abandon fee.
@@ -167,6 +174,24 @@ const PINNED_KEYS = new Set([
 /** Signed offers by node; every use re-verifies it under the caller's policy. */
 const offerCache = new Map<string, { offer: VerifiedOffer; at: number }>();
 
+/** The announced keys for `baseUrl`, when its scheme authenticates the server. */
+async function discoveredPins(
+  baseUrl: string,
+  options: ConfidentialRequestOptions,
+): Promise<readonly string[] | undefined> {
+  if (!options.nodePubkeysFor) return undefined;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return undefined;
+  }
+  const authenticated = url.protocol === "https:" || url.hostname.endsWith(".onion");
+  if (!authenticated) return undefined;
+  const keys = await options.nodePubkeysFor(baseUrl);
+  return keys && keys.length > 0 ? keys : undefined;
+}
+
 async function verifiedOffer(
   baseUrl: string,
   options: ConfidentialRequestOptions,
@@ -174,7 +199,7 @@ async function verifiedOffer(
 ): Promise<VerifiedOffer> {
   const key = baseUrl.replace(/\/$/, "");
   const policy = {
-    pinnedPubkeys: options.nodePubkeys,
+    pinnedPubkeys: options.nodePubkeys ?? (await discoveredPins(baseUrl, options)),
     allowUnpinned: options.allowUnpinned,
     trustedHosts: options.trustedHosts,
   };
@@ -215,14 +240,25 @@ export function buildPinnedBody(
   return new TextEncoder().encode(prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix);
 }
 
-function requestedMaxTokens(request: Record<string, unknown>, cap: number): number {
+/**
+ * The token cap the session pins: the caller's own (`max_tokens`, else
+ * `max_completion_tokens`, else `max_output_tokens`), at most the node's cap.
+ * `clampedFrom` is the caller's value when the node's cap lowered it, so the
+ * response can say the answer may be cut short.
+ */
+export function maxTokensFor(
+  request: Record<string, unknown>,
+  cap: number,
+): { maxTokens: number; clampedFrom?: number } {
   for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
     const v = request[k];
     if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-      return Math.max(1, Math.min(Math.trunc(v), cap));
+      const asked = Math.trunc(v);
+      const maxTokens = Math.max(1, Math.min(asked, cap));
+      return maxTokens < asked ? { maxTokens, clampedFrom: asked } : { maxTokens };
     }
   }
-  return cap;
+  return { maxTokens: cap };
 }
 
 /**
@@ -359,10 +395,10 @@ async function fetchConfidentialOnce(
   const request = (params.body ?? {}) as Record<string, unknown>;
   const model = typeof request.model === "string" ? request.model : "";
   const offer = await verifiedOffer(baseUrl, options, freshOffer);
-  if (!(model in offer.price_list)) {
+  if (!Object.hasOwn(offer.price_list, model)) {
     throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not serve ${model} confidentially`);
   }
-  const maxTokens = requestedMaxTokens(request, Number(offer.max_tokens_cap ?? 4096));
+  const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
   const body = buildPinnedBody(request, model, maxTokens);
   const wantStream = request.stream === true;
 
@@ -538,6 +574,11 @@ async function fetchConfidentialOnce(
   }
   headers.set("x-routstr-verify", "confidential");
   headers.set("x-routstr-confidential-sid", session.sid);
+  // The node's cap lowered the caller's token limit: say so, since the answer
+  // may end early (finish_reason "length") for that reason alone.
+  if (clampedFrom !== undefined) {
+    headers.set("x-routstr-confidential-max-tokens", `${maxTokens}; requested=${clampedFrom}`);
+  }
   if (usePool) headers.set("x-routstr-confidential-prewarmed", prewarmed ? "1" : "0");
   const ok = head.status < 400 && /event-stream/i.test(head.headers["content-type"] ?? "");
   if (wantStream) {
