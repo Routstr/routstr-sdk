@@ -26,8 +26,11 @@ import {
   TrustedHostError,
 } from "./errors";
 
-/** Protocol versions this client speaks. */
-export const CONFIDENTIAL_VERSION_MIN = 1;
+/**
+ * Protocol versions this client speaks: only v2 (the two-party handshake).
+ * Protocol v1 is retired; a node that offers only v1 is refused.
+ */
+export const CONFIDENTIAL_VERSION_MIN = 2;
 export const CONFIDENTIAL_VERSION_MAX = 2;
 
 export interface ConfidentialPriceEntry {
@@ -268,7 +271,8 @@ export function verifyConfidentialOffer(
   if (!supportedVersion(offer)) {
     throw new OfferUnsupportedVersionError(
       `offer version v=${offer.v} min_v=${offer.min_v ?? offer.v} max_v=${offer.max_v ?? offer.v} ` +
-        `outside supported range ${CONFIDENTIAL_VERSION_MIN}-${CONFIDENTIAL_VERSION_MAX}`,
+        `is not supported: this client speaks only protocol v${CONFIDENTIAL_VERSION_MIN}` +
+        (offer.v < CONFIDENTIAL_VERSION_MIN ? " (protocol v1 is retired; the node must offer v2)" : ""),
     );
   }
 

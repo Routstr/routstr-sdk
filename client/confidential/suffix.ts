@@ -5,15 +5,13 @@
  *  - `canonicalSuffix` — the byte-exact JSON suffix the sidecar reconstructs
  *    and requires (GAP-1). Must match `crypto/relay/src/main.rs::canonical_suffix`.
  *  - `buildConfidentialBody` — a body whose last bytes are that suffix.
- *  - `checkPiNParams` — rebuild π_N's statement from the published template,
- *    our own body length and the keystream we sent (review #10).
  *  - `parseHttpResponse` — split the decrypted upstream bytes into status,
  *    headers and body (the TLS fork has already verified every GCM tag).
- *  - `extractUsageDisclosure` — locate the π_C3 disclosure window `R`.
+ *  - `extractUsageDisclosure` — locate the π_C3S disclosure window `R`.
  */
 
 import { concat } from "./advice";
-import { ResponseVerificationError, SessionProtocolError } from "./errors";
+import { ResponseVerificationError } from "./errors";
 
 /**
  * The public JSON suffix that pins every cost-relevant parameter. Byte-exact
@@ -41,76 +39,6 @@ export function buildConfidentialBody(
   encoder: TextEncoder = new TextEncoder(),
 ): Uint8Array {
   return encoder.encode(privateJson + suffix);
-}
-
-// ─── π_N statement rebuild ──────────────────────────────────────────────────
-
-export interface PiNParams {
-  template: number[];
-  key_len: number;
-  key_offsets: number[];
-  head_len: number;
-  header: number[];
-  s: number[];
-  key_alphabet?: string;
-}
-
-function arraysEqual(a: ArrayLike<number>, b: ArrayLike<number>): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-/**
- * Verify that the π_N public statement the node handed us is exactly the one we
- * can rebuild from our own knowledge: the published head template, our body
- * length, and the keystream `s` we sent. A node must not be able to prove a
- * different path/headers, a different `s`, or key offsets over non-key bytes.
- */
-export function checkPiNParams(
-  params: unknown,
-  ready: { offer?: { head_template?: string; key_length?: number; key_alphabet?: string } },
-  s: Uint8Array,
-  bodyLen: number,
-): void {
-  const p = (params as { PiN?: PiNParams } | null)?.PiN;
-  if (!p) throw new SessionProtocolError("π_N params missing from c_commit");
-  const tpl: string = ready.offer?.head_template ?? "";
-  const keyLen: number = ready.offer?.key_length ?? p.key_len;
-  const alphabet: string = ready.offer?.key_alphabet ?? "[A-Za-z0-9_-]";
-  const token = `{KEY:${keyLen}}`;
-  if (!tpl.includes(token)) {
-    throw new SessionProtocolError("π_N: published template lacks the {KEY:n} token");
-  }
-  if (p.key_alphabet !== undefined && p.key_alphabet !== alphabet) {
-    throw new SessionProtocolError("π_N: key alphabet differs from the signed offer");
-  }
-  const filled = new TextEncoder().encode(
-    tpl.replace(token, "\u0000".repeat(keyLen)).replace("{LEN}", String(bodyLen)),
-  );
-  const offs: number[] = [];
-  filled.forEach((b, i) => {
-    if (b === 0) offs.push(i);
-  });
-  if (p.key_len !== keyLen || offs.length !== keyLen) {
-    throw new SessionProtocolError("π_N: key length mismatch");
-  }
-  if (!arraysEqual(p.template, filled)) {
-    throw new SessionProtocolError("π_N: template differs from the published one");
-  }
-  if (!arraysEqual(p.key_offsets, offs)) {
-    throw new SessionProtocolError("π_N: key offsets differ from the template");
-  }
-  if (p.head_len !== filled.length) {
-    throw new SessionProtocolError("π_N: head_len mismatch");
-  }
-  if (!arraysEqual(p.s, s)) {
-    throw new SessionProtocolError("π_N: keystream differs from the one we sent");
-  }
-  const n = filled.length + 1;
-  if (!arraysEqual(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) {
-    throw new SessionProtocolError("π_N: record header mismatch");
-  }
 }
 
 // ─── HTTP response parsing (plaintext after TLS) ────────────────────────────
