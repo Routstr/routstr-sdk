@@ -490,6 +490,9 @@ const modelPathsCache = new Map<string, { paths: NodeModelPaths; at: number }>()
 /** Drop cached /v1/models/paths payloads (tests, manual refresh). */
 export function clearModelPathsCache(): void {
   modelPathsCache.clear();
+  modelPathsForModelCache.clear();
+  modelPathsForModelFailures.clear();
+  modelPathsForModelInFlight.clear();
 }
 
 /**
@@ -509,6 +512,236 @@ export async function getNodeModelPaths(
     return fetched;
   }
   return cached?.paths ?? null;
+}
+
+// ─── Per-model path lookups ─────────────────────────────────────────────
+//
+// The full GET /v1/models/paths payload is large (5.4 MB / 13–22 s on a busy
+// node, measured 2026-10-12) and routinely blew the 10 s fetch abort, which
+// silently dropped the node from every auto-pin ranking. Ranking only ever
+// needs ONE model's paths, which GET /v1/models/paths/model?model_id=<id>
+// serves in kilobytes (78 KB / ~4 s on the same node). The helpers below use
+// that endpoint with:
+//   - stale-while-revalidate: a cached entry is returned immediately, even
+//     when expired, and refreshed in the background;
+//   - in-flight dedupe: concurrent requests share one fetch per node+model;
+//   - negative caching with exponential backoff: a node that fails is not
+//     re-probed (and its timeout not re-paid) by every request.
+
+/** Abort for one per-model path fetch. */
+export const MODEL_PATHS_FETCH_TIMEOUT_MS = 10_000;
+/** A fresh per-model entry is served without a refresh for this long. */
+const MODEL_PATHS_FOR_MODEL_TTL_MS = 10 * 60 * 1000;
+/** Stale entries older than this are no longer served while refreshing. */
+const MODEL_PATHS_FOR_MODEL_MAX_STALE_MS = 60 * 60 * 1000;
+/** First negative-cache window after a failed fetch; doubles per failure. */
+const MODEL_PATHS_NEGATIVE_BASE_MS = 60 * 1000;
+const MODEL_PATHS_NEGATIVE_MAX_MS = 30 * 60 * 1000;
+
+interface ModelPathsForModelEntry {
+  paths: NodeModelPaths | null;
+  at: number;
+}
+const modelPathsForModelCache = new Map<string, ModelPathsForModelEntry>();
+const modelPathsForModelFailures = new Map<
+  string,
+  { failures: number; retryAt: number }
+>();
+const modelPathsForModelInFlight = new Map<
+  string,
+  Promise<NodeModelPaths | null>
+>();
+
+function modelPathsForModelKey(baseUrl: string, modelId: string): string {
+  return `${baseUrl.toLowerCase()}|${modelId.toLowerCase()}`;
+}
+
+/**
+ * Parse a GET /v1/models/paths/model payload: a flat
+ * `data: [{ path, provider, endpoint, model }]` list for one model, with no
+ * `id` / `paths` / `alias_ids` wrapper. Each route's own `model.id` names the
+ * spelling the node files it under (falls back to the requested id). Also
+ * accepts the full /v1/models/paths shape. Returns an empty (not null)
+ * result for a well-formed payload with no paths.
+ */
+export function parseModelPathsForModelPayload(
+  payload: unknown,
+  requestedModelId: string
+): NodeModelPaths | null {
+  if (!payload || typeof payload !== "object") return null;
+  const data = (payload as Record<string, unknown>).data;
+  if (!Array.isArray(data)) return null;
+  const updatedAtRaw = (payload as Record<string, unknown>).updated_at;
+  const updatedAt = typeof updatedAtRaw === "number" ? updatedAtRaw : null;
+  if (data.length === 0) return { data: [], updatedAt };
+  // Full-shape payload (entries carry id + paths): reuse the full parser.
+  const looksFull = data.some(
+    (entry) =>
+      !!entry &&
+      typeof entry === "object" &&
+      Array.isArray((entry as Record<string, unknown>).paths)
+  );
+  if (looksFull) return parseModelPathsPayload(payload) ?? { data: [], updatedAt };
+  const byId = new Map<string, NodeModelPathEntry[]>();
+  for (const raw of data) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    const path = record.path;
+    if (typeof path !== "string" || path.length === 0) continue;
+    const model = parsePathMetadata(record.model);
+    const rawModel = record.model as Record<string, unknown> | undefined;
+    const id =
+      rawModel && typeof rawModel.id === "string" && rawModel.id.length > 0
+        ? rawModel.id
+        : requestedModelId;
+    const list = byId.get(id) ?? [];
+    list.push(model ? { path, model } : { path });
+    byId.set(id, list);
+  }
+  return {
+    data: [...byId.entries()].map(([id, paths]) => ({
+      id,
+      paths,
+      alias_ids: [],
+    })),
+    updatedAt,
+  };
+}
+
+/**
+ * Fetch one model's paths from GET /v1/models/paths/model?model_id=<id>.
+ * A 404 means the node does not serve that spelling: an empty result, not a
+ * failure. Returns null on network error, timeout, other non-2xx, or a
+ * malformed payload.
+ */
+export async function fetchModelPathsForModel(
+  baseUrl: string,
+  modelId: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = MODEL_PATHS_FETCH_TIMEOUT_MS
+): Promise<NodeModelPaths | null> {
+  const normalized = normalizeProviderUrl(baseUrl);
+  if (!normalized) return null;
+  let url: URL;
+  try {
+    url = new URL("v1/models/paths/model", normalized);
+    url.searchParams.set("model_id", modelId);
+  } catch {
+    return null;
+  }
+  try {
+    const response = await fetchImpl(url.toString(), {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (response.status === 404) return { data: [], updatedAt: null };
+    if (!response.ok) return null;
+    return parseModelPathsForModelPayload(await response.json(), modelId);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchModelPathsForSpellings(
+  baseUrl: string,
+  spellings: string[]
+): Promise<NodeModelPaths | null> {
+  const results = await Promise.all(
+    spellings.map((id) => fetchModelPathsForModel(baseUrl, id))
+  );
+  // Any failed spelling makes the whole lookup a failure: a partial result
+  // could hide the node's preferred route and mis-rank it.
+  if (results.some((r) => r === null)) return null;
+  const byId = new Map<string, NodeModelPathEntry[]>();
+  let updatedAt: number | null = null;
+  for (const result of results as NodeModelPaths[]) {
+    if (result.updatedAt != null) {
+      updatedAt = Math.max(updatedAt ?? 0, result.updatedAt);
+    }
+    for (const entry of result.data) {
+      const list = byId.get(entry.id) ?? [];
+      const seen = new Set(list.map((p) => p.path));
+      for (const path of entry.paths) {
+        if (!seen.has(path.path)) list.push(path);
+      }
+      byId.set(entry.id, list);
+    }
+  }
+  return {
+    data: [...byId.entries()].map(([id, paths]) => ({
+      id,
+      paths,
+      alias_ids: [],
+    })),
+    updatedAt,
+  };
+}
+
+/**
+ * One model's advertised paths on a node, via the per-model endpoint, for
+ * every spelling the SDK knows (canonical id, mapping variants, and any
+ * `extraSpellings` such as the node catalog's alias_ids). Never throws.
+ *
+ * Returns a cached entry immediately when one exists (refreshing it in the
+ * background once older than the TTL), null while the node is in its
+ * negative-cache window, and otherwise awaits a single shared fetch.
+ */
+export function getNodeModelPathsForModel(
+  baseUrl: string,
+  modelId: string,
+  options: { mappings?: ModelIdMappings; extraSpellings?: string[] } = {}
+): Promise<NodeModelPaths | null> {
+  const key = modelPathsForModelKey(baseUrl, modelId);
+  const now = Date.now();
+  const cached = modelPathsForModelCache.get(key);
+  const failure = modelPathsForModelFailures.get(key);
+
+  const startFetch = (): Promise<NodeModelPaths | null> => {
+    const existing = modelPathsForModelInFlight.get(key);
+    if (existing) return existing;
+    const spellings = [
+      ...new Set(
+        [
+          ...modelIdVariants(modelId, options.mappings),
+          ...(options.extraSpellings ?? []),
+        ].filter((s) => typeof s === "string" && s.length > 0)
+      ),
+    ];
+    const promise = fetchModelPathsForSpellings(baseUrl, spellings)
+      .then((paths) => {
+        if (paths) {
+          modelPathsForModelCache.set(key, { paths, at: Date.now() });
+          modelPathsForModelFailures.delete(key);
+        } else {
+          const failures = (modelPathsForModelFailures.get(key)?.failures ?? 0) + 1;
+          const backoff = Math.min(
+            MODEL_PATHS_NEGATIVE_BASE_MS * 2 ** (failures - 1),
+            MODEL_PATHS_NEGATIVE_MAX_MS
+          );
+          modelPathsForModelFailures.set(key, {
+            failures,
+            retryAt: Date.now() + backoff,
+          });
+        }
+        return paths;
+      })
+      .catch(() => null)
+      .finally(() => {
+        modelPathsForModelInFlight.delete(key);
+      });
+    modelPathsForModelInFlight.set(key, promise);
+    return promise;
+  };
+
+  const inBackoff = !!failure && now < failure.retryAt;
+  if (cached && now - cached.at < MODEL_PATHS_FOR_MODEL_MAX_STALE_MS) {
+    if (now - cached.at >= MODEL_PATHS_FOR_MODEL_TTL_MS && !inBackoff) {
+      void startFetch();
+    }
+    return Promise.resolve(cached.paths);
+  }
+  if (inBackoff) return Promise.resolve(null);
+  return startFetch().then((paths) => paths ?? cached?.paths ?? null);
 }
 
 

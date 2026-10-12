@@ -1352,13 +1352,17 @@ describe("ProviderManager", () => {
         acceptableMintUrls: ["https://mint-b.example"],
       });
       expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_B}/`]);
-      expect(fetch).toHaveBeenCalledTimes(1);
+      // Only NODE_B is fetched (one per-model call per known spelling).
+      const fetchedNodes = () =>
+        new Set(fetch.mock.calls.map((c) => new URL(String(c[0])).origin));
+      expect(fetchedNodes()).toEqual(new Set([NODE_B]));
+      const callsAfterFirst = fetch.mock.calls.length;
       const excluded = await manager.getModelPathProviderRanking(MODEL_ID, {
         acceptableMintUrls: ["https://mint-b.example"],
         excludeBaseUrls: new Set([`${NODE_B}/`]),
       });
       expect(excluded).toEqual([]);
-      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(fetch.mock.calls.length).toBe(callsAfterFirst);
     });
 
     it("ranks whitelisted nodes by per-route completion price", async () => {

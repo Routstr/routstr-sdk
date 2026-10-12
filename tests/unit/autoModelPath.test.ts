@@ -264,8 +264,11 @@ describe("resolveRequestContext model-path selection", () => {
     // NODE_A is pricier, but the caller forced it: pin NODE_A's own paths.
     expect(ctx.baseUrl).toBe(`${NODE_A}/`);
     expect(ctx.modelPath?.selector).toBe(DEEPSEEK_SELECTOR);
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(String(fetchMock.mock.calls[0][0])).toContain(NODE_A);
+    // Only the forced node's paths are fetched.
+    expect(fetchMock).toHaveBeenCalled();
+    for (const call of fetchMock.mock.calls) {
+      expect(String(call[0])).toContain(NODE_A);
+    }
   });
 
   it("does not pin when the caller forced a non-whitelisted node", async () => {

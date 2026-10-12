@@ -270,12 +270,75 @@ describe("RoutstrClient pinned model-path failover", () => {
     ).toBe(NEXT_SELECTOR);
   });
 
-  it("surfaces the error when an auto-pinned request has no model-path node left", async () => {
+  it("fails an auto-pinned request over UNPINNED when no model-path route is left (2026-10-12 incident)", async () => {
+    // Incident: routstr.otrta.me advertised a single whitelisted route
+    // (api.ppq.ai), whose upstream account ran dry (402 "Insufficient credit
+    // on credit id …"); the other auto nodes were unreachable, the
+    // model-path re-rank came back empty, and the request failed with
+    // "All providers failed" while five ordinary providers served the model.
+    const OTRTA = "https://routstr.otrta.me/";
+    const PPQ_SELECTOR =
+      "url=https%3A%2F%2Fapi.ppq.ai&model-id=deepseek-v4.1-flash";
+    const HEALTHY = "https://llm.satsandsports.cash/";
     const client = makeClient();
     vi.spyOn(
       (client as any).providerManager,
       "getModelPathProviderRanking"
     ).mockResolvedValue([]);
+    const findNext = vi
+      .spyOn((client as any).providerManager, "findNextBestProvider")
+      .mockReturnValue(HEALTHY);
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "fresh_token",
+      selectedMintUrl: MINT_URL,
+      tokenBalance: 100,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    const makeRequest = vi
+      .spyOn(client as any, "_makeRequest")
+      .mockResolvedValue(new Response("ok"));
+
+    const response = await (client as any)._handleErrorResponse(
+      {
+        ...errorParams({ "X-Routstr-Model-Path": PPQ_SELECTOR }),
+        baseUrl: OTRTA,
+        body: { messages: [], model: "deepseek-v4.1-flash" },
+        autoModelPath: { selector: PPQ_SELECTOR },
+      },
+      TOKEN,
+      402,
+      "req-1",
+      undefined,
+      JSON.stringify({
+        error:
+          "Insufficient credit on credit id 38b602db: this request requires a minimum balance of $0.0104 and your current balance is -$0.0004",
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(findNext).toHaveBeenCalled();
+    const retry = makeRequest.mock.calls[0][0] as any;
+    expect(retry.baseUrl).toBe(HEALTHY);
+    // A non-path node must never receive the failed node's selector.
+    expect(retry.autoModelPath).toBeUndefined();
+    for (const headers of [retry.baseHeaders, retry.headers]) {
+      expect(
+        Object.keys(headers ?? {}).map((h) => h.toLowerCase())
+      ).not.toContain("x-routstr-model-path");
+    }
+  });
+
+  it("surfaces the error when an auto-pinned request has no model-path node and no ordinary provider left", async () => {
+    const client = makeClient();
+    vi.spyOn(
+      (client as any).providerManager,
+      "getModelPathProviderRanking"
+    ).mockResolvedValue([]);
+    vi.spyOn(
+      (client as any).providerManager,
+      "findNextBestProvider"
+    ).mockReturnValue(null);
 
     await expect(
       (client as any)._handleErrorResponse(

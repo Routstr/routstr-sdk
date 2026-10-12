@@ -459,12 +459,33 @@ export class RoutstrClient {
             }
           );
           const nextSelector = next?.selectors[0];
-          if (!next || !nextSelector) throw error;
           const headers = Object.fromEntries(
             Object.entries(current.headers ?? {}).filter(
               ([name]) => name.toLowerCase() !== MODEL_PATH_HEADER
             )
           );
+          if (!next || !nextSelector) {
+            // No fundable model-path route left: degrade to the ordinary
+            // price ranking unpinned rather than failing the request.
+            const fallback = this._findNextBestProvider(
+              current.modelId,
+              current.baseUrl,
+              attempted,
+              fundedMints
+            );
+            if (!fallback || attempted.has(fallback)) throw error;
+            this._log(
+              "WARN",
+              `[RoutstrClient] routeRequest: provider-mint shortfall on ${current.baseUrl} and no model-path route left; failing over unpinned to ${fallback}`
+            );
+            current = {
+              ...current,
+              baseUrl: fallback,
+              headers,
+              autoModelPath: undefined,
+            };
+            continue;
+          }
           current = {
             ...current,
             baseUrl: next.baseUrl,
@@ -1930,6 +1951,10 @@ export class RoutstrClient {
     let nextModelPathSelector: string | undefined;
     let nextModelPathPricing: ModelPathSatsPricing | undefined;
     let nextTriedModelPaths: string[] | undefined;
+    // Set when an auto-pinned request fails over to a provider outside the
+    // model-path ranking: the retry must carry no selector, since a node
+    // only accepts selectors it advertised itself.
+    let dropModelPathPin = false;
     if (params.pinnedProvider) {
       // A caller-forced provider is a pin. Re-sending the same prompt to
       // another node is exactly what the caller asked us not to do, so a
@@ -1979,6 +2004,32 @@ export class RoutstrClient {
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: auto-pinned request failing over to next model-path route: ${nextProvider} (${nextModelPathSelector})`
           );
+        } else {
+          // The auto-pin is an SDK preference, not a caller constraint. With
+          // no model-path route left (the node's only route failed, the
+          // other nodes are unreachable or cooled down), degrade to the
+          // ordinary price ranking UNPINNED — the same fallback initial
+          // selection uses. Without this, one failed route on a node with a
+          // single whitelisted route surfaced as "All providers failed"
+          // while several healthy providers served the model.
+          nextProvider = this._findNextBestProvider(
+            failoverModelId,
+            baseUrl,
+            failures.attemptedProviders,
+            fundedMintUrlsForFailover
+          );
+          if (nextProvider && failures.attemptedProviders.has(nextProvider)) {
+            nextProvider = null;
+          }
+          nextModelPathSelector = undefined;
+          nextModelPathPricing = undefined;
+          if (nextProvider) {
+            dropModelPathPin = true;
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: no model-path route left for ${failoverModelId}; failing over unpinned to ${nextProvider}`
+            );
+          }
         }
       }
     } else {
@@ -2088,6 +2139,24 @@ export class RoutstrClient {
               nextModelPathSelector = next?.selectors[0];
               nextModelPathPricing = next?.satsPricing[0] ?? undefined;
               nextTriedModelPaths = [...tried];
+              if (!nextProvider) {
+                // Same degradation as above: no fundable model-path route
+                // left, so try the ordinary ranking unpinned.
+                nextProvider = this._findNextBestProvider(
+                  failoverModelId,
+                  baseUrl,
+                  attemptedForSpend,
+                  fundedMintUrlsForFailover
+                );
+                if (nextProvider && attemptedForSpend.has(nextProvider)) {
+                  nextProvider = null;
+                }
+                nextModelPathSelector = undefined;
+                nextModelPathPricing = undefined;
+                dropModelPathPin = nextProvider !== null;
+              } else {
+                dropModelPathPin = false;
+              }
               continue;
             }
             nextProvider = this._findNextBestProvider(
@@ -2145,6 +2214,12 @@ export class RoutstrClient {
         const retryBaseHeaders = { ...params.baseHeaders };
         if (nextModelPathSelector !== undefined) {
           retryBaseHeaders[MODEL_PATH_HEADER] = nextModelPathSelector;
+        } else if (dropModelPathPin) {
+          for (const name of Object.keys(retryBaseHeaders)) {
+            if (name.toLowerCase() === MODEL_PATH_HEADER) {
+              delete retryBaseHeaders[name];
+            }
+          }
         }
         const retryResponse = await this._makeRequest({
           ...params,
