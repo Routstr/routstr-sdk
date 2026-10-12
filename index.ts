@@ -12,7 +12,10 @@ export * from "./core";
 export {
   type DiscoveryAdapter,
   ModelManager,
+  DEFAULT_ENABLED_REVIEW_LABELS,
   type ModelManagerConfig,
+  type ProviderReviewIndex,
+  type ReviewLabelMatch,
   MintDiscovery,
 } from "./discovery";
 
