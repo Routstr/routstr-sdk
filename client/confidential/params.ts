@@ -90,10 +90,9 @@ function checkSuffixWindow(
   const selStart = w - 1 - selLen;
   if (selStart < 0) fail(proof, "suffix does not fit in our final record");
   if (p.seq !== own.seq) fail(proof, `seq ${p.seq} is not our final record ${own.seq}`);
-  // The compared range is our suffix, optionally followed by the record's
-  // inner content type (0x17), which is public too.
-  const withType = p.sel_len === selLen + 1;
-  const want = withType ? Uint8Array.from([...own.suffix, 0x17]) : own.suffix;
+  // v2 compares our suffix followed by the record's inner content type
+  // (0x17, public too); v1's π_C2 compares the suffix alone.
+  const want = proof === "π_C2S" ? Uint8Array.from([...own.suffix, 0x17]) : own.suffix;
   if (p.off !== off || p.w !== w || p.sel_start !== selStart || p.sel_len !== want.length) {
     fail(proof, "window is not the end of our final record");
   }

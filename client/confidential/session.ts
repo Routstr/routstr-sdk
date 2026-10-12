@@ -714,8 +714,6 @@ export class ConfidentialSession {
       len: this.bodyLength,
       armed: true,
     };
-    // v2: let the suffix proof also pin the final record's content type.
-    if (this.protocol === 2) setup.suffix_type = true;
     // The node settles at the rates of exactly the offer we verified.
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     // Accept that offer's fees explicitly (the node refuses a setup that does
