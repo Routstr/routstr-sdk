@@ -147,17 +147,29 @@ function checkTailRecords(
   const first = Math.max(0, end - recs.length);
   const mine = own.serverRecords.slice(first, end);
   if (mine.length !== recs.length) fail(proof, "more records than we received");
+  // π_C3S decrypts the first record only from the last block boundary that
+  // still covers the disclosure; the offset is determined by our own records.
+  const contentOf = (m: Uint8Array) => m.length - 16 - 1;
+  const total = mine.reduce((n, m) => n + contentOf(m), 0);
+  const need = own.r.length + own.skip;
+  const firstContent = contentOf(mine[0]!);
+  const expectedOff =
+    proof === "π_C3S" && total >= need
+      ? Math.floor((firstContent - Math.max(0, need - (total - firstContent))) / 16) * 16
+      : 0;
   if (own.epochBase !== undefined && recs[0]!.seq !== first - own.epochBase) {
     fail(proof, "record sequence numbers are not their position in our transcript");
   }
   let covered = 0;
   for (let i = 0; i < recs.length; i++) {
     const { seq, ct } = recs[i]!;
+    const off = (recs[i] as { off?: number }).off ?? 0;
     if (!Number.isInteger(seq) || (i > 0 && seq !== recs[i - 1]!.seq + 1)) {
       fail(proof, "records are not contiguous");
     }
+    if (off !== (i === 0 ? expectedOff : 0)) fail(proof, "record offset is not the one our disclosure needs");
     const m = mine[i]!;
-    if (!eq(ct, m.subarray(0, m.length - 16))) {
+    if (!eq(ct, m.subarray(off, m.length - 16))) {
       fail(proof, "records are not the end of the transcript we received");
     }
     covered += m.length - 16 - 1;
