@@ -220,14 +220,49 @@ function endsWithUsageEvent(joined: Uint8Array): boolean {
 }
 
 /**
+ * The SSE data carried by a disclosure window `R`: either `R` starts at a
+ * chunk-size line, or at an event line inside a chunk (a raw LF, then
+ * `data: `), whose data runs to the first CRLF (SSE data carries no CR).
+ */
+export function dechunkDisclosure(r: Uint8Array): Uint8Array | null {
+  const lineStart = [10, 100, 97, 116, 97, 58, 32]; // "\ndata: "
+  if (r.length >= lineStart.length && lineStart.every((b, i) => r[i] === b)) {
+    let end = -1;
+    for (let i = 0; i + 1 < r.length; i++) {
+      if (r[i] === 13 && r[i + 1] === 10) {
+        end = i;
+        break;
+      }
+    }
+    if (end < 0) return null;
+    const rest = parseChunks(r.subarray(end + 2));
+    if (!rest) return null;
+    return concat(r.subarray(1, end), ...rest.map((c) => c.data));
+  }
+  const chunks = parseChunks(r);
+  return chunks ? concat(...chunks.map((c) => c.data)) : null;
+}
+
+/**
  * Locate the minimal suffix of the chunked body that still ends with the final
- * usage event + `[DONE]` — the π_C3 disclosure window `R`.
+ * usage event + `[DONE]` — the π_C3 disclosure window `R`. It starts at the
+ * usage event's own line when the provider (or a CDN) put the end of the
+ * stream in one large chunk, so the proof's work follows the usage event,
+ * not the chunk size.
  */
 export function extractUsageDisclosure(responseBytes: Uint8Array): Uint8Array | null {
   const parsedBodyStart = findBodyStart(responseBytes);
   const body = responseBytes.subarray(parsedBodyStart);
   const all = parseChunks(body);
   if (!all) return null;
+  // The last "\ndata: " whose tail is exactly the usage event and [DONE].
+  for (let i = body.length - 7; i >= 0; i--) {
+    if (body[i] !== 10 || body[i + 1] !== 100) continue;
+    const r = body.subarray(i);
+    const joined = dechunkDisclosure(r);
+    if (joined && endsWithUsageEvent(joined) && startsWithOneEvent(joined)) return r;
+    if (body.length - i > 1 << 16) break;
+  }
   for (let i = all.length - 1; i >= 0; i--) {
     const r = body.subarray(all[i]!.start);
     const chunks = parseChunks(r);
@@ -236,6 +271,12 @@ export function extractUsageDisclosure(responseBytes: Uint8Array): Uint8Array | 
     if (endsWithUsageEvent(joined)) return r;
   }
   return null;
+}
+
+/** The data is the usage event, then `[DONE]`, and nothing before them. */
+function startsWithOneEvent(joined: Uint8Array): boolean {
+  const text = Buffer.from(joined).toString("utf8");
+  return text.startsWith("data: ") && text.indexOf("\n\ndata: ") === text.lastIndexOf("\n\ndata: ");
 }
 
 function findBodyStart(b: Uint8Array): number {
@@ -257,8 +298,8 @@ export function usageEventFromDisclosure(r: Uint8Array): UpstreamUsageEvent | nu
   // Decode the chunk framing first: an event may be split across HTTP chunks
   // (the provider or a CDN chunks wherever it likes). Fall back to the raw text
   // for an unchunked window.
-  const chunks = parseChunks(r);
-  const text = chunks ? Buffer.from(concat(...chunks.map((c) => c.data))).toString("utf8") : Buffer.from(r).toString("utf8");
+  const joined = dechunkDisclosure(r);
+  const text = joined ? Buffer.from(joined).toString("utf8") : Buffer.from(r).toString("utf8");
   const tail = "data: [DONE]\n\n";
   const before = text.endsWith(tail) ? text.slice(0, text.length - tail.length) : text;
   const idx = before.lastIndexOf("data: ");

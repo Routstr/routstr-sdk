@@ -165,7 +165,7 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
   it("π_C3S must cover exactly the final records we received, anchored on our h2", () => {
     const recs = [bytes(60, 1), bytes(80, 2), bytes(70, 3)];
     const r = bytes(40, 9);
-    const params = (records: { seq: number; ct: number[] }[], opts: { skip?: number; h2?: Uint8Array } = {}) => ({
+    const params = (records: { seq: number; ct: number[]; off?: number }[], opts: { skip?: number; h2?: Uint8Array } = {}) => ({
       PiC3S: {
         h2: Array.from(opts.h2 ?? h2),
         records,
@@ -173,12 +173,19 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
         skip: opts.skip ?? 0,
       },
     });
-    const tail = [
-      { seq: 1, ct: Array.from(recs[1]!.subarray(0, 64)) },
+    // R (40 bytes) fits in the last record's 53 content bytes, so the first
+    // covered record is decrypted only from its last block boundary (48).
+    const tail: { seq: number; ct: number[]; off?: number }[] = [
+      { seq: 1, ct: Array.from(recs[1]!.subarray(48, 64)), off: 48 },
       { seq: 2, ct: Array.from(recs[2]!.subarray(0, 54)) },
     ];
     const own = { h2, serverRecords: recs, r, skip: 0 };
     expect(() => checkPiC3SParams(params(tail), own)).not.toThrow();
+    // Any other offset (more or less of the record than the rule gives) is refused.
+    for (const off of [0, 32]) {
+      const other = [{ ...tail[0]!, off, ct: Array.from(recs[1]!.subarray(off, 64)) }, tail[1]!];
+      expect(() => checkPiC3SParams(params(other), own)).toThrow(/offset/);
+    }
     // A trailing close_notify-sized record is tolerated.
     expect(() =>
       checkPiC3SParams(params(tail), { ...own, serverRecords: [...recs, bytes(19, 4)] }),
@@ -200,8 +207,8 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     const recs = [bytes(60, 1), bytes(80, 2), bytes(70, 3), bytes(70, 4)];
     const r = bytes(40, 9);
     // The covered records' epoch starts at wire index 2: their seqs are 0, 1.
-    const tail = [
-      { seq: 0, ct: Array.from(recs[2]!.subarray(0, 54)) },
+    const tail: { seq: number; ct: number[]; off?: number }[] = [
+      { seq: 0, ct: Array.from(recs[2]!.subarray(48, 54)), off: 48 },
       { seq: 1, ct: Array.from(recs[3]!.subarray(0, 54)) },
     ];
     const params = (ku?: number, records = tail) => ({
