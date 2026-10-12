@@ -13,6 +13,7 @@ import {
   checkPiC2SParams,
   checkPiC3SParams,
   checkPiNKParams,
+  serverTailEpoch,
 } from "../../client/confidential/params";
 import {
   encodeTwoPcFrame,
@@ -222,6 +223,34 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     // Sequence numbers must be the records' offsets in that epoch.
     const shifted = tail.map((t) => ({ ...t, seq: t.seq + 2 }));
     expect(() => checkPiC3SParams(params(1, shifted), own)).toThrow(/sequence numbers/);
+  });
+
+  it("π_C3S with KeyUpdates and a close_notify after the usage event", () => {
+    const D = { data: true, keyUpdates: 0 };
+    const KU = { data: false, keyUpdates: 1 };
+    const CN = { data: false, keyUpdates: 0 };
+    // A KeyUpdate after the covered records leaves their epoch alone.
+    expect(serverTailEpoch([D, D, D, KU, CN], 2)).toEqual({ trailing: 2, keyUpdates: 0, epochStart: 0 });
+    // KeyUpdates before them count, coalesced ones too.
+    expect(serverTailEpoch([D, KU, D, { data: false, keyUpdates: 2 }, D, D, KU], 2)).toEqual({
+      trailing: 1,
+      keyUpdates: 3,
+      epochStart: 4,
+    });
+    // A key change inside the covered records cannot be proven.
+    expect(() => serverTailEpoch([D, KU, D], 2)).toThrow(SessionProtocolError);
+    expect(() => serverTailEpoch([D, KU], 2)).toThrow(SessionProtocolError);
+
+    // The node's records must end before the trailing ones we counted.
+    const recs = [bytes(60, 1), bytes(70, 3), bytes(22, 5), bytes(19, 4)];
+    const r = bytes(40, 9);
+    const tail = [{ seq: 1, ct: Array.from(recs[1]!.subarray(0, 54)) }];
+    const params = (records = tail) => ({
+      PiC3S: { h2: Array.from(h2), records, expected: Array.from(r), skip: 0 },
+    });
+    const own = { h2, serverRecords: recs, r, skip: 0, epochBase: 0, trailing: 2 };
+    expect(() => checkPiC3SParams(params(), own)).not.toThrow();
+    expect(() => checkPiC3SParams(params(), { ...own, trailing: 1 })).toThrow(SessionProtocolError);
   });
 });
 
