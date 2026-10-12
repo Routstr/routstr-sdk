@@ -119,7 +119,8 @@ const EKU_ANY = '2.5.29.37.0';
  * critical extension; every issuer must assert basicConstraints CA:TRUE,
  * honour pathLenConstraint, include keyCertSign if keyUsage is present and
  * serverAuth/anyExtendedKeyUsage if extendedKeyUsage is present; the leaf's
- * extendedKeyUsage, if present, must include serverAuth/anyExtendedKeyUsage;
+ * extendedKeyUsage, if present, must include serverAuth/anyExtendedKeyUsage,
+ * and its keyUsage, if present, digitalSignature (TLS-14);
  * nameConstraints (dNSName and directoryName) are enforced, and a constraint
  * of any other name type that would apply rejects the path. Path building
  * backtracks over candidate issuers. AIA issuer fetching happens only when a
@@ -146,6 +147,13 @@ export async function verifyCertificateChain(chain, host, logger, fetchCertifica
     const leafEku = leaf.getExtendedKeyUsages();
     if (leafEku && !leafEku.includes(EKU_SERVER_AUTH) && !leafEku.includes(EKU_ANY)) {
         throw new Error('Leaf certificate extendedKeyUsage does not allow serverAuth');
+    }
+    // FORK PATCH (TLS-14): the leaf key signs the CertificateVerify, so a
+    // keyUsage extension, if present, must assert digitalSignature
+    // (RFC 8446 4.4.2.2, RFC 5280 4.2.1.3).
+    const leafKu = leaf.getKeyUsages();
+    if (leafKu && !leafKu.includes('digitalSignature')) {
+        throw new Error('Leaf certificate keyUsage does not include digitalSignature');
     }
     const ctx = {
         host,

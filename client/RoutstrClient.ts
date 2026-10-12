@@ -901,6 +901,12 @@ export class RoutstrClient {
       const requestResponseLogId = (response as any).requestResponseLogId as
         | string
         | undefined;
+      // Raw logging is off for confidential responses unless the request
+      // opted in (see `_makeRequest`).
+      const logSink: RequestResponseLogSink | undefined = (response as any)
+        .requestResponseLogSuppressed
+        ? undefined
+        : this.requestResponseLogSink;
 
       processedResponse = new Response(clientStream, {
         status: response.status,
@@ -926,7 +932,7 @@ export class RoutstrClient {
         },
         {
           onRawChunk: (_chunk, sequence, text) => {
-            void this.requestResponseLogSink?.logResponseChunk?.(
+            void logSink?.logResponseChunk?.(
               requestResponseLogId,
               sequence,
               text
@@ -934,10 +940,10 @@ export class RoutstrClient {
           },
         }
       ).then(async (result) => {
-        await this.requestResponseLogSink?.logResponseEnd?.(requestResponseLogId);
+        await logSink?.logResponseEnd?.(requestResponseLogId);
         return result;
       }).catch(async (error) => {
-        await this.requestResponseLogSink?.logResponseError?.(requestResponseLogId, error);
+        await logSink?.logResponseError?.(requestResponseLogId, error);
         throw error;
       });
 
@@ -1052,7 +1058,14 @@ export class RoutstrClient {
         attemptBody === undefined || method === "GET"
           ? undefined
           : JSON.stringify(attemptBody);
-      const requestLogId = await this.requestResponseLogSink?.logRequest?.({
+      // A confidential request exists so that its prompt and response stay
+      // on this machine and out of every log: the raw request/response sink
+      // is skipped for it unless the caller opted in (`logPlaintext`).
+      const logSink: RequestResponseLogSink | undefined =
+        params.confidential && params.confidential.logPlaintext !== true
+          ? undefined
+          : this.requestResponseLogSink;
+      const requestLogId = await logSink?.logRequest?.({
         method,
         url,
         path,
@@ -1103,12 +1116,13 @@ export class RoutstrClient {
       (response as any).token = token;
       (response as any).selectedMintUrl = params.selectedMintUrl;
       (response as any).requestResponseLogId = requestLogId;
-      await this.requestResponseLogSink?.logResponseStart?.(requestLogId, response);
+      if (!logSink) (response as any).requestResponseLogSuppressed = true;
+      await logSink?.logResponseStart?.(requestLogId, response);
 
       const contentType = response.headers.get("content-type") || "";
 
       if (!response.ok) {
-        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+        void logSink?.logResponseBody?.(requestLogId, response.clone());
         // An HTTP error the *upstream* returned through a confidential session
         // (the transport marks those with the session id; a node-side refusal
         // carries no sid). The node has settled it: a 4xx/503 at the session
@@ -1185,7 +1199,7 @@ export class RoutstrClient {
       }
 
       if (!contentType.includes("text/event-stream")) {
-        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+        void logSink?.logResponseBody?.(requestLogId, response.clone());
       }
 
       return response;

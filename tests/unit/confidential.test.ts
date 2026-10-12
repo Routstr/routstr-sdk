@@ -48,17 +48,21 @@ import {
   buildPinnedBody,
   fetchConfidential,
   isConfidentialEndpoint,
+  SseDoneHoldback,
 } from "../../client/confidential/transport";
 import { checkPiC2Params, checkPiC3Params } from "../../client/confidential/params";
 import { ReceiptVerificationError } from "../../client/confidential/errors";
+import { ConfidentialSession } from "../../client/confidential/session";
 import {
   TrustedHostMatcher,
   matchHostname,
   normalizeHostname,
   parseTrustedHostPattern,
+  encryptedNodeTransport,
 } from "../../client/confidential/hosts";
 import {
   OfferBadSignatureError,
+  OfferMalformedError,
   OfferPinMismatchError,
   OfferUnpinnedError,
   OfferUnsupportedVersionError,
@@ -208,6 +212,22 @@ describe("offer verification + pinning", () => {
     // v2 (two-party handshake) is supported alongside v1.
     expect(supportedVersion({ v: 2, min_v: 2, max_v: 2 } as never)).toBe(true);
     expect(supportedVersion({ v: 1, min_v: 1, max_v: 2 } as never)).toBe(true);
+  });
+
+  it("rejects an offer whose version lies outside its own min_v..max_v", () => {
+    // v=1 inside the client's range, but the node says it speaks only v2
+    expect(supportedVersion({ v: 1, min_v: 2, max_v: 2 } as never)).toBe(false);
+    expect(supportedVersion({ v: 2, min_v: 1, max_v: 1 } as never)).toBe(false);
+    for (const bad of [
+      { v: 1, min_v: 2, max_v: 2 },
+      { v: 2, min_v: 1, max_v: 1 },
+      { v: 2, min_v: 3 },
+      { v: 1.5, min_v: 1, max_v: 2 },
+      { v: 2, min_v: "1", max_v: 2 },
+    ]) {
+      const { offer } = signedOffer(bad as never);
+      expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(OfferMalformedError);
+    }
   });
 
   it("enforces the trusted-host list when provided", () => {
@@ -428,6 +448,28 @@ describe("receipt verification", () => {
       priceEntry: { in: 1000, out: 1000 },
     });
     expect(res.costWithinOffer).toBe(false);
+  });
+
+  it("never refuses the node's cached-input charge for float rounding", () => {
+    // The node bills ceil((in·(p−c) + min(cached_in,in)·c + out·k)/1000). With
+    // cached_in = in that equals the uncached price mathematically, but in
+    // floating point 1.1·9999 + 1.1·1 rounds above 11000: the node charges 12.
+    const priceEntry = { in: 1.1, cached_in: 1.1, out: 0 };
+    const usage = { prompt_tokens: 10000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 1 } };
+    const node = Math.ceil((1.1 * (10000 - 1) + 1.1 * 1 + 0 * 0) / 1000);
+    expect(node).toBe(12);
+    expect(maxChargeMsats(priceEntry, usage)).toBe(12);
+    // Without cached tokens the bound is unchanged.
+    expect(maxChargeMsats(priceEntry, { prompt_tokens: 10000, completion_tokens: 0 })).toBe(11);
+    // A cached rate above `in` is not honoured beyond `in`.
+    expect(maxChargeMsats({ in: 1, cached_in: 5, out: 0 }, { ...usage, prompt_tokens: 1000 })).toBe(1);
+    const own = { model: "m", usage } as never;
+    const r = verifyReceipt({
+      receipt: { sid: "s", model: "m", usage: { usage }, cost_msats: 12 } as never,
+      ownUsage: own,
+      priceEntry,
+    });
+    expect(r.costWithinOffer).toBe(true);
   });
 
   it("allows the signed session fee on top of the usage, never more", () => {
@@ -662,6 +704,33 @@ describe("security regressions", () => {
     }
   });
 
+  it("refuses plain http to a remote node even with a pinned key", async () => {
+    const { offer, pubHex } = signedOffer();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify(offer), { status: 200 })) as typeof fetch;
+    try {
+      const call = (baseUrl: string, extra: Record<string, unknown> = {}) =>
+        fetchConfidential({
+          baseUrl,
+          body: { model: "absent" },
+          bearer: "sk-x",
+          options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex], ...extra },
+        });
+      await expect(call("http://plain-a.example")).rejects.toThrow(/plain http/);
+      await expect(call("http://10.0.0.5:8000")).rejects.toThrow(/plain http/);
+      // Loopback, onion and https pass the gate (then the model is refused).
+      for (const ok of ["http://127.0.0.1:8010", "http://localhost:8010", "http://[::1]:8010", "http://abc.onion", "https://plain-b.example"]) {
+        await expect(call(ok)).rejects.toThrow(/does not serve/);
+      }
+      // The explicit development opt-in.
+      await expect(call("http://plain-c.example", { allowInsecureTransport: true })).rejects.toThrow(/does not serve/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(encryptedNodeTransport("ws://127.0.0.1")).toBe(false);
+    expect(encryptedNodeTransport("not a url")).toBe(false);
+  });
+
   it("re-applies the caller's policy to a cached offer", async () => {
     const { offer } = signedOffer();
     const realFetch = globalThis.fetch;
@@ -671,7 +740,7 @@ describe("security regressions", () => {
       return new Response(JSON.stringify(offer), { status: 200 });
     }) as typeof fetch;
     try {
-      const base = { baseUrl: "http://cache-policy.example", body: { model: "absent" }, bearer: "sk-x" };
+      const base = { baseUrl: "https://cache-policy.example", body: { model: "absent" }, bearer: "sk-x" };
       // Loose policy: the offer verifies, then the unknown model is refused.
       await expect(
         fetchConfidential({ ...base, options: { trustedHosts: ["*.venice.ai"], allowUnpinned: true } }),
@@ -741,6 +810,34 @@ describe("security regressions", () => {
     expect(() => checkAttestationBinding(att({}), { sid: "s1" })).toThrow(ReceiptVerificationError);
     expect(() => checkAttestationBinding("null", own)).toThrow(ReceiptVerificationError);
     expect(() => checkAttestationBinding("{", own)).toThrow(/JSON/);
+  });
+
+  it("checks the attestation's commitment, certificate hash and upstream byte record against ours", () => {
+    const thSH = new Uint8Array(32).fill(7);
+    const thSF = new Uint8Array(32).fill(9);
+    const chain = new Uint8Array(32).fill(3);
+    const recv = new Uint8Array(32).fill(4);
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32), certChainHash: chain, serverRecords: 9, recvSha256: recv };
+    const att = (o: Record<string, unknown>) =>
+      canonicalJson({
+        sid: "s1",
+        th_sh: bytesToHex(thSH),
+        th_sf: bytesToHex(thSF),
+        c_commit: "ab".repeat(32),
+        cert_chain_hash: bytesToHex(chain),
+        server_records: 9,
+        client_records: 4,
+        sha256_recv: bytesToHex(recv),
+        sha256_sent: "00".repeat(32),
+        time: 1,
+        ...o,
+      });
+    expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    expect(() => checkAttestationBinding(att({ c_commit: "cd".repeat(32) }), own)).toThrow(/commitment/);
+    expect(() => checkAttestationBinding(att({ c_commit: null }), own)).toThrow(/commitment/);
+    expect(() => checkAttestationBinding(att({ cert_chain_hash: "00".repeat(32) }), own)).toThrow(/certificate/);
+    expect(() => checkAttestationBinding(att({ server_records: 10 }), own)).toThrow(/upstream records/);
+    expect(() => checkAttestationBinding(att({ sha256_recv: "00".repeat(32) }), own)).toThrow(/upstream bytes/);
   });
 
   describe("node-supplied proof parameters", () => {
@@ -873,5 +970,80 @@ describe("confidential deposit sizing", () => {
     expect(
       confidentialRequiredSats(model({ session_fee_msat: 2000, abandon_fee_msat: 10_000 }), 100),
     ).toBeCloseTo(base + 10);
+  });
+});
+
+describe("stream end held until settlement", () => {
+  const enc = (t: string) => new TextEncoder().encode(t);
+  const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+  const run = (parts: string[]) => {
+    const h = new SseDoneHoldback();
+    const now = parts.map((p) => dec(h.push(enc(p))));
+    return { now, rest: dec(h.release()) };
+  };
+
+  it("passes events through and holds back from the [DONE] line on", () => {
+    const ev = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n';
+    const { now, rest } = run([ev, 'data: {"usage":{}}\n\n', "data: [DONE]\n\n"]);
+    expect(now).toEqual([ev, 'data: {"usage":{}}\n\n', ""]);
+    expect(rest).toBe("data: [DONE]\n\n");
+  });
+
+  it("finds the marker split across chunks and without the space", () => {
+    for (const parts of [
+      ["data: x\n\ndata: [DO", "NE]\n\n"],
+      ["data: x\n\nd", "ata: [DONE]\n\n"],
+      ["data: x\n\n", "data:[DONE]\n\n"],
+      ["data: x\n\ndata: [DONE]\n\n"],
+    ]) {
+      const { now, rest } = run(parts);
+      expect(now.join("")).toBe("data: x\n\n");
+      expect(now.join("") + rest).toBe(parts.join(""));
+    }
+  });
+
+  it("delays only a possible marker prefix, and only at a line start", () => {
+    const h = new SseDoneHoldback();
+    expect(dec(h.push(enc("data: a\n\nda")))).toBe("data: a\n\n");
+    expect(dec(h.push(enc("ta: b\n\n")))).toBe("data: b\n\n");
+    // "[DONE]" inside content is not the end of the stream
+    expect(dec(h.push(enc('data: {"c":"data: [DONE]"}\n\n')))).toBe('data: {"c":"data: [DONE]"}\n\n');
+    expect(dec(h.release())).toBe("");
+  });
+});
+
+describe("session construction guards", () => {
+  const opts = (extra: Record<string, unknown> = {}) =>
+    ({
+      baseUrl: "http://127.0.0.1:8010",
+      offer: { v: 2, notary_pubkey: "00".repeat(32) },
+      auth: "sk-x",
+      model: "m",
+      maxTokens: 10,
+      bodyLength: 100,
+      prover: {},
+      ...extra,
+    }) as never;
+
+  it("refuses the insecure test hooks unless the process opts in", () => {
+    const prev = process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
+    delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
+    try {
+      expect(() => new ConfidentialSession(opts())).not.toThrow();
+      expect(() => new ConfidentialSession(opts({ insecureNoProofs: true }))).toThrow(/test hooks/);
+      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).toThrow(/test hooks/);
+      process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = "1";
+      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).not.toThrow();
+    } finally {
+      if (prev === undefined) delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
+      else process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = prev;
+    }
+  });
+
+  it("refuses a plain-http remote node", () => {
+    expect(() => new ConfidentialSession(opts({ baseUrl: "http://node.example" }))).toThrow(/plain http/);
+    expect(() =>
+      new ConfidentialSession(opts({ baseUrl: "http://node.example", allowInsecureTransport: true })),
+    ).not.toThrow();
   });
 });

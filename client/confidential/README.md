@@ -30,6 +30,17 @@ accounting are the client's normal ones: `RoutstrClient` runs
 entrypoints register the transport, so the browser-safe bundle never imports
 this directory.
 
+The node URL must be `https:`, an onion service or loopback: pinned keys
+authenticate the offer, not the connection, and the session's setup carries
+the node credential (`allowInsecureTransport` is a development opt-out).
+A stream's final `data: [DONE]` line is delivered only after the settlement
+checks passed; a failed check ends the stream with an error instead.
+Confidential requests skip the client's raw request/response log sink unless
+`logPlaintext` is set, and `runsDir` (development evidence) writes the
+decrypted response to disk. `ConfidentialSession`'s `insecureNoProofs` and
+`allowUnsignedSettlement` are test hooks, refused unless the process sets
+`ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
+
 ## Protocol versions
 
 The session follows the verified offer's `v`:
