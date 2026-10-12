@@ -24,7 +24,7 @@ export interface ReceiptVerificationInput {
   /** Our own usage event parsed from the π_C3 disclosure. */
   ownUsage: UpstreamUsageEvent;
   /** The model's rates from the *signed* offer. */
-  priceEntry?: { in: number; out: number };
+  priceEntry?: { in: number; out: number; cached_in?: number };
   /** The signed offer's session fee (msats); 0 or absent when none. */
   sessionFeeMsat?: number;
   /** The signed offer's abandon fee (msats); a receipt may not name more. */
@@ -46,19 +46,44 @@ export interface ReceiptVerificationResult {
  * The most a node may charge for a usage at the signed offer's terms:
  * ceil((in·prompt + out·completion)/1000) + the session fee. The rates already
  * include any surcharge (the node signs the surcharged price list).
+ *
+ * Cached prompt tokens may be billed at `cached_in` (never above `in`), so
+ * the honest charge is at most this bound. The node computes its charge as
+ * ceil((in·(prompt−cached) + min(cached_in, in)·cached + out·completion)/1000)
+ * in floating point, which can round one msat above the uncached formula when
+ * the two are mathematically equal; the bound is the larger of both, so an
+ * honest receipt is never refused for that rounding.
  */
 export function maxChargeMsats(
-  priceEntry: { in: number; out: number },
-  usage: { prompt_tokens?: number; completion_tokens?: number },
+  priceEntry: { in: number; out: number; cached_in?: number },
+  usage: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: unknown;
+    [k: string]: unknown;
+  },
   sessionFeeMsat = 0,
 ): number {
-  return (
-    Math.ceil(
-      (Number(priceEntry.in) * (usage.prompt_tokens ?? 0) +
-        Number(priceEntry.out) * (usage.completion_tokens ?? 0)) /
-        1000,
-    ) + Math.max(0, sessionFeeMsat)
-  );
+  const inRate = Number(priceEntry.in);
+  const outRate = Number(priceEntry.out);
+  const prompt = usage.prompt_tokens ?? 0;
+  const completion = usage.completion_tokens ?? 0;
+  const uncached = Math.ceil((inRate * prompt + outRate * completion) / 1000);
+  const details = usage.prompt_tokens_details as { cached_tokens?: unknown } | undefined;
+  const cached = Math.min(tokenCount(details?.cached_tokens), prompt);
+  const cachedRate = Math.min(Number(priceEntry.cached_in ?? inRate), inRate);
+  const withCached =
+    cached > 0 && Number.isFinite(cachedRate)
+      ? Math.ceil((inRate * (prompt - cached) + cachedRate * cached + outRate * completion) / 1000)
+      : uncached;
+  return Math.max(uncached, withCached) + Math.max(0, sessionFeeMsat);
+}
+
+/** A token count as the node reads one (non-negative integer, else 0). */
+function tokenCount(v: unknown): number {
+  if (typeof v === "boolean") return 0;
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0;
 }
 
 /**
@@ -143,12 +168,39 @@ export function parseSignedReceipt(input: {
  * The attestation's own fields must name this session: its sid and the two
  * handshake transcript hashes we computed ourselves. A validly signed
  * attestation of another session is not evidence about this one.
+ *
+ * The fields we can recompute from our own records are checked as well, each
+ * when we have it: the head-record commitment the node sent us (`c_commit`),
+ * the hash of the certificate list the provider sent, and the count and hash
+ * of every upstream byte the node relayed to us. A node cannot then sign one
+ * account of the session for us and another for anyone it shows the
+ * attestation to.
  */
 export function checkAttestationBinding(
   attestationJson: string,
-  own: { sid: string; thSH?: Uint8Array; thSF?: Uint8Array },
+  own: {
+    sid: string;
+    thSH?: Uint8Array;
+    thSF?: Uint8Array;
+    /** Hex `c_commit` from the node's c_commit frame. */
+    cCommit?: string;
+    /** SHA-256 of the provider's certificate DERs, concatenated in order. */
+    certChainHash?: Uint8Array;
+    /** Complete TLS records received from upstream (all content types). */
+    serverRecords?: number;
+    /** SHA-256 of every upstream byte received. */
+    recvSha256?: Uint8Array;
+  },
 ): void {
-  let a: { sid?: unknown; th_sh?: unknown; th_sf?: unknown };
+  let a: {
+    sid?: unknown;
+    th_sh?: unknown;
+    th_sf?: unknown;
+    c_commit?: unknown;
+    cert_chain_hash?: unknown;
+    server_records?: unknown;
+    sha256_recv?: unknown;
+  };
   try {
     a = JSON.parse(attestationJson) as typeof a;
   } catch {
@@ -165,5 +217,19 @@ export function checkAttestationBinding(
   }
   if (a.th_sh !== hex(own.thSH) || a.th_sf !== hex(own.thSF)) {
     throw new ReceiptVerificationError("attestation names a different TLS handshake");
+  }
+  if (own.cCommit !== undefined && a.c_commit !== own.cCommit) {
+    throw new ReceiptVerificationError("attestation names a different head-record commitment");
+  }
+  if (own.certChainHash && a.cert_chain_hash !== hex(own.certChainHash)) {
+    throw new ReceiptVerificationError("attestation names a different certificate chain");
+  }
+  if (own.serverRecords !== undefined && a.server_records !== own.serverRecords) {
+    throw new ReceiptVerificationError(
+      `attestation counts ${String(a.server_records)} upstream records, we received ${own.serverRecords}`,
+    );
+  }
+  if (own.recvSha256 && a.sha256_recv !== hex(own.recvSha256)) {
+    throw new ReceiptVerificationError("attestation hashes different upstream bytes than we received");
   }
 }

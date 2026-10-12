@@ -266,6 +266,77 @@ describe("pre-warm heuristics", () => {
     t.end(1000);
   });
 
+  it("backs off exponentially when armed sessions keep dying before use", async () => {
+    const h = harness({ backoffBaseMs: 30_000, backoffMaxMs: 600_000 }, 1e12, 2000);
+    await h.request();
+    // The node ends every armed session shortly after arming.
+    const killLatest = async () => {
+      await completeArms(h);
+      h.arms[h.arms.length - 1]!.session.healthy = false;
+      h.advance(1_000);
+      h.pool.reconcile(); // prune notices the death
+      await h.flush();
+    };
+    await h.flush();
+    expect(h.arms).toHaveLength(1);
+    await killLatest();
+    expect(h.logs.some((l) => l.includes("died before use; backing off 30s"))).toBe(true);
+    // No new arm until the backoff passes (a tick would otherwise re-arm at once).
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(1);
+    h.advance(31_000);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(2);
+    await killLatest();
+    expect(h.logs.some((l) => l.includes("backing off 60s"))).toBe(true);
+    h.advance(61_000);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(3);
+    await killLatest();
+    expect(h.logs.some((l) => l.includes("backing off 120s"))).toBe(true);
+    h.advance(60_000);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(3); // still backing off
+
+    // A warm request that settles resets the count.
+    h.advance(61_000);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(4);
+    await completeArms(h);
+    const lease = await h.request();
+    expect(lease?.ready).toBe(true);
+    await h.flush();
+    expect(h.arms).toHaveLength(5);
+    await killLatest();
+    expect(h.logs.filter((l) => l.includes("died before use; backing off 30s"))).toHaveLength(2);
+  });
+
+  it("a claimed armed session that fails before use backs the key off", async () => {
+    const h = harness({ backoffBaseMs: 30_000 });
+    await h.request();
+    await completeArms(h);
+    const t = h.pool.begin(h.info, null, 500);
+    const lease = t.take();
+    expect(lease?.ready).toBe(true);
+    await lease!.session;
+    t.warm();
+    await h.flush();
+    t.armedFailed("websocket closed");
+    t.cold();
+    t.end(1000);
+    await h.flush();
+    expect(h.logs.some((l) => l.includes("failed before use: websocket closed; backing off 30s"))).toBe(true);
+    const before = h.arms.length;
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms.length).toBe(before);
+  });
+
   it("does not arm when the balance cannot cover the reservations", async () => {
     const h = harness({}, 1500); // < 2 × 1000
     await h.request();

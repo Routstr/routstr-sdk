@@ -75,7 +75,7 @@ external: {
   is `undefined`); client certificates are refused.
 - `getTranscriptHashes()` returns `{ thSH, thSF }`.
 
-## Security patches (TLS-01 … TLS-13)
+## Security patches (TLS-01 … TLS-14)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -157,6 +157,14 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   the `webpki-roots` version pinned in `crypto/Cargo.lock`, the node's own
   root store, so client and node trust the same set. Upstream's four
   intermediate CA certificates used as extra trust anchors were removed.
+- **TLS-14, leaf keyUsage** (`utils/parse-certificate.js`
+  `verifyCertificateChain`). The leaf key signs the CertificateVerify, so a
+  leaf keyUsage extension, if present, must include digitalSignature
+  (RFC 8446 §4.4.2.2).
+
+Not done: revocation. Neither this client nor the sidecar (rustls/webpki
+with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider
+certificate is accepted by both, until it expires.
 
 ## Runtime dependencies
 
