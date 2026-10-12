@@ -66,7 +66,7 @@ export interface ConfidentialRequestOptions {
   /** `cu-prover` binary (else CU_PROVER_BIN / CU_PROVER / PATH). */
   proverPath?: string;
   /**
-   * `cu-2pc` binary for protocol v2 offers (else CU_2PC_BIN / CU_2PC, then
+   * `cu-2pc` binary (else CU_2PC_BIN / CU_2PC, then
    * next to cu-prover, then PATH).
    */
   twoPcPath?: string;
@@ -83,9 +83,9 @@ export interface ConfidentialRequestOptions {
    */
   logPlaintext?: boolean;
   /**
-   * Traffic-driven pre-warming of protocol v2 sessions (see `prewarm.ts`).
+   * Traffic-driven pre-warming of sessions (see `prewarm.ts`).
    * Off unless set; `{}` enables it with the defaults. Not used for one-off
-   * Cashu bearers (`returnChange`) or v1 offers.
+   * Cashu bearers (`returnChange`).
    */
   prewarm?: PrewarmOptions;
 }
@@ -123,7 +123,6 @@ function armPooledSession(
   let cancelled = false;
   const ready = (async () => {
     const offer = await verifiedOffer(info.baseUrl, options);
-    if (offer.v !== 2) throw new ConfidentialError("offer_malformed", "pre-warm needs a protocol v2 offer");
     if (!Object.hasOwn(offer.price_list, info.model)) {
       throw new ConfidentialError("offer_malformed", `node no longer serves ${info.model} confidentially`);
     }
@@ -449,14 +448,13 @@ async function fetchConfidentialOnce(
       allowInsecureTransport: options.allowInsecureTransport,
     });
 
-  // Pre-warm: v2 only, a stable credential only (a one-off Cashu bearer is
+  // Pre-warm: a stable credential only (a one-off Cashu bearer is
   // spent per request), and a body that ends with the pinned suffix.
   const suffix = canonicalSuffix(model, maxTokens);
   const usePool =
     options.prewarm !== undefined &&
     options.prewarm.enabled !== false &&
     !params.returnChange &&
-    offer.v === 2 &&
     endsWith(body, new TextEncoder().encode(suffix));
   const ticket: RequestTicket<ConfidentialSession> | undefined = usePool
     ? prewarmPool(options.prewarm!).begin(
