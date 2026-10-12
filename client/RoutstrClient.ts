@@ -1109,6 +1109,20 @@ export class RoutstrClient {
 
       if (!response.ok) {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+        // An HTTP error the *upstream* returned through a confidential session
+        // (the transport marks those with the session id; a node-side refusal
+        // carries no sid). The node has settled it: a 4xx/503 at the session
+        // fee, another 5xx at the full reservation. Failing over would run the
+        // same request again on another node and pay for it twice, and the
+        // refund/cooldown logic below was written for node-originated errors.
+        if (params.confidential && response.headers.has("x-routstr-confidential-sid")) {
+          this._log("WARN", "[RoutstrClient] confidential upstream error; returned as is (no failover)", {
+            baseUrl,
+            status: response.status,
+          });
+          (response as any).passthrough = true;
+          return response;
+        }
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
         // Capture the wire-level envelope before the body read consumes the response.

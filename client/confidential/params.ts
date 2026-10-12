@@ -90,11 +90,15 @@ function checkSuffixWindow(
   const selStart = w - 1 - selLen;
   if (selStart < 0) fail(proof, "suffix does not fit in our final record");
   if (p.seq !== own.seq) fail(proof, `seq ${p.seq} is not our final record ${own.seq}`);
-  if (p.off !== off || p.w !== w || p.sel_start !== selStart || p.sel_len !== selLen) {
+  // The compared range is our suffix, optionally followed by the record's
+  // inner content type (0x17), which is public too.
+  const withType = p.sel_len === selLen + 1;
+  const want = withType ? Uint8Array.from([...own.suffix, 0x17]) : own.suffix;
+  if (p.off !== off || p.w !== w || p.sel_start !== selStart || p.sel_len !== want.length) {
     fail(proof, "window is not the end of our final record");
   }
   if (!eq(p.ct_window, payload.subarray(off, off + w))) fail(proof, "ciphertext is not ours");
-  if (!eq(p.expected, own.suffix)) fail(proof, "expected bytes are not our suffix");
+  if (!eq(p.expected, want)) fail(proof, "expected bytes are not our suffix");
 }
 
 /**
@@ -119,18 +123,34 @@ export function checkPiC3Params(
 function checkTailRecords(
   proof: string,
   p: Record<string, any>,
-  own: { serverRecords: Uint8Array[]; r: Uint8Array; skip: number },
+  own: {
+    serverRecords: Uint8Array[];
+    r: Uint8Array;
+    skip: number;
+    /** Server KeyUpdates we saw before the covered records (v2). */
+    keyUpdates?: number;
+    /**
+     * Wire index (in `serverRecords`) of sequence 0 of the covered records'
+     * key epoch; when given, every record's `seq` must be exactly its offset.
+     */
+    epochBase?: number;
+  },
 ): void {
   if (!eq(p.expected, own.r)) fail(proof, "expected bytes are not our disclosure");
   if ((p.skip ?? 0) !== own.skip) fail(proof, "skip differs from ours");
+  if ((p.key_updates ?? 0) !== (own.keyUpdates ?? 0)) fail(proof, "server key epoch differs from ours");
   const recs = p.records as { seq: number; ct: Bytes }[] | undefined;
   if (!Array.isArray(recs) || recs.length === 0) fail(proof, "no records");
   // One trailing close_notify-sized record (2 + 1 + 16 bytes) may follow.
   let end = own.serverRecords.length;
   const lastRec = own.serverRecords[end - 1];
   if (lastRec && lastRec.length === 19 && recs[recs.length - 1]!.ct?.length !== 3) end -= 1;
-  const mine = own.serverRecords.slice(Math.max(0, end - recs.length), end);
+  const first = Math.max(0, end - recs.length);
+  const mine = own.serverRecords.slice(first, end);
   if (mine.length !== recs.length) fail(proof, "more records than we received");
+  if (own.epochBase !== undefined && recs[0]!.seq !== first - own.epochBase) {
+    fail(proof, "record sequence numbers are not their position in our transcript");
+  }
   let covered = 0;
   for (let i = 0; i < recs.length; i++) {
     const { seq, ct } = recs[i]!;
@@ -167,7 +187,14 @@ export function checkPiC2SParams(
 /** π_C3S: the final server records as we received them, anchored on our h2. */
 export function checkPiC3SParams(
   params: unknown,
-  own: { h2: Uint8Array; serverRecords: Uint8Array[]; r: Uint8Array; skip: number },
+  own: {
+    h2: Uint8Array;
+    serverRecords: Uint8Array[];
+    r: Uint8Array;
+    skip: number;
+    keyUpdates?: number;
+    epochBase?: number;
+  },
 ): void {
   const p = (params as { PiC3S?: Record<string, any> } | null)?.PiC3S;
   if (!p) fail("π_C3S", "missing");
@@ -183,7 +210,7 @@ export function checkPiC3SParams(
 export function checkPiNKParams(
   params: unknown,
   own: {
-    offer: { head_template?: string; key_length?: number; key_alphabet?: string };
+    offer: { head_template?: string; key_length?: number; key_alphabet?: string; upstream_host?: string };
     hk: Uint8Array;
     bodyLen: number;
   },
@@ -191,6 +218,7 @@ export function checkPiNKParams(
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
   if (!p) fail("π_NK", "missing");
   const tpl = own.offer.head_template ?? "";
+  checkHeadTemplate(tpl, own.offer.upstream_host ?? "");
   const keyLen = own.offer.key_length;
   if (typeof keyLen !== "number" || !Number.isInteger(keyLen) || keyLen <= 0) {
     fail("π_NK", "signed offer has no key length");
@@ -216,4 +244,33 @@ export function checkPiNKParams(
     fail("π_NK", "record header mismatch");
   }
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) fail("π_NK", "c_commit missing");
+}
+
+/**
+ * The published head template must be one HTTP/1.1 POST request head for the
+ * offer's upstream host: `Host` names that host, the body length is the
+ * `Content-Length`, and exactly one key token and one length token appear.
+ * (The node writes the head, so this is what π_NK lets us hold it to.)
+ */
+export function checkHeadTemplate(tpl: string, upstreamHost: string): void {
+  const count = (re: RegExp) => (tpl.match(re) ?? []).length;
+  if (count(/\{KEY:\d+\}/g) !== 1) fail("π_NK", "template must carry exactly one {KEY:n} token");
+  if (count(/\{LEN\}/g) !== 1) fail("π_NK", "template must carry exactly one {LEN} token");
+  if (count(/[{}]/g) !== 4) fail("π_NK", "template carries other placeholders");
+  if (!/^POST \/[\x21-\x7e]* HTTP\/1\.1\r\n/.test(tpl)) fail("π_NK", "template is not an HTTP/1.1 POST");
+  if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
+    fail("π_NK", "template is not exactly one request head");
+  }
+  const headers = tpl.slice(0, -4).split("\r\n").slice(1);
+  const values = (name: string) =>
+    headers
+      .filter((h) => h.slice(0, h.indexOf(":")).trim().toLowerCase() === name)
+      .map((h) => h.slice(h.indexOf(":") + 1).trim());
+  const host = values("host");
+  if (!upstreamHost || host.length !== 1 || host[0]!.toLowerCase() !== upstreamHost.toLowerCase()) {
+    fail("π_NK", "template Host is not the offer's upstream host");
+  }
+  const len = values("content-length");
+  if (len.length !== 1 || len[0] !== "{LEN}") fail("π_NK", "template Content-Length is not the body length");
+  if (values("transfer-encoding").length > 0) fail("π_NK", "template sets Transfer-Encoding");
 }

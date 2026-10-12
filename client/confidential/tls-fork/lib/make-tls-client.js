@@ -55,6 +55,14 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
     let handshakePacketStream = new Uint8Array();
     let clientCertificateRequested = false;
     let certificatesVerified = false;
+    // FORK PATCH (TLS-11): the TLS 1.3 server flight must arrive in RFC 8446
+    // order, each message once, and Finished is accepted only after a
+    // CertificateVerify proved possession of the certificate's key. Without
+    // this, a flight of EncryptedExtensions, Certificate (any valid public
+    // chain for the host) and Finished passed every check, so whoever knew
+    // the ECDHE secret could impersonate the server.
+    let encryptedExtensionsSeen = false;
+    let certificateVerifyDone = false;
     // FORK PATCH (TLS-10): any failure while processing a received
     // record (decryption, parsing, validation) ends the client: it is marked
     // ended at once, so records already queued are dropped, end(err) is
@@ -96,14 +104,25 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 version: connTlsVersion,
                 macKey,
             });
+            let innerEnd = decrypted.plaintext.length;
             if (connTlsVersion === 'TLS1_3') {
-                // TLS 1.3 has an extra byte suffixed
-                // this denotes the content type of the
-                // packet
-                const contentTypeNum = decrypted
-                    .plaintext[decrypted.plaintext.length - 1];
+                // TLS 1.3 inner plaintext is content ‖ type ‖ zero padding
+                // (RFC 8446 §5.4). FORK PATCH (TLS-12): strip the padding
+                // before reading the type, and refuse an unknown type instead
+                // of delivering the whole plaintext as application data.
+                while (innerEnd > 0 && decrypted.plaintext[innerEnd - 1] === 0) {
+                    innerEnd -= 1;
+                }
+                if (innerEnd === 0) {
+                    throw new Error('TLS 1.3 record without a content type');
+                }
+                const contentTypeNum = decrypted.plaintext[innerEnd - 1];
                 contentType = Object.entries(CONTENT_TYPE_MAP)
                     .find(([, val]) => val === contentTypeNum)?.[0];
+                if (!contentType) {
+                    throw new Error(`unknown TLS 1.3 inner content type ${contentTypeNum}`);
+                }
+                innerEnd -= 1;
             }
             ctx = {
                 type: 'ciphertext',
@@ -116,10 +135,7 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 plaintext: decrypted.plaintext,
                 contentType,
             };
-            content = decrypted.plaintext;
-            if (contentType) {
-                content = content.slice(0, -1);
-            }
+            content = decrypted.plaintext.slice(0, innerEnd);
             logger.trace({
                 recordRecvCount,
                 contentType,
@@ -164,9 +180,19 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             let data;
             while (data = readPacket()) {
                 const { type, content } = data;
+                // FORK PATCH (TLS-11): after the handshake only NewSessionTicket
+                // and KeyUpdate are valid post-handshake messages.
+                if (handshakeDone && connTlsVersion === 'TLS1_3'
+                    && type !== SUPPORTED_RECORD_TYPE_MAP.SESSION_TICKET
+                    && type !== SUPPORTED_RECORD_TYPE_MAP.KEY_UPDATE) {
+                    throw new Error(`unexpected handshake message ${type} after the handshake`);
+                }
                 switch (type) {
                     case SUPPORTED_RECORD_TYPE_MAP.SERVER_HELLO:
                         logger.trace('received server hello');
+                        if (connTlsVersion) {
+                            throw new Error('duplicate ServerHello');
+                        }
                         // FORK PATCH (v2): reject a HelloRetryRequest
                         // (a ServerHello with the HRR random) explicitly.
                         if (external && areUint8ArraysEqualConstantTime(content.slice(2, 34), HRR_RANDOM)) {
@@ -200,6 +226,10 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         }
                         break;
                     case SUPPORTED_RECORD_TYPE_MAP.ENCRYPTED_EXTENSIONS:
+                        if (encryptedExtensionsSeen) {
+                            throw new Error('duplicate EncryptedExtensions');
+                        }
+                        encryptedExtensionsSeen = true;
                         const extData = parseServerExtensions(content);
                         logger.debug({
                             len: content.length,
@@ -211,6 +241,16 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         throw new Error('Hello retry not supported. Please re-establish connection');
                     case SUPPORTED_RECORD_TYPE_MAP.CERTIFICATE:
                         logger.trace({ len: content.length }, 'received certificate');
+                        // FORK PATCH (TLS-11): one Certificate message, after
+                        // EncryptedExtensions. A second one would replace the
+                        // chain whose key CertificateVerify is checked against
+                        // while `certificatesVerified` stays true.
+                        if (certificates) {
+                            throw new Error('duplicate Certificate message');
+                        }
+                        if (connTlsVersion === 'TLS1_3' && !encryptedExtensionsSeen) {
+                            throw new Error('Certificate before EncryptedExtensions');
+                        }
                         const result = parseCertificates(content, { version: connTlsVersion });
                         certificates = result.certificates;
                         logger.debug({ len: certificates.length }, 'parsed certificates');
@@ -228,12 +268,20 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         if (!certificates?.length) {
                             throw new Error('No certificates received');
                         }
+                        // FORK PATCH (TLS-11): once, and only over a verified chain.
+                        if (certificateVerifyDone) {
+                            throw new Error('duplicate CertificateVerify');
+                        }
+                        if (verifyServerCertificate && !certificatesVerified) {
+                            throw new Error('CertificateVerify before the certificate chain was verified');
+                        }
                         const signatureData = await getSignatureDataTls13(handshakeMsgs.slice(0, -1), cipherSuite);
                         await verifyCertificateSignature({
                             ...signature,
                             publicKey: certificates[0].getPublicKey(),
                             signatureData,
                         });
+                        certificateVerifyDone = true;
                         break;
                     case SUPPORTED_RECORD_TYPE_MAP.FINISHED:
                         await processServerFinish(content);
@@ -447,6 +495,14 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             && !earlySecret
             && verifyServerCertificate) {
             throw new Error('Finish received before certificate verification');
+        }
+        // FORK PATCH (TLS-11): the chain alone proves nothing about the peer;
+        // only CertificateVerify binds the handshake to the certificate's key.
+        if (connTlsVersion === 'TLS1_3'
+            && verifyServerCertificate
+            && !earlySecret
+            && !certificateVerifyDone) {
+            throw new Error('Finished received without CertificateVerify');
         }
         if (connTlsVersion === 'TLS1_2') {
             await processServerFinishTls12(serverFinish);
