@@ -120,8 +120,8 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
       off,
       w,
       sel_start: w - 1 - suffix.length,
-      sel_len: suffix.length,
-      expected: Array.from(suffix),
+      sel_len: suffix.length + 1,
+      expected: [...Array.from(suffix), 0x17],
     },
   });
   const ownC2 = { h1, seq: 3, record, suffix };
@@ -148,18 +148,17 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     expect(() => checkPiC2SParams({ PiC2: honestC2().PiC2S }, ownC2)).toThrow(SessionProtocolError);
   });
 
-  it("accepts the suffix followed by the content type byte, and nothing else", () => {
-    const typed = honestC2();
-    typed.PiC2S.expected = [...typed.PiC2S.expected, 0x17];
-    typed.PiC2S.sel_len += 1;
-    expect(() => checkPiC2SParams(typed, ownC2)).not.toThrow();
+  it("requires the suffix followed by the content type byte 0x17", () => {
+    const bare = honestC2();
+    bare.PiC2S.expected = bare.PiC2S.expected.slice(0, -1);
+    bare.PiC2S.sel_len -= 1;
+    expect(() => checkPiC2SParams(bare, ownC2)).toThrow(SessionProtocolError);
     const otherType = honestC2();
-    otherType.PiC2S.expected = [...otherType.PiC2S.expected, 0x16];
-    otherType.PiC2S.sel_len += 1;
+    otherType.PiC2S.expected[otherType.PiC2S.expected.length - 1] = 0x16;
     expect(() => checkPiC2SParams(otherType, ownC2)).toThrow(SessionProtocolError);
     const longer = honestC2();
-    longer.PiC2S.expected = [...longer.PiC2S.expected, 0x17, 0x00];
-    longer.PiC2S.sel_len += 2;
+    longer.PiC2S.expected = [...longer.PiC2S.expected, 0x00];
+    longer.PiC2S.sel_len += 1;
     expect(() => checkPiC2SParams(longer, ownC2)).toThrow(SessionProtocolError);
   });
 
