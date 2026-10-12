@@ -36,8 +36,8 @@ export interface ReceiptVerificationResult {
   usageMatch: boolean;
   /**
    * cost_msats ≤ usage priced at the signed offer's rates + the signed session
-   * fee (true if no rates given), and any fee the receipt names is at most the
-   * signed one.
+   * fee (false if no rates were given: an unpriced model has no bound), and
+   * any fee the receipt names is at most the signed one.
    */
   costWithinOffer: boolean;
 }
@@ -84,8 +84,10 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
     receipt.model === ownUsage.model;
 
   // The node may charge less than its signed terms (cached input), never more.
+  // Without a signed rate for the model there is no bound to check against,
+  // so the cost cannot be accepted.
   const fee = Math.max(0, input.sessionFeeMsat ?? 0);
-  let costWithinOffer = true;
+  let costWithinOffer = false;
   if (input.priceEntry) {
     const maxMsats = maxChargeMsats(input.priceEntry, ownUsage.usage, fee);
     costWithinOffer = (receipt.cost_msats ?? 0) <= maxMsats;
@@ -112,8 +114,9 @@ export function parseSignedReceipt(input: {
   sig?: string;
   pubkey?: string;
   sid: string;
-  /** The attestation bytes the node signed (`a_json`), when it sent them. */
-  attestationJson?: string;
+  /** The attestation bytes the node signed (`a_json`, or the attestation as
+   * the client serialized and verified it). The receipt must hash them. */
+  attestationJson: string;
 }): ConfidentialReceipt {
   if (!verifySchnorrSignature(input.receiptJson, input.sig, input.pubkey)) {
     throw new ReceiptVerificationError("receipt signature invalid");
@@ -128,7 +131,7 @@ export function parseSignedReceipt(input: {
     throw new ReceiptVerificationError(`receipt is for session ${receipt.sid}, not ${input.sid}`);
   }
   if (
-    input.attestationJson !== undefined &&
+    typeof receipt.attestation_hash !== "string" ||
     receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(input.attestationJson)))
   ) {
     throw new ReceiptVerificationError("receipt is not bound to this session's attestation");
