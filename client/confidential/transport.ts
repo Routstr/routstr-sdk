@@ -395,6 +395,9 @@ async function fetchConfidentialOnce(
         body.length,
       )
     : undefined;
+  // The request's start: a warm request may first wait for an arm still in
+  // progress, and that wait belongs in its timings.
+  const tRequest = Date.now();
   const lease = ticket?.take();
   let session: ConfidentialSession = lease ? (undefined as never) : coldSession();
   let prewarmed = false;
@@ -446,10 +449,11 @@ async function fetchConfidentialOnce(
     }
     session = warm;
     attach(session);
-    prewarmed = true;
+    // Pre-warmed only if the session was already armed when the request came.
+    prewarmed = lease!.ready;
     ticket!.warm();
     try {
-      return await warm.claim(padPinnedBody(body, warm.bodyLength, suffix));
+      return await warm.claim(padPinnedBody(body, warm.bodyLength, suffix), tRequest);
     } catch (error) {
       // Before the credential record is released nothing reached the
       // provider: retry once on a fresh cold session. Never after.
