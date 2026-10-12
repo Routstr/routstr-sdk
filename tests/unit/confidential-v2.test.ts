@@ -28,8 +28,9 @@ const bytes = (n: number, fill: number) => new Uint8Array(n).fill(fill);
 describe("π_NK statement rebuild (v2)", () => {
   const keyLen = 4;
   const alphabet = "[A-Za-z0-9_-]";
-  const tpl = "POST /x HTTP/1.1\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n";
-  const offer = { head_template: tpl, key_length: keyLen, key_alphabet: alphabet };
+  const tpl =
+    "POST /x HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n";
+  const offer = { head_template: tpl, key_length: keyLen, key_alphabet: alphabet, upstream_host: "api.example.com" };
   const hk = bytes(32, 0x5a);
   const filled = new TextEncoder().encode(
     tpl.replace("{KEY:4}", "\u0000".repeat(keyLen)).replace("{LEN}", "10"),
@@ -55,6 +56,23 @@ describe("π_NK statement rebuild (v2)", () => {
 
   it("accepts the statement the node builds for our body and our hk", () => {
     expect(() => checkPiNKParams(honest(), own)).not.toThrow();
+  });
+
+  it("holds the published template to one POST head for the upstream host", () => {
+    const withTpl = (t: string, host = "api.example.com") => () =>
+      checkPiNKParams(honest(), { ...own, offer: { ...offer, head_template: t, upstream_host: host } });
+    const bad = [
+      tpl.replace("Host: api.example.com", "Host: other.example.com"),
+      tpl.replace("Host: api.example.com\r\n", ""),
+      tpl.replace("POST /x", "GET /x"),
+      tpl.replace("{LEN}", "10"),
+      tpl.replace("\r\n\r\n", "\r\nX-Key: {KEY:4}\r\n\r\n"),
+      tpl.replace("\r\n\r\n", "\r\nTransfer-Encoding: chunked\r\n\r\n"),
+      tpl + "POST /y HTTP/1.1\r\n\r\n",
+      tpl.replace("\r\n\r\n", "\r\nX-A: {OTHER}\r\n\r\n"),
+    ];
+    for (const t of bad) expect(withTpl(t)).toThrow(/template/);
+    expect(withTpl(tpl, "API.EXAMPLE.COM")).not.toThrow();
   });
 
   it("rejects a K_0 other than the one our 2PC anchored", () => {
@@ -130,6 +148,21 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     expect(() => checkPiC2SParams({ PiC2: honestC2().PiC2S }, ownC2)).toThrow(SessionProtocolError);
   });
 
+  it("accepts the suffix followed by the content type byte, and nothing else", () => {
+    const typed = honestC2();
+    typed.PiC2S.expected = [...typed.PiC2S.expected, 0x17];
+    typed.PiC2S.sel_len += 1;
+    expect(() => checkPiC2SParams(typed, ownC2)).not.toThrow();
+    const otherType = honestC2();
+    otherType.PiC2S.expected = [...otherType.PiC2S.expected, 0x16];
+    otherType.PiC2S.sel_len += 1;
+    expect(() => checkPiC2SParams(otherType, ownC2)).toThrow(SessionProtocolError);
+    const longer = honestC2();
+    longer.PiC2S.expected = [...longer.PiC2S.expected, 0x17, 0x00];
+    longer.PiC2S.sel_len += 2;
+    expect(() => checkPiC2SParams(longer, ownC2)).toThrow(SessionProtocolError);
+  });
+
   it("π_C3S must cover exactly the final records we received, anchored on our h2", () => {
     const recs = [bytes(60, 1), bytes(80, 2), bytes(70, 3)];
     const r = bytes(40, 9);
@@ -162,6 +195,27 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     expect(() =>
       checkPiC3SParams(params([tail[1]!]), { ...own, r: bytes(60, 9) }),
     ).toThrow(SessionProtocolError);
+  });
+
+  it("π_C3S after a server KeyUpdate: our epoch count and exact sequence numbers", () => {
+    const recs = [bytes(60, 1), bytes(80, 2), bytes(70, 3), bytes(70, 4)];
+    const r = bytes(40, 9);
+    // The covered records' epoch starts at wire index 2: their seqs are 0, 1.
+    const tail = [
+      { seq: 0, ct: Array.from(recs[2]!.subarray(0, 54)) },
+      { seq: 1, ct: Array.from(recs[3]!.subarray(0, 54)) },
+    ];
+    const params = (ku?: number, records = tail) => ({
+      PiC3S: { h2: Array.from(h2), records, expected: Array.from(r), skip: 0, ...(ku ? { key_updates: ku } : {}) },
+    });
+    const own = { h2, serverRecords: recs, r, skip: 0, keyUpdates: 1, epochBase: 2 };
+    expect(() => checkPiC3SParams(params(1), own)).not.toThrow();
+    // The node may not drop or invent a key epoch.
+    expect(() => checkPiC3SParams(params(), own)).toThrow(/key epoch/);
+    expect(() => checkPiC3SParams(params(2), own)).toThrow(/key epoch/);
+    // Sequence numbers must be the records' offsets in that epoch.
+    const shifted = tail.map((t) => ({ ...t, seq: t.seq + 2 }));
+    expect(() => checkPiC3SParams(params(1, shifted), own)).toThrow(/sequence numbers/);
   });
 });
 
