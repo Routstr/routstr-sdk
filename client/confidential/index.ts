@@ -34,6 +34,7 @@ export {
   parseTrustedHostPattern,
   matchHostname,
   isTrustedHost,
+  encryptedNodeTransport,
 } from "./hosts";
 
 export {

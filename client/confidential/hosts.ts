@@ -170,3 +170,25 @@ export class TrustedHostMatcher {
 export function isTrustedHost(host: string, patterns: readonly string[]): boolean {
   return new TrustedHostMatcher(patterns).matches(host);
 }
+
+/**
+ * Whether the node URL keeps the session's traffic (and the credential in its
+ * setup) encrypted or local: https, an onion service, or a loopback host.
+ */
+export function encryptedNodeTransport(baseUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  if (url.protocol === "https:") return true;
+  if (url.protocol !== "http:") return false;
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  return (
+    host.endsWith(".onion") ||
+    host === "localhost" ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    host === "[::1]"
+  );
+}
