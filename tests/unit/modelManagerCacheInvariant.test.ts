@@ -4,7 +4,7 @@ import type { NostrEvent } from "applesauce-core/helpers";
  *
  * A fresh provider timestamp must always imply a present model payload.
  * Covers the poisoned-cache family: failures stamped fresh, stamps written
- * before the end-of-pass payload write, prunes leaving stale stamps, and
+ * before the incremental payload write, prunes leaving stale stamps, and
  * cache hits sliding the expiry window.
  */
 
@@ -135,8 +135,14 @@ describe("fetchModels cache invariant", () => {
     ]);
   });
 
-  it("does not expose a fresh stamp before the pass writes its payload", async () => {
+  it("publishes each payload before its stamp while other providers are pending", async () => {
     const adapter = makeAdapter();
+    const stamp = adapter.setProviderLastUpdate;
+    const payloadsAtStamp: Array<Model[] | undefined> = [];
+    adapter.setProviderLastUpdate = (base, time) => {
+      payloadsAtStamp.push(adapter.getCachedModels()[base]);
+      stamp(base, time);
+    };
     const manager = new ModelManager(adapter, { logger: silentLogger });
     let resolveB!: (res: Response) => void;
     const bGate = new Promise<Response>((resolve) => (resolveB = resolve));
@@ -156,8 +162,10 @@ describe("fetchModels cache invariant", () => {
       firstTick()
     );
     await aSettled;
-    expect(adapter.getProviderLastUpdate(PROVIDER_A)).toBeNull();
-    expect(adapter.getCachedModels()[PROVIDER_A]).toBeUndefined();
+    expect(adapter.getProviderLastUpdate(PROVIDER_A)).toBeGreaterThan(0);
+    expect(adapter.getCachedModels()[PROVIDER_A]?.[0].id).toBe("model-a");
+    expect(payloadsAtStamp[0]?.[0].id).toBe("model-a");
+    expect(adapter.getProviderLastUpdate(PROVIDER_B)).toBeNull();
 
     resolveB(okResponse("model-b"));
     await pass;
