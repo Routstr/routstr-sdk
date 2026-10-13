@@ -106,6 +106,11 @@ export class CuProverBackend {
           () => reject(new ProverError(`zk timeout (${timeoutMs}ms) for ${job.proof}`)),
           timeoutMs,
         );
+        // The node may refuse the proof connection before any proof runs
+        // (the socket closes or errors without opening): fail at once
+        // instead of waiting for the timeout.
+        ws.onerror = () => reject(new ProverError(`zk ws error for ${job.proof}`));
+        ws.onclose = () => reject(new ProverError(`zk ws closed before the ${job.proof} proof started`));
         ws.onopen = () => {
           wsOpen = true;
           for (const chunk of pending) ws.send(chunk);

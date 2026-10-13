@@ -80,6 +80,7 @@ import type {
   ConfidentialFetchParams,
   ConfidentialRequestOptions,
 } from "./confidential/transport";
+import type { ConfidentialOffer } from "./confidential/offer";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -238,10 +239,46 @@ function rewrapRoutstrResponse(
 // never imports it. The registry lives on globalThis because each entrypoint
 // is a separate bundle with its own copy of this module.
 type ConfidentialTransport = (params: ConfidentialFetchParams) => Promise<Response>;
+/**
+ * Checks, without a credential, that a node would run a confidential session
+ * for a model (its signed offer verifies under the caller's policy and names
+ * the model); throws the error the session would raise.
+ */
+type ConfidentialQualifier = (
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions
+) => Promise<unknown>;
 const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
+const CONFIDENTIAL_QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
 
-export function setConfidentialTransport(transport: ConfidentialTransport): void {
+export function setConfidentialTransport(
+  transport: ConfidentialTransport,
+  qualify?: ConfidentialQualifier
+): void {
   (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_TRANSPORT] = transport;
+  if (qualify) (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] = qualify;
+}
+
+/**
+ * Qualify `baseUrl` for a confidential request before any token is spent on
+ * it. Without a registered qualifier (an older entrypoint) the transport's
+ * own check after the spend still fails closed.
+ */
+async function qualifyConfidentialNode(
+  baseUrl: string,
+  model: unknown,
+  options: ConfidentialRequestOptions
+): Promise<ConfidentialDepositOffer | undefined> {
+  requireConfidentialTransport();
+  const qualify = (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] as
+    | ConfidentialQualifier
+    | undefined;
+  if (!qualify) return undefined;
+  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options);
+  return offer && typeof offer === "object" && "price_list" in offer
+    ? (offer as ConfidentialDepositOffer)
+    : undefined;
 }
 
 function requireConfidentialTransport(): ConfidentialTransport {
@@ -264,45 +301,95 @@ function isConfidentialEndpoint(method: string, path: string): boolean {
   );
 }
 
+/** Reserve margin assumed when the node's signed offer is not at hand. */
+export const CONFIDENTIAL_DEFAULT_RESERVE_MARGIN_TOKENS = 16;
+
+/** The signed-offer fields the deposit depends on. */
+type ConfidentialDepositOffer = Pick<
+  ConfidentialOffer,
+  | "price_list"
+  | "max_tokens_cap"
+  | "session_fee_msat"
+  | "abandon_fee_msat"
+  | "rate_surcharge_pct"
+  | "reserve_margin_tokens"
+>;
+
 /**
- * A confidential node cannot read the prompt, so it reserves a full-context
- * prompt plus the pinned completion cap; deposit for that (5% margin, capped
- * at the model's envelope like the plain estimate). A node that prices
- * confidential sessions (the `confidential_upstream` field of its model
- * listing) adds its rate surcharge to that, and on top the larger of its
- * session and abandon fees (the node reserves that much).
+ * The reservation (msats) a confidential node holds for this request, by the
+ * node's own formula. The prompt is opaque, so it reserves the model's full
+ * context length plus the pinned completion cap and the offer's
+ * `reserve_margin_tokens` at the signed (surcharged) rates; without a known
+ * context length, the model's undiscounted maximum cost raised by the
+ * surcharge plus the same margin. The larger of the session and abandon fees
+ * comes on top. With the signed offer every input is the node's; without it
+ * the rates come from the model listing (sats per token, raised by the
+ * listed surcharge), the fees from its `confidential_upstream` field, and the
+ * margin is a conservative default.
+ */
+export function confidentialReservationMsats(
+  model: Model,
+  maxTokens: number | undefined,
+  offer?: ConfidentialDepositOffer
+): number | undefined {
+  const sp = model.sats_pricing as
+    | { max_cost?: number; max_completion_cost?: number; prompt?: number; completion?: number }
+    | undefined;
+  const cu = model.confidential_upstream;
+  const positive = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+  const pct = positive(offer ? offer.rate_surcharge_pct : cu?.rate_surcharge_pct);
+  const factor = 1 + pct / 100;
+  const signed = offer?.price_list?.[model.id];
+  const inRate = signed ? Number(signed.in) : positive(sp?.prompt) * 1_000_000 * factor;
+  const outRate = signed ? Number(signed.out) : positive(sp?.completion) * 1_000_000 * factor;
+  // Integer offer fields as the offer helpers read them (kept local so the
+  // browser bundle does not pull in the offer verifier).
+  const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const margin = offer ? count(offer.reserve_margin_tokens) : CONFIDENTIAL_DEFAULT_RESERVE_MARGIN_TOKENS;
+  const feeMsat = offer
+    ? Math.max(count(offer.session_fee_msat), count(offer.abandon_fee_msat))
+    : Math.max(positive(cu?.session_fee_msat), positive(cu?.abandon_fee_msat));
+  // The completion cap the transport pins: the request's, clamped to the
+  // offer's cap; the offer's cap when the request names none.
+  const cap = offer && positive(offer.max_tokens_cap) ? Math.trunc(offer.max_tokens_cap) : undefined;
+  let completion: number;
+  if (maxTokens !== undefined && Number.isFinite(maxTokens) && maxTokens > 0) {
+    const asked = Math.max(1, Math.trunc(maxTokens));
+    completion = cap !== undefined ? Math.min(asked, cap) : asked;
+  } else if (cap !== undefined) {
+    completion = cap;
+  } else if (positive(sp?.completion) && positive(sp?.max_completion_cost)) {
+    completion = Math.ceil(sp!.max_completion_cost! / sp!.completion!);
+  } else {
+    completion = 4096;
+  }
+  // The node's prompt limit: the first positive integer context length.
+  const top = (model as { top_provider?: { context_length?: unknown } }).top_provider;
+  const limit = [top?.context_length, model.context_length].find(
+    (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0
+  );
+  let msats: number;
+  if (limit !== undefined) {
+    if (!inRate || !outRate) return undefined;
+    msats = Math.ceil((limit * inRate + (completion + margin) * outRate) / 1000);
+  } else {
+    if (!sp || !positive(sp.max_cost)) return undefined;
+    msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * factor + (margin * outRate) / 1000);
+  }
+  return msats + feeMsat;
+}
+
+/**
+ * The deposit (sats) a confidential request needs: the node's reservation
+ * for it (see `confidentialReservationMsats`), rounded up.
  */
 export function confidentialRequiredSats(
   model: Model,
-  maxTokens: number | undefined
+  maxTokens: number | undefined,
+  offer?: ConfidentialDepositOffer
 ): number | undefined {
-  const sp = model.sats_pricing as
-    | {
-        max_cost?: number;
-        max_prompt_cost?: number;
-        max_completion_cost?: number;
-        completion?: number;
-        request?: number;
-      }
-    | undefined;
-  if (!sp || typeof sp.max_cost !== "number") return undefined;
-  const prompt = sp.max_prompt_cost ?? sp.max_cost;
-  const completion =
-    maxTokens !== undefined && sp.completion
-      ? sp.completion * maxTokens
-      : (sp.max_completion_cost ?? 0);
-  const base = Math.min(sp.max_cost, (prompt + completion + (sp.request ?? 0)) * 1.05);
-  const cu = model.confidential_upstream;
-  const pct =
-    typeof cu?.rate_surcharge_pct === "number" &&
-    Number.isFinite(cu.rate_surcharge_pct) &&
-    cu.rate_surcharge_pct > 0
-      ? cu.rate_surcharge_pct
-      : 0;
-  const fee = (v: unknown) =>
-    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
-  const feeMsat = Math.max(fee(cu?.session_fee_msat), fee(cu?.abandon_fee_msat));
-  return base * (1 + pct / 100) + Math.ceil(feeMsat / 1000);
+  const msats = confidentialReservationMsats(model, maxTokens, offer);
+  return msats === undefined ? undefined : Math.ceil(msats / 1000);
 }
 
 export interface RouteRequestParams {
@@ -796,7 +883,8 @@ export class RoutstrClient {
           current.modelId,
           current.baseUrl,
           attempted,
-          fundedMints
+          fundedMints,
+          Boolean(current.confidential)
         );
         if (!nextProvider || attempted.has(nextProvider)) throw error;
         this._log(
@@ -844,6 +932,16 @@ export class RoutstrClient {
 
     await this._checkBalance(baseUrl);
 
+    // A confidential request: the node must hold a valid offer for the model
+    // before a token is spent on it; the offer also sizes the deposit.
+    const confidentialOffer = params.confidential
+      ? await qualifyConfidentialNode(
+          baseUrl,
+          (body as { model?: unknown } | undefined)?.model,
+          params.confidential
+        )
+      : undefined;
+
     let requiredSats = 1;
     let selectedModel: Model | undefined;
     let requestMaxTokens: number | undefined;
@@ -878,7 +976,7 @@ export class RoutstrClient {
         );
 
         requiredSats = params.confidential
-          ? confidentialRequiredSats(selectedModel, requestMaxTokens) ??
+          ? confidentialRequiredSats(selectedModel, requestMaxTokens, confidentialOffer) ??
             this.providerManager.getRequiredSatsForModel(
               selectedModel,
               [],
@@ -1533,20 +1631,22 @@ export class RoutstrClient {
     modelId: string,
     currentBaseUrl: string,
     attempted: ReadonlySet<string>,
-    fundedMints: string[]
+    fundedMints: string[],
+    requireConfidential = false
   ): string | null {
+    // A confidential request only ever fails over to a node that advertises
+    // confidential sessions for the model.
+    const confidential = requireConfidential ? { requireConfidential: true } : {};
     if (fundedMints.length === 0) {
-      return this.providerManager.findNextBestProvider(
-        modelId,
-        currentBaseUrl,
-        attempted
-      );
+      return requireConfidential
+        ? this.providerManager.findNextBestProvider(modelId, currentBaseUrl, attempted, confidential)
+        : this.providerManager.findNextBestProvider(modelId, currentBaseUrl, attempted);
     }
     return this.providerManager.findNextBestProvider(
       modelId,
       currentBaseUrl,
       attempted,
-      { acceptableMintUrls: fundedMints }
+      { acceptableMintUrls: fundedMints, ...confidential }
     );
   }
 
@@ -1582,6 +1682,8 @@ export class RoutstrClient {
       lifecycle?: RequestLifecycleContext;
       transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
       attemptKind?: "mint_retry";
+      /** Run as a confidential-upstream session (failover keeps it). */
+      confidential?: ConfidentialRequestOptions;
     },
     token: string,
     status: number,
@@ -2488,7 +2590,8 @@ export class RoutstrClient {
         failoverModelId,
         baseUrl,
         failures.attemptedProviders,
-        fundedMintUrlsForFailover
+        fundedMintUrlsForFailover,
+        Boolean(params.confidential)
       );
     }
 
@@ -2534,7 +2637,7 @@ export class RoutstrClient {
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
 
-        newRequiredSats =
+        const plainRequiredSats = () =>
           this.providerManager.getRequiredSatsForModel(
             newModel,
             messagesForPricing,
@@ -2544,6 +2647,35 @@ export class RoutstrClient {
               : undefined,
             nextModelPathPricing
           );
+        let failoverOffer: ConfidentialDepositOffer | undefined;
+        if (params.confidential) {
+          // Never spend on a node that would refuse the session: qualify its
+          // signed offer first, and move on to the next node if it fails.
+          try {
+            failoverOffer = await qualifyConfidentialNode(nextProvider, newModel.id, params.confidential);
+          } catch (error) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: ${nextProvider} does not qualify for a confidential session; trying another provider`,
+              error instanceof Error ? error.message : String(error)
+            );
+            attemptedForSpend.add(nextProvider);
+            nextProvider = this._findNextBestProvider(
+              failoverModelId,
+              baseUrl,
+              attemptedForSpend,
+              fundedMintUrlsForFailover,
+              true
+            );
+            if (nextProvider && attemptedForSpend.has(nextProvider)) {
+              nextProvider = null;
+            }
+            continue;
+          }
+        }
+        newRequiredSats = params.confidential
+          ? confidentialRequiredSats(newModel, params.maxTokens, failoverOffer) ?? plainRequiredSats()
+          : plainRequiredSats();
 
         if (params.tinfoilEnabled) {
           this._log(
@@ -2624,7 +2756,8 @@ export class RoutstrClient {
               failoverModelId,
               baseUrl,
               attemptedForSpend,
-              fundedMintUrlsForFailover
+              fundedMintUrlsForFailover,
+              Boolean(params.confidential)
             );
             if (nextProvider && attemptedForSpend.has(nextProvider)) {
               nextProvider = null;

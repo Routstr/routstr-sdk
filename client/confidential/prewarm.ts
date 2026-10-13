@@ -79,7 +79,7 @@ export interface PrewarmOptions {
   burstCount?: number;
   maxPerKey?: number;
   maxTotal?: number;
-  /** Retire armed sessions older than this (from setup). */
+  /** Retire armed sessions older than this (from setup; at least 60 s). */
   maxAgeMs?: number;
   /** Requests remembered per key (bucket choice). */
   historySize?: number;
@@ -126,6 +126,13 @@ export const PREWARM_DEFAULTS = {
   maxSessionFeeMsat: 5000,
   maxArmedWithFee: 6,
 };
+
+/**
+ * The shortest `maxAgeMs` the pool accepts. Each retired, unused session costs
+ * its 2PC traffic and possibly an abandon fee, so a near-zero age would arm
+ * and retire sessions on every housekeeping tick.
+ */
+export const PREWARM_MIN_MAX_AGE_MS = 60_000;
 
 type Config = typeof PREWARM_DEFAULTS & { log: (message: string) => void };
 
@@ -295,11 +302,13 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     const defined = Object.fromEntries(
       Object.entries(options).filter(([, v]) => v !== undefined),
     ) as PrewarmOptions;
-    return {
+    const cfg = {
       ...PREWARM_DEFAULTS,
       log: (m: string) => console.info(m),
       ...defined,
     } as Config;
+    if (!(cfg.maxAgeMs >= PREWARM_MIN_MAX_AGE_MS)) cfg.maxAgeMs = PREWARM_MIN_MAX_AGE_MS;
+    return cfg;
   }
 
   /** Update the policy (e.g. the caller's config changed). */

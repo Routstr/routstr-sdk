@@ -47,7 +47,7 @@ import {
 import { CuProverBackend } from "./prover";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
-import { checkAttestationBinding, feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt";
+import { checkAttestationBinding, checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
   disclosureTailLens,
@@ -770,7 +770,6 @@ export class ConfidentialSession {
     if (!this.ap) throw new SessionProtocolError("prepareProofs before arm");
     this.tCommitWait = Date.now();
     const commit = await this.waitT("c_commit", this.timeouts.cCommit);
-    if (typeof commit.c_commit === "string") this.cCommitHex = commit.c_commit;
     // The relayed anchors, when present, must be the ones our own 2PC output.
     for (const k of ["h1", "h2", "hk"] as const) {
       if (commit[k] !== undefined && commit[k] !== hex(this.ap[k])) {
@@ -779,6 +778,13 @@ export class ConfidentialSession {
     }
     // Rebuilt from the *signed* offer, our body length and our hk.
     checkPiNKParams(commit.params, { offer: this.offer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    // The head-record commitment the attestation must name is the one π_NK
+    // proves; the frame has to carry exactly it.
+    const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
+    if (commit.c_commit !== pinkCommit) {
+      throw new SessionProtocolError("c_commit: the frame's commitment is not the one π_NK proves");
+    }
+    this.cCommitHex = pinkCommit;
     await this.proofV2("pi_nk", "verify", commit.params);
     this.event({ ev: "pi_nk_ok" });
     this.tProofsReady = Date.now();
@@ -956,6 +962,7 @@ export class ConfidentialSession {
       keyUpdates: epoch.keyUpdates,
       epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
       trailing: epoch.trailing,
+      tailLens,
     });
     await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
     this.twoPc?.close();
@@ -1000,17 +1007,9 @@ export class ConfidentialSession {
     let usageMatch: boolean;
     if (upstreamError) {
       // The node saw the same error status; errors the provider answers before
-      // doing any work (4xx, 503) must cost nothing.
-      const ru = receipt.usage as unknown as { error_status?: number };
-      usageMatch = ru?.error_status === httpEarly.status;
-      // With a session fee, that fee (the node's 2PC work) is all it may charge.
-      const unbilled = httpEarly.status === 503 || (httpEarly.status >= 400 && httpEarly.status < 500);
-      const fee = offerSessionFeeMsat(this.offer);
-      if (unbilled && !feeOnlyChargeOk(receipt.cost_msats, fee)) {
-        throw new ReceiptVerificationError(
-          `node charged ${receipt.cost_msats} msats for an unbilled upstream error (session fee ${fee} msats)`,
-        );
-      }
+      // doing any work (4xx, 503) cost at most the session fee (the node's 2PC
+      // work), any other error at most the session's reservation.
+      usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, offerSessionFeeMsat(this.offer));
     } else {
       const ownUsage = usageEventFromDisclosure(r);
       if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");

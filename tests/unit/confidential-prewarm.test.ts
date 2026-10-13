@@ -244,6 +244,25 @@ describe("pre-warm heuristics", () => {
     t.end(1000);
   });
 
+  it("floors maxAgeMs so a zero age does not arm and retire on every tick", async () => {
+    const h = harness({ maxAgeMs: 0, activityWindowMs: 600_000 });
+    await h.request();
+    await completeArms(h);
+    const armsBefore = h.arms.length;
+    for (let i = 0; i < 3; i++) {
+      h.advance(15_000);
+      h.pool.reconcile();
+      await h.flush();
+    }
+    expect(h.arms.length).toBe(armsBefore);
+    expect(h.arms.every((a) => !a.cancelled)).toBe(true);
+    // Retired once the 60 s floor has passed.
+    h.advance(16_000);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms[0]!.cancelled).toBe(true);
+  });
+
   it("drops dead armed sessions and backs off after a failed arm", async () => {
     const h = harness({ backoffBaseMs: 30_000 });
     await h.request();
