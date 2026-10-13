@@ -25,12 +25,35 @@ import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtil
 import {
   canonicalModelPath,
   DEEPSEEK_AUTO_NODE_URLS,
-  getNodeModelPaths,
+  getNodeModelPathsForModel,
   modelPathCandidateKey,
   resolveDeepSeekModelPathSelectors,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+
+/**
+ * Upper bound one auto-pin ranking waits for any single node's model paths.
+ * Before this, the ranking awaited every node's fetch, so its latency was the
+ * slowest node's 10 s abort — paid by every request while a node was slow.
+ */
+export const MODEL_PATH_RANKING_BUDGET_MS = 6_000;
+
+function withBudget<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      }
+    );
+  });
+}
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
@@ -1420,7 +1443,18 @@ export class ProviderManager {
         );
         if (!model) return null;
 
-        const nodePaths = await getNodeModelPaths(baseUrl);
+        // Per-model lookup (kilobytes), cached with stale-while-revalidate,
+        // in-flight dedupe and negative caching; raced against a ranking
+        // budget so one slow or hung node cannot stall every request. A node
+        // that misses the budget is skipped for this ranking only — its
+        // fetch keeps running and fills the cache for the next request.
+        const nodePaths = await withBudget(
+          getNodeModelPathsForModel(baseUrl, modelId, {
+            mappings: this.getModelIdMappings(),
+            extraSpellings: [model.id, ...(model.alias_ids ?? [])],
+          }),
+          MODEL_PATH_RANKING_BUDGET_MS
+        );
         if (!nodePaths) return null;
         const resolved = resolveDeepSeekModelPathSelectors(
           nodePaths,

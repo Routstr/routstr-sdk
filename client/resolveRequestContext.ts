@@ -25,7 +25,7 @@ import type { SdkStore } from "../storage/store";
 import {
   DEEPSEEK_AUTO_MODEL_ID,
   DEEPSEEK_AUTO_NODE_URLS,
-  getNodeModelPaths,
+  getNodeModelPathsForModel,
   MODEL_PATH_HEADER,
   resolveDeepSeekModelPathSelectors,
   sameNode,
@@ -273,7 +273,17 @@ export async function resolveRequestContext(
         sameNode(nodeUrl, normalizedProvider)
       )
     ) {
-      const nodePaths = await getNodeModelPaths(normalizedProvider);
+      const nodePaths = await getNodeModelPathsForModel(
+        normalizedProvider,
+        canonicalizeModelId(
+          modelId,
+          discoveryAdapter.getModelIdMappings?.() ?? undefined
+        ),
+        {
+          mappings: discoveryAdapter.getModelIdMappings?.() ?? undefined,
+          extraSpellings: [match.id, ...(match.alias_ids ?? [])],
+        }
+      );
       const resolved = nodePaths
         ? resolveDeepSeekModelPathSelectors(
             nodePaths,

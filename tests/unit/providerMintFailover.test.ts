@@ -252,8 +252,36 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
     expect(providerManager.getRequiredSatsForModel.mock.calls.at(-1)[4]).toEqual(pricing);
   });
 
-  it("exhausts automatic paths without falling back to ordinary provider routing", async () => {
+  it("degrades to ordinary provider routing, unpinned, once automatic paths are exhausted", async () => {
+    // An auto-pin is an SDK preference, not a caller constraint: initial
+    // selection already degrades to the generic ranking when no model-path
+    // route is available, and failover must do the same instead of failing
+    // a request other providers can serve.
     const { client, providerManager } = createClient(() => NEXT_URL);
+    providerManager.getModelPathProviderRanking = vi.fn(async () => []);
+    vi.spyOn(client as any, "_spendToken").mockImplementation(async ({baseUrl}: any) => {
+      if (baseUrl === BASE_URL) throw new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A]);
+      return spendResultFor(MINT_B);
+    });
+    const request = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(
+      Response.json({ok: true})
+    );
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
+    await client.routeRequest({
+      ...routeParams,
+      headers: { "X-Routstr-Model-Path": "old-selector" },
+      autoModelPath: {selector: "old-selector"},
+    } as any);
+    expect(providerManager.findNextBestProvider).toHaveBeenCalled();
+    const call = request.mock.calls[0][0] as any;
+    expect(call.baseUrl).toBe(NEXT_URL);
+    expect(call.autoModelPath).toBeUndefined();
+    const headerNames = Object.keys(call.baseHeaders ?? {}).map((h) => h.toLowerCase());
+    expect(headerNames).not.toContain("x-routstr-model-path");
+  });
+
+  it("still surfaces the shortfall when neither paths nor ordinary providers remain", async () => {
+    const { client, providerManager } = createClient(() => null);
     providerManager.getModelPathProviderRanking = vi.fn(async () => []);
     vi.spyOn(client as any, "_spendToken").mockRejectedValue(
       new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A])
@@ -261,7 +289,6 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
     await expect(client.routeRequest({
       ...routeParams, autoModelPath: {selector: "old-selector"},
     } as any)).rejects.toBeInstanceOf(ProviderMintBalanceError);
-    expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
   });
 
 });
