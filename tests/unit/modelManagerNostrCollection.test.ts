@@ -9,7 +9,8 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Observable, of, merge, NEVER } from "rxjs";
+import { Observable, of, merge, NEVER, Subject } from "rxjs";
+import { EventStore } from "applesauce-core";
 import type { NostrEvent } from "applesauce-core/helpers";
 import { ModelManager } from "../../discovery/ModelManager";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
@@ -112,6 +113,35 @@ describe("ModelManager Nostr collection", () => {
   afterEach(() => {
     vi.useRealTimers();
     relayStream.current = null;
+  });
+
+  it("starts all refresh queries before completion and applies policy only afterwards", async () => {
+    vi.useFakeTimers();
+    const streams = new Map<number, Subject<NostrEvent>>();
+    relayStream.current = (filter: unknown) => {
+      const kind = (filter as { kinds: number[] }).kinds[0];
+      const stream = new Subject<NostrEvent>();
+      streams.set(kind, stream);
+      return stream;
+    };
+    const manager = new ModelManager(makeAdapter(), {
+      logger: silentLogger, eventStore: new EventStore(),
+    });
+    const prune = vi.spyOn(manager, "pruneSupersededDiscoveryEvents").mockResolvedValue(0);
+    const policy = vi.spyOn(manager, "syncReviewedProvidersFromNostr").mockResolvedValue([]);
+    const refresh = manager.refreshNostrEvents();
+    await vi.advanceTimersByTimeAsync(0);
+    expect([...streams.keys()].sort()).toEqual([38421, 38423, 38425, 38426]);
+    expect(prune).not.toHaveBeenCalled();
+    expect(policy).not.toHaveBeenCalled();
+    for (const kind of [38421, 38423, 38425]) streams.get(kind)!.complete();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(policy).not.toHaveBeenCalled();
+    streams.get(38426)!.complete();
+    await refresh;
+    expect(prune).toHaveBeenCalledOnce();
+    expect(policy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("resolves as soon as every relay finishes, without waiting out the timeout", async () => {

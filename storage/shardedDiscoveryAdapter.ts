@@ -287,6 +287,9 @@ export const createShardedDiscoveryAdapter = async (
       // Write new/updated providers
       for (const [baseUrl, modelList] of Object.entries(models)) {
         const normalized = normalizeBaseUrl(baseUrl);
+        // Incremental publication spreads the existing cache, retaining the
+        // unchanged arrays. Avoid rewriting every shard for each success.
+        if (modelsByBaseUrl.get(normalized) === modelList) continue;
         providerIndex.add(normalized);
         modelsByBaseUrl.set(normalized, modelList);
         const ts = timestampsByBaseUrl.get(normalized) ?? Date.now();

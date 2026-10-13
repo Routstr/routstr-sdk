@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SDK_STORAGE_KEYS,
   createMemoryDriver,
@@ -74,6 +74,44 @@ describe("Sharded DiscoveryAdapter", () => {
     expect(
       adapter.getProviderLastUpdate("https://provider-b.example.com"),
     ).toBeNull();
+  });
+
+  it("writes only changed model shards during incremental publication", async () => {
+    const driver = createMemoryDriver();
+    const adapter = await createShardedDiscoveryAdapter({ driver });
+    const a = [model("a")];
+    const b = [model("b")];
+    adapter.setCachedModels({ "https://a.example": a, "https://b.example/": b });
+    const write = vi.spyOn(driver, "setItem");
+    adapter.setCachedModels({ ...adapter.getCachedModels(), "https://a.example": a });
+    expect(write.mock.calls.filter(([, value]) => Array.isArray(value) && value.some(item => typeof item === "object"))).toHaveLength(0);
+    write.mockClear();
+    const nextA = [model("new-a")];
+    adapter.setCachedModels({ ...adapter.getCachedModels(), "https://a.example/": nextA });
+    const payloadWrites = write.mock.calls.filter(([, value]) => value === nextA || value === b);
+    expect(payloadWrites).toHaveLength(1);
+    expect(payloadWrites[0]![1]).toBe(nextA);
+    expect(adapter.getCachedModels()["https://b.example/"]).toBe(b);
+    expect(adapter.getProviderLastUpdate("https://b.example/")).not.toBeNull();
+    adapter.setCachedModels({ "https://a.example/": nextA });
+    expect(adapter.getProviderLastUpdate("https://b.example/")).toBeNull();
+    const restored = await createShardedDiscoveryAdapter({ driver });
+    expect(restored.getCachedModels()).toEqual({ "https://a.example/": nextA });
+  });
+
+  it("keeps incremental payload writes linear in successful providers", async () => {
+    const driver = createMemoryDriver();
+    const adapter = await createShardedDiscoveryAdapter({ driver });
+    const initial = Object.fromEntries(Array.from({ length: 39 }, (_, i) =>
+      [`https://p${i}.example/`, [model(`old-${i}`)]]));
+    adapter.setCachedModels(initial);
+    const write = vi.spyOn(driver, "setItem");
+    for (let i = 0; i < 29; i++) {
+      adapter.setCachedModels({ ...adapter.getCachedModels(), [`https://p${i}.example/`]: [model(`new-${i}`)] });
+    }
+    const payloadWrites = write.mock.calls.filter(([, value]) =>
+      Array.isArray(value) && value.some(item => typeof item === "object"));
+    expect(payloadWrites).toHaveLength(29); // not 29 * 39
   });
 
   it("clears all cached models through replacement semantics", async () => {

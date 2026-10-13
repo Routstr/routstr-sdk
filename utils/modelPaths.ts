@@ -19,6 +19,7 @@
 import type { ModelSatsPricing } from "../core/types";
 import { modelIdVariants, type ModelIdMappings } from "../core/modelMappings";
 import { normalizeProviderUrl } from "./torUtils";
+import { withProviderDeadline } from "../discovery/providerDeadline";
 
 /** The only request header the SDK forwards upstream on routed requests. */
 export const MODEL_PATH_HEADER = "x-routstr-model-path";
@@ -159,12 +160,13 @@ export async function fetchModelPaths(
   }
   let payload: unknown;
   try {
-    const response = await fetchImpl(url.toString(), {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) return null;
-    payload = await response.json();
+    payload = await withProviderDeadline(async (signal) => {
+      const response = await fetchImpl(url.toString(), {
+        headers: { accept: "application/json" }, signal,
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    }, 10_000);
   } catch {
     return null;
   }
@@ -642,13 +644,14 @@ export async function fetchModelPathsForModel(
     return null;
   }
   try {
-    const response = await fetchImpl(url.toString(), {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (response.status === 404) return { data: [], updatedAt: null };
-    if (!response.ok) return null;
-    return parseModelPathsForModelPayload(await response.json(), modelId);
+    return await withProviderDeadline(async (signal) => {
+      const response = await fetchImpl(url.toString(), {
+        headers: { accept: "application/json" }, signal,
+      });
+      if (response.status === 404) return { data: [], updatedAt: null };
+      if (!response.ok) return null;
+      return parseModelPathsForModelPayload(await response.json(), modelId);
+    }, timeoutMs);
   } catch {
     return null;
   }

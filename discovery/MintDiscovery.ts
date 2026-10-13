@@ -4,6 +4,7 @@
  */
 
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
+import { withProviderDeadline } from "./providerDeadline";
 import type { SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import {
@@ -47,6 +48,7 @@ export class MintDiscovery {
   // Tracked here, not via the adapter's provider timestamp: that stamp
   // belongs to the model cache and mint refreshes kept it alive forever.
   private lastMintFetch = new Map<string, number>();
+  private providerInfoRequests = new Map<string, Promise<ProviderInfo>>();
   // Last pass's failures, so an unchanged outage collapses into the summary
   // instead of re-printing a line per provider per pass. See the report for
   // the transition rules.
@@ -77,8 +79,6 @@ export class MintDiscovery {
       return { mintsFromProviders: {}, infoFromProviders: {} };
     }
 
-    const mintsFromAllProviders: Record<string, string[]> = {};
-    const infoFromAllProviders: Record<string, ProviderInfo> = {};
     const forceRefresh = options.forceRefresh ?? false;
     const startedAt = Date.now();
     // Only network-fetched bases count as retried, so a provider served from
@@ -96,10 +96,6 @@ export class MintDiscovery {
           if (cacheValid) {
             const cachedMints = this.adapter.getCachedMints()[base] || [];
             const cachedInfo = this.adapter.getCachedProviderInfo()[base];
-            mintsFromAllProviders[base] = cachedMints;
-            if (cachedInfo) {
-              infoFromAllProviders[base] = cachedInfo;
-            }
             return {
               success: true,
               base,
@@ -109,27 +105,8 @@ export class MintDiscovery {
           }
         }
 
-        const res = await fetch(`${base}v1/info`, {
-          signal: AbortSignal.timeout(INFO_FETCH_TIMEOUT_MS),
-        });
-        if (!res.ok) {
-          throw new Error(`Failed to fetch info: ${res.status}`);
-        }
-
-        const json = await res.json();
-
-        // Extract mints array from response
-        const mints: string[] = Array.isArray(json?.mints) ? json.mints : [];
-
-        // Normalize mint URLs (remove trailing slashes for consistency)
-        const normalizedMints = mints.map((mint) =>
-          mint.endsWith("/") ? mint.slice(0, -1) : mint
-        );
-
-        // Save provider mints and full info
-        mintsFromAllProviders[base] = normalizedMints;
-        infoFromAllProviders[base] = json;
-        this.lastMintFetch.set(base, Date.now());
+        const json = await this.fetchProviderInfo(base);
+        const normalizedMints = this.adapter.getCachedMints()[base] ?? [];
         freshlyFetched.add(base);
 
         return { success: true, base, mints: normalizedMints, info: json };
@@ -160,35 +137,44 @@ export class MintDiscovery {
       Date.now() - startedAt
     );
 
-    // Handle results
     for (const result of results) {
-      if (result.status === "fulfilled") {
-        const { success, base, mints, info } = result.value;
-        if (!success) continue;
-        mintsFromAllProviders[base] = mints;
-        if (info) {
-          infoFromAllProviders[base] = info;
-        }
-      } else {
+      if (result.status === "rejected") {
         this.logger.error("Mint discovery error:", result.reason);
       }
     }
 
-    // Merge into the latest cache: transient failures must not erase known
-    // restrictions, and concurrent provider-info writes must not be lost.
-    const mergedMints = { ...this.adapter.getCachedMints(), ...mintsFromAllProviders };
-    const mergedInfo = { ...this.adapter.getCachedProviderInfo(), ...infoFromAllProviders };
-    try {
-      this.adapter.setCachedMints(mergedMints);
-      this.adapter.setCachedProviderInfo(mergedInfo);
-    } catch (error) {
-      this.logger.error("Error caching mint discovery results:", error);
-    }
-
+    // Successes were published immediately. Do not merge an older pass's
+    // snapshot here: it could overwrite advertisements refreshed meanwhile.
     return {
-      mintsFromProviders: mergedMints,
-      infoFromProviders: mergedInfo,
+      mintsFromProviders: this.adapter.getCachedMints(),
+      infoFromProviders: this.adapter.getCachedProviderInfo(),
     };
+  }
+
+  private fetchProviderInfo(base: string): Promise<ProviderInfo> {
+    const running = this.providerInfoRequests.get(base);
+    if (running) return running;
+
+    const request = withProviderDeadline(async (signal) => {
+      const res = await fetch(`${base}v1/info`, { signal });
+      if (!res.ok) throw new Error(`Failed to fetch info: ${res.status}`);
+      return await res.json() as ProviderInfo;
+    }, INFO_FETCH_TIMEOUT_MS).then((info) => {
+      const mints: string[] = Array.isArray(info?.mints) ? info.mints : [];
+      const normalized = mints.map((mint) =>
+        mint.endsWith("/") ? mint.slice(0, -1) : mint
+      );
+      // Merge freshest state and retain known restrictions on every failure.
+      // The freshness clock advances only after both payloads are published.
+      this.adapter.setCachedMints({ ...this.adapter.getCachedMints(), [base]: normalized });
+      this.adapter.setCachedProviderInfo({ ...this.adapter.getCachedProviderInfo(), [base]: info });
+      this.lastMintFetch.set(base, Date.now());
+      return info;
+    }).finally(() => {
+      this.providerInfoRequests.delete(base);
+    });
+    this.providerInfoRequests.set(base, request);
+    return request;
   }
 
   /**

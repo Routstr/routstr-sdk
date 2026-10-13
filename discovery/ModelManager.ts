@@ -8,6 +8,7 @@ import type { Model, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
+import { withProviderDeadline } from "./providerDeadline";
 import {
   classifyProviderFailure,
   diffProviderOutage,
@@ -254,6 +255,10 @@ export class ModelManager {
    * worth locking for.
    */
   private providerFailures = new Map<string, ProviderFailure>();
+  private providerModelRequests = new Map<string, Promise<Model[]>>();
+  private modelPassSequence = 0;
+  private activeModelPasses = new Map<number, Set<string>>();
+  private latestModelPassUrls = new Set<string>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -594,34 +599,22 @@ export class ModelManager {
       return;
     }
 
-    // Kind 38421 — provider discovery
-    await this.getNostrEvents(
-      { kinds: [38421], limit: 100 },
-      true,
-      undefined,
-      (event) => this.isProviderAnnouncement(event)
-    );
-
-    // Kind 38425 — provider review/audit events (lgtm, avoid, ...). Fetch all
-    // labels so a provider that was later re-reviewed as `avoid` is discovered;
-    // querying only `#t:["lgtm"]` here would silently keep stale approvals.
-    await this.getNostrEvents(
-      { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
-      true
-    );
-
-    // Kind 38423 — routstr21 curated model list. Fetch every published
-    // version so the latest one can be selected from the persistent store;
-    // limiting to 1 here could persist a stale event.
-    await this.getNostrEvents(
-      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
-      true
-    );
-
-    // Kind 38426 — authoritative variant -> canonical ID snapshot.
-    // One forced query fetches and applies it; getNostrEvents also returns
-    // previously stored evidence when the relays are temporarily unavailable.
-    await this.fetchModelIdMappings(true);
+    // Independent relay filters share one timeout window. Policy application
+    // and pruning must wait for every query (including mappings) to finish.
+    await Promise.all([
+      this.getNostrEvents(
+        { kinds: [38421], limit: 100 }, true, undefined,
+        (event) => this.isProviderAnnouncement(event)
+      ),
+      // Fetch all review labels, including approval -> avoid reversals.
+      this.getNostrEvents(
+        { kinds: [38425], limit: 500, authors: [this.routstrPubkey] }, true
+      ),
+      this.getNostrEvents(
+        { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] }, true
+      ),
+      this.fetchModelIdMappings(true),
+    ]);
 
     // Per-scheduled-pass chatter: the caller reports the pass outcome, so the
     // phase markers stay at `debug` rather than re-printing every 21 minutes.
@@ -1383,137 +1376,130 @@ export class ModelManager {
     }
 
     const startedAt = Date.now();
+    const passId = ++this.modelPassSequence;
+    const normalizedUrls = new Set(baseUrls.map((url) =>
+      url.endsWith("/") ? url : `${url}/`
+    ));
+    this.latestModelPassUrls = normalizedUrls;
+    this.activeModelPasses.set(passId, normalizedUrls);
+    try {
+      // Bootstrap refreshes mappings before model grouping. Direct fetchModels
+      // calls use the already-hydrated snapshot (or bundled offline fallback).
+      const mappings = this.getModelIdMappings();
+      const bestById = new Map<string, { model: Model; base: string }>();
+      // Only network-fetched bases get a new stamp, so cache hits do not
+      // slide the expiry window and failed fetches are retried next pass.
+      const freshlyFetched = new Set<string>();
+      const disabledProviders = this.adapter.getDisabledProviders();
 
-    // Bootstrap refreshes mappings before model grouping. Direct fetchModels
-    // calls use the already-hydrated snapshot (or bundled offline fallback).
-    const mappings = this.getModelIdMappings();
-    const bestById = new Map<string, { model: Model; base: string }>();
-    const modelsFromAllProviders: Record<string, Model[]> = {};
-    // Only network-fetched bases get a new stamp, so cache hits do not
-    // slide the expiry window and failed fetches are retried next pass.
-    const freshlyFetched = new Set<string>();
-    const disabledProviders = this.adapter.getDisabledProviders();
+      // Helper to estimate minimum cost for a model
+      const estimateMinCost = (m: Model): number => {
+        return m?.sats_pricing?.completion ?? 0;
+      };
 
-    // Helper to estimate minimum cost for a model
-    const estimateMinCost = (m: Model): number => {
-      return m?.sats_pricing?.completion ?? 0;
-    };
+      // Helper to emit current progress
+      const emitProgress = () => {
+        if (onProgress) {
+          const currentModels = Array.from(bestById.values()).map((v) => v.model);
+          onProgress(currentModels);
+        }
+      };
 
-    // Helper to emit current progress
-    const emitProgress = () => {
-      if (onProgress) {
-        const currentModels = Array.from(bestById.values()).map((v) => v.model);
-        onProgress(currentModels);
-      }
-    };
+      // Fetch from all providers in parallel with progressive updates
+      const fetchPromises = baseUrls.map(async (url) => {
+        const base = url.endsWith("/") ? url : `${url}/`;
+        try {
+          // Check cache if not forcing refresh
+          let list: Model[];
 
-    // Fetch from all providers in parallel with progressive updates
-    const fetchPromises = baseUrls.map(async (url) => {
-      const base = url.endsWith("/") ? url : `${url}/`;
-      try {
-        // Check cache if not forcing refresh
-        let list: Model[];
+          if (!forceRefresh) {
+            const lastUpdate = this.adapter.getProviderLastUpdate(base);
+            const cacheValid =
+              lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
+            const cachedModels = this.adapter.getCachedModels();
 
-        if (!forceRefresh) {
-          const lastUpdate = this.adapter.getProviderLastUpdate(base);
-          const cacheValid =
-            lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
-          const cachedModels = this.adapter.getCachedModels();
-
-          // Trust a stamp only when its payload actually exists: stamps
-          // written without payloads (older SDK versions) must refetch.
-          if (cacheValid && base in cachedModels) {
-            list = cachedModels[base];
+            // Trust a stamp only when its payload actually exists: stamps
+            // written without payloads (older SDK versions) must refetch.
+            if (cacheValid && base in cachedModels) {
+              list = cachedModels[base];
+            } else {
+              // Cache expired or doesn't exist, fetch fresh
+              list = await this.fetchModelsFromProvider(base);
+              freshlyFetched.add(base);
+            }
           } else {
-            // Cache expired or doesn't exist, fetch fresh
+            // Force refresh
             list = await this.fetchModelsFromProvider(base);
             freshlyFetched.add(base);
           }
-        } else {
-          // Force refresh
-          list = await this.fetchModelsFromProvider(base);
-          freshlyFetched.add(base);
-        }
 
-        modelsFromAllProviders[base] = list;
+          // Update best-priced models if provider not disabled
+          if (!disabledProviders.includes(base)) {
+            for (const m of list) {
+              // Group by canonical id so providers serving the same model
+              // under a mapped variant id or alias fold into one entry.
+              const canonicalId = canonicalIdForModel(m, mappings);
+              const existing = bestById.get(canonicalId);
 
-        // Update best-priced models if provider not disabled
-        if (!disabledProviders.includes(base)) {
-          for (const m of list) {
-            // Group by canonical id so providers serving the same model
-            // under a mapped variant id or alias fold into one entry.
-            const canonicalId = canonicalIdForModel(m, mappings);
-            const existing = bestById.get(canonicalId);
+              // Skip models without sats pricing
+              if (!m.sats_pricing) continue;
 
-            // Skip models without sats pricing
-            if (!m.sats_pricing) continue;
+              if (!existing) {
+                bestById.set(canonicalId, { model: m, base });
+                continue;
+              }
 
-            if (!existing) {
-              bestById.set(canonicalId, { model: m, base });
-              continue;
-            }
-
-            // Replace if this provider has lower cost
-            const currentCost = estimateMinCost(m);
-            const existingCost = estimateMinCost(existing.model);
-            if (currentCost < existingCost && m.sats_pricing) {
-              bestById.set(canonicalId, { model: m, base });
+              // Replace if this provider has lower cost
+              const currentCost = estimateMinCost(m);
+              const existingCost = estimateMinCost(existing.model);
+              if (currentCost < existingCost && m.sats_pricing) {
+                bestById.set(canonicalId, { model: m, base });
+              }
             }
           }
+
+          emitProgress();
+
+          return { base };
+        } catch (error) {
+          // No stamp on failure, or the provider is served as "offers
+          // nothing" until the TTL expires; last known models keep serving.
+          // The raw error text is kept, but reporting is deferred to the end of
+          // the pass so a node that has been down for days cannot re-print its
+          // error line on every refresh. See reportProviderFailures().
+          return { base, failure: classifyProviderFailure(error) };
         }
+      });
 
-        emitProgress();
+      const settled = await Promise.allSettled(fetchPromises);
+      this.reportProviderFailures(
+        settled.flatMap((result) =>
+          result.status === "fulfilled" ? [result.value] : []
+        ),
+        freshlyFetched,
+        baseUrls.length,
+        Date.now() - startedAt
+      );
 
-        return { base };
-      } catch (error) {
-        // No stamp on failure, or the provider is served as "offers
-        // nothing" until the TTL expires; last known models keep serving.
-        // The raw error text is kept, but reporting is deferred to the end of
-        // the pass so a node that has been down for days cannot re-print its
-        // error line on every refresh. See reportProviderFailures().
-        return { base, failure: classifyProviderFailure(error) };
+      // Return this caller's subset, with its own policy snapshot/progress.
+      return Array.from(bestById.values()).map((v) => v.model);
+    } finally {
+      this.activeModelPasses.delete(passId);
+      // A finishing older/narrower pass must not erase a newer pass's results.
+      // Keep active callers' subsets too; once they settle, the most recently
+      // requested provider set is authoritative for pruning.
+      const keep = new Set(this.latestModelPassUrls);
+      for (const urls of this.activeModelPasses.values()) {
+        for (const url of urls) keep.add(url);
       }
-    });
-
-    const settled = await Promise.allSettled(fetchPromises);
-    this.reportProviderFailures(
-      settled.flatMap((result) =>
-        result.status === "fulfilled" ? [result.value] : []
-      ),
-      freshlyFetched,
-      baseUrls.length,
-      Date.now() - startedAt
-    );
-
-    // Cache all provider results, pruning stale entries for providers
-    // that are no longer in the current baseUrls (e.g. their Nostr event
-    // was lost).  Without this, stale models from vanished providers
-    // accumulate in the cache forever.
-    const existingCache = this.adapter.getCachedModels();
-    const currentBaseUrls = new Set(baseUrls);
-    const prunedExisting: Record<string, Model[]> = {};
-    for (const url of Object.keys(existingCache)) {
-      if (currentBaseUrls.has(url)) {
-        prunedExisting[url] = existingCache[url];
-      } else {
-        // A pruned payload must take its freshness stamp with it, or the
-        // provider reads as valid-but-empty until the TTL expires.
-        this.adapter.setProviderLastUpdate(url, 0);
+      const cache = this.adapter.getCachedModels();
+      const retained: Record<string, Model[]> = {};
+      for (const [url, models] of Object.entries(cache)) {
+        if (keep.has(url)) retained[url] = models;
+        else this.adapter.setProviderLastUpdate(url, 0);
       }
+      this.adapter.setCachedModels(retained);
     }
-    this.adapter.setCachedModels({
-      ...prunedExisting,
-      ...modelsFromAllProviders,
-    });
-    // Stamp after the payload write so no reader ever sees a fresh stamp
-    // with a missing payload.
-    const stampTime = Date.now();
-    for (const base of freshlyFetched) {
-      this.adapter.setProviderLastUpdate(base, stampTime);
-    }
-
-    // Return combined models array
-    return Array.from(bestById.values()).map((v) => v.model);
   }
 
   /**
@@ -1521,18 +1507,25 @@ export class ModelManager {
    * @param baseUrl Provider base URL
    * @returns Array of models from provider
    */
-  private async fetchModelsFromProvider(baseUrl: string): Promise<Model[]> {
-    const res = await fetch(`${baseUrl}v1/models`, {
-      signal: AbortSignal.timeout(PROVIDER_FETCH_TIMEOUT_MS),
+  private fetchModelsFromProvider(baseUrl: string): Promise<Model[]> {
+    const running = this.providerModelRequests.get(baseUrl);
+    if (running) return running;
+
+    const request = withProviderDeadline(async (signal) => {
+      const res = await fetch(`${baseUrl}v1/models`, { signal });
+      if (!res.ok) throw new Error(`Failed to fetch models: ${res.status}`);
+      const json = await res.json();
+      return (Array.isArray(json?.data) ? json.data : []) as Model[];
+    }, PROVIDER_FETCH_TIMEOUT_MS).then((list) => {
+      // Only the bounded result can publish, never a late underlying response.
+      this.adapter.setCachedModels({ ...this.adapter.getCachedModels(), [baseUrl]: list });
+      this.adapter.setProviderLastUpdate(baseUrl, Date.now());
+      return list;
+    }).finally(() => {
+      this.providerModelRequests.delete(baseUrl);
     });
-    if (!res.ok) {
-      throw new Error(`Failed to fetch models: ${res.status}`);
-    }
-
-    const json = await res.json();
-    const list = Array.isArray(json?.data) ? json.data : [];
-
-    return list;
+    this.providerModelRequests.set(baseUrl, request);
+    return request;
   }
 
   /**
