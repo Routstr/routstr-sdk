@@ -1,5 +1,6 @@
 /**
- * Provider outage reporting for one `fetchModels` pass.
+ * Provider outage reporting for one provider-info pass (`ModelManager`
+ * `fetchModels`, `MintDiscovery` `discoverMints`).
  *
  * A refresh runs on a fixed cadence against a mostly stable provider set, so
  * the same unreachable nodes would otherwise re-print a raw warning every
@@ -9,7 +10,7 @@
  * per-provider detail at `debug`.
  *
  * Pure (previous state in, next state and lines out), so it is testable
- * without a `ModelManager` or a `DiscoveryAdapter`.
+ * without a `ModelManager`, a `MintDiscovery` or a `DiscoveryAdapter`.
  */
 
 /** A provider's failure in one fetch pass, normalized for a one-line summary. */
@@ -69,7 +70,9 @@ export function isProviderDownError(error: unknown): boolean {
 export function classifyProviderFailure(error: unknown): ProviderFailureInfo {
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
-  const status = /Failed to fetch models:\s*(\d+)/.exec(message);
+  // Both passes phrase a rejection the same way, only the resource differs:
+  // "Failed to fetch models: 530" here, "Failed to fetch info: 405" for mints.
+  const status = /Failed to fetch \w+:\s*(\d+)/.exec(message);
   const isDown = isProviderDownError(error);
 
   const detail =
@@ -98,7 +101,9 @@ export function diffProviderOutage(
   outcomes: ProviderOutcome[],
   freshlyFetched: ReadonlySet<string>,
   total: number,
-  elapsedMs: number
+  elapsedMs: number,
+  /** Prefix of the one-line summary, so each pass names itself. */
+  label = "Model refresh"
 ): ProviderOutageReport {
   const lines: PassLogLine[] = [];
   const failures = new Map<string, ProviderFailure>();
@@ -141,7 +146,7 @@ export function diffProviderOutage(
   if (failures.size === 0 && recovered.length === 0) {
     lines.push({
       level: "debug",
-      message: `Model refresh: all ${total} provider(s) ok in ${formatDuration(elapsedMs)}`,
+      message: `${label}: all ${total} provider(s) ok in ${formatDuration(elapsedMs)}`,
     });
     return { lines, failures };
   }
@@ -149,6 +154,7 @@ export function diffProviderOutage(
   lines.push({
     level: "info",
     message: formatFetchSummary({
+      label,
       total,
       ok: total - failures.size,
       failures,
@@ -166,6 +172,7 @@ export function diffProviderOutage(
  * long one.
  */
 function formatFetchSummary(input: {
+  label: string;
   total: number;
   ok: number;
   failures: Map<string, ProviderFailure>;
@@ -173,7 +180,8 @@ function formatFetchSummary(input: {
   recovered: string[];
   elapsedMs: number;
 }): string {
-  const { total, ok, failures, newlyFailed, recovered, elapsedMs } = input;
+  const { label, total, ok, failures, newlyFailed, recovered, elapsedMs } =
+    input;
   const parts = [`${ok}/${total} providers ok`];
 
   if (failures.size > 0) {
@@ -189,7 +197,7 @@ function formatFetchSummary(input: {
   const down = Array.from(failures, ([base, failure]) =>
     `${providerHost(base)}(${failure.detail})`
   );
-  const summary = `Model refresh: ${parts.join(", ")} in ${formatDuration(elapsedMs)}`;
+  const summary = `${label}: ${parts.join(", ")} in ${formatDuration(elapsedMs)}`;
 
   return down.length > 0 ? `${summary} — ${formatProviderList(down)}` : summary;
 }
