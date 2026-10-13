@@ -13,9 +13,12 @@ export {
 // vendored @reclaimprotocol/tls fork). Never exported from the browser-safe
 // default entrypoint.
 export * from "./client/confidential";
-import { fetchConfidential as _fetchConfidential } from "./client/confidential";
+import {
+  fetchConfidential as _fetchConfidential,
+  qualifyConfidentialNode as _qualifyConfidentialNode,
+} from "./client/confidential";
 import { setConfidentialTransport as _setConfidentialTransport } from "./client/RoutstrClient";
-_setConfidentialTransport(_fetchConfidential);
+_setConfidentialTransport(_fetchConfidential, _qualifyConfidentialNode);
 
 import {
   ModelManager as BrowserSafeModelManager,
