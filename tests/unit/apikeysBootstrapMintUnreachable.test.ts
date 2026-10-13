@@ -396,4 +396,35 @@ describe("RoutstrClient._spendToken — apikeys bootstrap key validation", () =>
     expect(storage.setApiKeys).toEqual([]);
     expect(result.token).toBe(BOOTSTRAP_TOKEN);
   });
+
+  it.each([
+    [false, [[BASE_URL, 6, 0]]],
+    [true, []],
+  ])("saves the balance it reads for a key stored at 0 (read failed: %s)", async (balanceUnknown, expected) => {
+    const storage = createStorage(BOOTSTRAP_TOKEN);
+    const saved = vi.spyOn(storage, "updateApiKeyBalance");
+    const client = new RoutstrClient(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "apikeys"
+    );
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 6000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: "",
+      isInvalidApiKey: false,
+      balanceUnknown,
+    });
+
+    await (client as any)._spendToken({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+    });
+
+    expect(saved.mock.calls).toEqual(expected);
+  });
 });

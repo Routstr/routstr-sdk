@@ -60,7 +60,7 @@ import {
   canonicalIdForModel,
   canonicalizeModelId,
 } from "../core/modelMappings";
-import { isNetworkErrorMessage } from "../wallet/tokenUtils";
+import { getBalanceInSats, isNetworkErrorMessage } from "../wallet/tokenUtils";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
   extractResponseId,
@@ -3143,6 +3143,18 @@ export class RoutstrClient {
           tokenReserved = balanceInfo.reserved;
           tokenBalanceUnit = balanceInfo.unit;
           tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
+          // A fresh key is stored at 0. Save what it holds now, or a request
+          // that fails leaves its deposit hidden from balances and refunds.
+          if (
+            !tokenBalanceUnknown &&
+            this.storageAdapter.getApiKey(baseUrl)?.key === parentApiKey.key
+          ) {
+            this.storageAdapter.updateApiKeyBalance(
+              baseUrl,
+              getBalanceInSats(tokenBalance, tokenBalanceUnit),
+              getBalanceInSats(tokenReserved, tokenBalanceUnit)
+            );
+          }
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
