@@ -66,6 +66,13 @@ function checkTailRecords(
      * key epoch; when given, every record's `seq` must be exactly its offset.
      */
     epochBase?: number;
+    /**
+     * The tail record lengths (content + type byte, last record first) we
+     * sent in our disclosure: the minimal tail covering R + skip. When given,
+     * the node must name exactly these records, so it cannot pad the proof
+     * with earlier ones.
+     */
+    tailLens?: number[];
   },
 ): void {
   if (!eq(p.expected, own.r)) fail(proof, "expected bytes are not our disclosure");
@@ -84,6 +91,15 @@ function checkTailRecords(
   const first = Math.max(0, end - recs.length);
   const mine = own.serverRecords.slice(first, end);
   if (mine.length !== recs.length) fail(proof, "more records than we received");
+  if (own.tailLens !== undefined) {
+    const want = own.tailLens;
+    if (recs.length !== want.length) fail(proof, "records are not the tail we disclosed");
+    for (let i = 0; i < mine.length; i++) {
+      if (mine[i]!.length - 16 !== want[want.length - 1 - i]) {
+        fail(proof, "records are not the tail we disclosed");
+      }
+    }
+  }
   // π_C3S decrypts the first record only from the last block boundary that
   // still covers the disclosure; the offset is determined by our own records.
   const contentOf = (m: Uint8Array) => m.length - 16 - 1;
@@ -91,9 +107,7 @@ function checkTailRecords(
   const need = own.r.length + own.skip;
   const firstContent = contentOf(mine[0]!);
   const expectedOff =
-    proof === "π_C3S" && total >= need
-      ? Math.floor((firstContent - Math.max(0, need - (total - firstContent))) / 16) * 16
-      : 0;
+    proof === "π_C3S" && total >= need ? firstTailOffset(firstContent, total - firstContent, need) : 0;
   if (own.epochBase !== undefined && recs[0]!.seq !== first - own.epochBase) {
     fail(proof, "record sequence numbers are not their position in our transcript");
   }
@@ -112,6 +126,18 @@ function checkTailRecords(
     covered += m.length - 16 - 1;
   }
   if (covered < own.r.length + own.skip) fail(proof, "records do not cover the disclosure");
+}
+
+/**
+ * The block-aligned offset into the first covered record (`firstContent`
+ * content bytes; the later ones hold `rest`) from which π_C3S decrypts it:
+ * the last block boundary that still covers `need` bytes, and never past its
+ * last content byte, which the proof always decrypts (also when the later
+ * records alone cover `need`). The node computes the same offset.
+ */
+export function firstTailOffset(firstContent: number, rest: number, need: number): number {
+  const neededFirst = Math.min(Math.max(need - rest, 1), Math.max(firstContent, 1));
+  return Math.floor((firstContent - Math.min(neededFirst, firstContent)) / 16) * 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +168,14 @@ export function checkPiC3SParams(
     keyUpdates?: number;
     epochBase?: number;
     trailing?: number;
+    /** The tail lengths we sent in our disclosure (required). */
+    tailLens: number[];
   },
 ): void {
   const p = (params as { PiC3S?: Record<string, any> } | null)?.PiC3S;
   if (!p) fail("π_C3S", "missing");
   if (!eq(p.h2, own.h2)) fail("π_C3S", "anchor h2 is not the one from our 2PC");
+  if (!Array.isArray(own.tailLens) || own.tailLens.length === 0) fail("π_C3S", "no disclosed tail to check against");
   checkTailRecords("π_C3S", p, own);
 }
 

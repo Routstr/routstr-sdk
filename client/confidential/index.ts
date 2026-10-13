@@ -115,6 +115,7 @@ export {
   verifyReceipt,
   maxChargeMsats,
   feeOnlyChargeOk,
+  checkUpstreamErrorReceipt,
   type ReceiptVerificationInput,
   type ReceiptVerificationResult,
 } from "./receipt";
@@ -145,6 +146,7 @@ export {
 
 export {
   fetchConfidential,
+  qualifyConfidentialNode,
   closeConfidentialPrewarm,
   confidentialPrewarmSnapshot,
   buildPinnedBody,

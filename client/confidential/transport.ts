@@ -246,6 +246,36 @@ async function verifiedOffer(
 }
 
 
+/** The node's verified offer, which must price `model`. */
+async function qualifiedOffer(
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions,
+  fresh = false,
+): Promise<VerifiedOffer> {
+  const offer = await verifiedOffer(baseUrl, options, fresh);
+  if (!Object.hasOwn(offer.price_list, model)) {
+    throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not serve ${model} confidentially`);
+  }
+  return offer;
+}
+
+/**
+ * Check, with no credential, that `baseUrl` would run a confidential session
+ * for `model`: its signed offer verifies under the caller's policy, the node
+ * is reachable over an encrypted transport and its price list names the
+ * model. Throws the error the session itself would raise; returns the
+ * verified offer. The client calls this before it spends a token on a node,
+ * and sizes the deposit from the offer.
+ */
+export async function qualifyConfidentialNode(
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions,
+): Promise<VerifiedOffer> {
+  return qualifiedOffer(baseUrl, model, options);
+}
+
 /** The one endpoint the confidential transport implements. */
 export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
   return (
@@ -426,10 +456,7 @@ async function fetchConfidentialOnce(
   const { baseUrl, options } = params;
   const request = (params.body ?? {}) as Record<string, unknown>;
   const model = typeof request.model === "string" ? request.model : "";
-  const offer = await verifiedOffer(baseUrl, options, freshOffer);
-  if (!Object.hasOwn(offer.price_list, model)) {
-    throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not serve ${model} confidentially`);
-  }
+  const offer = await qualifiedOffer(baseUrl, model, options, freshOffer);
   const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
   const body = buildPinnedBody(request, model, maxTokens);
   const wantStream = request.stream === true;
