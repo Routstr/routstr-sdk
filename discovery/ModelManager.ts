@@ -599,34 +599,22 @@ export class ModelManager {
       return;
     }
 
-    // Kind 38421 — provider discovery
-    await this.getNostrEvents(
-      { kinds: [38421], limit: 100 },
-      true,
-      undefined,
-      (event) => this.isProviderAnnouncement(event)
-    );
-
-    // Kind 38425 — provider review/audit events (lgtm, avoid, ...). Fetch all
-    // labels so a provider that was later re-reviewed as `avoid` is discovered;
-    // querying only `#t:["lgtm"]` here would silently keep stale approvals.
-    await this.getNostrEvents(
-      { kinds: [38425], limit: 500, authors: [this.routstrPubkey] },
-      true
-    );
-
-    // Kind 38423 — routstr21 curated model list. Fetch every published
-    // version so the latest one can be selected from the persistent store;
-    // limiting to 1 here could persist a stale event.
-    await this.getNostrEvents(
-      { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
-      true
-    );
-
-    // Kind 38426 — authoritative variant -> canonical ID snapshot.
-    // One forced query fetches and applies it; getNostrEvents also returns
-    // previously stored evidence when the relays are temporarily unavailable.
-    await this.fetchModelIdMappings(true);
+    // Independent relay filters share one timeout window. Policy application
+    // and pruning must wait for every query (including mappings) to finish.
+    await Promise.all([
+      this.getNostrEvents(
+        { kinds: [38421], limit: 100 }, true, undefined,
+        (event) => this.isProviderAnnouncement(event)
+      ),
+      // Fetch all review labels, including approval -> avoid reversals.
+      this.getNostrEvents(
+        { kinds: [38425], limit: 500, authors: [this.routstrPubkey] }, true
+      ),
+      this.getNostrEvents(
+        { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] }, true
+      ),
+      this.fetchModelIdMappings(true),
+    ]);
 
     // Per-scheduled-pass chatter: the caller reports the pass outcome, so the
     // phase markers stay at `debug` rather than re-printing every 21 minutes.
