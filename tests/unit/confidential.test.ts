@@ -31,6 +31,7 @@ import {
   supportedVersion,
 } from "../../client/confidential/offer";
 import {
+  checkUpstreamErrorReceipt,
   feeOnlyChargeOk,
   maxChargeMsats,
   checkAttestationBinding,
@@ -42,7 +43,7 @@ import {
   offerSessionFeeMsat,
   validateOfferShape,
 } from "../../client/confidential/offer";
-import { confidentialRequiredSats } from "../../client/RoutstrClient";
+import { confidentialRequiredSats, confidentialReservationMsats } from "../../client/RoutstrClient";
 import {
   aggregateChatCompletionSse,
   buildPinnedBody,
@@ -512,6 +513,33 @@ describe("receipt verification", () => {
     expect(feeOnlyChargeOk(2001, 2000)).toBe(false);
   });
 
+  it("bounds the charge for an upstream error receipt", () => {
+    const err = (status: unknown, extra: Record<string, unknown> = {}) =>
+      ({ sid: "s1", model: "m", usage: { error_status: status }, ...extra }) as never;
+    // 4xx / 503: at most the session fee.
+    expect(checkUpstreamErrorReceipt(err(429, { cost_msats: 0 }), 429, 0)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(503, { cost_msats: 2000 }), 503, 2000)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(503, { cost_msats: 2001, reserved_msats: 9000 }), 503, 2000)).toThrow(
+      ReceiptVerificationError,
+    );
+    // Other 5xx: at most the reservation the receipt names.
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0)).toThrow(
+      /reservation/,
+    );
+    expect(() => checkUpstreamErrorReceipt(err(502, { cost_msats: 1e12 }), 502, 0)).toThrow(/reservation/);
+    expect(checkUpstreamErrorReceipt(err(504, { cost_msats: 500 }), 504, 500)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: -1, reserved_msats: 9000 }), 500, 0)).toThrow(
+      ReceiptVerificationError,
+    );
+    expect(() =>
+      checkUpstreamErrorReceipt(err(500, { cost_msats: 10, reserved_msats: 9000, session_fee_msat: 5 }), 500, 0),
+    ).toThrow(/session fee/);
+    // The status must be the one we saw, as a number.
+    expect(checkUpstreamErrorReceipt(err("500", { cost_msats: 0 }), 500, 0)).toBe(false);
+    expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 0 }), 500, 0)).toBe(false);
+  });
+
   it("flags a usage mismatch", () => {
     const receipt = {
       ...base,
@@ -776,10 +804,13 @@ describe("security regressions", () => {
   it("accepts only an attestation naming this session and handshake", () => {
     const thSH = new Uint8Array(32).fill(7);
     const thSF = new Uint8Array(32).fill(9);
-    const own = { sid: "s1", thSH, thSF };
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) };
     const att = (o: Record<string, unknown>) =>
-      canonicalJson({ sid: "s1", th_sh: bytesToHex(thSH), th_sf: bytesToHex(thSF), c_commit: null, ...o });
+      canonicalJson({ sid: "s1", th_sh: bytesToHex(thSH), th_sf: bytesToHex(thSF), c_commit: "ab".repeat(32), ...o });
     expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    // The commitment is always checked: without ours there is nothing to compare.
+    expect(() => checkAttestationBinding(att({}), { sid: "s1", thSH, thSF })).toThrow(/commitment/);
+    expect(() => checkAttestationBinding(att({ c_commit: null }), own)).toThrow(/commitment/);
     expect(() => checkAttestationBinding(att({ sid: "s2" }), own)).toThrow(/not s1/);
     expect(() => checkAttestationBinding(att({ th_sh: "00".repeat(32) }), own)).toThrow(/handshake/);
     expect(() => checkAttestationBinding(att({ th_sf: null }), own)).toThrow(/handshake/);
@@ -856,27 +887,109 @@ describe("confidential session fee and surcharge in the offer", () => {
 });
 
 describe("confidential deposit sizing", () => {
-  const model = (cu?: Record<string, unknown>) =>
+  // routstr-core `confidential.reserve` (msats), with min_request_msat = 1.
+  const nodeReservation = (o: {
+    limit?: number;
+    maxCost: number;
+    rates: { in: number; out: number };
+    maxTokens: number;
+    margin: number;
+    pct: number;
+    fee: number;
+    abandon: number;
+  }) => {
+    const base =
+      o.limit !== undefined
+        ? Math.ceil((o.limit * o.rates.in + (o.maxTokens + o.margin) * o.rates.out) / 1000)
+        : Math.ceil(Math.ceil(o.maxCost * 1000) * (1 + o.pct / 100) + (o.margin * o.rates.out) / 1000);
+    return Math.max(1, base) + Math.max(o.fee, Math.max(o.abandon, o.fee));
+  };
+  // Listing prices in sats per token; the node's rates are msats per 1k tokens.
+  const prompt = 0.0003;
+  const completion = 0.0012;
+  const model = (opts: { contextLength?: number; top?: number; cu?: Record<string, unknown> } = {}) =>
     ({
       id: "m",
-      sats_pricing: { max_cost: 1000, max_prompt_cost: 900, completion: 0.1, request: 0 },
-      ...(cu ? { confidential_upstream: { v: 2, offer_url: "x", ...cu } } : {}),
+      ...(opts.contextLength !== undefined ? { context_length: opts.contextLength } : {}),
+      ...(opts.top !== undefined ? { top_provider: { context_length: opts.top } } : {}),
+      sats_pricing: { prompt, completion, max_cost: 70, max_prompt_cost: 39.3, max_completion_cost: 4.9, request: 0 },
+      ...(opts.cu ? { confidential_upstream: { v: 2, offer_url: "x", ...opts.cu } } : {}),
+    }) as never;
+  const offer = (o: Record<string, unknown> = {}) =>
+    ({
+      price_list: { m: { in: 360, cached_in: 360, out: 1440 } },
+      max_tokens_cap: 4096,
+      rate_surcharge_pct: 20,
+      session_fee_msat: 2000,
+      abandon_fee_msat: 5000,
+      reserve_margin_tokens: 16,
+      ...o,
     }) as never;
 
-  it("is unchanged without a fee or surcharge", () => {
-    expect(confidentialRequiredSats(model(), 100)).toBeCloseTo(Math.min(1000, 910 * 1.05));
-    expect(confidentialRequiredSats(model({}), 100)).toBeCloseTo(Math.min(1000, 910 * 1.05));
+  it("equals the node's reservation with the signed offer (context length known)", () => {
+    for (const maxTokens of [1, 100, 4000, 4096]) {
+      const want = nodeReservation({
+        limit: 131072,
+        maxCost: 70,
+        rates: { in: 360, out: 1440 },
+        maxTokens,
+        margin: 16,
+        pct: 20,
+        fee: 2000,
+        abandon: 5000,
+      });
+      expect(confidentialReservationMsats(model({ contextLength: 131072 }), maxTokens, offer())).toBe(want);
+      expect(confidentialRequiredSats(model({ contextLength: 131072 }), maxTokens, offer())).toBe(
+        Math.ceil(want / 1000),
+      );
+    }
+    // The pinned cap: an over-cap request is clamped, no request means the cap.
+    const atCap = confidentialReservationMsats(model({ contextLength: 131072 }), 4096, offer());
+    expect(confidentialReservationMsats(model({ contextLength: 131072 }), 9999, offer())).toBe(atCap);
+    expect(confidentialReservationMsats(model({ contextLength: 131072 }), undefined, offer())).toBe(atCap);
+    // The provider's context length comes first, like on the node.
+    expect(confidentialReservationMsats(model({ contextLength: 8192, top: 131072 }), 100, offer())).toBe(
+      confidentialReservationMsats(model({ contextLength: 131072 }), 100, offer()),
+    );
+    // No margin in the offer: the node reserves none.
+    expect(confidentialReservationMsats(model({ contextLength: 1000 }), 100, offer({ reserve_margin_tokens: undefined }))).toBe(
+      nodeReservation({ limit: 1000, maxCost: 70, rates: { in: 360, out: 1440 }, maxTokens: 100, margin: 0, pct: 20, fee: 2000, abandon: 5000 }),
+    );
   });
 
-  it("adds the surcharge and the larger of the session and abandon fees", () => {
-    const base = Math.min(1000, 910 * 1.05);
-    expect(confidentialRequiredSats(model({ rate_surcharge_pct: 20, session_fee_msat: 2000 }), 100)).toBeCloseTo(
-      base * 1.2 + 2,
+  it("equals the node's reservation without a context length (undiscounted max cost)", () => {
+    const want = nodeReservation({
+      maxCost: 70,
+      rates: { in: 360, out: 1440 },
+      maxTokens: 100,
+      margin: 16,
+      pct: 20,
+      fee: 2000,
+      abandon: 5000,
+    });
+    expect(confidentialReservationMsats(model(), 100, offer())).toBe(want);
+  });
+
+  it("without the offer: listing rates and fees, a default margin, never below the node", () => {
+    const cu = { rate_surcharge_pct: 20, session_fee_msat: 2000, abandon_fee_msat: 5000 };
+    const signed = confidentialReservationMsats(model({ contextLength: 131072 }), 100, offer())!;
+    const listed = confidentialReservationMsats(model({ contextLength: 131072, cu }), 100)!;
+    expect(listed).toBeGreaterThanOrEqual(signed);
+    expect(Math.abs(listed - signed)).toBeLessThanOrEqual(1);
+    expect(confidentialReservationMsats(model({ cu }), 100)).toBe(confidentialReservationMsats(model(), 100, offer()));
+    // No fees listed: none added.
+    expect(confidentialReservationMsats(model({ contextLength: 1000, cu: {} }), 100)).toBe(
+      nodeReservation({ limit: 1000, maxCost: 70, rates: { in: 300, out: 1200 }, maxTokens: 100, margin: 16, pct: 0, fee: 0, abandon: 0 }),
     );
-    expect(confidentialRequiredSats(model({ session_fee_msat: 1500 }), 100)).toBeCloseTo(base + 2);
-    expect(
-      confidentialRequiredSats(model({ session_fee_msat: 2000, abandon_fee_msat: 10_000 }), 100),
-    ).toBeCloseTo(base + 10);
+  });
+
+  it("is not capped at the plaintext max cost", () => {
+    // The listing's max_cost discounts the prompt by the provider's own
+    // completion limit; the node reserves the full context plus the cap.
+    const m = { ...(model({ contextLength: 131072 }) as object), sats_pricing: { prompt, completion, max_cost: 40, max_prompt_cost: 39.3, max_completion_cost: 4.9, request: 0 } } as never;
+    const sats = confidentialRequiredSats(m, 4096, offer())!;
+    expect(sats).toBeGreaterThan(40);
+    expect(sats).toBe(Math.ceil(confidentialReservationMsats(model({ contextLength: 131072 }), 4096, offer())! / 1000));
   });
 });
 

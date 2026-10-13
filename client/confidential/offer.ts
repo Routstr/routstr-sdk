@@ -76,6 +76,11 @@ export interface ConfidentialOffer {
    * rates for confidential sessions. `price_list` already includes it.
    */
   rate_surcharge_pct?: number;
+  /**
+   * Completion tokens the node reserves beyond the pinned cap (a provider may
+   * bill slightly past it); absent when none.
+   */
+  reserve_margin_tokens?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
@@ -193,6 +198,11 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
 
 function feeValue(fee: unknown): number {
   return typeof fee === "number" && Number.isSafeInteger(fee) && fee > 0 ? fee : 0;
+}
+
+/** The signed offer's completion-token margin on the reservation (0 when none). */
+export function offerReserveMarginTokens(offer: Pick<ConfidentialOffer, "reserve_margin_tokens">): number {
+  return feeValue(offer.reserve_margin_tokens);
 }
 
 /** The signed offer's session fee in msats (0 when the node charges none). */
