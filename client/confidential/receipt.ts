@@ -95,6 +95,54 @@ export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 
   return (costMsats ?? 0) <= Math.max(0, sessionFeeMsat);
 }
 
+/**
+ * A receipt for an upstream HTTP error (no usage event to price). It must name
+ * the status we saw ourselves (returned as the usage match). A refusal the
+ * provider answers before doing any work (4xx, 503) costs at most the signed
+ * session fee; any other error at most the session's reservation, which is
+ * what the node charges when it cannot attribute the provider's work. A charge
+ * outside these bounds throws.
+ */
+export function checkUpstreamErrorReceipt(
+  receipt: ConfidentialReceipt,
+  status: number,
+  sessionFeeMsat = 0,
+): boolean {
+  const ru = receipt.usage as unknown as { error_status?: unknown } | undefined;
+  const usageMatch = ru?.error_status === status;
+  const fee = Math.max(0, sessionFeeMsat);
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    throw new ReceiptVerificationError(
+      `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
+    );
+  }
+  const cost = receipt.cost_msats ?? 0;
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+    throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
+  }
+  const unbilled = status === 503 || (status >= 400 && status < 500);
+  if (unbilled) {
+    if (!feeOnlyChargeOk(cost, fee)) {
+      throw new ReceiptVerificationError(
+        `node charged ${cost} msats for an unbilled upstream error (session fee ${fee} msats)`,
+      );
+    }
+  } else if (cost > fee) {
+    const reserved = receipt.reserved_msats;
+    if (typeof reserved !== "number" || !Number.isFinite(reserved)) {
+      throw new ReceiptVerificationError(
+        `node charged ${cost} msats for upstream error ${status} without naming its reservation`,
+      );
+    }
+    if (cost > reserved) {
+      throw new ReceiptVerificationError(
+        `node charged ${cost} msats for upstream error ${status}, more than its reservation (${reserved} msats)`,
+      );
+    }
+  }
+  return usageMatch;
+}
+
 export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificationResult {
   const { receipt, ownUsage } = input;
   const receiptJson = input.receiptJson ?? JSON.stringify(receipt);
@@ -169,10 +217,10 @@ export function parseSignedReceipt(input: {
  * handshake transcript hashes we computed ourselves. A validly signed
  * attestation of another session is not evidence about this one.
  *
- * The fields we can recompute from our own records are checked as well, each
- * when we have it: the head-record commitment the node sent us (`c_commit`),
- * the hash of the certificate list the provider sent, and the count and hash
- * of every upstream byte the node relayed to us. A node cannot then sign one
+ * The head-record commitment (`c_commit`) must be the one π_NK proved to us.
+ * The other fields we can recompute from our own records are checked as well,
+ * each when we have it: the hash of the certificate list the provider sent,
+ * and the count and hash of every upstream byte the node relayed to us. A node cannot then sign one
  * account of the session for us and another for anyone it shows the
  * attestation to.
  */
@@ -182,7 +230,7 @@ export function checkAttestationBinding(
     sid: string;
     thSH?: Uint8Array;
     thSF?: Uint8Array;
-    /** Hex `c_commit` from the node's c_commit frame. */
+    /** Hex `c_commit` of the π_NK statement we verified (required). */
     cCommit?: string;
     /** SHA-256 of the provider's certificate DERs, concatenated in order. */
     certChainHash?: Uint8Array;
@@ -218,7 +266,10 @@ export function checkAttestationBinding(
   if (a.th_sh !== hex(own.thSH) || a.th_sf !== hex(own.thSF)) {
     throw new ReceiptVerificationError("attestation names a different TLS handshake");
   }
-  if (own.cCommit !== undefined && a.c_commit !== own.cCommit) {
+  if (!own.cCommit) {
+    throw new ReceiptVerificationError("no head-record commitment to check the attestation against");
+  }
+  if (a.c_commit !== own.cCommit) {
     throw new ReceiptVerificationError("attestation names a different head-record commitment");
   }
   if (own.certChainHash && a.cert_chain_hash !== hex(own.certChainHash)) {

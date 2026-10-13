@@ -130,3 +130,41 @@ describe("proof channel bridge (v2)", () => {
     expect(t.chan.failed).toBe(true);
   });
 });
+
+describe("per-proof connection refused by the node", () => {
+  it("fails at once when the /zk socket closes without opening", async () => {
+    const { CuProverBackend } = await import("../../client/confidential/prover");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdin, stdout, kill: () => true });
+    class RefusedSocket {
+      binaryType = "";
+      readyState = 3;
+      onopen?: () => void;
+      onclose?: () => void;
+      onerror?: () => void;
+      onmessage?: () => void;
+      constructor(_url: string) {
+        setTimeout(() => this.onclose?.(), 1);
+      }
+      send() {}
+      close() {}
+    }
+    const original = globalThis.WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = RefusedSocket;
+    try {
+      const prover = new CuProverBackend({
+        binaryPath: "/nonexistent/cu-prover",
+        timeoutMs: 30_000,
+        spawnImpl: (() => child) as never,
+      });
+      const t = Date.now();
+      await expect(
+        prover.run("ws://node/zk?proof=pi_c3s", { proof: "pi_c3s", role: "prover", params: {} }),
+      ).rejects.toThrow(/closed before/);
+      expect(Date.now() - t).toBeLessThan(5_000);
+    } finally {
+      (globalThis as { WebSocket: unknown }).WebSocket = original;
+    }
+  });
+});

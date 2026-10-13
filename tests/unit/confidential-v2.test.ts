@@ -13,6 +13,7 @@ import {
   checkPiC2SParams,
   checkPiC3SParams,
   checkPiNKParams,
+  firstTailOffset,
   serverTailEpoch,
 } from "../../client/confidential/params";
 import {
@@ -180,7 +181,8 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
       { seq: 1, ct: Array.from(recs[1]!.subarray(48, 64)), off: 48 },
       { seq: 2, ct: Array.from(recs[2]!.subarray(0, 54)) },
     ];
-    const own = { h2, serverRecords: recs, r, skip: 0 };
+    // A two-record tail (the check follows the tail lengths we disclosed).
+    const own = { h2, serverRecords: recs, r, skip: 0, tailLens: [54, 64] };
     expect(() => checkPiC3SParams(params(tail), own)).not.toThrow();
     // Any other offset (more or less of the record than the rule gives) is refused.
     for (const off of [0, 32]) {
@@ -215,7 +217,7 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     const params = (ku?: number, records = tail) => ({
       PiC3S: { h2: Array.from(h2), records, expected: Array.from(r), skip: 0, ...(ku ? { key_updates: ku } : {}) },
     });
-    const own = { h2, serverRecords: recs, r, skip: 0, keyUpdates: 1, epochBase: 2 };
+    const own = { h2, serverRecords: recs, r, skip: 0, keyUpdates: 1, epochBase: 2, tailLens: [54, 54] };
     expect(() => checkPiC3SParams(params(1), own)).not.toThrow();
     // The node may not drop or invent a key epoch.
     expect(() => checkPiC3SParams(params(), own)).toThrow(/key epoch/);
@@ -248,9 +250,72 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
     const params = (records = tail) => ({
       PiC3S: { h2: Array.from(h2), records, expected: Array.from(r), skip: 0 },
     });
-    const own = { h2, serverRecords: recs, r, skip: 0, epochBase: 0, trailing: 2 };
+    const own = { h2, serverRecords: recs, r, skip: 0, epochBase: 0, trailing: 2, tailLens: [54] };
     expect(() => checkPiC3SParams(params(), own)).not.toThrow();
     expect(() => checkPiC3SParams(params(), { ...own, trailing: 1 })).toThrow(SessionProtocolError);
+  });
+
+  it("π_C3S must name exactly the tail we disclosed, not a longer one", () => {
+    const recs = [bytes(60, 1), bytes(80, 2), bytes(70, 3)];
+    const r = bytes(40, 9);
+    const params = (records: { seq: number; ct: number[]; off?: number }[]) => ({
+      PiC3S: { h2: Array.from(h2), records, expected: Array.from(r), skip: 0 },
+    });
+    // R (40 bytes) fits in the last record: the minimal tail is that record.
+    const minimal = [{ seq: 2, ct: Array.from(recs[2]!.subarray(0, 54)) }];
+    const own = { h2, serverRecords: recs, r, skip: 0, epochBase: 0, trailing: 0, tailLens: [54] };
+    expect(() => checkPiC3SParams(params(minimal), own)).not.toThrow();
+    // Earlier genuine records prepended to it (more proof work) are refused.
+    const padded = [{ seq: 1, ct: Array.from(recs[1]!.subarray(48, 64)), off: 48 }, ...minimal];
+    expect(() => checkPiC3SParams(params(padded), own)).toThrow(/tail we disclosed/);
+    const all = [
+      { seq: 0, ct: Array.from(recs[0]!.subarray(32, 44)), off: 32 },
+      { seq: 1, ct: Array.from(recs[1]!.subarray(0, 64)) },
+      ...minimal,
+    ];
+    expect(() => checkPiC3SParams(params(all), own)).toThrow(/tail we disclosed/);
+    // Record lengths must be the ones we sent, too.
+    expect(() => checkPiC3SParams(params(minimal), { ...own, tailLens: [53] })).toThrow(/tail we disclosed/);
+    // Without our tail lengths there is nothing to hold the node to.
+    expect(() => checkPiC3SParams(params(minimal), { ...own, tailLens: [] })).toThrow(SessionProtocolError);
+    expect(() =>
+      checkPiC3SParams(params(minimal), { ...own, tailLens: undefined as unknown as number[] }),
+    ).toThrow(SessionProtocolError);
+  });
+
+  it("π_C3S first-record offset keeps at least one content byte (same rule as the node)", () => {
+    expect(firstTailOffset(100, 10, 30)).toBe(80);
+    expect(firstTailOffset(100, 10, 110)).toBe(0);
+    expect(firstTailOffset(32, 10, 11)).toBe(16);
+    expect(firstTailOffset(63, 53, 40)).toBe(48);
+    // Later records alone cover R + skip: the first record still keeps its
+    // last content byte, so a content length that is a multiple of 16 backs
+    // off one block.
+    expect(firstTailOffset(32, 50, 40)).toBe(16);
+    expect(firstTailOffset(4000, 50, 40)).toBe(3984);
+    expect(firstTailOffset(16, 130, 130)).toBe(0);
+    for (let content = 1; content < 100; content++) {
+      const off = firstTailOffset(content, 50, 40);
+      expect(off % 16).toBe(0);
+      expect(content + 1 - off).toBeGreaterThanOrEqual(2);
+    }
+    // The check applies it: first record of 32 content bytes (+ type + tag).
+    const recs = [bytes(49, 1), bytes(67, 2)];
+    const r = bytes(40, 9);
+    const params = (off: number) => ({
+      PiC3S: {
+        h2: Array.from(h2),
+        records: [
+          { seq: 0, ct: Array.from(recs[0]!.subarray(off, 33)), off },
+          { seq: 1, ct: Array.from(recs[1]!.subarray(0, 51)) },
+        ],
+        expected: Array.from(r),
+        skip: 0,
+      },
+    });
+    const own = { h2, serverRecords: recs, r, skip: 0, epochBase: 0, trailing: 0, tailLens: [51, 33] };
+    expect(() => checkPiC3SParams(params(16), own)).not.toThrow();
+    expect(() => checkPiC3SParams(params(32), own)).toThrow(/offset/);
   });
 });
 

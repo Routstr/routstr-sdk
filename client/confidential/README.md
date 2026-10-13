@@ -118,18 +118,24 @@ download-limited link.
 - The proofs: π_NK against the published template, and every parameter the
   node sends for π_C2S/π_C3S against the client's own records (`params.ts`),
   so the client only proves statements about data it chose to disclose.
+  π_C3S must cover exactly the tail records the client named in its
+  disclosure (no earlier records that only add proof work).
   π_C2S/π_C3S reveal one bit to the node, never plaintext.
 - The attestation: the sidecar's record of the session (sid, certificate-chain
   hash, both handshake transcript hashes, record counts and the SHA-256 of all
   bytes in each direction, the credential-record commitment, the time), signed
   by the sidecar's per-process Ed25519 key and re-signed by the node's Nostr
-  key. The client requires the node's signature and checks that the sid and
-  both transcript hashes are its own (`checkAttestationBinding`).
+  key. The client requires the node's signature and checks that the sid,
+  both transcript hashes and the credential-record commitment (the one π_NK
+  proved) are its own (`checkAttestationBinding`).
 - The receipt: required Schnorr signature over the exact signed bytes, this
   session's sid and attestation hash, the usage equal to the client's own
   plaintext, and a cost no higher than that usage at the signed offer's rates
   plus the offer's session fee (`maxChargeMsats`); a receipt naming larger
-  fees than the signed ones is refused.
+  fees than the signed ones is refused. For an upstream HTTP error the
+  receipt must name the status the client saw; 4xx/503 may cost at most the
+  session fee, any other error at most the reservation the receipt names
+  (`checkUpstreamErrorReceipt`).
 
 A non-streaming call fails if any check after the response fails; a stream
 ends with an error instead of a clean end. On an upstream HTTP error the node
@@ -153,6 +159,14 @@ session gets no receipt; its charge shows in the balance.
 The prover gets its job, including the traffic secret it proves about, on stdin; nothing
 is written to disk. The same holds for `cu-2pc`, whose secrets come back on its
 stdout control channel and are never logged.
+
+What this does not cover: JavaScript cannot wipe memory reliably. The witness buffers
+handed to the prover are zeroed after the write, but the session's traffic secrets
+(`c_ap_1`, `s_ap_0`), the TLS library's keys and the decrypted response live in ordinary
+JS objects until the garbage collector reclaims them, and may be in a heap snapshot or core
+dump taken before then. `cu-prover` and `cu-2pc` are spawned with the parent's
+environment (`process.env`), so they see every variable the client process has; run the
+client with only the environment it needs, and use only prover and 2PC binaries you trust.
 
 ## Files
 

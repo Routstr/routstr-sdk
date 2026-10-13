@@ -1406,7 +1406,7 @@ export class ProviderManager {
     modelId: string,
     currentBaseUrl: string,
     attemptedProviders: ReadonlySet<string> = new Set(),
-    options: { acceptableMintUrls?: string[] } = {}
+    options: { acceptableMintUrls?: string[]; requireConfidential?: boolean } = {}
   ): string | null {
     try {
       // Empty when the wallet knows no funded mint; providerAcceptsAnyMint
@@ -1419,7 +1419,10 @@ export class ProviderManager {
         // pick agree on which node is cheapest.
         basket: WARM_COST_BASKET,
       }).find(
-        ({ baseUrl }) =>
+        ({ baseUrl, model }) =>
+          // A confidential request needs a node that offers confidential
+          // sessions for this model.
+          (!options.requireConfidential || Boolean(model.confidential_upstream)) &&
           baseUrl !== currentBaseUrl &&
           !attemptedProviders.has(baseUrl) &&
           this.providerAcceptsAnyMint(baseUrl, acceptableMints)
