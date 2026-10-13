@@ -24,7 +24,7 @@ import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
 import { ProviderManager } from "./ProviderManager";
-import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey } from "../utils/modelPaths";
+import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey, selectorModelId } from "../utils/modelPaths";
 import type { ModelPathSatsPricing } from "../utils/modelPaths";
 import {
   ProviderError,
@@ -603,20 +603,6 @@ export class RoutstrClient {
       }
     }
 
-    // Forward the provider-native model id when selection resolved through a
-    // static mapping: mapped providers only know their own id, so the
-    // caller-facing canonical id would 400/404 upstream. Only touches JSON
-    // bodies that already carry a string `model` field.
-    if (selectedModel && requestBody && typeof requestBody === "object") {
-      const bodyObj = requestBody as Record<string, unknown>;
-      if (
-        typeof bodyObj.model === "string" &&
-        bodyObj.model !== selectedModel.id
-      ) {
-        requestBody = { ...bodyObj, model: selectedModel.id };
-      }
-    }
-
     // Keep the opaque selector in baseHeaders so request retries preserve it.
     // A caller-supplied selector is never forwarded to a different provider:
     // failover is disabled for caller-pinned requests in _handleErrorResponse.
@@ -628,6 +614,35 @@ export class RoutstrClient {
     const modelPathSelector = this._findModelPathHeader(headers);
     if (modelPathSelector) {
       baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
+    }
+
+    // Forward the provider-native model id when selection resolved through a
+    // static mapping: mapped providers only know their own id, so the
+    // caller-facing canonical id would 400/404 upstream. Only touches JSON
+    // bodies that already carry a string `model` field.
+    // A pinned model path outranks the mapping: the node validates the body's
+    // model against the selector's model-id byte for byte, and a route may be
+    // advertised under a different spelling than the catalog entry selection
+    // resolved to — the direct Venice route is filed only as
+    // deepseek-v4-1-flash while the catalog lists deepseek-v4.1-flash
+    // (observed live: 400 "x-routstr-model-path selects model
+    // 'deepseek-v4-1-flash' but the request asks for 'deepseek-v4.1-flash'").
+    const pinnedSelectorModelId = modelPathSelector
+      ? selectorModelId(modelPathSelector)
+      : null;
+    const targetBodyModelId = pinnedSelectorModelId ?? selectedModel?.id;
+    if (
+      targetBodyModelId &&
+      requestBody &&
+      typeof requestBody === "object"
+    ) {
+      const bodyObj = requestBody as Record<string, unknown>;
+      if (
+        typeof bodyObj.model === "string" &&
+        bodyObj.model !== targetBodyModelId
+      ) {
+        requestBody = { ...bodyObj, model: targetBodyModelId };
+      }
     }
 
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
@@ -2201,13 +2216,20 @@ export class RoutstrClient {
         // after the provider may already have charged the request.
         // The failover target may serve the model under a different native id
         // (static mapping), so forward newModel.id, not the original body model.
+        // A model-path pin outranks it: the body must name the model exactly
+        // as the next node's pinned selector does — a node advertises a route
+        // under its own spelling (e.g. deepseek-v4-1-flash), and the node
+        // rejects a pair that disagrees with 400 invalid_request.
         const bodyObj =
           body && typeof body === "object"
             ? (body as Record<string, unknown>)
             : undefined;
+        const retryModelId = nextModelPathSelector
+          ? selectorModelId(nextModelPathSelector) ?? newModel.id
+          : newModel.id;
         const retryBody =
           bodyObj && typeof bodyObj.model === "string"
-            ? { ...bodyObj, model: newModel.id }
+            ? { ...bodyObj, model: retryModelId }
             : body;
         // An auto-pinned request swaps its selector for one the new node
         // advertised; the failed node's selector is never forwarded.

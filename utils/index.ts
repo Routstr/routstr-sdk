@@ -18,6 +18,7 @@ export {
   DEEPSEEK_AUTO_NODE_URL,
   DEEPSEEK_AUTO_NODE_URLS,
   canonicalModelPath,
+  selectorModelId,
   modelPathCandidateKey,
   deepSeekModelPath,
   deepSeekModelPathHeaders,
