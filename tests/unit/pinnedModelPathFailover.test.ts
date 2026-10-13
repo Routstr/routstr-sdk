@@ -8,7 +8,7 @@
  * These tests pin that behavior on RoutstrClient._handleErrorResponse.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import {
   clearModelPathsCache,
@@ -155,6 +155,23 @@ function makeClient(discovery?: DiscoveryAdapter) {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  // Unit tests must never reach the network. `_handleErrorResponse` resolves
+  // the failover model through ProviderManager.getModelForProvider, which
+  // fetches `<provider>/v1/info` unless the test stubs it. A real fetch has no
+  // egress in CI and hangs until vitest kills the test (5000 ms timeout),
+  // which is how this suite failed there while the assertions themselves were
+  // fine. Tests that need transport stub it themselves with vi.stubGlobal.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: unknown) => {
+      throw new Error(
+        `unexpected network request in unit test: ${String(input)}`
+      );
+    })
+  );
 });
 
 describe("RoutstrClient pinned model-path failover", () => {
