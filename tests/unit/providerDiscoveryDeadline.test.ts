@@ -238,3 +238,31 @@ it("never stamps models when publishing their payload fails", async () => {
   expect(storage.getProviderLastUpdate(A)).toBeNull();
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it("prunes to the latest narrow set after an older broad pass finishes", async () => {
+  vi.useFakeTimers();
+  const storage = adapter();
+  const manager = new ModelManager(storage, { logger });
+  const a = deferred<Response>();
+  const b = deferred<Response>();
+  const slow = deferred<Response>();
+  vi.stubGlobal("fetch", vi.fn((url: string) =>
+    (url.startsWith(A) ? a : url.startsWith(B) ? b : slow).promise));
+  const broad = manager.fetchModels([A, B, C], true);
+  await vi.advanceTimersByTimeAsync(0);
+  const narrow = manager.fetchModels([A], true);
+  a.resolve(Response.json({ data: models("a") }));
+  await narrow;
+  b.resolve(Response.json({ data: models("b") }));
+  await vi.advanceTimersByTimeAsync(0);
+  // While the broad pass is active its provider shards remain protected.
+  expect(storage.getCachedModels()[B]?.[0].id).toBe("b");
+  slow.resolve(Response.json({ data: models("slow") }));
+  expect((await broad).map(model => model.id).sort()).toEqual(["a", "b", "slow"]);
+  // Pass results remain caller-specific, but the final cache follows the
+  // latest requested set, not whichever request happened to finish last.
+  expect(Object.keys(storage.getCachedModels())).toEqual([A]);
+  expect(storage.getProviderLastUpdate(B)).toBe(0);
+  expect(storage.getProviderLastUpdate(C)).toBe(0);
+  expect(vi.getTimerCount()).toBe(0);
+});
