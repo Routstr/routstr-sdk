@@ -27,6 +27,7 @@ import {
   DEEPSEEK_AUTO_MODEL_ID,
   DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPathsForModel,
+  MODEL_PATHS_FETCH_TIMEOUT_MS,
   modelPathCandidateKey,
   resolveDeepSeekModelPathSelectors,
   type ModelPathSatsPricing,
@@ -41,19 +42,22 @@ import { isTinfoilModel } from "./TinfoilSecure";
 export const MODEL_PATH_RANKING_BUDGET_MS = 6_000;
 
 /**
- * Upper bound the warm pass waits for any single node's paths. Larger than
- * the ranking budget on purpose: a warm pass runs off the request path
- * (routstrd's 21-minute model refresh), so it can afford to let a slow but
- * alive node finish instead of skipping it for a whole cycle. A lookup that
- * misses it keeps running and still fills the cache for the next ranking.
+ * Backstop on a single warm lookup, derived from the per-spelling fetch
+ * deadline rather than set beside it so the two cannot drift apart. That
+ * deadline is the real ceiling — a fetch settles by it even when the runtime
+ * ignores the abort (withProviderDeadline) — so this only fires if the inner
+ * bound ever stops holding. Both are far above what a healthy pass costs.
  */
-export const MODEL_PATH_WARM_BUDGET_MS = 15_000;
+export const MODEL_PATH_WARM_BUDGET_MS = MODEL_PATHS_FETCH_TIMEOUT_MS + 5_000;
 
 /** One (node, model) lookup of a warm pass. */
 export interface ModelPathWarmResult {
   baseUrl: string;
   modelId: string;
-  /** Routes the node advertises for the model (0 when unknown). */
+  /**
+   * Distinct routes the node advertises for the model, deduped across the
+   * spellings the node filed them under (0 when unknown).
+   */
   paths: number;
   /** Of those, how many are on the DeepSeek model-path whitelist. */
   whitelisted: number;
@@ -1672,7 +1676,11 @@ export class ProviderManager {
             this.getModelIdMappings()
           );
           return report({
-            paths: nodePaths.data.reduce((n, entry) => n + entry.paths.length, 0),
+            paths: new Set(
+              nodePaths.data.flatMap((entry) =>
+                entry.paths.map((path) => path.path)
+              )
+            ).size,
             whitelisted: (resolved?.selectors ?? []).filter(
               (selector): selector is string => !!selector
             ).length,

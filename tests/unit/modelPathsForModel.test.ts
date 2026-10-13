@@ -265,8 +265,10 @@ describe("getNodeModelPathsForModel forced refresh", () => {
       ...opts,
       force: true,
     });
-    // The stale window survives a failed refresh: dropping the entry here
-    // would put every request back on the full fetch timeout.
+    // The forced call went to the network even though the entry was fresh...
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // ...and the stale window survives a failed refresh: dropping the entry
+    // here would put every request back on the full fetch timeout.
     expect(forced).toBe(first);
     expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBe(first);
   });
@@ -364,7 +366,7 @@ describe("warmModelPathCaches", () => {
   });
 
   it("reports why a node contributed nothing, and does not fetch it", async () => {
-    const fetchMock = vi.fn(async () => {
+    const fetchMock = vi.fn(async (_input: unknown) => {
       throw new Error("unreachable");
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -378,7 +380,7 @@ describe("warmModelPathCaches", () => {
     ]);
     // Only the node that is both enabled and in the catalog was probed.
     expect(
-      fetchMock.mock.calls.every(([url]) => String(url).startsWith(A))
+      fetchMock.mock.calls.every((call) => String(call[0]).startsWith(A))
     ).toBe(true);
     const line = formatModelPathWarmSummary(warm);
     expect(line).toContain("0/3 ok");
