@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BalanceManager } from "../../wallet/BalanceManager";
 import { InsufficientBalanceError } from "../../core/errors";
 import { noopLogger } from "../../core/types";
@@ -107,5 +107,68 @@ describe("concurrent provider tokens on one wallet", () => {
 
     expect(results.filter((r) => !r.success).map((r) => r.error)).toEqual([]);
     expect(total()).toBe(2900 - 20 * 3);
+  });
+
+  describe("top-ups of one key", () => {
+    let deposits: string[];
+
+    beforeEach(() => {
+      deposits = [];
+      vi.stubGlobal("fetch", async (_url: string, init?: RequestInit) => {
+        deposits.push(JSON.parse(String(init?.body)).cashu_token);
+        return new Response("{}", { status: 200 });
+      });
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    // One request every 2 ms, each with its own BalanceManager, all asking
+    // the same key for 11 sats while the wallet's sends take 50 ms.
+    const topUpInParallel = (wallet: WalletAdapter, requests: number) => {
+      const storage = createStorage();
+      return Promise.all(
+        Array.from({ length: requests }, async (_, i) => {
+          await new Promise((resolve) => setTimeout(resolve, i * 2));
+          const manager = new BalanceManager(
+            wallet,
+            storage,
+            undefined,
+            undefined,
+            noopLogger
+          );
+          return manager.topUp({
+            mintUrl: MINT,
+            baseUrl: PROVIDER,
+            amount: 11,
+            token: "sk-key",
+          });
+        })
+      );
+    };
+
+    it("makes one deposit for the top-ups that wait behind a send", async () => {
+      const { wallet, total } = createReservingWallet(2900, 50);
+
+      const results = await topUpInParallel(wallet, 10);
+
+      expect(results.every((r) => r.success)).toBe(true);
+      // The first top-up goes out alone; the other nine arrive while it is at
+      // the mint and leave together.
+      expect(deposits).toEqual(["cashuB_11", "cashuB_99"]);
+      expect(total()).toBe(2900 - 10 * 11);
+    });
+
+    it("tops up alone when the wallet cannot pay the merged deposit", async () => {
+      // 32 sats: 11 go out first, leaving 21, short of the merged 22.
+      const { wallet, total } = createReservingWallet(32, 50);
+
+      const results = await topUpInParallel(wallet, 3);
+
+      expect(results.map((r) => r.success)).toEqual([true, true, false]);
+      expect(deposits).toEqual(["cashuB_11", "cashuB_11"]);
+      expect(total()).toBe(32 - 2 * 11);
+    });
   });
 });
