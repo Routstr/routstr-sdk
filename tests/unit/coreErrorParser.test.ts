@@ -6,6 +6,7 @@ import {
   isNoBalanceToRefundError,
   shouldFailoverToAnotherMint,
   summarizeCoreError,
+  isHandledRedemptionError,
   CoreErrorType,
   CoreErrorCode,
 } from "../../core/errorTypes";
@@ -224,6 +225,66 @@ describe("shouldFailoverToAnotherMint", () => {
       503
     );
     expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
+  });
+
+  it("returns true for mint_rate_limited in the Bearer envelope", () => {
+    // The exact body routstr-core sends when the node's mint throttles it.
+    const parsed = parseCoreError(
+      JSON.stringify({
+        detail: {
+          error: {
+            message: "Cashu mint is rate-limiting requests; retry later",
+            type: "mint_rate_limited",
+            code: "cashu_mint_rate_limited",
+          },
+        },
+        error: {
+          message: "Cashu mint is rate-limiting requests; retry later",
+          type: "mint_rate_limited",
+          code: "cashu_mint_rate_limited",
+        },
+        request_id: "54ca081a-7657-41d6-a096-61ae9c94c80b",
+      }),
+      503
+    );
+    expect(parsed).toMatchObject({
+      type: CoreErrorType.MINT_RATE_LIMITED,
+      code: CoreErrorCode.CASHU_MINT_RATE_LIMITED,
+      status: 503,
+      raw: false,
+    });
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
+  });
+
+  it("returns true for mint_rate_limited in the X-Cashu envelope", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: {
+          type: "mint_rate_limited",
+          code: "cashu_mint_rate_limited",
+          message: "Cashu mint is rate-limiting requests; retry later",
+        },
+      }),
+      503
+    );
+    expect(shouldFailoverToAnotherMint(parsed)).toBe(true);
+  });
+
+  it("keeps the rate limit out of the structured-redemption-error class", () => {
+    const parsed = parseCoreError(
+      JSON.stringify({
+        error: { type: "mint_rate_limited", code: "cashu_mint_rate_limited" },
+      }),
+      503
+    );
+    // The wire strings are part of the public taxonomy.
+    expect(CoreErrorType.MINT_RATE_LIMITED).toBe("mint_rate_limited");
+    expect(CoreErrorCode.CASHU_MINT_RATE_LIMITED).toBe("cashu_mint_rate_limited");
+    // Invariant guard (holds with or without the taxonomy entry): it is
+    // recovered like mint_unreachable — reclaim, then another mint on the same
+    // provider — never like the typed redemption errors that fail over with a
+    // stored-credential decision attached.
+    expect(isHandledRedemptionError(parsed)).toBe(false);
   });
 
   it("returns false for token_already_spent", () => {

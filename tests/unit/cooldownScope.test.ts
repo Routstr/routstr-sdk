@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { ProviderManager } from "../../client/ProviderManager";
 import { ProviderError } from "../../core/errors";
-import { CoreErrorType } from "../../core/errorTypes";
+import { CoreErrorType, CoreErrorCode } from "../../core/errorTypes";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -165,6 +165,23 @@ describe("_getCooldownScope", () => {
       { type: CoreErrorType.MINT_UNREACHABLE, raw: false },
       model
     );
+    expect(scope).toEqual({});
+  });
+
+  it("scopes mint_rate_limited provider-wide", () => {
+    const { client } = createClient();
+    const scope = (client as any)._getCooldownScope(
+      503,
+      {
+        type: CoreErrorType.MINT_RATE_LIMITED,
+        code: CoreErrorCode.CASHU_MINT_RATE_LIMITED,
+        raw: false,
+      },
+      model
+    );
+    // The rate limit throttles the node's mint traffic for every model it
+    // serves, so cooling only the requested model would keep sending its
+    // siblings at a node that cannot redeem their payments.
     expect(scope).toEqual({});
   });
 

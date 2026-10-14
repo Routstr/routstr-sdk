@@ -1058,9 +1058,12 @@ export class RoutstrClient {
   /**
    * Decide the cooldown scope for a failure.
    *
-   * - Network errors (status -1) and `mint_unreachable` are model-independent:
-   *   the provider host or its mint/wallet infrastructure is down, so the
-   *   whole provider is cooled down (empty scope).
+   * - Network errors (status -1), `mint_unreachable` and `mint_rate_limited`
+   *   are model-independent: the provider host or its mint/wallet
+   *   infrastructure is down (or refusing to serve), so the failure is
+   *   attributed to the whole provider (empty scope) rather than to one model.
+   *   A rate limit throttles the node's mint traffic for every model it
+   *   serves, not just the one that was requested.
    * - A pinned x-routstr-model-path request attributes the failure to that
    *   upstream route: only the canonical path is cooled on the provider, so
    *   the provider's other routes for the same model stay usable.
@@ -1076,6 +1079,7 @@ export class RoutstrClient {
     if (!selectedModel) return {};
     if (status === -1) return {};
     if (parsedError.type === CoreErrorType.MINT_UNREACHABLE) return {};
+    if (parsedError.type === CoreErrorType.MINT_RATE_LIMITED) return {};
     const modelId = this._canonicalRequestModelId(
       selectedModel,
       requestedModelId
