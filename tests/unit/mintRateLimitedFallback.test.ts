@@ -14,12 +14,13 @@
  * - `shouldFailoverToAnotherMint` treats `mint_rate_limited` as retryable, so
  *   `RoutstrClient._handleErrorResponse` re-spends against the same provider
  *   with the throttled mint excluded instead of abandoning the node.
- * - `RoutstrClient._getCooldownScope` scopes the failure provider-wide: a rate
- *   limit throttles every model on the node, not just the requested one.
+ * - Failed mint rotation retains model/path-scoped cooldowns: a healthy
+ *   alternative mint may still have enough balance for cheaper requests.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
+import { ProviderManager } from "../../client/ProviderManager";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 import type { Model } from "../../core/types";
@@ -177,7 +178,7 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
     vi.unstubAllGlobals();
   });
 
-  it("apikeys: reclaims the bootstrap token and retries the same provider with the throttled mint excluded", async () => {
+  it.each([false, true])("apikeys: reclaims and retries the same provider (pinnedProvider=%s)", async (pinnedProvider) => {
     const storage = createStorage(BOOTSTRAP_TOKEN);
     const providerManager = failoverProviderManager();
     const client = new RoutstrClient(
@@ -197,7 +198,7 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
       .mockResolvedValue(new Response("ok", { status: 200 }));
 
     const response = await (client as any)._handleErrorResponse(
-      errorParams(BOOTSTRAP_TOKEN),
+      { ...errorParams(BOOTSTRAP_TOKEN), pinnedProvider },
       BOOTSTRAP_TOKEN,
       503,
       "req-503",
@@ -275,7 +276,7 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
     expect(makeRequestSpy.mock.calls[0][0].baseUrl).toBe(BASE_URL);
   });
 
-  it("cools the whole provider down and fails over when no other funded mint is available", async () => {
+  it("cools only the requested model and fails over when no alternative mint can fund it", async () => {
     const storage = createStorage(BOOTSTRAP_TOKEN);
     const providerManager = failoverProviderManager();
     const client = new RoutstrClient(
@@ -312,12 +313,12 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
     );
 
     expect(response.status).toBe(200);
-    // Provider-wide cooldown: the rate limit throttles every model on the node,
-    // not just the one that was requested.
+    // Keep the failure request-scoped: an alternative mint may still fund
+    // cheaper sibling models on this provider.
     expect(providerManager.markFailed).toHaveBeenCalledWith(
       BASE_URL,
       expect.stringContaining("type=mint_rate_limited"),
-      undefined,
+      makeModel().id,
       undefined
     );
     expect(providerManager.findNextBestProvider).toHaveBeenCalledOnce();
@@ -327,5 +328,97 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
       baseUrl: SECOND_BASE_URL,
     });
     expect(makeRequestSpy.mock.calls[0][0].baseUrl).toBe(SECOND_BASE_URL);
+  });
+
+  it("keeps cheaper models routable when an alternative mint cannot fund expensive bootstrap retries", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const expensiveModel = makeModel();
+    const cheapModel = {
+      ...expensiveModel,
+      id: "cheap-model",
+      sats_pricing: { prompt: 0.01, completion: 0.01, max_cost: 1 },
+    } as Model;
+    const discovery: DiscoveryAdapter = {
+      ...createDiscovery(),
+      getCachedModels: () => ({ [BASE_URL]: [expensiveModel, cheapModel] }),
+      getCachedMints: () => ({ [BASE_URL]: [MINT_URL, FALLBACK_MINT_URL] }),
+    };
+    const sendToken = vi.fn(async () => "cashu_cheap_bootstrap_token");
+    const wallet = createWallet({
+      getBalances: async () => ({ [MINT_URL]: 1000, [FALLBACK_MINT_URL]: 20 }),
+      getMintUnits: () => ({ [MINT_URL]: "sat", [FALLBACK_MINT_URL]: "sat" }),
+      sendToken,
+    });
+    const storage = createStorage();
+    const providerManager = new ProviderManager(discovery);
+    const client = new RoutstrClient(
+      wallet,
+      storage,
+      discovery,
+      "ERROR",
+      "apikeys",
+      { providerManager }
+    );
+    const spendSpy = vi.spyOn(client as any, "_spendToken");
+    const receiveSpy = vi.spyOn(client.getCashuSpender(), "receiveToken");
+    const requestSpy = vi.spyOn(client as any, "_makeRequest");
+
+    // Exercise actual mint selection/spending: B's 20 sats cannot cover the
+    // expensive request's 140-sat bootstrap deposit. Two failures previously
+    // activated a provider-wide cooldown, removing even the cheap model.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = `${BOOTSTRAP_TOKEN}_${attempt}`;
+      storage.setApiKey(BASE_URL, token);
+      const response = await (client as any)._handleErrorResponse(
+        { ...errorParams(token), pinnedProvider: true },
+        token,
+        503,
+        "req-expensive",
+        undefined,
+        RATE_LIMITED_BODY,
+        0
+      );
+      expect(response.status).toBeGreaterThanOrEqual(500);
+      expect(storage.getApiKey(BASE_URL)).toBeNull();
+    }
+    expect(receiveSpy).toHaveBeenCalledTimes(2);
+    expect(spendSpy).toHaveBeenCalledTimes(2);
+    expect(spendSpy).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+      excludeMints: [MINT_URL],
+    });
+    expect(sendToken).not.toHaveBeenCalled();
+    expect(requestSpy).not.toHaveBeenCalled();
+    expect(providerManager.isOnCooldown(BASE_URL, expensiveModel.id)).toBe(true);
+    expect(providerManager.isOnCooldown(BASE_URL)).toBe(false);
+    expect(providerManager.isOnCooldown(BASE_URL, cheapModel.id)).toBe(false);
+    expect(providerManager.getProviderPriceRankingForModel(cheapModel.id)).toEqual([
+      expect.objectContaining({ baseUrl: BASE_URL, model: cheapModel }),
+    ]);
+
+    // Prove the remaining route is fundable, not just visible in ranking:
+    // the cheap request's minimum 7-sat deposit can be issued from mint B.
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 7000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: "canonical-cheap-key",
+    });
+    const cheapSpend = await (client as any)._spendToken({
+      mintUrl: MINT_URL,
+      amount: 1,
+      baseUrl: BASE_URL,
+      excludeMints: [MINT_URL],
+    });
+    expect(cheapSpend.selectedMintUrl).toBe(FALLBACK_MINT_URL);
+    expect(cheapSpend.token).toBe("cashu_cheap_bootstrap_token");
+    expect(sendToken).toHaveBeenCalledExactlyOnceWith(
+      FALLBACK_MINT_URL,
+      7,
+      undefined,
+      expect.any(Function)
+    );
   });
 });
