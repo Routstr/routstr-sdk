@@ -106,6 +106,24 @@ export interface BalanceState {
 }
 
 /**
+ * Sends from one wallet run one at a time. A send holds its proofs while the
+ * swap is at the mint, and the wallet reports only proofs nobody holds, so an
+ * overlapping send would read a funded wallet as empty. Keyed by the adapter
+ * because routstrd builds a new BalanceManager for every request.
+ */
+const walletSendQueues = new WeakMap<WalletAdapter, Promise<unknown>>();
+
+function runWalletSend<T>(
+  walletAdapter: WalletAdapter,
+  send: () => Promise<T>
+): Promise<T> {
+  const previous = walletSendQueues.get(walletAdapter) ?? Promise.resolve();
+  const current = previous.then(send);
+  walletSendQueues.set(walletAdapter, current.catch(() => {}));
+  return current;
+}
+
+/**
  * BalanceManager handles token refunds and topups from providers
  */
 export class BalanceManager {
@@ -711,6 +729,14 @@ export class BalanceManager {
   async createProviderToken(
     options: CreateProviderTokenOptions
   ): Promise<ProviderTokenResult> {
+    return runWalletSend(this.walletAdapter, () =>
+      this._createProviderToken(options)
+    );
+  }
+
+  private async _createProviderToken(
+    options: CreateProviderTokenOptions
+  ): Promise<ProviderTokenResult> {
     const {
       mintUrl,
       baseUrl,
@@ -754,7 +780,7 @@ export class BalanceManager {
       retryCount < 3
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
-      return this.createProviderToken({
+      return this._createProviderToken({
         ...options,
         retryCount: retryCount + 1,
       });
