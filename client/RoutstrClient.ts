@@ -1485,6 +1485,7 @@ export class RoutstrClient {
       } else {
         let topupAmount = params.requiredSats;
         let balanceValidated = false;
+        let balanceSufficient = false;
 
         try {
           const currentBalanceInfo = await this.balanceManager.getTokenBalance(
@@ -1516,6 +1517,7 @@ export class RoutstrClient {
                 "WARN",
                 `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; API-key balance is sufficient (required=${params.requiredSats}, available=${availableBalance})`
               );
+              balanceSufficient = true;
             } else {
               balanceValidated = true;
               topupAmount =
@@ -1538,7 +1540,10 @@ export class RoutstrClient {
         }
 
         if (!balanceValidated) {
-          tryNextProvider = true;
+          // Parallel requests holding the key's balance can make the node
+          // refuse a request the key covers a moment later: retry here. The
+          // retry limit below still fails over if the node keeps refusing.
+          tryNextProvider = !balanceSufficient;
         } else {
           // A proactive (pre-request) topup may already be in flight for
           // this key — join it instead of stacking a second deposit.
@@ -1618,30 +1623,30 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: Topup successful, will retry with new token`
             );
           }
-          if (!tryNextProvider) {
-            if (retryCount < MAX_RETRIES_PER_PROVIDER) {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
-              );
-              return this._makeRequest({
-                ...params,
-                token: params.token,
-                headers: this._withAuthAndTinfoilHeaders(
-                  params.baseHeaders,
-                  params.token,
-                  params.tinfoilEnabled,
-                  params.selectedModel?.id
-                ),
-                retryCount: retryCount + 1,
-              });
-            } else {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _handleErrorResponse: 402 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
-              );
-              tryNextProvider = true;
-            }
+        }
+        if (!tryNextProvider) {
+          if (retryCount < MAX_RETRIES_PER_PROVIDER) {
+            this._log(
+              "DEBUG",
+              `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
+            );
+            return this._makeRequest({
+              ...params,
+              token: params.token,
+              headers: this._withAuthAndTinfoilHeaders(
+                params.baseHeaders,
+                params.token,
+                params.tinfoilEnabled,
+                params.selectedModel?.id
+              ),
+              retryCount: retryCount + 1,
+            });
+          } else {
+            this._log(
+              "DEBUG",
+              `[RoutstrClient] _handleErrorResponse: 402 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
+            );
+            tryNextProvider = true;
           }
         }
       }

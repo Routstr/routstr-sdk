@@ -119,7 +119,7 @@ function createClient(nextProvider: string | null = null) {
   return { client, providerManager };
 }
 
-async function handle402(client: RoutstrClient, body: string) {
+async function handle402(client: RoutstrClient, body: string, retryCount = 0) {
   return (client as any)._handleErrorResponse(
     params,
     API_KEY,
@@ -127,7 +127,7 @@ async function handle402(client: RoutstrClient, body: string) {
     "req-402",
     undefined,
     body,
-    0
+    retryCount
   );
 }
 
@@ -236,21 +236,39 @@ describe("RoutstrClient 402 top-up validation", () => {
     expect(topUp).not.toHaveBeenCalled();
   });
 
-  it("does not top up when the local API-key balance is already sufficient", async () => {
-    const { client } = createClient();
-    const balanceManager = client.getBalanceManager();
-    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+  // Parallel requests on the key held its balance when the node answered;
+  // they have finished by the time the balance is read.
+  const sufficientBalance = (client: RoutstrClient) =>
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
       amount: 150_000,
       reserved: 10_000,
       unit: "msat",
       apiKey: API_KEY,
     });
-    const topUp = vi.spyOn(balanceManager, "topUp");
+
+  it("retries the same provider without a top-up when the API-key balance is already sufficient", async () => {
+    const { client } = createClient();
+    sufficientBalance(client);
+    const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
+    const ok = new Response("ok", { status: 200 });
+    const retry = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(ok);
+
+    await expect(handle402(client, localInsufficientBalanceBody)).resolves.toBe(ok);
+    expect(retry).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: BASE_URL, retryCount: 1 })
+    );
+    expect(topUp).not.toHaveBeenCalled();
+  });
+
+  it("fails over once retries for an already-sufficient balance run out", async () => {
+    const { client } = createClient();
+    sufficientBalance(client);
+    const retry = vi.spyOn(client as any, "_makeRequest");
 
     await expect(
-      handle402(client, localInsufficientBalanceBody)
+      handle402(client, localInsufficientBalanceBody, 2)
     ).rejects.toBeInstanceOf(FailoverError);
-    expect(topUp).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
   });
 
   it("does not top up when the API-key balance cannot be validated", async () => {
