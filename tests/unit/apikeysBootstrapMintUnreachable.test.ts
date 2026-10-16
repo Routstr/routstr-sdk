@@ -427,4 +427,40 @@ describe("RoutstrClient._spendToken — apikeys bootstrap key validation", () =>
 
     expect(saved.mock.calls).toEqual(expected);
   });
+
+  it("does not save a read that belongs to a key storage no longer holds", async () => {
+    const storage = createStorage(BOOTSTRAP_TOKEN);
+    const saved = vi.spyOn(storage, "updateApiKeyBalance");
+    const client = new RoutstrClient(
+      createWallet(),
+      storage,
+      createDiscovery(),
+      "ERROR",
+      "apikeys"
+    );
+    // The balance read is in flight while another request swaps in the
+    // provider's canonical key; the numbers now describe a credential we no
+    // longer use, so they must not be stamped onto the replacement.
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockImplementation(
+      async () => {
+        storage.setApiKey(BASE_URL, "sk_canonical_key_456");
+        return {
+          amount: 6000,
+          reserved: 0,
+          unit: "msat" as const,
+          apiKey: "",
+          isInvalidApiKey: false,
+          balanceUnknown: false,
+        };
+      }
+    );
+
+    await (client as any)._spendToken({
+      mintUrl: MINT_URL,
+      amount: 100,
+      baseUrl: BASE_URL,
+    });
+
+    expect(saved.mock.calls).toEqual([]);
+  });
 });
