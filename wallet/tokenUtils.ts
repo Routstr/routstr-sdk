@@ -16,6 +16,11 @@ export function isNetworkErrorMessage(message: string): boolean {
   );
 }
 
+/**
+ * The single msat→sat converter for balances. Keep the fraction: this value is
+ * for arithmetic and comparisons. Use `persistApiKeyBalance` to *store* a
+ * balance, since storage keeps whole sats.
+ */
 export function getBalanceInSats(
   balance: number,
   unit: "sat" | "msat" | string | undefined

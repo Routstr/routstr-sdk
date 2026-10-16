@@ -19,6 +19,7 @@ import {
   isHandledRedemptionError,
 } from "../core/errorTypes";
 import { BalanceManager } from "./BalanceManager";
+import { persistApiKeyBalance } from "./apiKeyBalance";
 import { getBalanceInSats, isNetworkErrorMessage } from "./tokenUtils";
 import { getTokenMetadata } from "@cashu/cashu-ts";
 
@@ -879,19 +880,17 @@ export class CashuSpender {
             continue;
           }
 
-          if (balanceResult.amount >= 0 && !balanceResult.balanceUnknown) {
-            const balanceSat = balanceResult.unit === "msat"
-              ? Math.floor(balanceResult.amount / 1000)
-              : balanceResult.amount;
-            const reservedSat = balanceResult.unit === "msat"
-              ? Math.floor(balanceResult.reserved / 1000)
-              : balanceResult.reserved;
-            this.storageAdapter.updateApiKeyBalance(
-              apiKeyEntry.baseUrl,
-              balanceSat,
-              reservedSat
-            );
-          } else {
+          const refreshedBalance = persistApiKeyBalance(
+            this.storageAdapter,
+            apiKeyEntry.baseUrl,
+            apiKeyEntryFull.key,
+            balanceResult
+          );
+          if (
+            !refreshedBalance &&
+            !balanceResult.balanceUnknown &&
+            balanceResult.amount < 0
+          ) {
             this.logger.warn(
               `refundProviders: balance refresh for ${apiKeyEntry.baseUrl} returned negative amount; keeping stale local balance=${apiKeyEntryFull.balance}`
             );
@@ -1015,7 +1014,7 @@ export class CashuSpender {
 
       if (response.ok) {
         const data = await response.json();
-        return data.balance / 1000;
+        return getBalanceInSats(data.balance, "msat");
       }
     } catch {
       return 0;

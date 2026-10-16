@@ -60,7 +60,8 @@ import {
   canonicalIdForModel,
   canonicalizeModelId,
 } from "../core/modelMappings";
-import { isNetworkErrorMessage } from "../wallet/tokenUtils";
+import { getBalanceInSats, isNetworkErrorMessage } from "../wallet/tokenUtils";
+import { persistApiKeyBalance } from "../wallet/apiKeyBalance";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
   extractResponseId,
@@ -745,8 +746,7 @@ export class RoutstrClient {
       requestedModelId: modelId,
     });
 
-    let tokenBalanceInSats =
-      tokenBalanceUnit === "msat" ? tokenBalance / 1000 : tokenBalance;
+    let tokenBalanceInSats = getBalanceInSats(tokenBalance, tokenBalanceUnit);
     let initialTokenBalanceUnknown = tokenBalanceUnknown;
     const baseUrlUsed = (response as any).baseUrl || baseUrl;
     const tokenUsed = (response as any).token || token;
@@ -1410,10 +1410,10 @@ export class RoutstrClient {
           ),
           retryCount: retryCount + 1,
         });
-        (retryResponse as any).initialTokenBalanceInSats =
-          spendResult.tokenBalanceUnit === "msat"
-            ? spendResult.tokenBalance / 1000
-            : spendResult.tokenBalance;
+        (retryResponse as any).initialTokenBalanceInSats = getBalanceInSats(
+          spendResult.tokenBalance,
+          spendResult.tokenBalanceUnit
+        );
         (retryResponse as any).initialTokenBalanceUnknown =
           spendResult.tokenBalanceUnknown;
         return retryResponse;
@@ -1498,14 +1498,14 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; current API-key balance is unknown`
             );
           } else {
-            const currentBalance =
-              currentBalanceInfo.unit === "msat"
-                ? currentBalanceInfo.amount / 1000
-                : currentBalanceInfo.amount;
-            const reservedBalance =
-              currentBalanceInfo.unit === "msat"
-                ? (currentBalanceInfo.reserved ?? 0) / 1000
-                : (currentBalanceInfo.reserved ?? 0);
+            const currentBalance = getBalanceInSats(
+              currentBalanceInfo.amount,
+              currentBalanceInfo.unit
+            );
+            const reservedBalance = getBalanceInSats(
+              currentBalanceInfo.reserved ?? 0,
+              currentBalanceInfo.unit
+            );
             const availableBalance = currentBalance - reservedBalance;
             const shortfall = Math.max(
               0,
@@ -1674,17 +1674,6 @@ export class RoutstrClient {
           this.storageAdapter.removeApiKey(baseUrl);
           tryNextProvider = true;
         } else {
-          const latestTokenBalance = latestBalanceInfo.balanceUnknown
-            ? undefined
-            : latestBalanceInfo.unit === "msat"
-              ? latestBalanceInfo.amount / 1000
-              : latestBalanceInfo.amount;
-          const latestReservedBalance = latestBalanceInfo.balanceUnknown
-            ? undefined
-            : latestBalanceInfo.unit === "msat"
-              ? latestBalanceInfo.reserved / 1000
-              : latestBalanceInfo.reserved;
-
           if (latestBalanceInfo.apiKey) {
             const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
             if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
@@ -1693,12 +1682,14 @@ export class RoutstrClient {
             retryToken = latestBalanceInfo.apiKey;
           }
 
-          if (latestTokenBalance !== undefined && latestTokenBalance >= 0) {
-            this.storageAdapter.updateApiKeyBalance(
+          if (
+            persistApiKeyBalance(
+              this.storageAdapter,
               baseUrl,
-              latestTokenBalance,
-              latestReservedBalance
-            );
+              latestBalanceInfo.apiKey ?? params.token,
+              latestBalanceInfo
+            )
+          ) {
             this.storageAdapter.touchApiKeyLastUsed(baseUrl);
           }
         }
@@ -2286,10 +2277,10 @@ export class RoutstrClient {
           ),
           retryCount: 0,
         });
-        (retryResponse as any).initialTokenBalanceInSats =
-          spendResult.tokenBalanceUnit === "msat"
-            ? spendResult.tokenBalance / 1000
-            : spendResult.tokenBalance;
+        (retryResponse as any).initialTokenBalanceInSats = getBalanceInSats(
+          spendResult.tokenBalance,
+          spendResult.tokenBalanceUnit
+        );
         (retryResponse as any).initialTokenBalanceUnknown =
           spendResult.tokenBalanceUnknown;
         return retryResponse;
@@ -2553,17 +2544,6 @@ export class RoutstrClient {
           REDACTED_CREDENTIAL,
           baseUrl
         );
-        const latestTokenBalance = latestBalanceInfo.balanceUnknown
-          ? undefined
-          : latestBalanceInfo.unit === "msat"
-            ? latestBalanceInfo.amount / 1000
-            : latestBalanceInfo.amount;
-        const latestReservedBalance = latestBalanceInfo.balanceUnknown
-          ? undefined
-          : latestBalanceInfo.unit === "msat"
-            ? latestBalanceInfo.reserved / 1000
-            : latestBalanceInfo.reserved;
-
         const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
         if (
           storedApiKeyEntry?.key.startsWith("cashu") &&
@@ -2571,12 +2551,14 @@ export class RoutstrClient {
         ) {
           this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
         }
-        if (latestTokenBalance !== undefined) {
-          this.storageAdapter.updateApiKeyBalance(
-            baseUrl,
-            latestTokenBalance,
-            latestReservedBalance
-          );
+        const latestBalance = persistApiKeyBalance(
+          this.storageAdapter,
+          baseUrl,
+          latestBalanceInfo.apiKey ?? token,
+          latestBalanceInfo
+        );
+        const latestTokenBalance = latestBalance?.balance;
+        if (latestBalance) {
           this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
 
@@ -2803,15 +2785,14 @@ export class RoutstrClient {
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
 
-    const snapshotSats =
-      snapshot.tokenBalanceUnit === "msat"
-        ? snapshot.tokenBalance / 1000
-        : snapshot.tokenBalance;
-    const tokenReserved = snapshot.tokenReserved ?? 0;
-    const snapshotReservedSats =
-      snapshot.tokenBalanceUnit === "msat"
-        ? tokenReserved / 1000
-        : tokenReserved;
+    const snapshotSats = getBalanceInSats(
+      snapshot.tokenBalance,
+      snapshot.tokenBalanceUnit
+    );
+    const snapshotReservedSats = getBalanceInSats(
+      snapshot.tokenReserved ?? 0,
+      snapshot.tokenBalanceUnit
+    );
     const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
     // Maintain the margin up front: proactively top up whenever the available
     // balance is below the request price scaled by TOPUP_MARGIN, so the
@@ -2867,15 +2848,14 @@ export class RoutstrClient {
     tokenBalanceUnit: "sat" | "msat";
   }): Promise<TopUpResult> {
     try {
-      const tokenReserved = snapshot.tokenReserved ?? 0;
-      const snapshotSats =
-        snapshot.tokenBalanceUnit === "msat"
-          ? snapshot.tokenBalance / 1000
-          : snapshot.tokenBalance;
-      const reservedSats =
-        snapshot.tokenBalanceUnit === "msat"
-          ? tokenReserved / 1000
-          : tokenReserved;
+      const snapshotSats = getBalanceInSats(
+        snapshot.tokenBalance,
+        snapshot.tokenBalanceUnit
+      );
+      const reservedSats = getBalanceInSats(
+        snapshot.tokenReserved ?? 0,
+        snapshot.tokenBalanceUnit
+      );
       const availableSats = snapshotSats - reservedSats;
       // The trigger already guaranteed available < target, so the shortfall
       // is exactly the amount needed to land the key at the margin.
@@ -3153,6 +3133,15 @@ export class RoutstrClient {
           tokenReserved = balanceInfo.reserved;
           tokenBalanceUnit = balanceInfo.unit;
           tokenBalanceUnknown = Boolean(balanceInfo.balanceUnknown);
+          // A fresh key is stored at 0. Save what it holds now, or a request
+          // that fails leaves its deposit hidden from balances and refunds.
+          // This reuses the read above, so there is no extra request.
+          persistApiKeyBalance(
+            this.storageAdapter,
+            baseUrl,
+            parentApiKey.key,
+            balanceInfo
+          );
         } catch (e) {
           this._log("WARN", "Could not get initial API key balance:", e);
         }
