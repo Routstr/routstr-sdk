@@ -36,13 +36,13 @@ export function persistApiKeyBalance(
     !read ||
     read.balanceUnknown ||
     read.amount < 0 ||
-    (read.reserved ?? 0) < 0
+    read.reserved < 0
   ) {
     return undefined;
   }
   if (storage.getApiKey(baseUrl)?.key !== key) return undefined;
   const balance = Math.floor(getBalanceInSats(read.amount, read.unit));
-  const reserved = Math.floor(getBalanceInSats(read.reserved ?? 0, read.unit));
+  const reserved = Math.floor(getBalanceInSats(read.reserved, read.unit));
   storage.updateApiKeyBalance(baseUrl, balance, reserved);
   return { balance, reserved };
 }
