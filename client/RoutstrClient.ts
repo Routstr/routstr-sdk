@@ -1061,6 +1061,9 @@ export class RoutstrClient {
    * - Network errors (status -1) and `mint_unreachable` are model-independent:
    *   the provider host or its mint/wallet infrastructure is down, so the
    *   whole provider is cooled down (empty scope).
+   * - `mint_rate_limited` retains model/path scope when mint rotation fails:
+   *   an alternative mint that cannot fund this request may still fund a
+   *   cheaper model, so the failure does not establish host unavailability.
    * - A pinned x-routstr-model-path request attributes the failure to that
    *   upstream route: only the canonical path is cooled on the provider, so
    *   the provider's other routes for the same model stay usable.

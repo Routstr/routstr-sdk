@@ -41,6 +41,10 @@ export const CoreErrorType = {
   MINT_ERROR: "mint_error",
   /** Mint could not be reached — retryable with backoff (503) */
   MINT_UNREACHABLE: "mint_unreachable",
+  /**
+   * Mint is rate-limiting redemptions — retryable with another mint (503)
+   */
+  MINT_RATE_LIMITED: "mint_rate_limited",
   /** Other expected wallet errors (400, not retryable) */
   CASHU_ERROR: "cashu_error",
   /** API-key balance is below the amount required for the request (402) */
@@ -68,6 +72,7 @@ export const CoreErrorCode = {
   CASHU_TOKEN_SWAP_FEES_EXCEED_AMOUNT: "cashu_token_swap_fees_exceed_amount",
   CASHU_FOREIGN_MINT_SWAP_FAILED: "cashu_foreign_mint_swap_failed",
   CASHU_MINT_UNREACHABLE: "cashu_mint_unreachable",
+  CASHU_MINT_RATE_LIMITED: "cashu_mint_rate_limited",
   CASHU_TOKEN_REDEMPTION_FAILED: "cashu_token_redemption_failed",
   CASHU_TOKEN_ZERO_VALUE: "cashu_token_zero_value",
   CASHU_TOKEN_CONSUMED: "cashu_token_consumed",
@@ -368,16 +373,22 @@ export function shouldPurgeStoredCredential(
  * Determine whether this error should be retried using another Cashu mint.
  *
  * This does not control provider failover. Mint-unreachable, foreign-mint
- * swap failure, and a rejected source mint can be retried with another mint
- * after the token is recovered. A token whose amount is too small for swap
- * fees cannot: changing mints alone does not fix the token sizing problem.
- * Unknown codes remain non-retryable by default.
+ * swap failure, a rejected source mint, and a rate-limited mint can be
+ * retried with another mint after the token is recovered. A token whose
+ * amount is too small for swap fees cannot: changing mints alone does not fix
+ * the token sizing problem. Unknown codes remain non-retryable by default.
+ *
+ * A rate limit is bucket-scoped to the mint the token came from, not to the
+ * node that redeemed it, so a token from another mint the provider accepts
+ * reaches a different bucket — and the failed token's sats are back in the
+ * wallet by the time the retry is made, so it costs no extra funds.
  */
 export function shouldFailoverToAnotherMint(
   parsed: ParsedCoreError
 ): boolean {
   return (
     parsed.type === CoreErrorType.MINT_UNREACHABLE ||
+    parsed.type === CoreErrorType.MINT_RATE_LIMITED ||
     (parsed.type === CoreErrorType.UNTRUSTED_MINT &&
       parsed.code === CoreErrorCode.CASHU_UNTRUSTED_SOURCE_MINT) ||
     (parsed.type === CoreErrorType.MINT_ERROR &&

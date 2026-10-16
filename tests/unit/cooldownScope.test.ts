@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { ProviderManager } from "../../client/ProviderManager";
 import { ProviderError } from "../../core/errors";
-import { CoreErrorType } from "../../core/errorTypes";
+import { CoreErrorType, CoreErrorCode } from "../../core/errorTypes";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -166,6 +166,42 @@ describe("_getCooldownScope", () => {
       model
     );
     expect(scope).toEqual({});
+  });
+
+  it("scopes mint_rate_limited to the requested model", () => {
+    const { client } = createClient();
+    const scope = (client as any)._getCooldownScope(
+      503,
+      {
+        type: CoreErrorType.MINT_RATE_LIMITED,
+        code: CoreErrorCode.CASHU_MINT_RATE_LIMITED,
+        raw: false,
+      },
+      model
+    );
+    // Another mint may still fund cheaper models even when it cannot fund
+    // this request. A failed mint retry does not establish host unavailability.
+    expect(scope).toEqual({ modelId: model.id });
+  });
+
+  it("scopes mint_rate_limited to a pinned model path", () => {
+    const { client } = createClient();
+    const pinned = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek";
+    const scope = (client as any)._getCooldownScope(
+      503,
+      {
+        type: CoreErrorType.MINT_RATE_LIMITED,
+        code: CoreErrorCode.CASHU_MINT_RATE_LIMITED,
+        raw: false,
+      },
+      model,
+      pinned
+    );
+    expect(scope.modelId).toBe(model.id);
+    expect(scope.modelPath).toBeTruthy();
+    expect(scope.modelPath).toBe(
+      (client as any)._getCooldownScope(404, { raw: true }, model, pinned).modelPath
+    );
   });
 
   it("scopes provider-wide when no model is selected", () => {

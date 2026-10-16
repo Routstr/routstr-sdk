@@ -206,6 +206,53 @@ describe("BalanceManager request-scoped mint selection", () => {
       excludeMints: [MINT_A],
     });
   });
+
+  it("retries a rate-limited topup with the throttled mint excluded", async () => {
+    const manager = new BalanceManager(wallet(), storage, discovery);
+    const createTokenSpy = vi
+      .spyOn(manager, "createProviderToken")
+      .mockResolvedValueOnce({
+        success: true,
+        token: "token-a",
+        selectedMintUrl: MINT_A,
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        token: "token-b",
+        selectedMintUrl: MINT_B,
+      });
+    vi.spyOn(manager as any, "_recoverFailedTopUp").mockResolvedValue(true);
+    const postSpy = vi
+      .spyOn(manager as any, "_postTopUp")
+      .mockResolvedValueOnce({
+        success: false,
+        error: "Cashu mint is rate-limiting requests; retry later",
+        parsedError: {
+          type: "mint_rate_limited",
+          code: "cashu_mint_rate_limited",
+          raw: false,
+        },
+      })
+      .mockResolvedValueOnce({ success: true });
+
+    const result = await manager.topUp({
+      mintUrl: MINT_A,
+      baseUrl: PROVIDER,
+      amount: 10,
+      token: "api-key",
+    });
+
+    expect(result.success).toBe(true);
+    expect(postSpy).toHaveBeenCalledTimes(2);
+    // The throttled mint is excluded, so the retry draws from the wallet's
+    // other provider-supported mint instead of the same rate-limited bucket.
+    expect(createTokenSpy).toHaveBeenNthCalledWith(2, {
+      mintUrl: MINT_A,
+      baseUrl: PROVIDER,
+      amount: 10,
+      excludeMints: [MINT_A],
+    });
+  });
 });
 
 describe("topup recovery spending invariant", () => {
