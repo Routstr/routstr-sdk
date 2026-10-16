@@ -717,8 +717,9 @@ async function fetchModelPathsForSpellings(
  * real fetch, even when the entry is fresh or the node is inside its
  * negative-cache window, so a periodic warm pass costs the refresh job its
  * latency instead of the next request's. A failed forced refresh keeps the
- * last good entry (the stale window stays intact) and records the failure
- * like any other.
+ * last good entry in the cache (the stale window stays intact) and records
+ * the failure like any other, but returns null so callers can distinguish
+ * a failed refresh from a successful one.
  */
 export function getNodeModelPathsForModel(
   baseUrl: string,
@@ -774,7 +775,7 @@ export function getNodeModelPathsForModel(
   // A forced refresh pays the fetch now; it still shares an in-flight lookup
   // (single-flight is per key, so the spelling set is already accounted for).
   if (options.force === true) {
-    return startFetch().then((paths) => paths ?? cached?.paths ?? null);
+    return startFetch();
   }
 
   const inBackoff = !!failure && now < failure.retryAt;

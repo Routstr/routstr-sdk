@@ -267,9 +267,9 @@ describe("getNodeModelPathsForModel forced refresh", () => {
     });
     // The forced call went to the network even though the entry was fresh...
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    // ...and the stale window survives a failed refresh: dropping the entry
-    // here would put every request back on the full fetch timeout.
-    expect(forced).toBe(first);
+    // ...but reports the failed refresh instead of disguising stale data as
+    // success. The last-good entry remains available to ordinary lookups.
+    expect(forced).toBeNull();
     expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBe(first);
   });
 });
@@ -362,6 +362,44 @@ describe("warmModelPathCaches", () => {
     );
     expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`, `${B}/`, `${C}/`]);
+    expect(ranking[0].selectors).toEqual([PPQ]);
+  });
+
+  it("reports a failed refresh without discarding the last-good ranking cache", async () => {
+    vi.useFakeTimers();
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const manager = makeManager({ [`${A}/`]: [MODEL] });
+
+    const first = await manager.warmModelPathCaches({ torMode: false });
+    expect(first[0].reason).toBeUndefined();
+    expect(first[0].whitelisted).toBe(1);
+
+    // The normal daemon refresh runs after the cache's 10-minute fresh TTL.
+    await vi.advanceTimersByTimeAsync(21 * 60 * 1_000);
+    fetchMock.mockImplementation(async () => {
+      throw new Error("unreachable");
+    });
+    const failed = await manager.warmModelPathCaches({ torMode: false });
+    expect(failed[0]).toMatchObject({
+      reason: "unreachable",
+      paths: 0,
+      whitelisted: 0,
+    });
+    expect(formatModelPathWarmSummary(failed)).toContain("0/3 ok");
+    expect(formatModelPathWarmSummary(failed)).toContain(
+      "ai.redsh1ft.com: unreachable"
+    );
+
+    // Failure reporting must not evict the cached routes or make the next
+    // request pay for another network lookup (including inside backoff).
+    const callsAfterWarm = fetchMock.mock.calls.length;
+    const ranking = await manager.getModelPathProviderRanking(
+      "deepseek-v4.1-flash",
+      { torMode: false }
+    );
+    expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
+    expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`]);
     expect(ranking[0].selectors).toEqual([PPQ]);
   });
 
