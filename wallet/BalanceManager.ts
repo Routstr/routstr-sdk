@@ -106,6 +106,35 @@ export interface BalanceState {
 }
 
 /**
+ * Sends from one wallet run one at a time. A send holds its proofs while the
+ * swap is at the mint, and the wallet reports only proofs nobody holds, so an
+ * overlapping send would read a funded wallet as empty. Keyed by the adapter
+ * because routstrd builds a new BalanceManager for every request.
+ */
+const walletSendQueues = new WeakMap<WalletAdapter, Promise<unknown>>();
+
+function runWalletSend<T>(
+  walletAdapter: WalletAdapter,
+  send: () => Promise<T>
+): Promise<T> {
+  const previous = walletSendQueues.get(walletAdapter) ?? Promise.resolve();
+  const current = previous.then(send);
+  walletSendQueues.set(walletAdapter, current.catch(() => {}));
+  return current;
+}
+
+interface QueuedTopUp {
+  amount: number;
+  result: Promise<TopUpResult>;
+}
+
+/**
+ * A top-up waiting behind another send takes in the top-ups for the same key
+ * that arrive meanwhile, so parallel requests make one deposit, not one each.
+ */
+const queuedTopUps = new Map<string, QueuedTopUp>();
+
+/**
  * BalanceManager handles token refunds and topups from providers
  */
 export class BalanceManager {
@@ -580,10 +609,40 @@ export class BalanceManager {
     this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
-      return await this._topUpImpl({ mintUrl, baseUrl, amount, token: providedToken });
+      return await this._queueTopUp({ mintUrl, baseUrl, amount, token: providedToken });
     } finally {
       this._endProviderWalletOperation(baseUrl, "topup");
     }
+  }
+
+  private async _queueTopUp(options: TopUpOptions): Promise<TopUpResult> {
+    const key = `${options.baseUrl}:${options.token}`;
+    let batch = queuedTopUps.get(key);
+    if (batch) {
+      batch.amount += options.amount;
+    } else {
+      const sends = walletSendQueues.get(this.walletAdapter) ?? Promise.resolve();
+      const started: QueuedTopUp = {
+        amount: options.amount,
+        result: sends.then(() => {
+          queuedTopUps.delete(key);
+          return this._topUpImpl({ ...options, amount: started.amount });
+        }),
+      };
+      batch = started;
+      queuedTopUps.set(key, batch);
+    }
+
+    const result = await batch.result;
+    // A wallet too short for the merged deposit may still cover this one.
+    if (
+      !result.success &&
+      batch.amount > options.amount &&
+      result.message?.includes("Insufficient balance")
+    ) {
+      return this._topUpImpl(options);
+    }
+    return result;
   }
 
   private async _topUpImpl(
@@ -711,6 +770,14 @@ export class BalanceManager {
   async createProviderToken(
     options: CreateProviderTokenOptions
   ): Promise<ProviderTokenResult> {
+    return runWalletSend(this.walletAdapter, () =>
+      this._createProviderToken(options)
+    );
+  }
+
+  private async _createProviderToken(
+    options: CreateProviderTokenOptions
+  ): Promise<ProviderTokenResult> {
     const {
       mintUrl,
       baseUrl,
@@ -754,7 +821,7 @@ export class BalanceManager {
       retryCount < 3
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
-      return this.createProviderToken({
+      return this._createProviderToken({
         ...options,
         retryCount: retryCount + 1,
       });

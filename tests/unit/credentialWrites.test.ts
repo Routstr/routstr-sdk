@@ -497,13 +497,21 @@ describe("handing a token over from the wallet", () => {
     const { control, driver } = controlledDriver(SDK_STORAGE_KEYS.XCASHU_TOKENS);
     control.release();
     const c = await client(driver);
+    // Sends from one wallet never overlap, so hold the first one until the
+    // second request has also asked for a token.
+    const manager = c.routstr.getBalanceManager();
+    const createProviderToken = manager.createProviderToken.bind(manager);
+    let asks = 0;
+    let bothAsked!: () => void;
+    const bothAsking = new Promise<void>((resolve) => (bothAsked = resolve));
+    vi.spyOn(manager, "createProviderToken").mockImplementation((options) => {
+      if (++asks === 2) bothAsked();
+      return createProviderToken(options);
+    });
     let sends = 0;
-    let bothSent!: () => void;
-    const bothStarted = new Promise<void>((resolve) => (bothSent = resolve));
     c.wallet.sendToken.mockImplementation(async (_mint, _amount, _pubkey, persistToken) => {
       const token = `cashuB_race_${++sends}`;
-      if (sends === 2) bothSent();
-      await bothStarted;
+      await bothAsking;
       await persistToken?.(token);
       return token;
     });
