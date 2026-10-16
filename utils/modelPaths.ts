@@ -566,8 +566,20 @@ const modelPathsForModelInFlight = new Map<
   Promise<NodeModelPaths | null>
 >();
 
-function modelPathsForModelKey(baseUrl: string, modelId: string): string {
-  return `${baseUrl.toLowerCase()}|${modelId.toLowerCase()}`;
+function modelPathsForModelKey(
+  baseUrl: string,
+  modelId: string,
+  spellings: readonly string[] = []
+): string {
+  const base = `${baseUrl.toLowerCase()}|${modelId.toLowerCase()}`;
+  // The spelling set is part of the entry's identity. Callers pass different
+  // sets — mapping variants, plus the node catalog's `alias_ids` on top — and
+  // a narrower payload cached under a spelling-agnostic key would be served
+  // to every later caller, hiding alias-only routes from them. Sorted so the
+  // same set always maps to the same key.
+  return spellings.length === 0
+    ? base
+    : `${base}|${[...spellings].sort().join(",")}`;
 }
 
 /**
@@ -700,13 +712,33 @@ async function fetchModelPathsForSpellings(
  * Returns a cached entry immediately when one exists (refreshing it in the
  * background once older than the TTL), null while the node is in its
  * negative-cache window, and otherwise awaits a single shared fetch.
+ *
+ * `force` inverts that for an off-request-path caller: it always awaits a
+ * real fetch, even when the entry is fresh or the node is inside its
+ * negative-cache window, so a periodic warm pass costs the refresh job its
+ * latency instead of the next request's. A failed forced refresh keeps the
+ * last good entry in the cache (the stale window stays intact) and records
+ * the failure like any other, but returns null so callers can distinguish
+ * a failed refresh from a successful one.
  */
 export function getNodeModelPathsForModel(
   baseUrl: string,
   modelId: string,
-  options: { mappings?: ModelIdMappings; extraSpellings?: string[] } = {}
+  options: {
+    mappings?: ModelIdMappings;
+    extraSpellings?: string[];
+    force?: boolean;
+  } = {}
 ): Promise<NodeModelPaths | null> {
-  const key = modelPathsForModelKey(baseUrl, modelId);
+  const spellings = [
+    ...new Set(
+      [
+        ...modelIdVariants(modelId, options.mappings),
+        ...(options.extraSpellings ?? []),
+      ].filter((s) => typeof s === "string" && s.length > 0)
+    ),
+  ];
+  const key = modelPathsForModelKey(baseUrl, modelId, spellings);
   const now = Date.now();
   const cached = modelPathsForModelCache.get(key);
   const failure = modelPathsForModelFailures.get(key);
@@ -714,14 +746,6 @@ export function getNodeModelPathsForModel(
   const startFetch = (): Promise<NodeModelPaths | null> => {
     const existing = modelPathsForModelInFlight.get(key);
     if (existing) return existing;
-    const spellings = [
-      ...new Set(
-        [
-          ...modelIdVariants(modelId, options.mappings),
-          ...(options.extraSpellings ?? []),
-        ].filter((s) => typeof s === "string" && s.length > 0)
-      ),
-    ];
     const promise = fetchModelPathsForSpellings(baseUrl, spellings)
       .then((paths) => {
         if (paths) {
@@ -747,6 +771,12 @@ export function getNodeModelPathsForModel(
     modelPathsForModelInFlight.set(key, promise);
     return promise;
   };
+
+  // A forced refresh pays the fetch now; it still shares an in-flight lookup
+  // (single-flight is per key, so the spelling set is already accounted for).
+  if (options.force === true) {
+    return startFetch();
+  }
 
   const inBackoff = !!failure && now < failure.retryAt;
   if (cached && now - cached.at < MODEL_PATHS_FOR_MODEL_MAX_STALE_MS) {

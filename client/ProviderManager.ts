@@ -24,8 +24,10 @@ import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
 import {
   canonicalModelPath,
+  DEEPSEEK_AUTO_MODEL_ID,
   DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPathsForModel,
+  MODEL_PATHS_FETCH_TIMEOUT_MS,
   modelPathCandidateKey,
   resolveDeepSeekModelPathSelectors,
   type ModelPathSatsPricing,
@@ -38,6 +40,78 @@ import { isTinfoilModel } from "./TinfoilSecure";
  * slowest node's 10 s abort — paid by every request while a node was slow.
  */
 export const MODEL_PATH_RANKING_BUDGET_MS = 6_000;
+
+/**
+ * Backstop on a single warm lookup, derived from the per-spelling fetch
+ * deadline rather than set beside it so the two cannot drift apart. That
+ * deadline is the real ceiling — a fetch settles by it even when the runtime
+ * ignores the abort (withProviderDeadline) — so this only fires if the inner
+ * bound ever stops holding. Both are far above what a healthy pass costs.
+ */
+export const MODEL_PATH_WARM_BUDGET_MS = MODEL_PATHS_FETCH_TIMEOUT_MS + 5_000;
+
+/** One (node, model) lookup of a warm pass. */
+export interface ModelPathWarmResult {
+  baseUrl: string;
+  modelId: string;
+  /**
+   * Distinct routes the node advertises for the model, deduped across the
+   * spellings the node filed them under (0 when unknown).
+   */
+  paths: number;
+  /** Of those, how many are on the DeepSeek model-path whitelist. */
+  whitelisted: number;
+  elapsedMs: number;
+  /**
+   * Why this lookup contributed nothing: "invalid-url", "disabled",
+   * "transport" (onion/clearnet mismatch), "no-catalog-model" (the node's
+   * catalog does not carry the model, so no request would reach it), or
+   * "unreachable" (the fetch failed or missed the budget). Absent on success.
+   */
+  reason?: string;
+}
+
+function hostOf(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host || baseUrl;
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
+ * One line for a warm pass, shaped for a refresh summary. Route counts are
+ * summed per node (a node usually carries one auto-pinned model); failures
+ * are grouped per node because a node that is down fails every model the
+ * same way.
+ */
+export function formatModelPathWarmSummary(
+  results: ModelPathWarmResult[]
+): string {
+  if (results.length === 0) return "model paths: no lookups";
+  const ok = results.filter((r) => !r.reason);
+  const perNode = new Map<string, number>();
+  for (const result of ok) {
+    perNode.set(result.baseUrl, (perNode.get(result.baseUrl) ?? 0) + result.whitelisted);
+  }
+  const parts = [`${ok.length}/${results.length} ok`];
+  let routes = `${ok.reduce((n, r) => n + r.whitelisted, 0)} whitelisted route(s)`;
+  if (perNode.size > 0) {
+    routes += ` (${[...perNode.entries()]
+      .map(([baseUrl, count]) => `${hostOf(baseUrl)} ${count}`)
+      .join(", ")})`;
+  }
+  parts.push(routes);
+  const failures = [
+    ...new Set(
+      results
+        .filter((r) => r.reason)
+        .map((r) => `${hostOf(r.baseUrl)}: ${r.reason}`)
+    ),
+  ];
+  if (failures.length > 0) parts.push(`failed: ${failures.join(", ")}`);
+  return `model paths: ${parts.join(", ")}`;
+}
 
 function withBudget<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return new Promise((resolve) => {
@@ -1513,6 +1587,108 @@ export class ProviderManager {
       )
       .sort((a, b) => a.cost - b.cost)
       .map(({ cost: _cost, ...candidate }) => candidate);
+  }
+
+  /**
+   * Refresh the auto-selection nodes' advertised paths for the auto-pinned
+   * models, off the request path. Call it after a model refresh (routstrd's
+   * periodic job) so the next ranking is a cache read.
+   *
+   * The ranking runs per request, but its per-model path lookups are cached
+   * (10 min fresh, 1 h stale) and are only refreshed lazily; without a warm
+   * pass the request that lands on a cold or expired entry pays the fetch,
+   * bounded by MODEL_PATH_RANKING_BUDGET_MS — which is how a node that is
+   * merely slow still taxes every request until its cache is filled.
+   *
+   * Nodes and models are gated exactly like getModelPathProviderRanking
+   * gates them (disabled, transport, catalog entry, alias spellings), so an
+   * entry written here is one the next ranking reads — same key, same
+   * spelling set. The result is a per-lookup report for the caller's log;
+   * this method never throws.
+   */
+  async warmModelPathCaches(
+    options: {
+      /** Models to warm; defaults to the auto-pinned model. */
+      modelIds?: readonly string[];
+      torMode?: boolean;
+      budgetMs?: number;
+    } = {}
+  ): Promise<ModelPathWarmResult[]> {
+    const modelIds = [
+      ...new Set(
+        (options.modelIds ?? [DEEPSEEK_AUTO_MODEL_ID]).map((id) =>
+          this.canonicalizeModelId(id)
+        )
+      ),
+    ];
+    const torMode = options.torMode ?? isTorContext();
+    const budgetMs = options.budgetMs ?? MODEL_PATH_WARM_BUDGET_MS;
+    const disabledProviders = new Set(
+      this.discoveryAdapter.getDisabledProviders()
+    );
+    const allModels = this.discoveryAdapter.getCachedModels();
+
+    const entries = await Promise.all(
+      DEEPSEEK_AUTO_NODE_URLS.flatMap((nodeUrl) =>
+        modelIds.map(async (modelId): Promise<ModelPathWarmResult> => {
+          const startedAt = Date.now();
+          const baseUrl = normalizeProviderUrl(nodeUrl);
+          const report = (
+            fields: Partial<ModelPathWarmResult> = {}
+          ): ModelPathWarmResult => ({
+            baseUrl: baseUrl ?? nodeUrl,
+            modelId,
+            paths: 0,
+            whitelisted: 0,
+            elapsedMs: Date.now() - startedAt,
+            ...fields,
+          });
+
+          if (!baseUrl) return report({ reason: "invalid-url" });
+          if (disabledProviders.has(baseUrl)) {
+            return report({ reason: "disabled" });
+          }
+          if (torMode !== isOnionUrl(baseUrl)) {
+            return report({ reason: "transport" });
+          }
+          // No catalog entry on this node means no request can reach it, so
+          // there is nothing to warm there.
+          const model = findModelForId(
+            allModels[baseUrl] || [],
+            modelId,
+            this.getModelIdMappings()
+          );
+          if (!model) return report({ reason: "no-catalog-model" });
+
+          const nodePaths = await withBudget(
+            getNodeModelPathsForModel(baseUrl, modelId, {
+              mappings: this.getModelIdMappings(),
+              extraSpellings: [model.id, ...(model.alias_ids ?? [])],
+              force: true,
+            }),
+            budgetMs
+          );
+          if (!nodePaths) return report({ reason: "unreachable" });
+
+          const resolved = resolveDeepSeekModelPathSelectors(
+            nodePaths,
+            modelId,
+            this.getModelIdMappings()
+          );
+          return report({
+            paths: new Set(
+              nodePaths.data.flatMap((entry) =>
+                entry.paths.map((path) => path.path)
+              )
+            ).size,
+            whitelisted: (resolved?.selectors ?? []).filter(
+              (selector): selector is string => !!selector
+            ).length,
+          });
+        })
+      )
+    );
+    return entries.flat();
   }
 
   /**

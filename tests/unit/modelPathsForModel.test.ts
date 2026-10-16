@@ -14,7 +14,7 @@ import {
   parseModelPathsForModelPayload,
   resolveDeepSeekModelPathSelectors,
 } from "../../utils/modelPaths";
-import { ProviderManager, MODEL_PATH_RANKING_BUDGET_MS } from "../../client/ProviderManager";
+import { ProviderManager, MODEL_PATH_RANKING_BUDGET_MS, formatModelPathWarmSummary } from "../../client/ProviderManager";
 import { DEEPSEEK_AUTO_NODE_URLS } from "../../utils/modelPaths";
 
 const NODE = "https://node.example/";
@@ -187,6 +187,91 @@ describe("getNodeModelPathsForModel caching", () => {
     expect(stale?.data[0].paths[0].path).toBe(PPQ);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("keys the entry by spelling set, so a narrow lookup cannot hide alias routes", async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const id = new URL(String(input)).searchParams.get("model_id")!;
+      return jsonResponse(
+        flatPayload(id, id === "m-dash" ? [VENICE_DASH] : [PPQ])
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const narrow = await getNodeModelPathsForModel(NODE, "m", { mappings: {} });
+    expect(narrow!.data.flatMap((m) => m.paths.map((p) => p.path))).toEqual([PPQ]);
+    // The rank path resolves the catalog model's alias_ids on top of the
+    // mapping variants. Under a spelling-agnostic key it would have been
+    // served the narrow entry and never seen the dash-only route.
+    const broad = await getNodeModelPathsForModel(NODE, "m", {
+      mappings: {},
+      extraSpellings: ["m-dash"],
+    });
+    expect(broad!.data.flatMap((m) => m.paths.map((p) => p.path))).toEqual(
+      expect.arrayContaining([PPQ, VENICE_DASH])
+    );
+  });
+});
+
+describe("getNodeModelPathsForModel forced refresh", () => {
+  const okFetch = () =>
+    vi.fn(async (input: unknown) => {
+      const id = new URL(String(input)).searchParams.get("model_id")!;
+      return jsonResponse(flatPayload(id, [PPQ]));
+    });
+
+  it("refetches a fresh entry instead of serving the cache", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const opts = { mappings: {} };
+    await getNodeModelPathsForModel(NODE, "m", opts);
+    await getNodeModelPathsForModel(NODE, "m", opts);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await getNodeModelPathsForModel(NODE, "m", { ...opts, force: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("probes a node inside its negative-cache window, and clears the failures", async () => {
+    let fail = true;
+    const fetchMock = vi.fn(async (input: unknown) => {
+      if (fail) throw new DOMException("timed out", "TimeoutError");
+      const id = new URL(String(input)).searchParams.get("model_id")!;
+      return jsonResponse(flatPayload(id, [PPQ]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const opts = { mappings: {} };
+    expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBeNull();
+    // Inside the backoff window an ordinary lookup is not retried...
+    expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // ...a forced one is, which is what lets a refresh cycle un-stick a node.
+    fail = false;
+    const forced = await getNodeModelPathsForModel(NODE, "m", {
+      ...opts,
+      force: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(forced?.data[0].paths[0].path).toBe(PPQ);
+    expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBe(forced);
+  });
+
+  it("keeps the last good entry when a forced refresh fails", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const opts = { mappings: {} };
+    const first = await getNodeModelPathsForModel(NODE, "m", opts);
+    fetchMock.mockImplementation(async () => {
+      throw new Error("unreachable");
+    });
+    const forced = await getNodeModelPathsForModel(NODE, "m", {
+      ...opts,
+      force: true,
+    });
+    // The forced call went to the network even though the entry was fresh...
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // ...but reports the failed refresh instead of disguising stale data as
+    // success. The last-good entry remains available to ordinary lookups.
+    expect(forced).toBeNull();
+    expect(await getNodeModelPathsForModel(NODE, "m", opts)).toBe(first);
+  });
 });
 
 describe("getModelPathProviderRanking latency budget", () => {
@@ -222,5 +307,146 @@ describe("getModelPathProviderRanking latency budget", () => {
     const ranking = await rankingPromise;
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${FAST}/`]);
     expect(ranking[0].selectors).toEqual([PPQ]);
+  });
+});
+
+describe("warmModelPathCaches", () => {
+  const MODEL = {
+    id: "deepseek-v4.1-flash",
+    sats_pricing: { prompt: 1, completion: 1 },
+  } as any;
+  const [A, B, C] = DEEPSEEK_AUTO_NODE_URLS;
+
+  const makeManager = (
+    models: Record<string, any[]>,
+    disabled: string[] = []
+  ) =>
+    new ProviderManager({
+      getCachedModels: () => models,
+      getCachedMints: () => ({}),
+      getCachedProviderInfo: () => ({}),
+      getDisabledProviders: () => disabled,
+      getModelIdMappings: () => null,
+      getBaseUrlsList: () => [],
+    } as any);
+
+  const okFetch = () =>
+    vi.fn(async (input: unknown) => {
+      const id = new URL(String(input)).searchParams.get("model_id")!;
+      return jsonResponse(flatPayload(id, [PPQ]));
+    });
+
+  it("warms every auto-selection node so the next ranking fetches nothing", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const manager = makeManager({
+      [`${A}/`]: [MODEL],
+      [`${B}/`]: [MODEL],
+      [`${C}/`]: [MODEL],
+    });
+
+    const warm = await manager.warmModelPathCaches({ torMode: false });
+    expect(warm.map((w) => w.reason)).toEqual([undefined, undefined, undefined]);
+    // Both known spellings per node: the canonical id and the mapping variant.
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(warm.map((w) => w.whitelisted)).toEqual([1, 1, 1]);
+    expect(formatModelPathWarmSummary(warm)).toBe(
+      "model paths: 3/3 ok, 3 whitelisted route(s) (ai.redsh1ft.com 1, routstr.otrta.me 1, api.nonkycai.com 1)"
+    );
+
+    // The point of the pass: the ranking that follows is a pure cache read.
+    const callsAfterWarm = fetchMock.mock.calls.length;
+    const ranking = await manager.getModelPathProviderRanking(
+      "deepseek-v4.1-flash",
+      { torMode: false }
+    );
+    expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
+    expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`, `${B}/`, `${C}/`]);
+    expect(ranking[0].selectors).toEqual([PPQ]);
+  });
+
+  it("reports a failed refresh without discarding the last-good ranking cache", async () => {
+    vi.useFakeTimers();
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const manager = makeManager({ [`${A}/`]: [MODEL] });
+
+    const first = await manager.warmModelPathCaches({ torMode: false });
+    expect(first[0].reason).toBeUndefined();
+    expect(first[0].whitelisted).toBe(1);
+
+    // The normal daemon refresh runs after the cache's 10-minute fresh TTL.
+    await vi.advanceTimersByTimeAsync(21 * 60 * 1_000);
+    fetchMock.mockImplementation(async () => {
+      throw new Error("unreachable");
+    });
+    const failed = await manager.warmModelPathCaches({ torMode: false });
+    expect(failed[0]).toMatchObject({
+      reason: "unreachable",
+      paths: 0,
+      whitelisted: 0,
+    });
+    expect(formatModelPathWarmSummary(failed)).toContain("0/3 ok");
+    expect(formatModelPathWarmSummary(failed)).toContain(
+      "ai.redsh1ft.com: unreachable"
+    );
+
+    // Failure reporting must not evict the cached routes or make the next
+    // request pay for another network lookup (including inside backoff).
+    const callsAfterWarm = fetchMock.mock.calls.length;
+    const ranking = await manager.getModelPathProviderRanking(
+      "deepseek-v4.1-flash",
+      { torMode: false }
+    );
+    expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
+    expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`]);
+    expect(ranking[0].selectors).toEqual([PPQ]);
+  });
+
+  it("reports why a node contributed nothing, and does not fetch it", async () => {
+    const fetchMock = vi.fn(async (_input: unknown) => {
+      throw new Error("unreachable");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const manager = makeManager({ [`${A}/`]: [MODEL] }, [`${B}/`]);
+
+    const warm = await manager.warmModelPathCaches({ torMode: false });
+    expect(warm.map((w) => [new URL(w.baseUrl).host, w.reason])).toEqual([
+      ["ai.redsh1ft.com", "unreachable"],
+      ["routstr.otrta.me", "disabled"],
+      ["api.nonkycai.com", "no-catalog-model"],
+    ]);
+    // Only the node that is both enabled and in the catalog was probed.
+    expect(
+      fetchMock.mock.calls.every((call) => String(call[0]).startsWith(A))
+    ).toBe(true);
+    const line = formatModelPathWarmSummary(warm);
+    expect(line).toContain("0/3 ok");
+    expect(line).toContain("api.nonkycai.com: no-catalog-model");
+  });
+
+  it("bounds the pass by its budget instead of a hung node's fetch", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.startsWith(A)) return new Promise(() => {});
+        const id = new URL(url).searchParams.get("model_id")!;
+        return jsonResponse(flatPayload(id, [PPQ]));
+      })
+    );
+    const manager = makeManager({ [`${A}/`]: [MODEL], [`${B}/`]: [MODEL] });
+
+    const warmPromise = manager.warmModelPathCaches({
+      torMode: false,
+      budgetMs: 1_000,
+    });
+    await vi.advanceTimersByTimeAsync(1_100);
+    const warm = await warmPromise;
+    expect(
+      warm.find((w) => w.baseUrl.startsWith(A))?.reason
+    ).toBe("unreachable");
+    expect(warm.find((w) => w.baseUrl.startsWith(B))?.whitelisted).toBe(1);
   });
 });
