@@ -145,6 +145,13 @@ function forwardableErrorHeaders(headers: Headers): Record<string, string> {
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
 
 /**
+ * Smallest deposit, in sats, for a new API key or a top-up. A cheap request
+ * can price well under 1 sat, and a 1-sat token is worth no more than the
+ * fee to redeem it at a 100 ppk mint, so the node refuses it.
+ */
+const MIN_DEPOSIT_SATS = 7;
+
+/**
  * An SDK-pinned x-routstr-model-path selector and the per-route pricing the
  * node advertised for it. Marks the request as auto-pinned (failover may
  * re-resolve a selector on the next model-path node); caller-supplied
@@ -1541,7 +1548,7 @@ export class RoutstrClient {
               this.balanceManager.topUp({
                 mintUrl,
                 baseUrl,
-                amount: topupAmount * TOPUP_MARGIN,
+                amount: Math.max(topupAmount * TOPUP_MARGIN, MIN_DEPOSIT_SATS),
                 token: params.token,
               })
           );
@@ -2883,7 +2890,8 @@ export class RoutstrClient {
 
       const topupAmount = Math.max(
         shortfall,
-        PROACTIVE_TOPUP_MIN_FRACTION * snapshot.requiredSats
+        PROACTIVE_TOPUP_MIN_FRACTION * snapshot.requiredSats,
+        MIN_DEPOSIT_SATS
       );
       const result = await this.balanceManager.topUp({
         mintUrl: snapshot.mintUrl,
@@ -3006,15 +3014,9 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _spendToken: No existing API key for ${baseUrl}, creating new one via Cashu`
         );
-        // Enforce a minimum deposit of 10 sats when creating a brand-new
-        // API key.  Without this, a tiny probe request (e.g. a 10-token
-        // health check with max_tokens=10) can price at well under 1 sat,
-        // and Math.ceil rounds it up to exactly 1 sat — leaving the new
-        // key with a balance too small to serve any real request.
-        const MIN_INITIAL_DEPOSIT = 7;
         const initialAmount = Math.max(
           Math.ceil(amount * TOPUP_MARGIN),
-          MIN_INITIAL_DEPOSIT
+          MIN_DEPOSIT_SATS
         );
         const spendResult = await this.cashuSpender.spend({
           mintUrl: mintUrl,

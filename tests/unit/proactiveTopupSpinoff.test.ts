@@ -230,6 +230,25 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     });
   });
 
+  it("never tops up less than the minimum deposit", async () => {
+    const { client } = createClient();
+    const topUp = vi
+      .spyOn(client.getBalanceManager(), "topUp")
+      .mockResolvedValue({ success: true, message: "ok" });
+
+    // target = 3 * 1.4 = 4.2; shortfall = 0.7. A 1-sat token is worth no
+    // more than its own redemption fee at a 100 ppk mint.
+    topUpIfNeeded(client, { requiredSats: 3, tokenBalance: 3.5 });
+
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
+    expect(topUp).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      baseUrl: BASE_URL,
+      amount: 7,
+      token: API_KEY,
+    });
+  });
+
   it("tops up from the snapshot without re-fetching the balance first", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();

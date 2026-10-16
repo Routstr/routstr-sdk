@@ -165,6 +165,41 @@ describe("RoutstrClient 402 top-up validation", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
 
+  it("never tops up less than the minimum deposit", async () => {
+    const { client } = createClient();
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 2_500,
+      reserved: 0,
+      unit: "msat",
+      apiKey: API_KEY,
+    });
+    const topUp = vi
+      .spyOn(balanceManager, "topUp")
+      .mockResolvedValue({ success: true, toppedUpAmount: 7, message: "ok" });
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(
+      new Response("ok", { status: 200 })
+    );
+
+    // shortfall = 3 - 2.5 = 0.5, floored to 0.21 * 3 = 0.63, x1.4 = 0.88.
+    await (client as any)._handleErrorResponse(
+      { ...params, requiredSats: 3 },
+      API_KEY,
+      402,
+      "req-402",
+      undefined,
+      localInsufficientBalanceBody,
+      0
+    );
+
+    expect(topUp).toHaveBeenCalledWith({
+      mintUrl: MINT_URL,
+      baseUrl: BASE_URL,
+      amount: 7,
+      token: API_KEY,
+    });
+  });
+
   it("does not top up a passed-through upstream-provider 402", async () => {
     const { client, providerManager } = createClient();
     const balanceManager = client.getBalanceManager();
