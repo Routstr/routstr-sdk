@@ -669,14 +669,13 @@ export class RoutstrClient {
         `[RoutstrClient] Tinfoil attestation passed, enclave=${verification.enclaveHost}, codeFingerprint=${verification.codeFingerprint.slice(0, 16)}...`
       );
 
-      // Strip the tinfoil- prefix for the model id inside the encrypted body.
       // The attested enclave expects the bare model id (e.g. "kimi-k2-6"),
       // not the caller-facing routstr id (e.g. "tinfoil-kimi-k2-6").
       // The full id is sent in the X-Routstr-Model header for proxy-side lookup.
       if (requestBody && typeof requestBody === "object" && modelId) {
         requestBody = {
           ...(requestBody as Record<string, unknown>),
-          model: getTinfoilUpstreamModelId(modelId),
+          model: this._upstreamBodyModelId(modelId, tinfoilEnabled),
         };
       }
     }
@@ -2226,13 +2225,21 @@ export class RoutstrClient {
         // as the next node's pinned selector does — a node advertises a route
         // under its own spelling (e.g. deepseek-v4-1-flash), and the node
         // rejects a pair that disagrees with 400 invalid_request.
+        // Whichever id wins, a Tinfoil request still needs the enclave's bare
+        // model: the failover target's native id is the caller-facing
+        // "tinfoil-*" routstr id, so forwarding it verbatim gets 404
+        // model_not_found from the enclave and hides the error that triggered
+        // the failover (typically a 429).
         const bodyObj =
           body && typeof body === "object"
             ? (body as Record<string, unknown>)
             : undefined;
-        const retryModelId = nextModelPathSelector
-          ? selectorModelId(nextModelPathSelector) ?? newModel.id
-          : newModel.id;
+        const retryModelId = this._upstreamBodyModelId(
+          nextModelPathSelector
+            ? selectorModelId(nextModelPathSelector) ?? newModel.id
+            : newModel.id,
+          params.tinfoilEnabled
+        );
         const retryBody =
           bodyObj && typeof bodyObj.model === "string"
             ? { ...bodyObj, model: retryModelId }
@@ -3243,6 +3250,30 @@ export class RoutstrClient {
     }
 
     return nextHeaders;
+  }
+
+  /**
+   * The model id to put in the upstream request body for a Tinfoil/EHBP call.
+   *
+   * The attested enclave expects the bare model id (e.g. `deepseek-v4-1-flash`),
+   * not the caller-facing routstr id (`tinfoil-deepseek-v4-1-flash`): the body is
+   * HPKE-encrypted, so the proxy routes, prices and looks the model up from the
+   * plaintext `X-Routstr-Model` header instead.
+   *
+   * Every path that (re)writes `body.model` — initial selection, static mapping,
+   * model-path pins, failover retries — must funnel through here. A body model
+   * the enclave does not know is a 404 `model_not_found`, and that 404 replaces
+   * whatever actually failed (e.g. the 429 that triggered the failover).
+   *
+   * Only strips when the id really is a Tinfoil id: `getTinfoilUpstreamModelId`
+   * slices unconditionally, so a bare id must pass through untouched.
+   */
+  private _upstreamBodyModelId(
+    modelId: string,
+    tinfoilEnabled?: boolean
+  ): string {
+    if (!tinfoilEnabled || !isTinfoilModel(modelId)) return modelId;
+    return getTinfoilUpstreamModelId(modelId);
   }
 
   /** The x-routstr-model-path selector on these headers, if any. */
