@@ -123,8 +123,10 @@ export interface StorageAdapter {
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];
 
-  /** Get stored API-key snapshots grouped by provider. `amount` is total
-   *  sats; `reserved` is the last known reserved sats and defaults to zero. */
+  /** Get stored API-key snapshots grouped by provider. `amount` is the
+   *  provider-reported **available** sats, i.e. already net of funds it holds
+   *  for in-flight requests; `reserved` is the last known reserved sats for
+   *  diagnostics and defaults to zero. Do not subtract it from `amount`. */
   getApiKeyDistribution(): Array<{
     baseUrl: string;
     amount: number;

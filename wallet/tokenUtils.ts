@@ -28,6 +28,32 @@ export function getBalanceInSats(
   return unit === "msat" ? balance / 1000 : balance;
 }
 
+/**
+ * Sats a provider will admit a new request against, from one balance read.
+ *
+ * routstr-core reports `/v1/wallet/info` as
+ * `{"balance": total_balance, "reserved": reserved_balance}`, and
+ * `total_balance` is defined as `balance - reserved_balance` (`routstr/core/db.py`).
+ * So the `balance` field is already net of everything currently held by
+ * in-flight requests: it is the same number `pay_for_request` compares
+ * against the request price (`routstr/auth.py`), and it can even be negative
+ * when a key is fully reserved. Subtracting `reserved` again would understate
+ * the caller's funds by exactly `reserved`, which inflates topups by that
+ * amount and makes an affordable request look short.
+ *
+ * Pinned by the node's own regression test
+ * `test_balance_info_matches_chat_available_balance`, added when the field
+ * switched from gross to net on 2026-05-20.
+ *
+ * `reserved` is kept alongside for diagnostics and storage snapshots only.
+ */
+export function getAvailableBalanceInSats(
+  amount: number,
+  unit: "sat" | "msat" | string | undefined
+): number {
+  return getBalanceInSats(amount, unit);
+}
+
 export function getTotalMintBalanceInSats(
   balances: Record<string, number>,
   units: Record<string, "sat" | "msat">

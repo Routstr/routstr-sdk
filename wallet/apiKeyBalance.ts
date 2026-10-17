@@ -8,7 +8,9 @@ import type { BalanceManager } from "./BalanceManager";
 import type { StorageAdapter } from "./interfaces";
 import { getBalanceInSats } from "./tokenUtils";
 
-/** A `/v1/wallet/info` read, as `BalanceManager.getTokenBalance` returns it. */
+/** A `/v1/wallet/info` read, as `BalanceManager.getTokenBalance` returns it.
+ *  `amount` is the provider's available balance (`total_balance`), already net
+ *  of `reserved`. */
 export type BalanceRead = Awaited<
   ReturnType<BalanceManager["getTokenBalance"]>
 >;
@@ -21,6 +23,10 @@ type ApiKeyStorage = Pick<
 
 /**
  * Save the balance a provider reported for `key`, floored to whole sats.
+ *
+ * Stored `balance` keeps the provider's `amount` verbatim, so it means
+ * *available* sats — the same figure the node's admission check uses. Stored
+ * `reserved` is a diagnostic snapshot and must never be subtracted from it.
  *
  * Returns the stored values, or `undefined` when nothing was written: the read
  * was unusable, or storage no longer holds `key` (a concurrent request swapped

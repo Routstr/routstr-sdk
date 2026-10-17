@@ -178,12 +178,12 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     );
   });
 
-  it("triggers from stored reserved balance even when stored total covers the request", async () => {
+  it("treats the snapshot as available balance instead of deducting reserved twice", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 120_000, // 120 sat total
-      reserved: 30_000, // 30 sat reserved → 90 sat available
+      amount: 120_000, // 120 sat *available*: already net of the 30 sat held
+      reserved: 30_000, // 30 sat reserved — informational, not deducted again
       unit: "msat",
       apiKey: API_KEY,
     });
@@ -191,16 +191,16 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    // Total alone covers 100 sats, but the stored reserved snapshot makes
-    // only 90 sats available (below the 140-sat margin) so it must trigger.
+    // target = 140. The gap is 140 - 120 = 20, floored to 21. Subtracting
+    // `reserved` a second time would wrongly report 90 available and deposit
+    // 50, over-funding the key by the held amount.
     topUpIfNeeded(client, { tokenBalance: 120, tokenReserved: 30 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      // target = 140; shortfall = 140 - 90 = 50 (floor 21)
-      amount: 50,
+      amount: 21,
       token: API_KEY,
     });
   });
@@ -461,7 +461,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     const { client } = createClient(
       {
         getApiKeyDistribution: () => [
-          { baseUrl: BASE_URL, amount: 120, reserved: 30 },
+          { baseUrl: BASE_URL, amount: 80, reserved: 30 },
         ],
       },
       {
@@ -471,8 +471,8 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     );
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 120_000, // 120 sat total
-      reserved: 30_000, // 90 sat available — below the 100-sat request
+      amount: 80_000, // 80 sat available — below the 100-sat request
+      reserved: 30_000,
       unit: "msat",
       apiKey: API_KEY,
     });
