@@ -250,7 +250,10 @@ export async function fetchAIResponse(
       body.max_tokens = maxTokens;
     }
 
-    if (selectedModel?.name?.startsWith("OpenAI:")) {
+    if (
+      selectedModel?.name?.startsWith("OpenAI:") &&
+      !selectedModel.architecture?.output_modalities?.includes("image")
+    ) {
       body.tools = [{ type: "web_search" }];
     }
 
