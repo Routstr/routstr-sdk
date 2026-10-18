@@ -76,6 +76,7 @@ import {
   prepareTinfoilClient,
   fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
+import { applyTinfoilReasoningEffort } from "./TinfoilReasoning";
 import { isOpenAiJsonBodyPath } from "../utils/openAiEndpoints";
 
 /**
@@ -922,15 +923,24 @@ export class RoutstrClient {
 
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      // EHBP seals the body end to end, so the proxy cannot translate a
+      // reasoning effort for us: map the caller's level onto the exact value
+      // the target model accepts before the request is encrypted. Applied per
+      // attempt, because a failover target publishes its own effort map.
+      const attemptBody = tinfoilEnabled
+        ? applyTinfoilReasoningEffort(body, params.selectedModel?.reasoning)
+        : body;
       const requestBodyText =
-        body === undefined || method === "GET" ? undefined : JSON.stringify(body);
+        attemptBody === undefined || method === "GET"
+          ? undefined
+          : JSON.stringify(attemptBody);
       const requestLogId = await this.requestResponseLogSink?.logRequest?.({
         method,
         url,
         path,
         baseUrl,
         headers,
-        body,
+        body: attemptBody,
         rawBody: requestBodyText,
       });
 
