@@ -90,22 +90,7 @@ export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
-/**
- * Multiple of the request price a key is kept funded to.
- *
- * Both the pre-request (proactive) path and the 402 handler size deposits from
- * the SDK's own `requiredSats` estimate, so this margin is the only buffer
- * against the node reserving *more* than we predict: the node prices its gate
- * from prompt allowances and `max_tokens` on its side (one live node reserved
- * 537 sats against an 804-sat gate without `max_tokens`; see
- * `ProviderManager.getRequiredSatsForModel`).
- *
- * Raised from 1.4 once the double subtraction of `reserved` was removed (see
- * `getAvailableBalanceInSats`): deposits used to be inflated by the key's
- * in-flight holds, which hid the missing headroom. 1.8 keeps the key clear of
- * the gate after one request instead of leaning on the bounded 402 retry.
- */
-const TOPUP_MARGIN = 1.8;
+const TOPUP_MARGIN = 1.4;
 
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";

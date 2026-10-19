@@ -174,20 +174,20 @@ describe("402 topup sizing uses the node's available balance", () => {
     stubBalance(client, { amount: 0, reserved: 500_000 });
     const topUp = vi
       .spyOn(client.getBalanceManager(), "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 180, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 140, message: "ok" });
     vi.spyOn(client as any, "_makeRequest").mockResolvedValue(
       new Response("ok", { status: 200 })
     );
 
     await handle402(client);
 
-    // available = 0 → shortfall = 100 → 100 x TOPUP_MARGIN(1.8) = 180.
-    // Deducting `reserved` again would ask for (100 + 500) x 1.8 = 1080.
+    // available = 0 → shortfall = 100 → 100 x TOPUP_MARGIN(1.4) = 140.
+    // Deducting `reserved` again would ask for (100 + 500) x 1.4 = 840.
     expect(topUp).toHaveBeenCalledOnce();
     expect(topUp.mock.calls[0][0]).toMatchObject({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 180,
+      amount: 140,
       token: API_KEY,
     });
   });
@@ -205,11 +205,11 @@ describe("402 topup sizing uses the node's available balance", () => {
 
     await handle402(client);
 
-    // available = -6.297 sat → shortfall = 106.297 → deposit 106.297 x 1.8.
-    // The old double subtraction saw -4416.933 available and deposited ~6324
-    // sat at the old 1.4 margin, i.e. the hold (4410 sat) plus the real gap.
+    // available = -6.297 sat → shortfall = 106.297 → deposit 106.297 x 1.4.
+    // The old double subtraction saw -4416.933 available and deposited
+    // ~6324 sat, i.e. the hold (4410 sat) plus the real gap, with margin.
     const deposited = topUp.mock.calls[0][0].amount as number;
-    expect(deposited).toBeCloseTo(106.297 * 1.8, 4);
+    expect(deposited).toBeCloseTo(106.297 * 1.4, 4);
     expect(deposited).toBeLessThan(200);
   });
 

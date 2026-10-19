@@ -159,22 +159,22 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     });
     const topUp = vi
       .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 160, message: "ok" });
+      .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
 
     topUpIfNeeded(client);
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // target = 100 * 1.8 = 180; shortfall = 180 - 20 = 160 (floor 21)
+    // target = 100 * 1.4 = 140; shortfall = 140 - 20 = 120 (floor 21)
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 160,
+      amount: 120,
       token: API_KEY,
     });
-    // After a successful topup the new available balance is persisted from
-    // toppedUpAmount (snapshot 20 + added 160) so it isn't stale-low.
+    // After a successful topup the new total is persisted from toppedUpAmount
+    // (snapshot 20 + added 120) so the stored snapshot isn't stale-low.
     await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 180, 0)
+      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 140, 0)
     );
   });
 
@@ -191,25 +191,24 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    // target = 180. The gap is 180 - 120 = 60, above the 21-sat floor.
-    // Subtracting `reserved` a second time would wrongly report 90 available
-    // and deposit 90, over-funding the key by the held amount.
+    // target = 140. The gap is 140 - 120 = 20, floored to 21. Subtracting
+    // `reserved` a second time would wrongly report 90 available and deposit
+    // 50, over-funding the key by the held amount.
     topUpIfNeeded(client, { tokenBalance: 120, tokenReserved: 30 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 60,
+      amount: 21,
       token: API_KEY,
     });
     // The stored snapshot stays on the same (available) scale as the deposit:
-    // 120 + 60 (= the 180-sat target), with the 30 sat hold carried only as a
-    // diagnostic. Writing `120 - 30 + 60` would put the snapshot on a
-    // different scale from the figure the topup trigger reads back, and
-    // re-open the double subtraction.
+    // 120 + 21, with the 30 sat hold carried only as a diagnostic. Writing
+    // `120 - 30 + 21` would put the snapshot on a different scale from the
+    // figure the topup trigger reads back, and re-open the double subtraction.
     await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 180, 30)
+      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 141, 30)
     );
   });
 
@@ -217,7 +216,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
-      amount: 165_000, // 165 sat → shortfall vs target (180) = 15 < 0.21 * 100
+      amount: 125_000, // 125 sat → shortfall vs target = 15 < 0.21 * 100
       reserved: 0,
       unit: "msat",
       apiKey: API_KEY,
@@ -226,7 +225,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    topUpIfNeeded(client, { tokenBalance: 165 });
+    topUpIfNeeded(client, { tokenBalance: 125 });
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // floor = 0.21 * 100 = 21
@@ -244,7 +243,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(client.getBalanceManager(), "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    // target = 3 * 1.8 = 5.4; shortfall = 1.9. A 1-sat token is worth no
+    // target = 3 * 1.4 = 4.2; shortfall = 0.7. A 1-sat token is worth no
     // more than its own redemption fee at a 100 ppk mint.
     topUpIfNeeded(client, { requiredSats: 3, tokenBalance: 3.5 });
 
@@ -260,13 +259,13 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
   it("tops up from the snapshot without re-fetching the balance first", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();
-    // A fresh call would say the key is plenty (200 sat ≥ the 180 target), but
-    // the proactive path trusts the snapshot and does not consult the provider
+    // A fresh call would say the key is plenty (150-10=140 sat), but the
+    // proactive path trusts the snapshot and does not consult the provider
     // before topping up.
     const getTokenBalance = vi
       .spyOn(balanceManager, "getTokenBalance")
       .mockResolvedValue({
-        amount: 200_000,
+        amount: 150_000,
         reserved: 10_000,
         unit: "msat",
         apiKey: API_KEY,
@@ -275,13 +274,13 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
 
-    topUpIfNeeded(client); // snapshot: 20 sat available < target 180
+    topUpIfNeeded(client); // snapshot: 20 sat available < target 140
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 160, // shortfall vs target from the snapshot (180 - 20)
+      amount: 120, // shortfall vs target from the snapshot (140 - 20)
       token: API_KEY,
     });
     expect(getTokenBalance).not.toHaveBeenCalled();
@@ -291,7 +290,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     const { client } = createClient();
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    topUpIfNeeded(client, { tokenBalance: 200 }); // ≥ required * 1.8 (margin)
+    topUpIfNeeded(client, { tokenBalance: 200 }); // ≥ required * 1.4 (margin)
     await new Promise((r) => setTimeout(r, 10));
 
     expect(topUp).not.toHaveBeenCalled();
