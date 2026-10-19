@@ -33,6 +33,15 @@ import {
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+import {
+  DEFAULT_CACHE_AWARE_BASKET,
+  estimateCacheAwareCost,
+  resolveCacheAwareRates,
+  type CacheAwareBasket,
+  type CacheAwareCost,
+  type CacheAwareRates,
+  type MissingCacheRatePolicy,
+} from "./cacheAwareCost";
 
 /**
  * Upper bound one auto-pin ranking waits for any single node's model paths.
@@ -180,6 +189,24 @@ export interface ModelProviderPrice {
   promptPerMillion: number;
   completionPerMillion: number;
   totalPerMillion: number;
+}
+
+/**
+ * One route priced against an explicit request basket.
+ *
+ * Unlike ModelProviderPrice (a per-million rate), `cost` is what the basket
+ * would actually cost on this route, and `rates`/`breakdown` are kept so the
+ * decision is inspectable: which cache rate was used, whether the node
+ * advertised it, and how the sats split across token classes.
+ */
+export interface CacheAwareProviderCost {
+  baseUrl: string;
+  model: Model;
+  /** Sats for the whole basket — the ranking key. */
+  cost: number;
+  rates: CacheAwareRates;
+  breakdown: CacheAwareCost;
+  basket: CacheAwareBasket;
 }
 
 /**
@@ -1798,6 +1825,92 @@ export class ProviderManager {
   ): string | null {
     const ranking = this.getProviderPriceRankingForModel(modelId, options);
     return ranking[0]?.baseUrl ?? null;
+  }
+
+  /**
+   * Rank providers for a model by what one request basket would cost, cache
+   * included.
+   *
+   * This is the cache-aware counterpart of getProviderPriceRankingForModel.
+   * That ranking sums the prompt and completion rates per million tokens,
+   * which prices a token the request may not send and ignores the input class
+   * it mostly does send: on a warm session most of the prompt is billed at the
+   * cache-read rate, which can be 5-10x cheaper than the prompt rate. Pricing
+   * an explicit basket keeps the comparison on the bill instead of on a rate.
+   *
+   * Same candidate filters as the price ranking (disabled, cooldown, Tor /
+   * onion transport, model id via native or mapped spelling). Routes that
+   * advertise no usable cache-read rate are priced by `missingCacheRate`
+   * (default: bill cache reads at the prompt rate) rather than being ranked as
+   * though cache were free.
+   */
+  getProviderCacheAwareRankingForModel(
+    modelId: string,
+    options: {
+      torMode?: boolean;
+      includeDisabled?: boolean;
+      /** Prompt/output/cache-hit assumptions; defaults to DEFAULT_CACHE_AWARE_BASKET. */
+      basket?: Partial<CacheAwareBasket>;
+      missingCacheRate?: MissingCacheRatePolicy;
+    } = {}
+  ): CacheAwareProviderCost[] {
+    modelId = this.canonicalizeModelId(modelId);
+    const includeDisabled = options.includeDisabled ?? false;
+    const torMode = options.torMode ?? false;
+    const basket: CacheAwareBasket = {
+      ...DEFAULT_CACHE_AWARE_BASKET,
+      ...(options.basket ?? {}),
+    };
+    const policy = options.missingCacheRate ?? "assume-miss";
+    const disabledProviders = new Set(
+      this.discoveryAdapter.getDisabledProviders()
+    );
+    const allModels = this.discoveryAdapter.getCachedModels();
+    const results: CacheAwareProviderCost[] = [];
+
+    for (const [baseUrl, models] of Object.entries(allModels)) {
+      if (!includeDisabled && disabledProviders.has(baseUrl)) continue;
+      if (this.isOnCooldown(baseUrl, modelId)) continue;
+      if (torMode !== baseUrl.includes(".onion")) continue;
+
+      const match = findModelForId(models, modelId, this.getModelIdMappings());
+      if (!match?.sats_pricing) continue;
+
+      const breakdown = estimateCacheAwareCost(match.sats_pricing, basket, policy);
+      results.push({
+        baseUrl,
+        model: match,
+        cost: breakdown.total,
+        rates: resolveCacheAwareRates(match.sats_pricing, policy),
+        breakdown,
+        basket,
+      });
+    }
+
+    results.sort((a, b) => {
+      if (a.cost !== b.cost) return a.cost - b.cost;
+      return a.baseUrl.localeCompare(b.baseUrl);
+    });
+
+    if (results.length > 0) {
+      this.logger.debug(
+        `getProviderCacheAwareRankingForModel: ${modelId} (${results.length} providers, ` +
+          `${basket.promptTokens} in @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit, ` +
+          `${basket.outputTokens} out):\n` +
+          results
+            .map(
+              (r, i) =>
+                `  ${i + 1}. ${r.baseUrl} ${r.cost.toFixed(2)} sats ` +
+                `(fresh=${r.breakdown.freshInputSats.toFixed(2)} ` +
+                `cache-read=${r.breakdown.cacheReadSats.toFixed(2)} ` +
+                `out=${r.breakdown.outputSats.toFixed(2)}; ` +
+                `cache-read rate ${r.rates.cacheRead.toFixed(6)} sats/tok ${r.rates.cacheReadSource})`
+            )
+            .join("\n")
+      );
+    }
+
+    return results;
   }
 
   /**
