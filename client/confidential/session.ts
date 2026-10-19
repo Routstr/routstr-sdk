@@ -371,6 +371,8 @@ export class ConfidentialSession {
   private flushChain: Promise<void> = Promise.resolve();
 
   private responseChunks: Uint8Array[] = [];
+  /** Each application-data record's length, for locating a disclosure's records. */
+  private responseRecordLens: number[] = [];
   /** The response chunks joined (built once, when first needed). */
   private responseJoined?: Uint8Array;
   /**
@@ -666,6 +668,7 @@ export class ConfidentialSession {
         // A chunk list, joined once when the response is complete: appending
         // to one growing buffer copied the whole response per record.
         this.responseChunks.push(rec);
+        this.responseRecordLens.push(rec.length);
         this.responseJoined = undefined;
         if (this.onResponseHead || this.onResponseBody) {
           try {
@@ -1035,8 +1038,16 @@ export class ConfidentialSession {
     const httpEarly = parseHttpResponse(responseBytes);
     const upstreamError = httpEarly.status >= 400;
     // An image request succeeded: its price was fixed at setup, so it needs no
-    // disclosure and no proof; accepting settles it at that price.
-    const flat = this.kind === "images" && !upstreamError;
+    // disclosure and no proof; accepting settles it at that price. Only a 2xx
+    // is a success: anything else that is not an error head to disclose (a
+    // redirect, no parsable response) is never accepted.
+    const outcome = this.kind === "images" ? imageOutcome(httpEarly.status) : undefined;
+    if (outcome === "refuse") {
+      throw new ResponseVerificationError(
+        `image response has status ${httpEarly.status}: not accepted (only a 2xx is a success)`,
+      );
+    }
+    const flat = outcome === "accept";
     let r: Uint8Array | undefined;
     if (flat) {
       this.sendText({ type: "accept" });
@@ -1167,7 +1178,7 @@ export class ConfidentialSession {
       model: this.model,
       effectiveModel,
       http,
-      responseText: image ? JSON.stringify(image) : http.bodyText,
+      responseText: image ? "" : http.bodyText,
       receipt,
       attestation: att.a,
       receiptSigOk,
@@ -1181,13 +1192,25 @@ export class ConfidentialSession {
       protocol: this.protocol,
       image,
     };
+    if (image) {
+      // An image's text form is megabytes; build it only if someone reads it.
+      let text: string | undefined;
+      Object.defineProperty(result, "responseText", {
+        enumerable: true,
+        get: () => (text ??= JSON.stringify(image)),
+      });
+    }
     this.persist(result);
     return result;
   }
 
   /** The decrypted response, joined once from its records. */
   private get responseBytes(): Uint8Array {
-    this.responseJoined ??= concat(...this.responseChunks);
+    if (!this.responseJoined) {
+      this.responseJoined = concat(...this.responseChunks);
+      // The joined buffer replaces the records: a large response is held once.
+      this.responseChunks = [this.responseJoined];
+    }
     return this.responseJoined;
   }
 
@@ -1208,7 +1231,7 @@ export class ConfidentialSession {
     }
     if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
     const tailLens = disclosureTailLens(
-      this.responseChunks.map((c) => c.length),
+      this.responseRecordLens,
       r.length + skip,
     );
     const epoch = serverTailEpoch(this.serverPost, tailLens.length);
@@ -1309,6 +1332,17 @@ export class ConfidentialSession {
       // Evidence writing must never break a session.
     }
   }
+}
+
+/**
+ * What an image session does with the provider's status: accept a 2xx (the
+ * flat price), disclose an error head (4xx/5xx), and refuse anything else
+ * (a redirect, an unparsed status) without settling it as a success.
+ */
+export function imageOutcome(status: number): "accept" | "disclose" | "refuse" {
+  if (status >= 200 && status < 300) return "accept";
+  if (status >= 400) return "disclose";
+  return "refuse";
 }
 
 /** The process opted into the insecure test hooks explicitly. */

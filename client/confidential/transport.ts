@@ -40,6 +40,7 @@ import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import { canonicalSuffix, HOP_BY_HOP_HEADERS } from "./suffix";
 import { encryptedNodeTransport } from "./hosts";
+import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
 import {
   endsWith,
   padPinnedBody,
@@ -311,88 +312,26 @@ export function isConfidentialImageEndpoint(method: string | undefined, path: st
   );
 }
 
-/** OpenAI image-request keys a provider with its own (`venice`) shape does not take. */
-const OPENAI_IMAGE_KEYS = new Set(["n", "size", "response_format", "output_format", "user", "stream"]);
-
 /**
  * An image request split into what the node may see (model, variant, count:
  * they set the price and are pinned in the suffix) and the private part
- * (prompt and every option that does not change the price). Throws when the
- * offer has no variant matching what the caller asked for: no silent
- * substitution of a dearer or different tier.
+ * (prompt and every option that does not change the price). The choice is
+ * `chooseImageVariant`'s, which refuses rather than substitutes.
  */
 export function planImageRequest(
   request: Record<string, unknown>,
   images: ConfidentialImagesOffer,
 ): { model: string; variant: ConfidentialImageVariant; count: number; body: Uint8Array; suffix: string } {
-  const model = typeof request.model === "string" ? request.model : "";
-  const variants = images.price_list[model];
-  if (!variants) {
-    throw new ConfidentialError("offer_malformed", `the node does not generate ${model} images confidentially`);
-  }
-  const rawCount = request[imageCountKey(images)] ?? request.n ?? request.variants ?? 1;
-  const count = typeof rawCount === "number" ? rawCount : NaN;
-  if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
-    throw new ConfidentialError(
-      "unsupported_endpoint",
-      `confidential image requests take 1 to ${images.max_count} images, not ${String(rawCount)}`,
-    );
-  }
-  // What the caller asked for, in the offer's terms.
-  const asked: Record<string, unknown> = {};
-  const resolution =
-    typeof request.resolution === "string" && request.resolution
-      ? request.resolution.toUpperCase()
-      : resolutionFromSize(request);
-  if (resolution) asked.resolution = resolution;
-  for (const k of ["quality", "format"]) if (request[k] !== undefined) asked[k] = request[k];
-  const fmt = request.output_format ?? request.format;
-  if (fmt !== undefined && fmt !== "webp") {
-    throw new ConfidentialError("unsupported_endpoint", `confidential images are WebP only, not ${String(fmt)}`);
-  }
-  // Only a key some variant pins selects among them: a model without
-  // resolution tiers takes any size (its price does not depend on it).
-  const tiered = new Set(variants.flatMap((v) => v.pins.map((p) => p[0])));
-  const matches = variants.filter((v) =>
-    Object.entries(asked).every(([k, want]) => {
-      if (!tiered.has(k)) return true;
-      const pin = v.pins.find((p) => p[0] === k);
-      return pin !== undefined && pin[1] === want;
-    }),
-  );
-  if (matches.length === 0) {
-    const ids = variants.map((v) => v.id).join(", ");
-    throw new ConfidentialError(
-      "unsupported_endpoint",
-      `no confidential ${model} variant matches ${JSON.stringify(asked)} (offered: ${ids})`,
-    );
-  }
-  // Several match (the caller left a tier open): the cheapest, normally the default tier.
-  const variant = matches.reduce((a, b) => (b.msat_per_image < a.msat_per_image ? b : a));
-  const pinned = new Set(["model", imageCountKey(images), ...images.fixed_pins.map((p) => p[0]), ...variant.pins.map((p) => p[0])]);
+  const { model, variant, count, countKey } = chooseImageVariant(request, images);
   const priv: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(request)) {
-    // Pinned keys go in the suffix (a prefix copy would be overridden anyway);
-    // tier keys of an untiered model stay private, they do not set its price.
-    if (pinned.has(k) || k === "n" || k === "variants") continue;
-    if (images.response_shape === "venice" && OPENAI_IMAGE_KEYS.has(k)) continue;
+    if (IMAGE_SELECTOR_KEYS.has(k) || k === countKey) continue;
     priv[k] = v;
   }
-  const suffix = renderImageSuffix(model, count, imageCountKey(images), images.fixed_pins, variant.pins);
+  const suffix = renderImageSuffix(model, count, countKey, images.fixed_pins, variant.pins);
   const prefix = JSON.stringify(priv).slice(0, -1);
   const text = prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix;
   return { model, variant, count, body: new TextEncoder().encode(text), suffix };
-}
-
-/** The resolution class of an OpenAI `size` (by area, as the node bills it). */
-function resolutionFromSize(request: Record<string, unknown>): string | undefined {
-  const size = request.size;
-  if (typeof size !== "string" || !/^\d+x\d+$/i.test(size)) return undefined;
-  const [w, h] = size.toLowerCase().split("x").map(Number);
-  const area = w! * h!;
-  if (area < 2 * 1024 * 1024) return "1K";
-  if (area < 2 * 2048 * 2048) return "2K";
-  return "4K";
 }
 
 /** The request body as the provider sees it: private part + pinned suffix. */
@@ -586,6 +525,9 @@ async function fetchConfidentialImageOnce(
   const onAbort = () => session.close();
   if (params.signal?.aborted) onAbort();
   params.signal?.addEventListener("abort", onAbort, { once: true });
+  // Image sessions never use the pre-warm pool, but its chat arms would
+  // compete with this session's own 2PC preparation: hold them meanwhile.
+  const releaseArming = pool?.holdArming();
   let result: ConfidentialSessionResult;
   try {
     result = await session.run(plan.body);
@@ -602,6 +544,7 @@ async function fetchConfidentialImageOnce(
     }
     throw error;
   } finally {
+    releaseArming?.();
     session.close();
     params.signal?.removeEventListener("abort", onAbort);
   }
