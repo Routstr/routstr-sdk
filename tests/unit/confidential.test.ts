@@ -8,7 +8,7 @@
  * real offer from an older node running the retired protocol v1 (refused).
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
@@ -46,12 +46,14 @@ import {
 import { confidentialRequiredSats, confidentialReservationMsats } from "../../client/RoutstrClient";
 import {
   aggregateChatCompletionSse,
+  maxTokensFor,
   buildPinnedBody,
   fetchConfidential,
   isConfidentialEndpoint,
   SseDoneHoldback,
 } from "../../client/confidential/transport";
-import { ReceiptVerificationError } from "../../client/confidential/errors";
+import { ProverMissingError, ReceiptVerificationError, SessionRejectedError } from "../../client/confidential/errors";
+import { CuProverBackend } from "../../client/confidential/prover";
 import { ConfidentialSession } from "../../client/confidential/session";
 import {
   TrustedHostMatcher,
@@ -427,6 +429,36 @@ describe("receipt verification", () => {
     expect(res.costWithinOffer).toBe(false);
   });
 
+  it("refuses a receipt without a whole, non-negative cost", () => {
+    for (const cost_msats of [undefined, -1, 1.5, Number.NaN]) {
+      const res = verifyReceipt({
+        receipt: { ...base, cost_msats } as never,
+        ownUsage,
+        priceEntry: { in: 1000, out: 1000 },
+      });
+      expect(res.costWithinOffer, String(cost_msats)).toBe(false);
+    }
+    expect(() => checkUpstreamErrorReceipt({ ...base, usage: { error_status: 400 } } as never, 400)).toThrow(
+      ReceiptVerificationError,
+    );
+  });
+
+  it("matches the cached-token count of the usage we saw", () => {
+    const cached = { ...ownUsage, usage: { ...ownUsage.usage, prompt_tokens_details: { cached_tokens: 4 } } };
+    const res = verifyReceipt({
+      receipt: { ...base, cost_msats: 1 } as never,
+      ownUsage: cached,
+      priceEntry: { in: 1000, out: 1000 },
+    });
+    expect(res.usageMatch).toBe(false);
+    const same = verifyReceipt({
+      receipt: { ...base, usage: cached, cost_msats: 1 } as never,
+      ownUsage: cached,
+      priceEntry: { in: 1000, out: 1000 },
+    });
+    expect(same.usageMatch).toBe(true);
+  });
+
   it("never refuses the node's cached-input charge for float rounding", () => {
     // The node bills ceil((in·(p−c) + min(cached_in,in)·c + out·k)/1000). With
     // cached_in = in that equals the uncached price mathematically, but in
@@ -580,6 +612,13 @@ describe("confidential transport body handling", () => {
     expect(JSON.parse(text).model).toBe("deepseek-v4-flash");
   });
 
+  it("pins the smallest token limit the caller set, clamped to the node's cap", () => {
+    expect(maxTokensFor({ max_tokens: 64000, max_completion_tokens: 100 }, 4096)).toEqual({ maxTokens: 100 });
+    expect(maxTokensFor({ max_completion_tokens: 100 }, 4096)).toEqual({ maxTokens: 100 });
+    expect(maxTokensFor({ max_tokens: 9000 }, 4096)).toEqual({ maxTokens: 4096, clampedFrom: 9000 });
+    expect(maxTokensFor({}, 4096)).toEqual({ maxTokens: 4096 });
+  });
+
   it("folds SSE into one chat.completion", () => {
     const sse = [
       'data: {"id":"x1","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"}}]}',
@@ -680,6 +719,11 @@ describe("security regressions", () => {
     expect(isConfidentialEndpoint("POST", "/v1/responses")).toBe(false);
     expect(isConfidentialEndpoint("POST", "/v1/embeddings")).toBe(false);
     expect(isConfidentialEndpoint("GET", "/v1/chat/completions")).toBe(false);
+    expect(isConfidentialEndpoint("POST", "/chat/completions/")).toBe(true);
+    expect(isConfidentialEndpoint("POST", "/v1/chat/completions?x=1")).toBe(true);
+    // Another endpoint that merely ends the same way is not the template's.
+    expect(isConfidentialEndpoint("POST", "/v1/other/chat/completions")).toBe(false);
+    expect(isConfidentialEndpoint("POST", "/v1/v1/chat/completions")).toBe(false);
   });
 
   it("pins the announcing key only for an authenticated node URL", async () => {
@@ -733,6 +777,37 @@ describe("security regressions", () => {
     }
     expect(encryptedNodeTransport("ws://127.0.0.1")).toBe(false);
     expect(encryptedNodeTransport("not a url")).toBe(false);
+  });
+
+  it("retries an expired offer only while the body was not released", async () => {
+    const { offer, pubHex } = signedOffer();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify(offer), { status: 200 })) as typeof fetch;
+    const expired = () =>
+      new SessionRejectedError("offer expired", undefined, 409, { error: { type: "offer_expired" } });
+    try {
+      for (const released of [false, true]) {
+        let runs = 0;
+        const run = vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: any) {
+          runs++;
+          if (released) this.released = true;
+          throw expired();
+        });
+        const call = fetchConfidential({
+          baseUrl: `https://expired-${released}.example`,
+          body: { model: "cheap", messages: [] },
+          bearer: "sk-x",
+          options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex] },
+        });
+        // Released: the node's refusal is the answer, never a second session.
+        if (released) expect((await call).status).toBe(409);
+        else await expect(call).rejects.toThrow(/offer expired/);
+        expect(runs).toBe(released ? 1 : 2);
+        run.mockRestore();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("re-applies the caller's policy to a cached offer", async () => {
@@ -882,6 +957,16 @@ describe("confidential session fee and surcharge in the offer", () => {
     }
     for (const bad of [-1, "20", Number.POSITIVE_INFINITY]) {
       expect(() => validateOfferShape({ ...shape, rate_surcharge_pct: bad })).toThrow();
+    }
+  });
+
+  it("rejects a malformed token cap or price entry", () => {
+    for (const bad of [0, -5, 1.5, Number.NaN, "4096"]) {
+      expect(() => validateOfferShape({ ...shape, max_tokens_cap: bad })).toThrow(/max_tokens_cap/);
+    }
+    validateOfferShape({ ...shape, price_list: { m: { in: 1.1, out: 2, cached_in: 0.5 } } });
+    for (const bad of [null, 5, { in: 1 }, { in: "1", out: 1 }, { in: 1, out: -1 }, { in: 1, out: 1, cached_in: "x" }]) {
+      expect(() => validateOfferShape({ ...shape, price_list: { m: bad } })).toThrow(/price_list/);
     }
   });
 });
@@ -1056,6 +1141,62 @@ describe("session construction guards", () => {
     } finally {
       if (prev === undefined) delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
       else process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = prev;
+    }
+  });
+
+  it("refuses to send the setup when cu-prover or cu-2pc is missing", async () => {
+    const realWs = (globalThis as any).WebSocket;
+    let dialed = 0;
+    (globalThis as any).WebSocket = class {
+      constructor() {
+        dialed++;
+        throw new Error("dialed");
+      }
+    };
+    try {
+      const missing = new CuProverBackend({ binaryPath: "/nonexistent/cu-prover" });
+      await expect(new ConfidentialSession(opts({ prover: missing })).arm()).rejects.toThrow(ProverMissingError);
+      // The prover exists, cu-2pc does not.
+      const present = new CuProverBackend({ binaryPath: process.execPath });
+      await expect(
+        new ConfidentialSession(opts({ prover: present, twoPcPath: "/nonexistent/cu-2pc" })).arm(),
+      ).rejects.toThrow(/cu-2pc/);
+      expect(dialed).toBe(0);
+    } finally {
+      (globalThis as any).WebSocket = realWs;
+    }
+  });
+
+  it("refuses a session announced under another key before the 2PC starts", async () => {
+    const realWs = (globalThis as any).WebSocket;
+    (globalThis as any).WebSocket = class {
+      onopen?: () => void;
+      onmessage?: (ev: { data: string }) => void;
+      onclose?: () => void;
+      onerror?: () => void;
+      constructor() {
+        setTimeout(() => this.onopen?.(), 0);
+      }
+      send() {
+        setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: "ready", v: 2, sid: "ab".repeat(32), pubkey: "11".repeat(32) }) }), 0);
+      }
+      close() {}
+    };
+    let twoPcStarted = 0;
+    try {
+      const session = new ConfidentialSession(
+        opts({
+          prover: new CuProverBackend({ binaryPath: process.execPath }),
+          twoPcFactory: () => {
+            twoPcStarted++;
+            throw new Error("2PC started");
+          },
+        }),
+      );
+      await expect(session.arm()).rejects.toThrow(/differs from the signed offer key/);
+      expect(twoPcStarted).toBe(0);
+    } finally {
+      (globalThis as any).WebSocket = realWs;
     }
   });
 
