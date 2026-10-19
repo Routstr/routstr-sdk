@@ -27,6 +27,9 @@ import {
   TrustedHostError,
 } from "./errors";
 
+/** The keys `canonicalSuffix` pins, in order (the sidecar's `SUFFIX_KEYS`). */
+export const CHAT_SUFFIX_KEYS: readonly string[] = ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"];
+
 /**
  * Protocol versions this client speaks: only v2 (the two-party handshake).
  * Protocol v1 is retired; a node that offers only v1 is refused.
@@ -207,6 +210,11 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   }
   if (!Array.isArray(offer.suffix_keys)) {
     throw new OfferMalformedError("offer.suffix_keys is not an array");
+  }
+  // The keys the canonical suffix pins, in its order: an offer naming others
+  // describes a suffix this client does not send (the sidecar refuses it too).
+  if (offer.suffix_keys.join("\n") !== CHAT_SUFFIX_KEYS.join("\n")) {
+    throw new OfferMalformedError(`offer.suffix_keys ${JSON.stringify(offer.suffix_keys)} are not the keys the suffix pins`);
   }
   if (!isObject(offer.price_list)) {
     throw new OfferMalformedError("offer.price_list is not an object");
