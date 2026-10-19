@@ -86,15 +86,22 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
   const body = /chunked/i.test(headers["transfer-encoding"] ?? "")
     ? dechunkAll(rawBody)
     : rawBody;
-  return {
+  const parsed = {
     status,
     statusText,
     headers,
     raw: bytes,
     body,
-    bodyText: Buffer.from(body).toString("utf8"),
     contentType: headers["content-type"] ?? "",
-  };
+  } as ParsedHttpResponse;
+  // Decoded on first use: an image body is megabytes, and most callers never
+  // read it as text.
+  let text: string | undefined;
+  Object.defineProperty(parsed, "bodyText", {
+    enumerable: true,
+    get: () => (text ??= Buffer.from(body).toString("utf8")),
+  });
+  return parsed;
 }
 
 // ─── π_C3 disclosure extraction (chunked transfer encoding) ─────────────────

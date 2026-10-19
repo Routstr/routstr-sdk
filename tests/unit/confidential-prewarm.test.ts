@@ -133,6 +133,18 @@ describe("pre-warm heuristics", () => {
     expect(h.arms.length).toBe(2);
   });
 
+  it("arms nothing while a request outside the pool (an image) prepares its own session", async () => {
+    const h = harness();
+    const release = h.pool.holdArming();
+    await h.request();
+    await h.flush();
+    expect(h.arms).toHaveLength(0);
+    release();
+    release(); // idempotent
+    await h.flush();
+    expect(h.arms).toHaveLength(1);
+  });
+
   it("does not arm before a reservation is known (no settled request yet)", async () => {
     const h = harness();
     const t = h.pool.begin(h.info, null, 500);
