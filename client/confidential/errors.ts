@@ -22,7 +22,8 @@ export type ConfidentialErrorCode =
   | "response_verification"
   | "timeout"
   | "not_configured"
-  | "unsupported_endpoint";
+  | "unsupported_endpoint"
+  | "offer_no_images";
 
 export class ConfidentialError extends Error {
   readonly code: ConfidentialErrorCode;

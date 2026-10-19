@@ -17,15 +17,23 @@
  * still sees the error (the rest of the stream is not delayed).
  * `confidentialSettled` carries the same outcome.
  *
- * Only `POST /v1/chat/completions` is supported: the pinned suffix, the head
- * template and the usage proof are all chat-completions specific.
+ * `POST /v1/chat/completions` runs a chat session (usage disclosed and
+ * proven). `POST /v1/images/generations` and `/v1/image/generate` run an image
+ * session when the node's signed offer has the `images` capability: the price
+ * is fixed at setup from the pinned model, variant and count, so nothing is
+ * disclosed on success. Image sessions are never pre-warmed.
  */
 
 import { ConfidentialError, SessionRejectedError } from "./errors";
 import {
   fetchConfidentialOffer,
   offerAbandonFeeMsat,
+  imageCountKey,
+  offerSupportsImages,
+  renderImageSuffix,
   verifyConfidentialOffer,
+  type ConfidentialImageVariant,
+  type ConfidentialImagesOffer,
   type VerifiedOffer,
 } from "./offer";
 import { CuProverBackend } from "./prover";
@@ -246,14 +254,24 @@ async function verifiedOffer(
 }
 
 
-/** The node's verified offer, which must price `model`. */
+/** The node's verified offer, which must price `model` for this kind of request. */
 async function qualifiedOffer(
   baseUrl: string,
   model: string,
   options: ConfidentialRequestOptions,
   fresh = false,
+  kind: "chat" | "images" = "chat",
 ): Promise<VerifiedOffer> {
   const offer = await verifiedOffer(baseUrl, options, fresh);
+  if (kind === "images") {
+    if (!offerSupportsImages(offer)) {
+      throw new ConfidentialError("offer_no_images", `node ${baseUrl} serves no confidential image generation`);
+    }
+    if (!Object.hasOwn(offer.images!.price_list, model)) {
+      throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not generate ${model} images confidentially`);
+    }
+    return offer;
+  }
   if (!Object.hasOwn(offer.price_list, model)) {
     throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not serve ${model} confidentially`);
   }
@@ -272,16 +290,109 @@ export async function qualifyConfidentialNode(
   baseUrl: string,
   model: string,
   options: ConfidentialRequestOptions,
+  kind: "chat" | "images" = "chat",
 ): Promise<VerifiedOffer> {
-  return qualifiedOffer(baseUrl, model, options);
+  return qualifiedOffer(baseUrl, model, options, false, kind);
 }
 
-/** The one endpoint the confidential transport implements. */
+/** The chat endpoint the confidential transport implements. */
 export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
   return (
     (method ?? "POST").toUpperCase() === "POST" &&
     /^(\/v1)?\/chat\/completions\/?$/.test((path ?? "/v1/chat/completions").split("?")[0]!)
   );
+}
+
+/** The image endpoints the confidential transport implements. */
+export function isConfidentialImageEndpoint(method: string | undefined, path: string | undefined): boolean {
+  return (
+    (method ?? "POST").toUpperCase() === "POST" &&
+    /^(\/v1)?\/(images\/generations|image\/generate)\/?$/.test((path ?? "").split("?")[0]!)
+  );
+}
+
+/** OpenAI image-request keys a provider with its own (`venice`) shape does not take. */
+const OPENAI_IMAGE_KEYS = new Set(["n", "size", "response_format", "output_format", "user", "stream"]);
+
+/**
+ * An image request split into what the node may see (model, variant, count:
+ * they set the price and are pinned in the suffix) and the private part
+ * (prompt and every option that does not change the price). Throws when the
+ * offer has no variant matching what the caller asked for: no silent
+ * substitution of a dearer or different tier.
+ */
+export function planImageRequest(
+  request: Record<string, unknown>,
+  images: ConfidentialImagesOffer,
+): { model: string; variant: ConfidentialImageVariant; count: number; body: Uint8Array; suffix: string } {
+  const model = typeof request.model === "string" ? request.model : "";
+  const variants = images.price_list[model];
+  if (!variants) {
+    throw new ConfidentialError("offer_malformed", `the node does not generate ${model} images confidentially`);
+  }
+  const rawCount = request[imageCountKey(images)] ?? request.n ?? request.variants ?? 1;
+  const count = typeof rawCount === "number" ? rawCount : NaN;
+  if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
+    throw new ConfidentialError(
+      "unsupported_endpoint",
+      `confidential image requests take 1 to ${images.max_count} images, not ${String(rawCount)}`,
+    );
+  }
+  // What the caller asked for, in the offer's terms.
+  const asked: Record<string, unknown> = {};
+  const resolution =
+    typeof request.resolution === "string" && request.resolution
+      ? request.resolution.toUpperCase()
+      : resolutionFromSize(request);
+  if (resolution) asked.resolution = resolution;
+  for (const k of ["quality", "format"]) if (request[k] !== undefined) asked[k] = request[k];
+  const fmt = request.output_format ?? request.format;
+  if (fmt !== undefined && fmt !== "webp") {
+    throw new ConfidentialError("unsupported_endpoint", `confidential images are WebP only, not ${String(fmt)}`);
+  }
+  // Only a key some variant pins selects among them: a model without
+  // resolution tiers takes any size (its price does not depend on it).
+  const tiered = new Set(variants.flatMap((v) => v.pins.map((p) => p[0])));
+  const matches = variants.filter((v) =>
+    Object.entries(asked).every(([k, want]) => {
+      if (!tiered.has(k)) return true;
+      const pin = v.pins.find((p) => p[0] === k);
+      return pin !== undefined && pin[1] === want;
+    }),
+  );
+  if (matches.length === 0) {
+    const ids = variants.map((v) => v.id).join(", ");
+    throw new ConfidentialError(
+      "unsupported_endpoint",
+      `no confidential ${model} variant matches ${JSON.stringify(asked)} (offered: ${ids})`,
+    );
+  }
+  // Several match (the caller left a tier open): the cheapest, normally the default tier.
+  const variant = matches.reduce((a, b) => (b.msat_per_image < a.msat_per_image ? b : a));
+  const pinned = new Set(["model", imageCountKey(images), ...images.fixed_pins.map((p) => p[0]), ...variant.pins.map((p) => p[0])]);
+  const priv: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(request)) {
+    // Pinned keys go in the suffix (a prefix copy would be overridden anyway);
+    // tier keys of an untiered model stay private, they do not set its price.
+    if (pinned.has(k) || k === "n" || k === "variants") continue;
+    if (images.response_shape === "venice" && OPENAI_IMAGE_KEYS.has(k)) continue;
+    priv[k] = v;
+  }
+  const suffix = renderImageSuffix(model, count, imageCountKey(images), images.fixed_pins, variant.pins);
+  const prefix = JSON.stringify(priv).slice(0, -1);
+  const text = prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix;
+  return { model, variant, count, body: new TextEncoder().encode(text), suffix };
+}
+
+/** The resolution class of an OpenAI `size` (by area, as the node bills it). */
+function resolutionFromSize(request: Record<string, unknown>): string | undefined {
+  const size = request.size;
+  if (typeof size !== "string" || !/^\d+x\d+$/i.test(size)) return undefined;
+  const [w, h] = size.toLowerCase().split("x").map(Number);
+  const area = w! * h!;
+  if (area < 2 * 1024 * 1024) return "1K";
+  if (area < 2 * 2048 * 2048) return "2K";
+  return "4K";
 }
 
 /** The request body as the provider sees it: private part + pinned suffix. */
@@ -427,20 +538,97 @@ export interface ConfidentialFetchParams {
 
 /** Run one confidential session and present it as a `Response`. */
 export async function fetchConfidential(params: ConfidentialFetchParams): Promise<Response> {
-  if (!isConfidentialEndpoint(params.method, params.path)) {
+  const image = isConfidentialImageEndpoint(params.method, params.path);
+  if (!image && !isConfidentialEndpoint(params.method, params.path)) {
     throw new ConfidentialError(
       "unsupported_endpoint",
-      `confidential mode supports only POST /v1/chat/completions, not ${params.method ?? ""} ${params.path ?? ""}`,
+      `confidential mode supports only POST /v1/chat/completions and /v1/images/generations, not ${params.method ?? ""} ${params.path ?? ""}`,
     );
   }
+  const once = image ? fetchConfidentialImageOnce : fetchConfidentialOnce;
   try {
-    return await fetchConfidentialOnce(params, false);
+    return await once(params, false);
   } catch (error) {
     // The node settles at the rates of the offer we verified; once it no
     // longer holds that offer it refuses the setup. Refetch and retry once.
-    if (error instanceof OfferExpired) return fetchConfidentialOnce(params, true);
+    if (error instanceof OfferExpired) return once(params, true);
     throw error;
   }
+}
+
+/**
+ * One confidential image request: always a cold session (image sessions are
+ * never armed ahead of a request), presented as an OpenAI images response.
+ */
+async function fetchConfidentialImageOnce(
+  params: ConfidentialFetchParams,
+  freshOffer: boolean,
+): Promise<Response> {
+  const { baseUrl, options } = params;
+  const request = (params.body ?? {}) as Record<string, unknown>;
+  const model = typeof request.model === "string" ? request.model : "";
+  const offer = await qualifiedOffer(baseUrl, model, options, freshOffer, "images");
+  const plan = planImageRequest(request, offer.images!);
+  const session = new ConfidentialSession({
+    baseUrl,
+    offer,
+    auth: params.bearer,
+    model: plan.model,
+    maxTokens: 0,
+    kind: "images",
+    image: { variant: plan.variant.id, count: plan.count },
+    bodyLength: plan.body.length,
+    prover: new CuProverBackend({ binaryPath: options.proverPath }),
+    twoPcPath: options.twoPcPath,
+    runsDir: options.runsDir,
+    allowInsecureTransport: options.allowInsecureTransport,
+  });
+  const onAbort = () => session.close();
+  if (params.signal?.aborted) onAbort();
+  params.signal?.addEventListener("abort", onAbort, { once: true });
+  let result: ConfidentialSessionResult;
+  try {
+    result = await session.run(plan.body);
+  } catch (error) {
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !session.bodyReleased) {
+      offerCache.delete(baseUrl.replace(/\/$/, ""));
+      throw new OfferExpired(error.message);
+    }
+    if (error instanceof SessionRejectedError && error.status) {
+      return new Response(JSON.stringify({ detail: error.nodeDetail ?? error.message }), {
+        status: error.status,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw error;
+  } finally {
+    session.close();
+    params.signal?.removeEventListener("abort", onAbort);
+  }
+  const headers = new Headers();
+  headers.set("x-routstr-verify", "confidential");
+  headers.set("x-routstr-confidential-sid", session.sid);
+  headers.set("x-routstr-confidential-variant", plan.variant.id);
+  if (typeof result.receipt.cost_msats === "number") {
+    headers.set("x-routstr-cost-msats", String(result.receipt.cost_msats));
+  }
+  let response: Response;
+  if (result.image) {
+    headers.set("content-type", "application/json");
+    response = new Response(JSON.stringify(result.image), { status: result.http.status, headers });
+  } else {
+    // An upstream error: its body as the provider sent it.
+    for (const [k, v] of Object.entries(result.http.headers)) {
+      if (!HOP_BY_HOP_HEADERS.has(k.toLowerCase()) && !headers.has(k)) headers.set(k, v);
+    }
+    response = new Response(new Blob([result.http.body as BlobPart]), { status: result.http.status, headers });
+  }
+  if (params.returnChange) {
+    const change = await withdrawBalance(baseUrl, params.bearer);
+    if (change) response.headers.set("x-cashu", change);
+  }
+  (response as unknown as { confidentialSettled: Promise<unknown> }).confidentialSettled = Promise.resolve();
+  return response;
 }
 
 class OfferExpired extends Error {}
