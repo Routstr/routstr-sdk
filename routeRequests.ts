@@ -100,12 +100,6 @@ export interface RouteRequestResult {
   baseUrl: string;
   /** The selected model with pricing info */
   selectedModel: Model;
-  /** Pricing info for the selected provider */
-  pricing: {
-    promptPerMillion: number;
-    completionPerMillion: number;
-    totalPerMillion: number;
-  };
   /** The response from the provider */
   response: {
     status: number;

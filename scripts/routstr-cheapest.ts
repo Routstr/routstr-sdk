@@ -210,8 +210,14 @@ async function main(): Promise<void> {
     selectedModel = cheapest.model;
 
     console.error(`Using provider: ${baseUrl}`);
+    const { breakdown, rates, basket } = cheapest;
     console.error(
-      `Pricing sats/M prompt=${cheapest.promptPerMillion.toFixed(2)} completion=${cheapest.completionPerMillion.toFixed(2)} total=${cheapest.totalPerMillion.toFixed(2)}`
+      `Cost ${cheapest.cost.toFixed(2)} sats for ${basket.promptTokens} prompt @ ` +
+        `${(basket.cacheHitRate * 100).toFixed(0)}% cache hit + ${basket.outputTokens} output ` +
+        `(fresh=${breakdown.freshInputSats.toFixed(2)} cache-read=${breakdown.cacheReadSats.toFixed(2)} ` +
+        `out=${breakdown.outputSats.toFixed(2)} request=${breakdown.requestSats.toFixed(2)}); ` +
+        `rates prompt=${rates.prompt} cache-read=${rates.cacheRead} (${rates.cacheReadSource}) ` +
+        `completion=${rates.completion}`
     );
   }
 

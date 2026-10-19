@@ -234,17 +234,20 @@ describe("provider ranking integration flow", () => {
 
     expect(ranking).toHaveLength(2);
 
-    // Cheapest provider (1+1 = 2 sats/token) should be first
+    // Cheapest provider (1+1 = 2 sats/token on the default basket) first.
+    // The default basket is 1M prompt + 1M completion at a 0% cache hit, so
+    // the cost is the same prompt+completion per-million sum the ranking
+    // used before, with the per-request fee added.
     expect(ranking[0].baseUrl).toBe(`${PROVIDER_B_URL}/`);
-    expect(ranking[0].promptPerMillion).toBe(1_000_000);
-    expect(ranking[0].completionPerMillion).toBe(1_000_000);
-    expect(ranking[0].totalPerMillion).toBe(2_000_000);
+    expect(ranking[0].cost).toBe(2_000_000);
+    expect(ranking[0].breakdown.freshInputSats).toBe(1_000_000);
+    expect(ranking[0].breakdown.outputSats).toBe(1_000_000);
 
-    // Expensive provider (10+10 = 20 sats/token) should be second
+    // Expensive provider (10+10 = 20 sats/token) second
     expect(ranking[1].baseUrl).toBe(`${PROVIDER_A_URL}/`);
-    expect(ranking[1].promptPerMillion).toBe(10_000_000);
-    expect(ranking[1].completionPerMillion).toBe(10_000_000);
-    expect(ranking[1].totalPerMillion).toBe(20_000_000);
+    expect(ranking[1].cost).toBe(20_000_000);
+    expect(ranking[1].breakdown.freshInputSats).toBe(10_000_000);
+    expect(ranking[1].breakdown.outputSats).toBe(10_000_000);
 
     // -- 8. Verify getBestProviderForModel returns cheapest --
     const best = providerManager.getBestProviderForModel("gpt-4o-mini");
@@ -361,7 +364,7 @@ describe("provider ranking integration flow", () => {
     expect(ranking).toHaveLength(0);
   });
 
-  it("alphabetical tiebreak when totalPerMillion is equal", async () => {
+  it("alphabetical tiebreak when the basket cost is equal", async () => {
     mockNostrEvents.push(
       makeProviderEvent("evt-prov-a", PROVIDER_A_NODE_PUBKEY, [
         "https://zulu.example.com",

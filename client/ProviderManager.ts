@@ -33,6 +33,15 @@ import {
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+import {
+  estimateCost,
+  resolveBasket,
+  resolveCostRates,
+  type CostBasket,
+  type CostEstimate,
+  type CostRates,
+  type MissingCacheRatePolicy,
+} from "./costEstimate";
 
 /**
  * Upper bound one auto-pin ranking waits for any single node's model paths.
@@ -174,12 +183,39 @@ const fetchProviderInfo = async (
   }
 };
 
+/**
+ * One provider priced against an explicit request basket.
+ *
+ * `cost` is what the basket would actually cost on this provider and is the
+ * ranking key. `rates` and `breakdown` are kept so the decision stays
+ * inspectable: which cache rate was used, whether the node advertised it, and
+ * how the sats split across token classes.
+ */
 export interface ModelProviderPrice {
   baseUrl: string;
   model: Model;
-  promptPerMillion: number;
-  completionPerMillion: number;
-  totalPerMillion: number;
+  /** Sats for the whole basket. */
+  cost: number;
+  /** The four rates the cost was computed from, with provenance. */
+  rates: CostRates;
+  /** Per-class sats for the basket. */
+  breakdown: CostEstimate;
+  /** The basket this entry was priced against. */
+  basket: CostBasket;
+}
+
+/** Options shared by the price ranking and best-provider selection. */
+export interface ProviderRankingOptions {
+  torMode?: boolean;
+  includeDisabled?: boolean;
+  /**
+   * Token split to price. Defaults to DEFAULT_COST_BASKET, which reproduces
+   * the old prompt+completion per-million ordering exactly — pass a measured
+   * basket to rank on what a real request costs.
+   */
+  basket?: Partial<CostBasket>;
+  /** Fill for routes that publish no usable cache-read rate. */
+  missingCacheRate?: MissingCacheRatePolicy;
 }
 
 /**
@@ -1725,15 +1761,30 @@ export class ProviderManager {
   }
 
   /**
-   * Get providers for a model sorted by prompt+completion pricing
+   * Get providers for a model, ranked by what one request basket costs.
+   *
+   * The cost of the basket (DEFAULT_COST_BASKET unless the caller passes one)
+   * is what the node would bill for it: fresh input at the prompt rate (or the
+   * cache-write rate when the basket participates in the cache), cache reads
+   * at the cache-read rate, output at the completion rate, plus the
+   * per-request fee. Routes that publish no usable cache-read rate are priced
+   * by `missingCacheRate` (default: bill cache reads at the prompt rate) rather
+   * than ranked as though cache were free, so a published 0 cannot win.
+   *
+   * The default basket is the one this ranking implied before the key changed
+   * (1M prompt + 1M completion at a 0% cache hit), so the ordering here is the
+   * prompt+completion per-million ordering plus the request fee. Pass a
+   * measured basket to rank on what a real request costs.
    */
   getProviderPriceRankingForModel(
     modelId: string,
-    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+    options: ProviderRankingOptions = {}
   ): ModelProviderPrice[] {
     modelId = this.canonicalizeModelId(modelId);
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
+    const basket = resolveBasket(options.basket);
+    const missingCacheRate = options.missingCacheRate ?? "assume-miss";
     const disabledProviders = new Set(this.discoveryAdapter.getDisabledProviders());
     const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
@@ -1757,31 +1808,50 @@ export class ProviderManager {
         continue;
       }
 
-      const promptPerMillion = prompt * 1_000_000;
-      const completionPerMillion = completion * 1_000_000;
-      const totalPerMillion = promptPerMillion + completionPerMillion;
+      const breakdown = estimateCost(
+        match.sats_pricing,
+        basket,
+        missingCacheRate
+      );
 
       results.push({
         baseUrl,
         model: match,
-        promptPerMillion,
-        completionPerMillion,
-        totalPerMillion,
+        cost: breakdown.total,
+        rates: resolveCostRates(match.sats_pricing, {
+          missingCacheRate,
+          cacheHitRate: basket.cacheHitRate,
+        }),
+        breakdown,
+        basket,
       });
     }
 
     results.sort((a, b) => {
-      if (a.totalPerMillion !== b.totalPerMillion) {
-        return a.totalPerMillion - b.totalPerMillion;
+      if (a.cost !== b.cost) {
+        return a.cost - b.cost;
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
 
     if (results.length > 0) {
       const ranking = results
-        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
+        .map(
+          (r, i) =>
+            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats ` +
+            `(fresh=${r.breakdown.freshInputSats.toFixed(2)} ` +
+            `cache-read=${r.breakdown.cacheReadSats.toFixed(2)} ` +
+            `out=${r.breakdown.outputSats.toFixed(2)} ` +
+            `request=${r.breakdown.requestSats.toFixed(2)}; ` +
+            `rates prompt=${r.rates.prompt} cache-read=${r.rates.cacheRead} ${r.rates.cacheReadSource} ` +
+            `cache-write=${r.rates.cacheWrite} ${r.rates.cacheWriteSource} completion=${r.rates.completion})`
+        )
         .join("\n");
-      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
+      this.logger.log(
+        `getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers, ` +
+          `${basket.promptTokens} in @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit, ` +
+          `${basket.outputTokens} out):\n${ranking}`
+      );
     } else {
       this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
     }
@@ -1794,7 +1864,7 @@ export class ProviderManager {
    */
   getBestProviderForModel(
     modelId: string,
-    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+    options: ProviderRankingOptions = {}
   ): string | null {
     const ranking = this.getProviderPriceRankingForModel(modelId, options);
     return ranking[0]?.baseUrl ?? null;

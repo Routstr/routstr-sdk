@@ -140,7 +140,7 @@ describe("ProviderManager", () => {
       expect(manager.getBestProviderForModel("gpt-4o-mini")).toBeNull();
     });
 
-    it("returns calculated per-million prices in ranking", () => {
+    it("prices the default basket per token class", () => {
       const registry = createRegistry({
         getCachedModels: () => ({
           "https://alpha.example.com/": [
@@ -155,9 +155,16 @@ describe("ProviderManager", () => {
       const manager = new ProviderManager(registry);
       const [entry] = manager.getProviderPriceRankingForModel("gpt-4o-mini");
 
-      expect(entry.promptPerMillion).toBe(150_000);
-      expect(entry.completionPerMillion).toBe(600_000);
-      expect(entry.totalPerMillion).toBe(750_000);
+      // 1M prompt (cold: all fresh, billed at the prompt rate) + 1M output.
+      expect(entry.basket).toEqual({
+        promptTokens: 1_000_000,
+        outputTokens: 1_000_000,
+        cacheHitRate: 0,
+      });
+      expect(entry.breakdown.freshInputTokens).toBe(1_000_000);
+      expect(entry.breakdown.freshInputSats).toBe(150_000);
+      expect(entry.breakdown.outputSats).toBe(600_000);
+      expect(entry.cost).toBe(750_000);
     });
 
     it("skips providers without sats_pricing", () => {
@@ -197,6 +204,153 @@ describe("ProviderManager", () => {
       expect(
         manager.getProviderPriceRankingForModel("gpt-4o-mini")
       ).toHaveLength(1);
+    });
+
+    it("orders exactly like prompt+completion per million on the default basket", () => {
+      const routes = {
+        "https://a.example.com/": { prompt: 332, completion: 15_921 },
+        "https://b.example.com/": { prompt: 2_708, completion: 13_541 },
+        "https://c.example.com/": { prompt: 453, completion: 21_710 },
+        "https://d.example.com/": { prompt: 5_002, completion: 25_009 },
+        "https://e.example.com/": { prompt: 4_897, completion: 24_485 },
+      };
+      const registry = createRegistry({
+        getCachedModels: () =>
+          Object.fromEntries(
+            Object.entries(routes).map(([baseUrl, sats_pricing]) => [
+              baseUrl,
+              [{ id: "kimi-k3", sats_pricing }],
+            ])
+          ) as any,
+      });
+
+      const ranking = new ProviderManager(
+        registry
+      ).getProviderPriceRankingForModel("kimi-k3");
+
+      const legacy = Object.entries(routes)
+        .map(([baseUrl, p]) => ({
+          baseUrl,
+          total: (p.prompt + p.completion) * 1_000_000,
+        }))
+        .sort((x, y) => x.total - y.total || x.baseUrl.localeCompare(y.baseUrl));
+      expect(ranking.map((entry) => entry.baseUrl)).toEqual(
+        legacy.map((entry) => entry.baseUrl)
+      );
+      expect(ranking.map((entry) => entry.cost)).toEqual(
+        legacy.map((entry) => entry.total)
+      );
+    });
+
+    it("breaks a rate tie on the per-request fee, not alphabetically", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1, request: 0 } },
+          ],
+          "https://zulu.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1, request: 50 } },
+          ],
+          "https://mid.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1 } },
+          ],
+        }) as any,
+      });
+
+      const ranking = new ProviderManager(
+        registry
+      ).getProviderPriceRankingForModel("gpt-4o-mini");
+
+      // The fee is real cost, so it decides ahead of the URL tiebreak.
+      expect(ranking.map((entry) => entry.baseUrl)).toEqual([
+        "https://alpha.example.com/",
+        "https://mid.example.com/",
+        "https://zulu.example.com/",
+      ]);
+      expect(ranking[2].cost - ranking[0].cost).toBe(50);
+    });
+
+    it("ranks a warm basket by the bill, not by the prompt rate", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          // Cheapest prompt rate, expensive cache reads: wins cold.
+          "https://prompt-cheap.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 1, completion: 5, input_cache_read: 10 },
+            },
+          ],
+          // Expensive prompt rate, cheap cache reads: wins warm.
+          "https://cache-cheap.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 5, input_cache_read: 0.5 },
+            },
+          ],
+        }) as any,
+      });
+      const manager = new ProviderManager(registry);
+      const basket = { promptTokens: 100_000, outputTokens: 2_000, cacheHitRate: 0.9 };
+
+      expect(
+        manager
+          .getProviderPriceRankingForModel("kimi-k3")
+          .map((entry) => entry.baseUrl)
+      ).toEqual(["https://prompt-cheap.example.com/", "https://cache-cheap.example.com/"]);
+
+      const warm = manager.getProviderPriceRankingForModel("kimi-k3", { basket });
+      expect(warm.map((entry) => entry.baseUrl)).toEqual([
+        "https://cache-cheap.example.com/",
+        "https://prompt-cheap.example.com/",
+      ]);
+      expect(warm.map((entry) => entry.cost)).toEqual([105_000, 920_000]);
+      expect(warm[0].basket).toEqual(basket);
+      expect(warm[0].rates.cacheReadSource).toBe("advertised");
+      expect(warm[0].breakdown.cacheReadTokens).toBe(90_000);
+    });
+
+    it("does not let a route that publishes no cache rate win a warm basket", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://unannounced.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 10, input_cache_read: 0 },
+            },
+          ],
+          "https://advertised.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 10, input_cache_read: 0.5 },
+            },
+          ],
+        }) as any,
+      });
+      const manager = new ProviderManager(registry);
+      const basket = { promptTokens: 100_000, outputTokens: 2_000, cacheHitRate: 0.9 };
+
+      // 0 means "not announced": bill those tokens at the prompt rate, so the
+      // unverifiable claim cannot outrank a route that published a rate.
+      const selfReported = manager.getProviderPriceRankingForModel("kimi-k3", {
+        basket,
+      });
+      expect(selfReported.map((entry) => entry.baseUrl)).toEqual([
+        "https://advertised.example.com/",
+        "https://unannounced.example.com/",
+      ]);
+      expect(selfReported[1].rates.cacheReadSource).toBe("assume-miss");
+      expect(selfReported[1].cost).toBe(520_000);
+
+      // Reading 0 as free is what makes such a route win — hence the policy.
+      const readAsFree = manager.getProviderPriceRankingForModel("kimi-k3", {
+        basket,
+        missingCacheRate: "assume-free",
+      });
+      expect(readAsFree.map((entry) => entry.baseUrl)).toEqual([
+        "https://unannounced.example.com/",
+        "https://advertised.example.com/",
+      ]);
+      expect(readAsFree[0].cost).toBe(70_000);
     });
 
     it("alphabetical tiebreak when total prices are equal", () => {
