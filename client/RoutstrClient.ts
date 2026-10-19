@@ -2770,10 +2770,13 @@ export class RoutstrClient {
   }
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
-  // Stored API-key snapshots contain both total and last-known reserved
-  // balance. The trigger and topup both trust this snapshot (no extra
-  // balance round-trip); the post-topup total is persisted from topUp's
-  // toppedUpAmount so the stored snapshot isn't stale-low and re-triggering.
+  // Stored API-key snapshots hold the provider's *available* sats (core's
+  // `total_balance`, already net of in-flight holds) plus the last-known
+  // `reserved` figure for diagnostics only — never subtract it from
+  // `balance`. The trigger and topup both trust this snapshot (no extra
+  // balance round-trip); the post-topup figure is persisted as
+  // `available + toppedUpAmount`, so the snapshot isn't stale-low and
+  // re-triggering.
 
   /**
    * Wait for a topup if the snapshot cannot cover this request; otherwise

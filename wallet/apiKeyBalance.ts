@@ -31,6 +31,13 @@ type ApiKeyStorage = Pick<
  * Returns the stored values, or `undefined` when nothing was written: the read
  * was unusable, or storage no longer holds `key` (a concurrent request swapped
  * the credential, so the numbers belong to a key we no longer use).
+ *
+ * A negative available figure is one of the unusable reads. It is a real node
+ * state (core reports `balance - reserved`, which goes below zero while a key
+ * is over-reserved), but a transient one: it clears as in-flight requests
+ * settle. The stored snapshot drives the proactive topup trigger, and the last
+ * non-negative figure describes that key better than a number that is about to
+ * be wrong again, so we skip the write and let the next live read correct it.
  */
 export function persistApiKeyBalance(
   storage: ApiKeyStorage,

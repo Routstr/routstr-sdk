@@ -43,7 +43,8 @@ export function getBalanceInSats(
  *
  * Pinned by the node's own regression test
  * `test_balance_info_matches_chat_available_balance`, added when the field
- * switched from gross to net on 2026-05-20.
+ * switched from gross to net (core `v0.4.4`, 2026-05-20). Nodes older than
+ * that are out of scope for this SDK.
  *
  * `reserved` is kept alongside for diagnostics and storage snapshots only.
  */

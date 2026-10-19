@@ -59,9 +59,12 @@ export interface WalletAdapter {
 export interface ApiKeyEntry {
   baseUrl: string;
   key: string;
-  balance: number; // total balance in sats, updated via provider responses
-  /** Last known reserved balance in sats. Optional for compatibility with
-   *  existing custom storage adapters and records created before this field. */
+  /** Provider-reported **available** sats (core's `total_balance`: already
+   *  net of funds held for in-flight requests). Do not subtract `reserved`. */
+  balance: number;
+  /** Last known reserved balance in sats, diagnostics only — it is already
+   *  reflected in `balance`. Optional for compatibility with existing custom
+   *  storage adapters and records created before this field. */
   reserved?: number;
   lastUsed: number | null;
 }

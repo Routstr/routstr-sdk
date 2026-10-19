@@ -886,6 +886,11 @@ export class CashuSpender {
             apiKeyEntryFull.key,
             balanceResult
           );
+          // `persistApiKeyBalance` refuses a negative available figure on
+          // purpose: it means the key is momentarily over-reserved, a state
+          // that clears as the in-flight holds settle. Keep the last
+          // non-negative snapshot and warn instead of writing a number that is
+          // stale by the time it lands.
           if (
             !refreshedBalance &&
             !balanceResult.balanceUnknown &&
