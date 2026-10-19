@@ -57,6 +57,7 @@ import {
 } from "./receipt";
 import {
   canonicalSuffix,
+  validateChatSuffix,
   disclosureTailLens,
   effectiveModelFromText,
   extractUsageDisclosure,
@@ -194,7 +195,7 @@ export interface ConfidentialSessionOptions {
   image?: { variant: string; count: number };
   /** Body length declared at setup (must equal the body passed to finish()). */
   bodyLength: number;
-  /** Canonical suffix; defaults to canonicalSuffix(model, maxTokens). */
+  /** Canonical suffix; defaults to canonicalSuffix(offer.chat, model, maxTokens). */
   suffix?: string;
   prover: CuProverBackend;
   /** Path to cu-2pc (default: CU_2PC_BIN/CU_2PC, then next to cu-prover, then PATH). */
@@ -334,7 +335,7 @@ export class ConfidentialSession {
   readonly model: string;
   readonly maxTokens: number;
   readonly bodyLength: number;
-  readonly suffix: string;
+  readonly suffix!: string;
   readonly kind: "chat" | "images";
   /** The image session's terms from the signed offer (kind `images`). */
   private readonly imageTerms?: { variant: ConfidentialImageVariant; count: number };
@@ -463,8 +464,6 @@ export class ConfidentialSession {
       if (options.suffix !== undefined && options.suffix !== this.suffix) {
         throw new SessionProtocolError("image suffix differs from the one the signed offer defines");
       }
-    } else {
-      this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
     }
     this.prover = options.prover;
     if (options.offer.v !== 2) {
@@ -505,6 +504,16 @@ export class ConfidentialSession {
     this.errP.catch((e: Error) => {
       this.failure ??= e;
     });
+    if (this.kind !== "images") {
+      // Held to the policy as at verification (a caller may pass an offer
+      // that did not go through verifyConfidentialOffer).
+      try {
+        validateChatSuffix(options.offer.chat, options.offer.suffix_keys);
+      } catch (e) {
+        throw new SessionProtocolError(`the signed offer's chat block is refused: ${(e as Error).message}`);
+      }
+      this.suffix = options.suffix ?? canonicalSuffix(options.offer.chat, options.model, options.maxTokens);
+    }
   }
 
   /**
