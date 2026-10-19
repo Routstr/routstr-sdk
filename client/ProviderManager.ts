@@ -639,6 +639,43 @@ function estimateNodePromptTokens(body: Record<string, unknown>): number {
 }
 
 /**
+ * The completion cap a request declares, whichever spelling it uses.
+ *
+ * `max_tokens` (legacy chat), `max_completion_tokens` (modern chat) and
+ * `max_output_tokens` (Responses API) are interchangeable names for the same
+ * limit. When a body sets more than one, the **largest** wins — the same rule
+ * routstr-core reserves against, because upstream precedence between the
+ * fields varies by provider and the smaller cap may not be honored. Pricing
+ * against the smaller one under-deposits against the node's gate.
+ *
+ * Returns `undefined` when the request declares no usable cap, in which case
+ * the node discounts nothing and the reservation stays at the full envelope.
+ */
+export function completionCapFromBody(
+  body: Record<string, unknown> | undefined
+): number | undefined {
+  if (!body) return undefined;
+
+  let cap: number | undefined;
+  for (const field of [
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+  ]) {
+    const raw = body[field];
+    const value =
+      typeof raw === "number"
+        ? raw
+        : typeof raw === "string" && raw.trim() !== ""
+          ? Number(raw)
+          : NaN;
+    if (!Number.isFinite(value)) continue;
+    cap = cap === undefined ? value : Math.max(cap, value);
+  }
+  return cap;
+}
+
+/**
  * Port of the node's minimum-balance gate
  * (`routstr/payment/helpers.py:calculate_discounted_max_cost`), in sats.
  *
@@ -658,9 +695,12 @@ function estimateNodePromptTokens(body: Record<string, unknown>): number {
  *    carrying an image blows past the budget and the node keeps its whole
  *    prompt allowance reserved. Pricing the prompt from a stripped local text
  *    estimate reserves far less than the gate.
- *  - The completion discount comes only from `body.max_tokens`. The node
- *    ignores Responses `max_output_tokens`, so honoring it here would reserve
- *    less than the gate for every Responses request that sets it.
+ *  - The completion discount comes from the **largest** cap the request
+ *    declares across `max_tokens`, `max_completion_tokens` and
+ *    `max_output_tokens`, matching the node's `calculate_discounted_max_cost`.
+ *    The node takes the largest because upstream precedence between the
+ *    fields varies by provider, so a smaller declared cap may not be honored;
+ *    reserving against it would under-cover the bill.
  */
 function nodeGateSats(
   model: Model,
@@ -722,19 +762,13 @@ function nodeGateSats(
     }
   }
 
-  // Completion budget: only from `max_tokens`, never Responses
-  // `max_output_tokens`. EHBP/Tinfoil bodies are sealed, so the node cannot
-  // read a budget out of them at all.
-  const rawMaxTokens = (requestBody as any)?.max_tokens;
-  const parsedMaxTokens =
-    typeof rawMaxTokens === "number"
-      ? rawMaxTokens
-      : typeof rawMaxTokens === "string" && rawMaxTokens.trim() !== ""
-        ? Number(rawMaxTokens)
-        : NaN;
+  // Completion budget: the largest cap the request declares, across all
+  // three interchangeable spellings. EHBP/Tinfoil bodies are sealed, so the
+  // node cannot read a budget out of them at all.
+  const parsedMaxTokens = completionCapFromBody(requestBody);
 
   if (
-    Number.isFinite(parsedMaxTokens) &&
+    parsedMaxTokens !== undefined &&
     parsedMaxTokens > 0 &&
     typeof satsPricing?.max_completion_cost === "number" &&
     completionPrice > 0 &&
@@ -1838,7 +1872,8 @@ export class ProviderManager {
    *
    * @param apiMessages chat-completions `messages` array (Responses
    *   requests pass [])
-   * @param maxTokens max_tokens / max_output_tokens from the request
+   * @param maxTokens the request's completion cap (see
+   *   `completionCapFromBody`); the largest of the three spellings
    * @param requestBody the full request body, used to count Responses
    *   input/instructions and tools definitions on both APIs
    */
@@ -1964,8 +1999,9 @@ export class ProviderManager {
       const promptCosts = (sp.prompt || 0) * totalInputTokens;
       let completionCost = sp.max_completion_cost;
       // Tinfoil/EHBP models encrypt the request body client-side, so the
-      // proxy/enclave cannot enforce max_tokens yet. Never apply the maxTokens
-      // completion discount for these models — always reserve max_completion_cost.
+      // proxy/enclave cannot enforce an output cap yet. Never apply the
+      // maxTokens completion discount for these models — always reserve
+      // max_completion_cost.
       if (maxTokens !== undefined && sp.completion && !isTinfoilModel(model.id)) {
         completionCost = sp.completion * maxTokens;
       }

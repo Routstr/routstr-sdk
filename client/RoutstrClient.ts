@@ -23,7 +23,7 @@ import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import { CashuSpender } from "../wallet/CashuSpender";
 import { BalanceManager } from "../wallet/BalanceManager";
-import { ProviderManager } from "./ProviderManager";
+import { ProviderManager, completionCapFromBody } from "./ProviderManager";
 import { MODEL_PATH_HEADER, canonicalModelPath, modelPathCandidateKey, selectorModelId } from "../utils/modelPaths";
 import type { ModelPathSatsPricing } from "../utils/modelPaths";
 import {
@@ -578,12 +578,12 @@ export class RoutstrClient {
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
         const requestBodyForPricing = (body ?? {}) as Record<string, unknown>;
-        requestMaxTokens =
-          typeof requestBodyForPricing.max_tokens === "number"
-            ? (requestBodyForPricing.max_tokens as number)
-            : typeof requestBodyForPricing.max_output_tokens === "number"
-              ? (requestBodyForPricing.max_output_tokens as number)
-              : undefined;
+        // The completion budget the node will price against: the largest cap
+        // the request declares across `max_tokens`, `max_completion_tokens`
+        // (the OpenAI-standard chat field routstrd injects as its default
+        // cap) and `max_output_tokens` (Responses API). Undefined prices at
+        // the provider's worst-case max_completion_cost.
+        requestMaxTokens = completionCapFromBody(requestBodyForPricing);
 
         this._log(
           "DEBUG",
