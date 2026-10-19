@@ -159,7 +159,7 @@ describe("RoutstrClient 402 top-up validation", () => {
     expect(topUp).toHaveBeenCalledWith({
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
-      amount: 80 * 1.4,
+      amount: 80 * 1.8,
       token: API_KEY,
     });
     expect(retry).toHaveBeenCalledOnce();
@@ -181,7 +181,7 @@ describe("RoutstrClient 402 top-up validation", () => {
       new Response("ok", { status: 200 })
     );
 
-    // shortfall = 3 - 2.5 = 0.5, floored to 0.21 * 3 = 0.63, x1.4 = 0.88.
+    // shortfall = 3 - 2.5 = 0.5, floored to 0.21 * 3 = 0.63, x1.8 = 1.13.
     await (client as any)._handleErrorResponse(
       { ...params, requiredSats: 3 },
       API_KEY,

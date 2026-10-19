@@ -1241,7 +1241,13 @@ export class BalanceManager {
   }
 
   /**
-   * Get token balance from provider
+   * Read a provider's balance for `token` from `GET /v1/wallet/info`.
+   *
+   * `amount` is routstr-core's `balance` field, i.e. `total_balance`, which is
+   * already net of currently reserved funds and is the figure its admission
+   * check compares against. `reserved` is informational (diagnostics and
+   * stored snapshots); callers must not subtract it from `amount` again — use
+   * `getAvailableBalanceInSats` for the spendable figure.
    */
   async getTokenBalance(
     token: string,

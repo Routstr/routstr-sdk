@@ -60,7 +60,11 @@ import {
   canonicalIdForModel,
   canonicalizeModelId,
 } from "../core/modelMappings";
-import { getBalanceInSats, isNetworkErrorMessage } from "../wallet/tokenUtils";
+import {
+  getAvailableBalanceInSats,
+  getBalanceInSats,
+  isNetworkErrorMessage,
+} from "../wallet/tokenUtils";
 import { persistApiKeyBalance } from "../wallet/apiKeyBalance";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
 import {
@@ -86,7 +90,22 @@ export type AlertLevel = "max" | "min";
 export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
-const TOPUP_MARGIN = 1.4;
+/**
+ * Multiple of the request price a key is kept funded to.
+ *
+ * Both the pre-request (proactive) path and the 402 handler size deposits from
+ * the SDK's own `requiredSats` estimate, so this margin is the only buffer
+ * against the node reserving *more* than we predict: the node prices its gate
+ * from prompt allowances and `max_tokens` on its side (one live node reserved
+ * 537 sats against an 804-sat gate without `max_tokens`; see
+ * `ProviderManager.getRequiredSatsForModel`).
+ *
+ * Raised from 1.4 once the double subtraction of `reserved` was removed (see
+ * `getAvailableBalanceInSats`): deposits used to be inflated by the key's
+ * in-flight holds, which hid the missing headroom. 1.8 keeps the key clear of
+ * the gate after one request instead of leaning on the bounded 402 retry.
+ */
+const TOPUP_MARGIN = 1.8;
 
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";
@@ -1507,7 +1526,12 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: Skipping topup for ${baseUrl}; current API-key balance is unknown`
             );
           } else {
-            const currentBalance = getBalanceInSats(
+            // `amount` is routstr-core's `total_balance`, which is already
+            // net of reservations and is the exact figure its admission check
+            // compares the request price against. Do not subtract `reserved`
+            // again: that understates available funds by the held amount and
+            // inflates the resulting topup by the same margin.
+            const availableBalance = getAvailableBalanceInSats(
               currentBalanceInfo.amount,
               currentBalanceInfo.unit
             );
@@ -1515,7 +1539,6 @@ export class RoutstrClient {
               currentBalanceInfo.reserved ?? 0,
               currentBalanceInfo.unit
             );
-            const availableBalance = currentBalance - reservedBalance;
             const shortfall = Math.max(
               0,
               params.requiredSats - availableBalance
@@ -1536,7 +1559,7 @@ export class RoutstrClient {
 
               this._log(
                 "DEBUG",
-                `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Current Balance: ${currentBalance}. Reserved Balance: ${reservedBalance}. Available Balance: ${availableBalance}`
+                `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Reserved Balance: ${reservedBalance}. Available Balance: ${availableBalance}`
               );
             }
           }
@@ -2779,10 +2802,13 @@ export class RoutstrClient {
   }
 
   // ── Proactive (pre-request) topup ─────────────────────────────────
-  // Stored API-key snapshots contain both total and last-known reserved
-  // balance. The trigger and topup both trust this snapshot (no extra
-  // balance round-trip); the post-topup total is persisted from topUp's
-  // toppedUpAmount so the stored snapshot isn't stale-low and re-triggering.
+  // Stored API-key snapshots hold the provider's *available* sats (core's
+  // `total_balance`, already net of in-flight holds) plus the last-known
+  // `reserved` figure for diagnostics only — never subtract it from
+  // `balance`. The trigger and topup both trust this snapshot (no extra
+  // balance round-trip); the post-topup figure is persisted as
+  // `available + toppedUpAmount`, so the snapshot isn't stale-low and
+  // re-triggering.
 
   /**
    * Wait for a topup if the snapshot cannot cover this request; otherwise
@@ -2802,7 +2828,9 @@ export class RoutstrClient {
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
 
-    const snapshotSats = getBalanceInSats(
+    // The stored/just-read snapshot is the provider's available balance
+    // (`total_balance`), so `reserved` must not be deducted a second time.
+    const snapshotAvailableSats = getAvailableBalanceInSats(
       snapshot.tokenBalance,
       snapshot.tokenBalanceUnit
     );
@@ -2810,7 +2838,6 @@ export class RoutstrClient {
       snapshot.tokenReserved ?? 0,
       snapshot.tokenBalanceUnit
     );
-    const snapshotAvailableSats = snapshotSats - snapshotReservedSats;
     // Maintain the margin up front: proactively top up whenever the available
     // balance is below the request price scaled by TOPUP_MARGIN, so the
     // key stays covered at the margin instead of reacting only after a 402.
@@ -2821,7 +2848,7 @@ export class RoutstrClient {
     const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
-      `[RoutstrClient] _topUpIfNeeded: snapshot total=${snapshotSats} sat, reserved=${snapshotReservedSats} sat, available=${snapshotAvailableSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
+      `[RoutstrClient] _topUpIfNeeded: snapshot available=${snapshotAvailableSats} sat, reserved=${snapshotReservedSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
     );
 
     // Concurrent callers join the same deposit. In the margin zone this is
@@ -2865,7 +2892,9 @@ export class RoutstrClient {
     tokenBalanceUnit: "sat" | "msat";
   }): Promise<TopUpResult> {
     try {
-      const snapshotSats = getBalanceInSats(
+      // Provider-reported available sats (`total_balance`); `reserved` is
+      // carried only to keep the stored snapshot's diagnostics intact.
+      const availableSats = getAvailableBalanceInSats(
         snapshot.tokenBalance,
         snapshot.tokenBalanceUnit
       );
@@ -2873,7 +2902,6 @@ export class RoutstrClient {
         snapshot.tokenReserved ?? 0,
         snapshot.tokenBalanceUnit
       );
-      const availableSats = snapshotSats - reservedSats;
       // The trigger already guaranteed available < target, so the shortfall
       // is exactly the amount needed to land the key at the margin.
       const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
@@ -2907,15 +2935,16 @@ export class RoutstrClient {
         `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount}, message=${result.message}`
       );
 
-      // Persist the new total so the stored snapshot does not stay stale-low
-      // and re-trigger a topup on every future request. topUp reports how
-      // much it added; combine it with the snapshot total instead of fetching
-      // the balance again.
+      // Persist the new snapshot so it does not stay stale-low and re-trigger
+      // a topup on every future request. topUp reports how much it added;
+      // combine it with the snapshot instead of fetching the balance again.
+      // The snapshot is an available figure, so adding the deposit keeps the
+      // same meaning (a held amount lowers available, not the deposit size).
       if (result.success) {
         const added = result.toppedUpAmount ?? topupAmount;
         this.storageAdapter.updateApiKeyBalance(
           snapshot.baseUrl,
-          Math.floor(snapshotSats + added),
+          Math.floor(availableSats + added),
           Math.floor(reservedSats)
         );
       }

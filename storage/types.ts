@@ -21,8 +21,10 @@ export interface SdkStorageState {
   apiKeys: Array<{
     baseUrl: string;
     key: string;
+    /** Provider-reported available sats, already net of `reserved`. */
     balance: number;
-    /** Last known reserved balance in sats. Optional for old persisted state. */
+    /** Last known reserved balance in sats, diagnostics only. Optional for
+     *  old persisted state. */
     reserved?: number;
     lastUsed: number | null;
   }>;
