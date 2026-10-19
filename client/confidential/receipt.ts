@@ -101,35 +101,70 @@ export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 
 }
 
 /**
+ * What a provider error costs, by status: a request the provider refused for
+ * its own content (4xx other than 429) is the client's, so it pays the
+ * abandon fee (the node ran the 2PC for it); a refusal for capacity (429, 503)
+ * costs the session fee; any other error the session's reservation.
+ */
+export function errorStatusCharge(status: number): "abandon_fee" | "session_fee" | "reservation" {
+  if (status === 429 || status === 503) return "session_fee";
+  if (status >= 400 && status < 500) return "abandon_fee";
+  return "reservation";
+}
+
+/**
  * A receipt for an upstream HTTP error (no usage event to price). It must name
- * the status we saw ourselves (returned as the usage match). A refusal the
- * provider answers before doing any work (4xx, 503) costs at most the signed
- * session fee; any other error at most the session's reservation, which is
- * what the node charges when it cannot attribute the provider's work. A charge
- * outside these bounds throws.
+ * the status we saw ourselves (returned as the usage match), and cost at most
+ * what that status is billed (`errorStatusCharge`, at the signed fees). For an
+ * image session the receipt must also carry the session's image terms, and
+ * even the reservation is bounded by them: price × count plus the larger fee.
+ * A charge outside these bounds throws.
  */
 export function checkUpstreamErrorReceipt(
   receipt: ConfidentialReceipt,
   status: number,
   sessionFeeMsat = 0,
+  options: {
+    abandonFeeMsat?: number;
+    image?: { model: string; variant: string; count: number; msatPerImage: number };
+  } = {},
 ): boolean {
   const ru = receipt.usage as unknown as { error_status?: unknown } | undefined;
   const usageMatch = ru?.error_status === status;
   const fee = Math.max(0, sessionFeeMsat);
+  const abandon = Math.max(fee, options.abandonFeeMsat ?? 0);
   if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
     throw new ReceiptVerificationError(
       `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
+    );
+  }
+  if (typeof receipt.abandon_fee_msat === "number" && receipt.abandon_fee_msat > abandon) {
+    throw new ReceiptVerificationError(
+      `receipt names an abandon fee of ${receipt.abandon_fee_msat} msats, more than the signed one`,
     );
   }
   const cost = receipt.cost_msats;
   if (!isMsatAmount(cost)) {
     throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
   }
-  const unbilled = status === 503 || (status >= 400 && status < 500);
-  if (unbilled) {
-    if (!feeOnlyChargeOk(cost, fee)) {
+  const image = options.image;
+  if (image) {
+    const fail = (what: string): never => {
+      throw new ReceiptVerificationError(`image error receipt: ${what}`);
+    };
+    if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+    if (receipt.model !== image.model) fail(`model ${String(receipt.model)} is not ${image.model}`);
+    if (receipt.variant !== image.variant) fail(`variant ${String(receipt.variant)} is not ${image.variant}`);
+    if (receipt.count !== image.count) fail(`count ${String(receipt.count)} is not ${image.count}`);
+    const ceiling = Math.ceil(image.msatPerImage * image.count + abandon);
+    if (cost > ceiling) fail(`cost ${cost} msats exceeds price × count plus the abandon fee (${ceiling} msats)`);
+  }
+  const charge = errorStatusCharge(status);
+  if (charge !== "reservation") {
+    const bound = charge === "abandon_fee" ? abandon : fee;
+    if (cost > bound) {
       throw new ReceiptVerificationError(
-        `node charged ${cost} msats for an unbilled upstream error (session fee ${fee} msats)`,
+        `node charged ${cost} msats for upstream error ${status}, more than the ${charge.replace("_", " ")} (${bound} msats)`,
       );
     }
   } else if (cost > fee) {

@@ -11,8 +11,10 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 
 import { canonicalJson } from "../../client/confidential/canonical";
 import {
+  imagesOfferProblem,
   offerSupportsImages,
   renderImageSuffix,
+  validateImagesOffer,
   validateOfferShape,
   verifyConfidentialOffer,
   type ConfidentialImagesOffer,
@@ -43,6 +45,7 @@ const IMAGES: ConfidentialImagesOffer = {
   max_count: 4,
   count_key: "variants",
   fixed_pins: FIXED,
+  param_space: { resolution: ["1K", "2K", "4K"], quality: ["low", "medium", "high"], format: ["webp"] },
   price_list: {
     "z-image-turbo": [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 12100 }],
     "nano-banana-pro": [
@@ -65,7 +68,7 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
     key_length: 42,
     key_alphabet: "[A-Za-z0-9_-]",
     head_template:
-      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Length: {LEN}\r\n\r\n",
+      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
     suffix_keys: ["model", "max_tokens", "stream"],
     price_list: { cheap: { in: 1000, cached_in: 1000, out: 1000 } },
     capabilities: ["chat", "images"],
@@ -96,17 +99,61 @@ describe("offer images block", () => {
 
   it("refuses malformed image terms", () => {
     const base = signedOffer().offer;
-    const bad = (images: unknown) => () => validateOfferShape({ ...base, images });
+    const bad = (images: unknown) => () => validateImagesOffer(images, "api.venice.ai");
+    const variant = (v: Record<string, unknown>) => ({ ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: 1, ...v }] } });
     expect(bad({ ...IMAGES, count_key: "" })).toThrow(/count_key/);
-    expect(bad({ ...IMAGES, fixed_pins: [["variants", 1]] })).toThrow(/fixed_pins/);
-    expect(bad({ ...IMAGES, fixed_pins: [["model", "x"]] })).toThrow(/fixed_pins/);
+    expect(bad({ ...IMAGES, fixed_pins: [["variants", false]] })).toThrow(/fixed_pins/);
+    expect(bad({ ...IMAGES, fixed_pins: [["model", false]] })).toThrow(/fixed_pins/);
     expect(bad({ ...IMAGES, response_shape: "png" })).toThrow(/response_shape/);
-    expect(bad({ ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: -1 }] } })).toThrow(/msat_per_image/);
-    expect(bad({ ...IMAGES, price_list: { m: [{ id: "a", pins: [["return_binary", true]], msat_per_image: 1 }] } })).toThrow(
-      /fixed key/,
-    );
+    expect(bad(variant({ msat_per_image: -1 }))).toThrow(/msat_per_image/);
     expect(bad({ ...IMAGES, price_list: { m: [] } })).toThrow(/no variants/);
     expect(() => validateOfferShape({ ...base, capabilities: "images" })).toThrow(/capabilities/);
+    // Fixed pins only switch extras off.
+    for (const v of [true, 1, "x", ["u"], { a: 1 }, null]) {
+      expect(bad({ ...IMAGES, fixed_pins: [["enable_web_search", v]] })).toThrow(/switched off/);
+    }
+    expect(bad({ ...IMAGES, fixed_pins: [["embed_exif_metadata", true]] })).toThrow(/switched off/);
+    // Variant pins only choose a published tier or the format.
+    expect(bad(variant({ pins: [["return_binary", true]] }))).toThrow(/fixed key/);
+    expect(bad(variant({ pins: [["aspect_ratio", "1:1"]] }))).toThrow(/price tier or the format/);
+    expect(bad(variant({ pins: [["safe_mode", "off"]] }))).toThrow(/price tier or the format/);
+    expect(bad(variant({ pins: [["resolution", "8K"]] }))).toThrow(/param_space/);
+    expect(bad(variant({ pins: [["resolution", 1]] }))).toThrow(/param_space/);
+    expect(bad(variant({ pins: [["format", "png"]] }))).toThrow(/param_space/);
+    expect(bad({ ...IMAGES, param_space: undefined })).toThrow(/param_space/);
+    expect(bad({ ...IMAGES, param_space: { format: [1] } })).toThrow(/param_space/);
+    // Bounded numbers.
+    expect(bad(variant({ msat_per_image: 1.5 }))).toThrow(/msat_per_image/);
+    expect(bad(variant({ msat_per_image: 0 }))).toThrow(/msat_per_image/);
+    expect(bad(variant({ max_count: 5 }))).toThrow(/max_count/);
+    expect(bad(variant({ max_count: 0 }))).toThrow(/max_count/);
+    expect(bad({ ...IMAGES, max_count: 5 })).toThrow(/max_count/);
+    expect(bad({ ...IMAGES, max_count: 1000 })).toThrow(/max_count/);
+    for (const idle of [1, 29, 601, 30.5]) expect(bad({ ...IMAGES, response_idle_s: idle })).toThrow(/response_idle_s/);
+    expect(bad({ ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: 1 }, { id: "a", pins: [], msat_per_image: 2 }] } })).toThrow(
+      /unique id/,
+    );
+    // A plain request head to the image endpoint.
+    const tpl = IMAGES.head_template;
+    for (const t of [
+      tpl.replace("/api/v1/image/generate", "/api/v1/image/generate?store=1"),
+      tpl.replace("/api/v1/image/generate", "/api/v1/chat/completions"),
+      tpl.replace("Connection: close\r\n", "Expect: 100-continue\r\nConnection: close\r\n"),
+      tpl.replace("Accept-Encoding: identity", "Accept-Encoding: gzip"),
+      tpl.replace("Connection: close", "Connection: keep-alive"),
+      tpl.replace("Connection: close\r\n", ""),
+    ]) {
+      expect(bad({ ...IMAGES, head_template: t })).toThrow(/head_template/);
+    }
+    expect(imagesOfferProblem(IMAGES, "api.venice.ai")).toBeUndefined();
+  });
+
+  it("drops a refused images block without refusing chat", () => {
+    const { offer, pubHex } = signedOffer({ images: { ...IMAGES, fixed_pins: [["enable_web_search", true]] } });
+    const v = verifyConfidentialOffer(offer, { pinnedPubkey: pubHex, trustedHosts: ["api.venice.ai"] });
+    expect(offerSupportsImages(v)).toBe(false);
+    expect(v.imagesRefused).toMatch(/switched off/);
+    expect(v.price_list.cheap).toBeDefined();
   });
 });
 
@@ -255,15 +302,15 @@ describe("image deposit", () => {
   it("is the selected variant times the count plus the larger fee", () => {
     const offer = { images: IMAGES, session_fee_msat: 0, abandon_fee_msat: 2000 } as never;
     // No tier asked: the request takes the cheapest (1K), and so does the deposit.
-    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { n: 2 })).toBe(Math.ceil((2 * 217800 + 2000) / 1000));
-    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { n: 2, resolution: "2K" })).toBe(
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", n: 2 })).toBe(Math.ceil((2 * 217800 + 2000) / 1000));
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", n: 2, resolution: "2K" })).toBe(
       Math.ceil((2 * 278300 + 2000) / 1000),
     );
     // A request the offer cannot serve is refused later; its deposit is the dearest single image.
-    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { resolution: "4K" })).toBe(
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", resolution: "4K" })).toBe(
       Math.ceil((278300 + 2000) / 1000),
     );
-    expect(confidentialImageRequiredSats(offer, "z-image-turbo", {})).toBe(Math.ceil((12100 + 2000) / 1000));
+    expect(confidentialImageRequiredSats(offer, "z-image-turbo", { prompt: "p" })).toBe(Math.ceil((12100 + 2000) / 1000));
     expect(confidentialImageRequiredSats(offer, "unknown", {})).toBeUndefined();
     expect(confidentialImageRequiredSats(undefined, "z-image-turbo", {})).toBeUndefined();
   });
@@ -292,6 +339,24 @@ describe("image session", () => {
     expect(() => new ConfidentialSession(opts({ offer: signedOffer({ capabilities: ["chat"] }).offer }))).toThrow(
       /no confidential image generation/,
     );
+    // A variant's own count cap is below the offer's.
+    const capped = {
+      ...IMAGES,
+      price_list: { ...IMAGES.price_list, "nano-banana-pro": [{ id: "4K-webp", pins: [["resolution", "4K"], ["format", "webp"]], msat_per_image: 400000, max_count: 1 }] },
+    };
+    const cappedOffer = signedOffer({ images: capped }).offer;
+    expect(() => new ConfidentialSession(opts({ offer: cappedOffer, image: { variant: "4K-webp", count: 2 } }))).toThrow(/outside 1..1/);
+    expect(new ConfidentialSession(opts({ offer: cappedOffer, image: { variant: "4K-webp", count: 1 } })).suffix).toContain('"variants":1');
+    // An offer that did not go through verification is held to the same shape.
+    const hostile = signedOffer({ images: { ...IMAGES, fixed_pins: [["enable_web_search", true]] } }).offer;
+    expect(() => new ConfidentialSession(opts({ offer: hostile }))).toThrow(/switched off/);
+  });
+
+  it("requires the relay to name the image suffix it pins", async () => {
+    const s = new ConfidentialSession(opts()) as any;
+    s.prepared = true;
+    s.ready = { pubkey: "00" };
+    await expect(s.finish(new Uint8Array(100))).rejects.toThrow(/did not name the image suffix/);
   });
 
   it("sends an image setup: kind, variant and count, never armed, no token cap", async () => {

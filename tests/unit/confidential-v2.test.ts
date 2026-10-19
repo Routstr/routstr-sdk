@@ -31,7 +31,7 @@ describe("π_NK statement rebuild (v2)", () => {
   const keyLen = 4;
   const alphabet = "[A-Za-z0-9_-]";
   const tpl =
-    "POST /x HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n";
+    "POST /v1/chat/completions HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n";
   const offer = { head_template: tpl, key_length: keyLen, key_alphabet: alphabet, upstream_host: "api.example.com" };
   const hk = bytes(32, 0x5a);
   const filled = new TextEncoder().encode(
@@ -66,7 +66,18 @@ describe("π_NK statement rebuild (v2)", () => {
     const bad = [
       tpl.replace("Host: api.example.com", "Host: other.example.com"),
       tpl.replace("Host: api.example.com\r\n", ""),
-      tpl.replace("POST /x", "GET /x"),
+      tpl.replace("POST /v1", "GET /v1"),
+      // No other endpoint, no query string, nothing that changes how the provider answers.
+      tpl.replace("/v1/chat/completions", "/v1/responses"),
+      tpl.replace("/v1/chat/completions", "/v1/chat/completions?store=true"),
+      tpl.replace("Connection: close\r\n", "Expect: 100-continue\r\nConnection: close\r\n"),
+      tpl.replace("Connection: close\r\n", "TE: trailers\r\nConnection: close\r\n"),
+      tpl.replace("Connection: close\r\n", "Upgrade: h2c\r\nConnection: close\r\n"),
+      tpl.replace("Accept-Encoding: identity", "Accept-Encoding: gzip"),
+      tpl.replace("Connection: close", "Connection: keep-alive"),
+      tpl.replace("Connection: close\r\n", ""),
+      tpl.replace("Content-Type: application/json", "Content-Type: text/plain"),
+      tpl.replace("Connection: close\r\n", "Connection: close\r\nConnection: close\r\n"),
       tpl.replace("{LEN}", "10"),
       tpl.replace("\r\n\r\n", "\r\nX-Key: {KEY:4}\r\n\r\n"),
       tpl.replace("\r\n\r\n", "\r\nTransfer-Encoding: chunked\r\n\r\n"),
@@ -75,6 +86,11 @@ describe("π_NK statement rebuild (v2)", () => {
     ];
     for (const t of bad) expect(withTpl(t)).toThrow(/template/);
     expect(withTpl(tpl, "API.EXAMPLE.COM")).not.toThrow();
+    // An image head must name an image endpoint, a chat head a chat endpoint.
+    const imageTpl = tpl.replace("/v1/chat/completions", "/api/v1/image/generate");
+    expect(() =>
+      checkPiNKParams(honest(), { ...own, offer: { ...offer, head_template: imageTpl }, kind: "chat" }),
+    ).toThrow(/not a chat endpoint/);
   });
 
   it("rejects a K_0 other than the one our 2PC anchored", () => {

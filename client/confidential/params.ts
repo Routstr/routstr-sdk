@@ -229,12 +229,14 @@ export function checkPiNKParams(
     offer: { head_template?: string; key_length?: number; key_alphabet?: string; upstream_host?: string };
     hk: Uint8Array;
     bodyLen: number;
+    /** Which request the head is for (default chat). */
+    kind?: HeadTemplateKind;
   },
 ): void {
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
   if (!p) fail("π_NK", "missing");
   const tpl = own.offer.head_template ?? "";
-  checkHeadTemplate(tpl, own.offer.upstream_host ?? "");
+  checkHeadTemplate(tpl, own.offer.upstream_host ?? "", own.kind ?? "chat");
   const keyLen = own.offer.key_length;
   if (typeof keyLen !== "number" || !Number.isInteger(keyLen) || keyLen <= 0) {
     fail("π_NK", "signed offer has no key length");
@@ -262,31 +264,68 @@ export function checkPiNKParams(
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) fail("π_NK", "c_commit missing");
 }
 
+/** Which request a head template is for: it decides the path it may name. */
+export type HeadTemplateKind = "chat" | "images";
+
+/** The request paths a head template may name, per kind (no query, no fragment). */
+const TEMPLATE_PATHS: Record<HeadTemplateKind, readonly string[]> = {
+  chat: ["/chat/completions"],
+  images: ["/image/generate", "/images/generations"],
+};
+
+/** The headers a head template carries: exactly these, each once, nothing else. */
+const TEMPLATE_HEADERS = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
+
 /**
- * The published head template must be one HTTP/1.1 POST request head for the
- * offer's upstream host: `Host` names that host, the body length is the
- * `Content-Length`, and exactly one key token and one length token appear.
- * (The node writes the head, so this is what π_NK lets us hold it to.)
+ * Why a published head template is not acceptable, or `undefined` when it is.
+ * It must be one HTTP/1.1 POST head to the offer's upstream host, for the
+ * kind's endpoint path (no query string: a node must not steer the request to
+ * another provider feature), with exactly the headers a plain JSON request
+ * needs and nothing that changes how the provider answers (`Expect`, `TE`,
+ * `Upgrade`, compression, keep-alive): the node writes this head, so this is
+ * what π_NK lets the client hold it to.
  */
-export function checkHeadTemplate(tpl: string, upstreamHost: string): void {
+export function headTemplateProblem(tpl: string, upstreamHost: string, kind: HeadTemplateKind): string | undefined {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
-  if (count(/\{KEY:\d+\}/g) !== 1) fail("π_NK", "template must carry exactly one {KEY:n} token");
-  if (count(/\{LEN\}/g) !== 1) fail("π_NK", "template must carry exactly one {LEN} token");
-  if (count(/[{}]/g) !== 4) fail("π_NK", "template carries other placeholders");
-  if (!/^POST \/[\x21-\x7e]* HTTP\/1\.1\r\n/.test(tpl)) fail("π_NK", "template is not an HTTP/1.1 POST");
+  if (count(/\{KEY:\d+\}/g) !== 1) return "template must carry exactly one {KEY:n} token";
+  if (count(/\{LEN\}/g) !== 1) return "template must carry exactly one {LEN} token";
+  if (count(/[{}]/g) !== 4) return "template carries other placeholders";
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
-    fail("π_NK", "template is not exactly one request head");
+    return "template is not exactly one request head";
   }
-  const headers = tpl.slice(0, -4).split("\r\n").slice(1);
-  const values = (name: string) =>
-    headers
-      .filter((h) => h.slice(0, h.indexOf(":")).trim().toLowerCase() === name)
-      .map((h) => h.slice(h.indexOf(":") + 1).trim());
-  const host = values("host");
-  if (!upstreamHost || host.length !== 1 || host[0]!.toLowerCase() !== upstreamHost.toLowerCase()) {
-    fail("π_NK", "template Host is not the offer's upstream host");
+  const lines = tpl.slice(0, -4).split("\r\n");
+  const m = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1$/.exec(lines[0] ?? "");
+  if (!m) return "template is not an HTTP/1.1 POST";
+  const path = m[1]!;
+  if (/[?#]/.test(path)) return "template path carries a query or fragment";
+  if (!TEMPLATE_PATHS[kind].some((end) => path.endsWith(end))) {
+    return `template path ${path} is not a ${kind} endpoint`;
   }
-  const len = values("content-length");
-  if (len.length !== 1 || len[0] !== "{LEN}") fail("π_NK", "template Content-Length is not the body length");
-  if (values("transfer-encoding").length > 0) fail("π_NK", "template sets Transfer-Encoding");
+  const seen = new Map<string, string>();
+  for (const h of lines.slice(1)) {
+    const i = h.indexOf(":");
+    if (i <= 0) return "template carries a malformed header line";
+    const name = h.slice(0, i).trim().toLowerCase();
+    if (!TEMPLATE_HEADERS.includes(name)) return `template sets the header ${name}`;
+    if (seen.has(name)) return `template repeats the header ${name}`;
+    seen.set(name, h.slice(i + 1).trim());
+  }
+  for (const name of TEMPLATE_HEADERS) {
+    if (!seen.has(name)) return `template lacks the header ${name}`;
+  }
+  if (!upstreamHost || seen.get("host")!.toLowerCase() !== upstreamHost.toLowerCase()) {
+    return "template Host is not the offer's upstream host";
+  }
+  if (!/\{KEY:\d+\}/.test(seen.get("authorization")!)) return "template Authorization does not carry the key";
+  if (seen.get("content-type")!.toLowerCase() !== "application/json") return "template Content-Type is not application/json";
+  if (seen.get("accept-encoding")!.toLowerCase() !== "identity") return "template Accept-Encoding is not identity";
+  if (seen.get("connection")!.toLowerCase() !== "close") return "template Connection is not close";
+  if (seen.get("content-length") !== "{LEN}") return "template Content-Length is not the body length";
+  return undefined;
+}
+
+/** `headTemplateProblem` as a refusal of the node's π_NK parameters. */
+export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: HeadTemplateKind = "chat"): void {
+  const problem = headTemplateProblem(tpl, upstreamHost, kind);
+  if (problem) fail("π_NK", problem);
 }

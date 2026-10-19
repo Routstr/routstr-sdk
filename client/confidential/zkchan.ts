@@ -268,8 +268,10 @@ export class ProofChannel {
     payload.fill(0);
     const m = await p;
     if (!m.ok) throw new ProverError(`proof channel: ${proof} failed: ${m.err ?? "unknown"}`);
-    if (cmd === "verify" && !(m.checks ?? []).every((c) => c.ok)) {
-      throw new ProverError(`proof channel: ${proof} checks failed`);
+    // A verification must report its checks, and every one must hold: an
+    // empty list proves nothing.
+    if (cmd === "verify" && (!m.checks?.length || !m.checks.every((c) => c.ok))) {
+      throw new ProverError(`proof channel: ${proof} checks failed or none were reported`);
     }
     return m;
   }
