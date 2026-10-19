@@ -48,7 +48,13 @@ import {
 import { CuProverBackend, isExecutable } from "./prover";
 import { resolveTwoPcPath, TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
-import { checkAttestationBinding, checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt";
+import {
+  checkAttestationBinding,
+  checkUpstreamErrorReceipt,
+  parseSignedReceipt,
+  verifyFlatReceipt,
+  verifyReceipt,
+} from "./receipt";
 import {
   canonicalSuffix,
   disclosureTailLens,
@@ -63,7 +69,15 @@ import {
 import { makeTLSClient } from "./tls-fork/lib/index.js";
 import { setCryptoImplementation } from "./tls-fork/lib/crypto/index.js";
 import { webcryptoCrypto } from "./tls-fork/lib/crypto/webcrypto.js";
-import { offerAbandonFeeMsat, offerSessionFeeMsat, type VerifiedOffer } from "./offer";
+import {
+  offerAbandonFeeMsat,
+  offerSessionFeeMsat,
+  imageCountKey,
+  offerSupportsImages,
+  renderImageSuffix,
+  type ConfidentialImageVariant,
+  type VerifiedOffer,
+} from "./offer";
 
 setCryptoImplementation(webcryptoCrypto);
 
@@ -142,6 +156,12 @@ export interface ConfidentialSessionResult {
   proofs: string[];
   /** Protocol version the session ran (always 2, the two-party handshake). */
   protocol: number;
+  /**
+   * An image session's response in the OpenAI shape
+   * (`{created, data: [{b64_json}]}`), converted from the provider's shape;
+   * absent for chat and for an upstream error.
+   */
+  image?: { created: number; data: { b64_json: string }[] };
 }
 
 export interface ConfidentialSessionOptions {
@@ -156,7 +176,15 @@ export interface ConfidentialSessionOptions {
    */
   auth: string;
   model: string;
+  /** The pinned completion cap (chat); unused for images. */
   maxTokens: number;
+  /**
+   * `images`: a flat-priced image generation session (no usage disclosure,
+   * never armed ahead of a request). Default `chat`.
+   */
+  kind?: "chat" | "images";
+  /** For `kind: "images"`: the offered variant id and the image count. */
+  image?: { variant: string; count: number };
   /** Body length declared at setup (must equal the body passed to finish()). */
   bodyLength: number;
   /** Canonical suffix; defaults to canonicalSuffix(model, maxTokens). */
@@ -300,6 +328,9 @@ export class ConfidentialSession {
   readonly maxTokens: number;
   readonly bodyLength: number;
   readonly suffix: string;
+  readonly kind: "chat" | "images";
+  /** The image session's terms from the signed offer (kind `images`). */
+  private readonly imageTerms?: { variant: ConfidentialImageVariant; count: number };
   /** Protocol version, from the verified offer (2 = two-party handshake, the only one). */
   readonly protocol: 2;
   private readonly prover: CuProverBackend;
@@ -340,8 +371,15 @@ export class ConfidentialSession {
   private flushChain: Promise<void> = Promise.resolve();
 
   private responseChunks: Uint8Array[] = [];
-  /** Server application-data record payloads, in arrival order (π_C3S check). */
+  /** The response chunks joined (built once, when first needed). */
+  private responseJoined?: Uint8Array;
+  /**
+   * Server application-data record payloads, in arrival order (π_C3S check):
+   * only the last `KEPT_SERVER_RECORDS` (π_C3S covers at most 64 records at
+   * the end), with `serverRecordsDropped` counting the ones let go.
+   */
   private serverRecords: Uint8Array[] = [];
+  private serverRecordsDropped = 0;
   /** Encrypted server records seen after the handshake (π_C3S key epoch). */
   private postHandshake = false;
   private serverPost: ServerPostRecord[] = [];
@@ -356,7 +394,6 @@ export class ConfidentialSession {
   /** Our body records as written (π_C2S check). */
   private bodyEpoch = false;
   private bodyRecords: Uint8Array[] = [];
-  private responseBytes: Uint8Array = new Uint8Array(0);
   private tlsEnded = false;
   private thSH?: Uint8Array;
   private thSF?: Uint8Array;
@@ -393,7 +430,28 @@ export class ConfidentialSession {
     this.model = options.model;
     this.maxTokens = options.maxTokens;
     this.bodyLength = options.bodyLength;
-    this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
+    this.kind = options.kind ?? "chat";
+    if (this.kind === "images") {
+      const images = options.offer.images;
+      if (!offerSupportsImages(options.offer) || !images) {
+        throw new SessionProtocolError("the signed offer serves no confidential image generation");
+      }
+      const variant = images.price_list[options.model]?.find((v) => v.id === options.image?.variant);
+      if (!variant) {
+        throw new SessionProtocolError(`the signed offer has no variant ${options.image?.variant} for ${options.model}`);
+      }
+      const count = options.image?.count ?? 1;
+      if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
+        throw new SessionProtocolError(`image count ${count} is outside 1..${images.max_count}`);
+      }
+      this.imageTerms = { variant, count };
+      this.suffix = renderImageSuffix(options.model, count, imageCountKey(images), images.fixed_pins, variant.pins);
+      if (options.suffix !== undefined && options.suffix !== this.suffix) {
+        throw new SessionProtocolError("image suffix differs from the one the signed offer defines");
+      }
+    } else {
+      this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
+    }
     this.prover = options.prover;
     if (options.offer.v !== 2) {
       throw new SessionProtocolError(
@@ -407,7 +465,11 @@ export class ConfidentialSession {
     this.proofChannelFactory = options.proofChannelFactory;
     this.auth = options.auth;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
-    this.timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
+    // An image response is silent until the image is done: wait as long as
+    // the offer says the provider may take.
+    const idle =
+      this.kind === "images" ? { attestation: Math.max(1, options.offer.images?.response_idle_s ?? 300) * 1000 } : {};
+    this.timeouts = { ...DEFAULT_TIMEOUTS, ...idle, ...(options.timeouts ?? {}) };
     this.runsDir = options.runsDir;
     this.onEvent = options.onEvent;
     if (!options.allowInsecureTransport && !encryptedNodeTransport(this.baseUrl)) {
@@ -601,8 +663,10 @@ export class ConfidentialSession {
       onApplicationData: (rec: Uint8Array) => {
         this.tLastData = Date.now();
         if (!this.ttft) this.ttft = Date.now();
+        // A chunk list, joined once when the response is complete: appending
+        // to one growing buffer copied the whole response per record.
         this.responseChunks.push(rec);
-        this.responseBytes = concat(this.responseBytes, rec);
+        this.responseJoined = undefined;
         if (this.onResponseHead || this.onResponseBody) {
           try {
             const parts = this.incremental.push(rec);
@@ -642,7 +706,14 @@ export class ConfidentialSession {
       const len = (buf[3]! << 8) | buf[4]!;
       if (buf.length < 5 + len) break;
       this.recvRecords += 1;
-      if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len));
+      if (buf[0] === 0x17) {
+        this.serverRecords.push(buf.slice(5, 5 + len));
+        if (this.serverRecords.length > 2 * KEPT_SERVER_RECORDS) {
+          const drop = this.serverRecords.length - KEPT_SERVER_RECORDS;
+          this.serverRecords.splice(0, drop);
+          this.serverRecordsDropped += drop;
+        }
+      }
       buf = buf.subarray(5 + len);
     }
     this.serverPending = buf.slice();
@@ -674,14 +745,26 @@ export class ConfidentialSession {
     this.checkBinaries();
     await this.open();
     const nonceC = hex(cryptoRandom(32));
-    const setup: Record<string, unknown> = {
-      type: "setup",
-      nonce_c: nonceC,
-      model: this.model,
-      max_tokens: this.maxTokens,
-      len: this.bodyLength,
-      armed: true,
-    };
+    const setup: Record<string, unknown> =
+      this.kind === "images"
+        ? {
+            // Never armed: an image session runs only for a request at hand.
+            type: "setup",
+            kind: "images",
+            nonce_c: nonceC,
+            model: this.model,
+            variant: this.imageTerms!.variant.id,
+            count: this.imageTerms!.count,
+            len: this.bodyLength,
+          }
+        : {
+            type: "setup",
+            nonce_c: nonceC,
+            model: this.model,
+            max_tokens: this.maxTokens,
+            len: this.bodyLength,
+            armed: true,
+          };
     // The node settles at the rates of exactly the offer we verified.
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     // Accept that offer's fees explicitly (the node refuses a setup that does
@@ -803,7 +886,10 @@ export class ConfidentialSession {
       }
     }
     // Rebuilt from the *signed* offer, our body length and our hk.
-    checkPiNKParams(commit.params, { offer: this.offer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    // An image request's head is the images template of the same signed offer.
+    const headOffer =
+      this.kind === "images" ? { ...this.offer, head_template: this.offer.images!.head_template } : this.offer;
+    checkPiNKParams(commit.params, { offer: headOffer, hk: this.ap.hk, bodyLen: this.bodyLength });
     // The head-record commitment the attestation must name is the one π_NK
     // proves; the frame has to carry exactly it.
     const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
@@ -945,55 +1031,21 @@ export class ConfidentialSession {
     // An upstream HTTP error (e.g. 503 overloaded) has no usage event. Disclose
     // only the response head (status line and headers): π_C3S proves where it
     // sits, its status decides the charge, and the error body stays private.
-    const httpEarly = parseHttpResponse(this.responseBytes);
+    const responseBytes = this.responseBytes;
+    const httpEarly = parseHttpResponse(responseBytes);
     const upstreamError = httpEarly.status >= 400;
+    // An image request succeeded: its price was fixed at setup, so it needs no
+    // disclosure and no proof; accepting settles it at that price.
+    const flat = this.kind === "images" && !upstreamError;
     let r: Uint8Array | undefined;
-    let skip = 0;
-    if (upstreamError) {
-      const headEnd = indexOfCrlfCrlf(this.responseBytes);
-      if (headEnd < 0) throw new ResponseVerificationError("upstream error response has no head");
-      r = this.responseBytes.slice(0, headEnd + 4);
-      skip = this.responseBytes.length - r.length;
+    if (flat) {
+      this.sendText({ type: "accept" });
+      this.twoPc?.close();
+      this.zkChan?.close();
+      this.event({ ev: "accept" });
     } else {
-      r = extractUsageDisclosure(this.responseBytes) ?? undefined;
+      r = await this.discloseAndProve(responseBytes, upstreamError);
     }
-    if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
-    const tailLens = disclosureTailLens(
-      this.responseChunks.map((c) => c.length),
-      r.length + skip,
-    );
-    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
-    const disclose: Record<string, unknown> = {
-      type: "disclose",
-      r: hex(r),
-      tail_lens: tailLens,
-      skip,
-      trailing: epoch.trailing,
-    };
-    if (epoch.keyUpdates > 0) {
-      disclose.key_updates = epoch.keyUpdates;
-      disclose.epoch_start = epoch.epochStart;
-    }
-    this.sendText(disclose);
-
-    const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
-    // Wire index of sequence 0 of the covered records' epoch: the records
-    // before the post-handshake ones are the encrypted server flight.
-    const handshakeRecords = this.serverRecords.length - this.serverPost.length;
-    checkPiC3SParams(c3.params, {
-      h2: this.ap!.h2,
-      serverRecords: this.serverRecords,
-      r,
-      skip,
-      keyUpdates: epoch.keyUpdates,
-      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
-      trailing: epoch.trailing,
-      tailLens,
-    });
-    await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
-    this.twoPc?.close();
-    this.zkChan?.close();
-    this.event({ ev: "pi_c3s_ok" });
 
     const terminal = await Promise.race([
       this.bus.wait("receipt").then((m) => ({ kind: "receipt" as const, m })),
@@ -1031,13 +1083,28 @@ export class ConfidentialSession {
     const receiptSigOk = verifySchnorrSignature(receiptJson, sigHex, this.ready.pubkey);
 
     let usageMatch: boolean;
-    if (upstreamError) {
+    if (flat) {
+      const terms = this.imageTerms!;
+      if (terminal.kind === "receipt") {
+        verifyFlatReceipt(receipt, {
+          model: this.model,
+          variant: terms.variant.id,
+          count: terms.count,
+          msatPerImage: terms.variant.msat_per_image,
+          sessionFeeMsat: offerSessionFeeMsat(this.offer),
+          abandonFeeMsat: offerAbandonFeeMsat(this.offer),
+        });
+      } else if ((receipt.usage as unknown as { flat?: unknown } | undefined)?.flat !== true) {
+        throw new ReceiptVerificationError("unsigned settlement is not flat");
+      }
+      usageMatch = true;
+    } else if (upstreamError) {
       // The node saw the same error status; errors the provider answers before
       // doing any work (4xx, 503) cost at most the session fee (the node's 2PC
       // work), any other error at most the session's reservation.
       usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, offerSessionFeeMsat(this.offer));
     } else {
-      const ownUsage = usageEventFromDisclosure(r);
+      const ownUsage = usageEventFromDisclosure(r!);
       if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
       const checked = verifyReceipt({
         receipt,
@@ -1061,8 +1128,14 @@ export class ConfidentialSession {
       throw new ReceiptVerificationError("receipt usage does not match our own plaintext");
     }
 
-    const http = parseHttpResponse(this.responseBytes);
-    const effectiveModel = effectiveModelFromText(http.bodyText);
+    const http = httpEarly;
+    let image: ConfidentialSessionResult["image"];
+    let effectiveModel: string | undefined;
+    if (this.kind === "images") {
+      if (flat) image = openAiImageResponse(http, this.offer.images!.response_shape);
+    } else {
+      effectiveModel = effectiveModelFromText(http.bodyText);
+    }
     if (effectiveModel !== undefined && effectiveModel !== this.model) {
       throw new ResponseVerificationError(`effective model ${effectiveModel} != ${this.model}`);
     }
@@ -1094,7 +1167,7 @@ export class ConfidentialSession {
       model: this.model,
       effectiveModel,
       http,
-      responseText: http.bodyText,
+      responseText: image ? JSON.stringify(image) : http.bodyText,
       receipt,
       attestation: att.a,
       receiptSigOk,
@@ -1104,11 +1177,75 @@ export class ConfidentialSession {
       ttftMs: ttftAbs - tClaim,
       totalMs: tEnd - tClaim,
       timings,
-      proofs: ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
+      proofs: flat ? ["twopc", "pi_nk", "pi_c2s"] : ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
       protocol: this.protocol,
+      image,
     };
     this.persist(result);
     return result;
+  }
+
+  /** The decrypted response, joined once from its records. */
+  private get responseBytes(): Uint8Array {
+    this.responseJoined ??= concat(...this.responseChunks);
+    return this.responseJoined;
+  }
+
+  /**
+   * Disclose R (the usage event, or for an upstream error only the response
+   * head) and prove it with π_C3S over the final server records.
+   */
+  private async discloseAndProve(responseBytes: Uint8Array, upstreamError: boolean): Promise<Uint8Array> {
+    let r: Uint8Array | undefined;
+    let skip = 0;
+    if (upstreamError) {
+      const headEnd = indexOfCrlfCrlf(responseBytes);
+      if (headEnd < 0) throw new ResponseVerificationError("upstream error response has no head");
+      r = responseBytes.slice(0, headEnd + 4);
+      skip = responseBytes.length - r.length;
+    } else {
+      r = extractUsageDisclosure(responseBytes) ?? undefined;
+    }
+    if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
+    const tailLens = disclosureTailLens(
+      this.responseChunks.map((c) => c.length),
+      r.length + skip,
+    );
+    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
+    const disclose: Record<string, unknown> = {
+      type: "disclose",
+      r: hex(r),
+      tail_lens: tailLens,
+      skip,
+      trailing: epoch.trailing,
+    };
+    if (epoch.keyUpdates > 0) {
+      disclose.key_updates = epoch.keyUpdates;
+      disclose.epoch_start = epoch.epochStart;
+    }
+    this.sendText(disclose);
+
+    const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
+    // Wire index of sequence 0 of the covered records' epoch: the records
+    // before the post-handshake ones are the encrypted server flight. Indices
+    // are into the kept records, so the dropped ones are subtracted.
+    const handshakeRecords = this.serverRecords.length + this.serverRecordsDropped - this.serverPost.length;
+    checkPiC3SParams(c3.params, {
+      h2: this.ap!.h2,
+      serverRecords: this.serverRecords,
+      r,
+      skip,
+      keyUpdates: epoch.keyUpdates,
+      epochBase:
+        handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart - this.serverRecordsDropped : undefined,
+      trailing: epoch.trailing,
+      tailLens,
+    });
+    await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
+    this.twoPc?.close();
+    this.zkChan?.close();
+    this.event({ ev: "pi_c3s_ok" });
+    return r;
   }
 
   /** Cold path: open → arm → claim (proofs → finish). */
@@ -1196,4 +1333,36 @@ function countKeyUpdates(content: Uint8Array): number {
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!);
   }
   return n;
+}
+
+/**
+ * Server application records kept for π_C3S: it covers at most 64 records at
+ * the end of the response, plus the ones that may trail them.
+ */
+const KEPT_SERVER_RECORDS = 128;
+
+/** An image response in the OpenAI shape, from the provider's own shape. */
+function openAiImageResponse(
+  http: ParsedHttpResponse,
+  shape: "venice" | "openai",
+): { created: number; data: { b64_json: string }[] } {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(http.bodyText) as Record<string, unknown>;
+  } catch {
+    throw new ResponseVerificationError("image response is not JSON");
+  }
+  const created = typeof body.created === "number" ? body.created : Math.floor(Date.now() / 1000);
+  if (shape === "venice") {
+    const images = body.images;
+    if (!Array.isArray(images) || !images.every((i) => typeof i === "string")) {
+      throw new ResponseVerificationError("image response carries no images");
+    }
+    return { created, data: images.map((b64_json) => ({ b64_json: b64_json as string })) };
+  }
+  const data = body.data;
+  if (!Array.isArray(data) || !data.every((d) => d && typeof (d as { b64_json?: unknown }).b64_json === "string")) {
+    throw new ResponseVerificationError("image response carries no b64_json images");
+  }
+  return { created, data: data.map((d) => ({ b64_json: (d as { b64_json: string }).b64_json })) };
 }

@@ -247,7 +247,8 @@ type ConfidentialTransport = (params: ConfidentialFetchParams) => Promise<Respon
 type ConfidentialQualifier = (
   baseUrl: string,
   model: string,
-  options: ConfidentialRequestOptions
+  options: ConfidentialRequestOptions,
+  kind?: "chat" | "images"
 ) => Promise<unknown>;
 const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
 const CONFIDENTIAL_QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
@@ -268,14 +269,15 @@ export function setConfidentialTransport(
 async function qualifyConfidentialNode(
   baseUrl: string,
   model: unknown,
-  options: ConfidentialRequestOptions
+  options: ConfidentialRequestOptions,
+  kind: "chat" | "images" = "chat"
 ): Promise<ConfidentialDepositOffer | undefined> {
   requireConfidentialTransport();
   const qualify = (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] as
     | ConfidentialQualifier
     | undefined;
   if (!qualify) return undefined;
-  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options);
+  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options, kind);
   return offer && typeof offer === "object" && "price_list" in offer
     ? (offer as ConfidentialDepositOffer)
     : undefined;
@@ -293,12 +295,39 @@ function requireConfidentialTransport(): ConfidentialTransport {
   return confidentialTransport;
 }
 
-/** The one endpoint a confidential session implements (see the transport). */
+/** The endpoints a confidential session implements (see the transport). */
 function isConfidentialEndpoint(method: string, path: string): boolean {
-  return (
-    method.toUpperCase() === "POST" &&
-    /^(\/v1)?\/chat\/completions\/?$/.test(path.split("?")[0] ?? "")
-  );
+  return method.toUpperCase() === "POST" && confidentialKind(path) !== undefined;
+}
+
+/** `chat` or `images` for a confidential endpoint path. */
+function confidentialKind(path: string): "chat" | "images" | undefined {
+  const p = path.split("?")[0] ?? "";
+  if (/^(\/v1)?\/chat\/completions\/?$/.test(p)) return "chat";
+  if (/^(\/v1)?\/(images\/generations|image\/generate)\/?$/.test(p)) return "images";
+  return undefined;
+}
+
+/**
+ * The deposit (sats) a confidential image request needs: the dearest offered
+ * variant of the model times the image count, plus the larger fee (the node
+ * reserves the chosen variant's price, never more).
+ */
+export function confidentialImageRequiredSats(
+  offer: ConfidentialDepositOffer | undefined,
+  model: string,
+  body: Record<string, unknown>
+): number | undefined {
+  const images = offer?.images;
+  const variants = images?.price_list?.[model];
+  if (!images || !Array.isArray(variants) || variants.length === 0) return undefined;
+  const countKey = typeof images.count_key === "string" && images.count_key ? images.count_key : "variants";
+  const raw = body[countKey] ?? body.n ?? body.variants ?? 1;
+  const count = typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0 ? raw : 1;
+  const price = Math.max(...variants.map((v) => v.msat_per_image));
+  const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const msats = Math.ceil(price * count) + Math.max(fee(offer!.session_fee_msat), fee(offer!.abandon_fee_msat));
+  return Math.ceil(msats / 1000);
 }
 
 /** Reserve margin assumed when the node's signed offer is not at hand. */
@@ -313,6 +342,7 @@ type ConfidentialDepositOffer = Pick<
   | "abandon_fee_msat"
   | "rate_surcharge_pct"
   | "reserve_margin_tokens"
+  | "images"
 >;
 
 /**
@@ -734,7 +764,7 @@ export class RoutstrClient {
     // only speaks chat completions, and must never fall back to plaintext.
     if (params.confidential && !isConfidentialEndpoint(params.method, params.path)) {
       throw new Error(
-        `confidential mode supports only POST /v1/chat/completions, not ${params.method} ${params.path}`
+        `confidential mode supports only POST /v1/chat/completions and /v1/images/generations, not ${params.method} ${params.path}`
       );
     }
     const prepared = await awaitWithAbort(this._prepareRoutedRequestWithMintFailover(params), params.signal);
@@ -946,11 +976,14 @@ export class RoutstrClient {
 
     // A confidential request: the node must hold a valid offer for the model
     // before a token is spent on it; the offer also sizes the deposit.
+    const confidentialImages =
+      params.confidential !== undefined && confidentialKind(requestPath) === "images";
     const confidentialOffer = params.confidential
       ? await qualifyConfidentialNode(
           baseUrl,
           (body as { model?: unknown } | undefined)?.model,
-          params.confidential
+          params.confidential,
+          confidentialImages ? "images" : "chat"
         )
       : undefined;
 
@@ -1007,6 +1040,16 @@ export class RoutstrClient {
               params.autoModelPath?.satsPricing
             );
       }
+    }
+
+    // A confidential image request: the deposit is the signed per-image price.
+    if (confidentialImages) {
+      const imageSats = confidentialImageRequiredSats(
+        confidentialOffer,
+        String((body as { model?: unknown } | undefined)?.model ?? ""),
+        (body ?? {}) as Record<string, unknown>
+      );
+      if (imageSats !== undefined) requiredSats = imageSats;
     }
 
     let requestBody = body;
