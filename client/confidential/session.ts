@@ -73,6 +73,7 @@ import {
   offerAbandonFeeMsat,
   offerSessionFeeMsat,
   imageCountKey,
+  imagesOfferProblem,
   offerSupportsImages,
   renderImageSuffix,
   type ConfidentialImageVariant,
@@ -162,6 +163,12 @@ export interface ConfidentialSessionResult {
    * absent for chat and for an upstream error.
    */
   image?: { created: number; data: { b64_json: string }[] };
+  /**
+   * Image sessions: what fell short in the accepted response (incomplete
+   * body, fewer images than pinned, a provider echo naming other terms).
+   * The charge was fixed at setup; these are reported, not thrown.
+   */
+  imageWarnings?: string[];
 }
 
 export interface ConfidentialSessionOptions {
@@ -438,13 +445,18 @@ export class ConfidentialSession {
       if (!offerSupportsImages(options.offer) || !images) {
         throw new SessionProtocolError("the signed offer serves no confidential image generation");
       }
+      // Held to the same narrow shape as at verification (a caller may pass
+      // an offer that did not go through verifyConfidentialOffer).
+      const problem = imagesOfferProblem(images, options.offer.upstream_host);
+      if (problem) throw new SessionProtocolError(`the signed offer's images block is refused: ${problem}`);
       const variant = images.price_list[options.model]?.find((v) => v.id === options.image?.variant);
       if (!variant) {
         throw new SessionProtocolError(`the signed offer has no variant ${options.image?.variant} for ${options.model}`);
       }
       const count = options.image?.count ?? 1;
-      if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
-        throw new SessionProtocolError(`image count ${count} is outside 1..${images.max_count}`);
+      const maxCount = Math.min(images.max_count, variant.max_count ?? images.max_count);
+      if (!Number.isSafeInteger(count) || count < 1 || count > maxCount) {
+        throw new SessionProtocolError(`image count ${count} is outside 1..${maxCount}`);
       }
       this.imageTerms = { variant, count };
       this.suffix = renderImageSuffix(options.model, count, imageCountKey(images), images.fixed_pins, variant.pins);
@@ -892,7 +904,7 @@ export class ConfidentialSession {
     // An image request's head is the images template of the same signed offer.
     const headOffer =
       this.kind === "images" ? { ...this.offer, head_template: this.offer.images!.head_template } : this.offer;
-    checkPiNKParams(commit.params, { offer: headOffer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    checkPiNKParams(commit.params, { offer: headOffer, hk: this.ap.hk, bodyLen: this.bodyLength, kind: this.kind });
     // The head-record commitment the attestation must name is the one π_NK
     // proves; the frame has to carry exactly it.
     const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
@@ -952,6 +964,11 @@ export class ConfidentialSession {
     }
     if (this.ready.suffix !== undefined && this.ready.suffix !== this.suffix) {
       throw new SessionProtocolError("node expects a different pinned suffix than ours");
+    }
+    // An image suffix is the node's rendering of its own signed offer: the
+    // relay must name it, so both sides are known to pin the same request.
+    if (this.kind === "images" && this.ready.suffix === undefined) {
+      throw new SessionProtocolError("the relay did not name the image suffix it pins");
     }
 
     this.released = true;
@@ -1113,7 +1130,13 @@ export class ConfidentialSession {
       // The node saw the same error status; errors the provider answers before
       // doing any work (4xx, 503) cost at most the session fee (the node's 2PC
       // work), any other error at most the session's reservation.
-      usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, offerSessionFeeMsat(this.offer));
+      const terms = this.imageTerms;
+      usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, offerSessionFeeMsat(this.offer), {
+        abandonFeeMsat: offerAbandonFeeMsat(this.offer),
+        image: terms
+          ? { model: this.model, variant: terms.variant.id, count: terms.count, msatPerImage: terms.variant.msat_per_image }
+          : undefined,
+      });
     } else {
       const ownUsage = usageEventFromDisclosure(r!);
       if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
@@ -1141,9 +1164,20 @@ export class ConfidentialSession {
 
     const http = httpEarly;
     let image: ConfidentialSessionResult["image"];
+    let imageWarnings: string[] | undefined;
     let effectiveModel: string | undefined;
     if (this.kind === "images") {
-      if (flat) image = openAiImageResponse(http, this.offer.images!.response_shape);
+      // Accepted already (refusing would only cost the reservation): any
+      // shortfall is reported, never thrown.
+      if (flat) {
+        const checked = checkImageResponse(http, this.offer.images!.response_shape, {
+          model: this.model,
+          count: this.imageTerms!.count,
+          countKey: imageCountKey(this.offer.images!),
+        });
+        image = checked.image;
+        imageWarnings = checked.warnings;
+      }
     } else {
       effectiveModel = effectiveModelFromText(http.bodyText);
     }
@@ -1191,6 +1225,7 @@ export class ConfidentialSession {
       proofs: flat ? ["twopc", "pi_nk", "pi_c2s"] : ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
       protocol: this.protocol,
       image,
+      imageWarnings,
     };
     if (image) {
       // An image's text form is megabytes; build it only if someone reads it.
@@ -1375,28 +1410,47 @@ function countKeyUpdates(content: Uint8Array): number {
  */
 const KEPT_SERVER_RECORDS = 128;
 
-/** An image response in the OpenAI shape, from the provider's own shape. */
-function openAiImageResponse(
+/**
+ * An accepted image response in the OpenAI shape, from the provider's own
+ * shape, with every shortfall named: an incomplete body, fewer images than
+ * pinned, or a provider echo (`request`) naming another model or count.
+ * The charge was fixed at setup, so none of these throws.
+ */
+export function checkImageResponse(
   http: ParsedHttpResponse,
   shape: "venice" | "openai",
-): { created: number; data: { b64_json: string }[] } {
-  let body: Record<string, unknown>;
+  want: { model: string; count: number; countKey: string },
+): { image: { created: number; data: { b64_json: string }[] }; warnings: string[] } {
+  const warnings: string[] = [];
+  if (!http.complete) warnings.push("the image response body is incomplete");
+  let body: Record<string, unknown> = {};
   try {
-    body = JSON.parse(http.bodyText) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(http.bodyText);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+    else warnings.push("the image response is not a JSON object");
   } catch {
-    throw new ResponseVerificationError("image response is not JSON");
+    warnings.push("the image response is not JSON");
   }
   const created = typeof body.created === "number" ? body.created : Math.floor(Date.now() / 1000);
+  let data: { b64_json: string }[] = [];
   if (shape === "venice") {
-    const images = body.images;
-    if (!Array.isArray(images) || !images.every((i) => typeof i === "string")) {
-      throw new ResponseVerificationError("image response carries no images");
+    const images = Array.isArray(body.images) ? body.images : [];
+    data = images.filter((i): i is string => typeof i === "string").map((b64_json) => ({ b64_json }));
+  } else {
+    const raw = Array.isArray(body.data) ? body.data : [];
+    data = raw
+      .filter((d): d is { b64_json: string } => !!d && typeof (d as { b64_json?: unknown }).b64_json === "string")
+      .map((d) => ({ b64_json: d.b64_json }));
+  }
+  if (data.length !== want.count) warnings.push(`the provider returned ${data.length} of ${want.count} images`);
+  const echo = body.request;
+  if (echo && typeof echo === "object" && !Array.isArray(echo)) {
+    const e = echo as Record<string, unknown>;
+    if (e.model !== undefined && e.model !== want.model) {
+      warnings.push(`the provider echoes model ${String(e.model)}, not ${want.model}`);
     }
-    return { created, data: images.map((b64_json) => ({ b64_json: b64_json as string })) };
+    const n = e[want.countKey];
+    if (n !== undefined && n !== want.count) warnings.push(`the provider echoes ${want.countKey}=${String(n)}, not ${want.count}`);
   }
-  const data = body.data;
-  if (!Array.isArray(data) || !data.every((d) => d && typeof (d as { b64_json?: unknown }).b64_json === "string")) {
-    throw new ResponseVerificationError("image response carries no b64_json images");
-  }
-  return { created, data: data.map((d) => ({ b64_json: (d as { b64_json: string }).b64_json })) };
+  return { image: { created, data }, warnings };
 }

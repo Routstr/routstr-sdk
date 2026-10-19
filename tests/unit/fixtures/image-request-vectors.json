@@ -213,6 +213,52 @@
           ],
           "msat_per_image": 30000
         }
+      ],
+      "capped": [
+        {
+          "id": "1K-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 20000
+        },
+        {
+          "id": "4K-webp",
+          "pins": [
+            [
+              "resolution",
+              "4K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 80000,
+          "max_count": 1
+        }
+      ]
+    },
+    "param_space": {
+      "resolution": [
+        "1K",
+        "2K",
+        "4K"
+      ],
+      "quality": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "format": [
+        "webp"
       ]
     }
   },
@@ -277,7 +323,7 @@
       }
     },
     {
-      "name": "count key wins over n",
+      "name": "count key and n disagree: refused",
       "body": {
         "model": "z-image-turbo",
         "prompt": "p",
@@ -285,11 +331,7 @@
         "n": 3
       },
       "expect": {
-        "variant": "webp",
-        "count": 2,
-        "private": [
-          "prompt"
-        ]
+        "error": true
       }
     },
     {
@@ -699,7 +741,7 @@
       }
     },
     {
-      "name": "count_key wins over n",
+      "name": "count_key and n disagree: refused",
       "body": {
         "model": "flat",
         "prompt": "a cat",
@@ -707,11 +749,7 @@
         "variants": 3
       },
       "expect": {
-        "variant": "webp",
-        "count": 3,
-        "private": [
-          "prompt"
-        ]
+        "error": true
       }
     },
     {
@@ -1119,6 +1157,173 @@
       "body": {
         "model": "nope",
         "prompt": "a cat"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "counts that agree are one count",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2,
+        "variants": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "n and count disagree: refused",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 1,
+        "count": 3
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "missing prompt refused",
+      "body": {
+        "model": "flat"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "empty prompt refused",
+      "body": {
+        "model": "flat",
+        "prompt": "  "
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "non-string prompt refused",
+      "body": {
+        "model": "flat",
+        "prompt": [
+          "a"
+        ]
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "size with an upper-case X",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "2048X2048"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "variant count cap: one 4K image",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "resolution": "4K"
+      },
+      "expect": {
+        "variant": "4K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "variant count cap: two 4K images refused",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "resolution": "4K",
+        "n": 2
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "variant count cap: the 1K variant takes the offer's max",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "n": 4
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 4,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "agreeing count fields",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2,
+        "variants": 2,
+        "count": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "prompt empty",
+      "body": {
+        "model": "flat",
+        "prompt": ""
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "prompt not a string",
+      "body": {
+        "model": "flat",
+        "prompt": [
+          "a",
+          "cat"
+        ]
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "another fixed pin as a private option",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "style_references": []
       },
       "expect": {
         "error": true

@@ -102,6 +102,16 @@ describe("proof channel bridge (v2)", () => {
     await expect(v).rejects.toThrow(/checks failed/);
   });
 
+  it("rejects a verification that reports no checks at all", async () => {
+    const t = fakeChannel();
+    t.chan.start("ws://x");
+    t.emit(1, JSON.stringify({ ev: "ready" }));
+    await t.chan.ready(1000);
+    const v = t.chan.run("verify", "pi_nk", {}, undefined, 1000);
+    t.emit(1, JSON.stringify({ ev: "done", id: 1, proof: "pi_nk", ok: true, checks: [] }));
+    await expect(v).rejects.toThrow(/none were reported/);
+  });
+
   it("a channel lost before any proof reports not-ready (the caller falls back)", async () => {
     const t = fakeChannel();
     t.chan.start("ws://x");

@@ -708,10 +708,10 @@ describe("security regressions", () => {
     );
   });
 
-  it("builds valid JSON when only pinned keys are present", () => {
-    const body = JSON.parse(new TextDecoder().decode(buildPinnedBody({ model: "m", max_tokens: 3 }, "m", 3)));
-    expect(body.model).toBe("m");
-    expect(body.max_tokens).toBe(3);
+  it("refuses a body of pinned keys only: the suffix must end the body exactly", () => {
+    expect(() => buildPinnedBody({ model: "m", max_tokens: 3 }, "m", 3)).toThrow(/messages/);
+    const body = buildPinnedBody({ model: "m", max_tokens: 3, messages: [] }, "m", 3);
+    expect(new TextDecoder().decode(body).endsWith(canonicalSuffix("m", 3))).toBe(true);
   });
 
   it("supports only POST chat/completions", () => {
