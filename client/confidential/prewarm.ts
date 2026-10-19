@@ -291,6 +291,8 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
   private cancelTimer?: () => void;
   private closed = false;
   private spentUnusedFeeMsats = 0;
+  /** Requests outside the pool (image sessions) running their own preparation. */
+  private externalPrep = 0;
 
   constructor(options: PrewarmOptions, deps: PrewarmDeps<S, C>) {
     this.cfg = PrewarmPool.config(options);
@@ -380,6 +382,22 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
   }
 
   // ── request path ───────────────────────────────────────────────────────
+
+  /**
+   * A request that never uses the pool (an image session) is preparing its
+   * own session: arm nothing meanwhile, as for a cold chat request. Returns
+   * the release (idempotent).
+   */
+  holdArming(): () => void {
+    this.externalPrep += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.externalPrep = Math.max(0, this.externalPrep - 1);
+      this.reconcile();
+    };
+  }
 
   /** Record a request for `info` with a pinned body of `bodyLength` bytes. */
   begin(info: PoolKeyInfo, ctx: C, bodyLength: number): RequestTicket<S> {
@@ -576,7 +594,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
     let total = this.totalPooled;
     let arming = 0;
     for (const k of keys) arming += k.entries.filter((e) => e.state === "arming").length;
-    const coldPrep = keys.some((k) => k.coldPrep > 0);
+    const coldPrep = this.externalPrep > 0 || keys.some((k) => k.coldPrep > 0);
     const feeKey = (k: KeyState<S, C>) => (k.abandonFeeMsat ?? 0) > 0;
     let pooledWithFee = 0;
     for (const k of keys) if (feeKey(k)) pooledWithFee += k.entries.filter((e) => !e.taken).length;
