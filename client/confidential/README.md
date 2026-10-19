@@ -197,5 +197,5 @@ client with only the environment it needs, and use only prover and 2PC binaries 
 | `zkchan.ts` | the pre-warmed proof channel (`cu-prover --channel`) |
 | `prewarm.ts` | traffic-driven pool of armed sessions, body-length buckets and padding |
 | `offer.ts`, `hosts.ts`, `canonical.ts` | signed offer verification, trusted-host wildcards, Schnorr/canonical JSON |
-| `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned suffix and response parsing, receipt checks, proof-parameter checks, byte helpers, `cu-prover` runner |
+| `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned chat suffix (rendered from the offer's `chat` block and held to the pin policy, routstr-confidential `docs/CHAT-SUFFIX.md`) and response parsing, receipt checks, proof-parameter checks, byte helpers, `cu-prover` runner |
 | `tls-fork/` | vendored `@reclaimprotocol/tls@0.1.4` (MIT) with the patches in `FORK-NOTES.md` |
