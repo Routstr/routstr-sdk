@@ -53,12 +53,36 @@ export interface ParsedHttpResponse {
   body: Uint8Array;
   bodyText: string;
   contentType: string;
+  /** The body is complete by its framing (chunked terminator or Content-Length). */
+  complete: boolean;
 }
 
 /** Split the decrypted upstream plaintext into an HTTP/1.1 response. */
 export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
+  let start = 0;
+  for (;;) {
+    const head = parseHead(bytes, start);
+    // A 1xx interim head (100 Continue, 103 Early Hints) is not the answer:
+    // the final status follows it. (101 switches protocols and is final.)
+    if (head.status >= 100 && head.status < 200 && head.status !== 101) {
+      start = head.end;
+      continue;
+    }
+    return finishResponse(bytes, head);
+  }
+}
+
+interface ParsedHead {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  /** Offset just past the head's blank line. */
+  end: number;
+}
+
+function parseHead(bytes: Uint8Array, from: number): ParsedHead {
   let headerEnd = -1;
-  for (let i = 0; i + 3 < bytes.length; i++) {
+  for (let i = from; i + 3 < bytes.length; i++) {
     if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) {
       headerEnd = i;
       break;
@@ -67,7 +91,7 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
   if (headerEnd < 0) {
     throw new ResponseVerificationError("upstream response has no HTTP header terminator");
   }
-  const headText = Buffer.from(bytes.subarray(0, headerEnd)).toString("latin1");
+  const headText = Buffer.from(bytes.subarray(from, headerEnd)).toString("latin1");
   const lines = headText.split("\r\n");
   const statusLine = lines.shift() ?? "";
   const m = /^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/.exec(statusLine);
@@ -82,10 +106,24 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
     if (idx <= 0) continue;
     headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
   }
-  const rawBody = bytes.subarray(headerEnd + 4);
-  const body = /chunked/i.test(headers["transfer-encoding"] ?? "")
-    ? dechunkAll(rawBody)
-    : rawBody;
+  return { status, statusText, headers, end: headerEnd + 4 };
+}
+
+function finishResponse(bytes: Uint8Array, head: ParsedHead): ParsedHttpResponse {
+  const { status, statusText, headers } = head;
+  const rawBody = bytes.subarray(head.end);
+  let body: Uint8Array;
+  let complete: boolean;
+  if (/chunked/i.test(headers["transfer-encoding"] ?? "")) {
+    const decoder = new ChunkedDecoder();
+    const parts = decoder.push(rawBody);
+    body = joinParts(parts);
+    complete = decoder.done;
+  } else {
+    body = rawBody;
+    const declared = headers["content-length"];
+    complete = declared === undefined || (/^\d+$/.test(declared) && Number(declared) === rawBody.length);
+  }
   const parsed = {
     status,
     statusText,
@@ -93,6 +131,7 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
     raw: bytes,
     body,
     contentType: headers["content-type"] ?? "",
+    complete,
   } as ParsedHttpResponse;
   // Decoded on first use: an image body is megabytes, and most callers never
   // read it as text.
@@ -283,9 +322,18 @@ export const HOP_BY_HOP_HEADERS = new Set([
   "proxy-connection",
 ]);
 
-function dechunkAll(raw: Uint8Array): Uint8Array {
-  const d = new ChunkedDecoder();
-  const parts = d.push(raw);
+/**
+ * Whether a provider response header is passed on to the caller: not a
+ * hop-by-hop header, and not the provider account's own state (its balance
+ * and rate-limit counters belong to the node operator; the client can read
+ * them in the decrypted response, but they are not handed on).
+ */
+export function exposedProviderHeader(name: string): boolean {
+  const n = name.toLowerCase();
+  return !HOP_BY_HOP_HEADERS.has(n) && !n.startsWith("x-venice-balance-") && !n.startsWith("x-ratelimit-");
+}
+
+function joinParts(parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let o = 0;
   for (const p of parts) {
@@ -317,6 +365,12 @@ export class IncrementalHttpResponse {
     this.buf = merged;
     for (let i = 0; i + 3 < merged.length; i++) {
       if (merged[i] === 13 && merged[i + 1] === 10 && merged[i + 2] === 13 && merged[i + 3] === 10) {
+        const interim = parseHead(merged, 0);
+        if (interim.status >= 100 && interim.status < 200 && interim.status !== 101) {
+          // An interim head: the answer's head follows it.
+          this.buf = new Uint8Array(0);
+          return this.push(merged.subarray(i + 4));
+        }
         const parsed = parseHttpResponse(merged.subarray(0, i + 4));
         this.head = { status: parsed.status, statusText: parsed.statusText, headers: parsed.headers };
         this.chunked = /chunked/i.test(parsed.headers["transfer-encoding"] ?? "");

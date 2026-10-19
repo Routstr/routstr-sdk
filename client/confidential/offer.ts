@@ -16,6 +16,7 @@ import {
   verifySchnorrSignature,
 } from "./canonical";
 import { TrustedHostMatcher } from "./hosts";
+import { headTemplateProblem } from "./params";
 import {
   OfferBadSignatureError,
   OfferMalformedError,
@@ -47,8 +48,10 @@ export interface ConfidentialImageVariant {
   id: string;
   /** Request keys and values the suffix pins for this variant, in order. */
   pins: [string, unknown][];
-  /** Flat price per generated image (msats, possibly fractional), surcharge included. */
+  /** Flat price per generated image (whole msats), surcharge included. */
   msat_per_image: number;
+  /** Most images per request for this variant, when lower than the offer's `max_count`. */
+  max_count?: number;
 }
 
 /**
@@ -147,6 +150,11 @@ export interface VerifyOfferOptions {
 export interface VerifiedOffer extends ConfidentialOffer {
   /** The exact payload whose signature verified. */
   signedPayload: string;
+  /**
+   * Why the offer's `images` block was refused (it is then dropped, chat is
+   * unaffected); an image request names this reason.
+   */
+  imagesRefused?: string;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -246,7 +254,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.capabilities is not a list of strings");
   }
-  if (offer.images !== undefined) validateImagesOffer(offer.images);
+  // The images block is checked in verifyConfidentialOffer: a malformed one
+  // disables images only, never chat.
 }
 
 function isPinList(v: unknown): v is [string, unknown][] {
@@ -256,25 +265,57 @@ function isPinList(v: unknown): v is [string, unknown][] {
   );
 }
 
-function validateImagesOffer(images: unknown): asserts images is ConfidentialImagesOffer {
+/** The variant keys an image offer may pin: price axes and the output format. */
+export const IMAGE_VARIANT_PIN_KEYS: ReadonlySet<string> = new Set(["resolution", "quality", "format"]);
+
+/** Most images one confidential request may ask for. */
+export const IMAGE_MAX_COUNT = 4;
+
+/** A fixed pin may only switch a provider extra off: `false` or an empty list. */
+function isOffValue(v: unknown): boolean {
+  return v === false || (Array.isArray(v) && v.length === 0);
+}
+
+/**
+ * Check a signed offer's `images` block. The node chooses every pinned value,
+ * so the client holds it to a narrow shape: fixed pins only switch extras off,
+ * variant pins only choose a price tier or the format among the published
+ * values, the head is a plain request to the image endpoint, and the numbers
+ * are bounded. Throws `OfferMalformedError`.
+ */
+export function validateImagesOffer(images: unknown, upstreamHost: string): asserts images is ConfidentialImagesOffer {
   const bad = (what: string): never => {
     throw new OfferMalformedError(`offer.images.${what}`);
   };
   if (!isObject(images)) bad("is not an object");
   const im = images as Record<string, unknown>;
   if (typeof im.head_template !== "string" || !im.head_template) bad("head_template is not a non-empty string");
+  const tplProblem = headTemplateProblem(im.head_template as string, upstreamHost, "images");
+  if (tplProblem) bad(`head_template: ${tplProblem}`);
   if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("response_shape is not venice or openai");
-  if (im.response_idle_s !== undefined && !(typeof im.response_idle_s === "number" && im.response_idle_s > 0)) {
-    bad("response_idle_s is not a positive number");
+  if (
+    im.response_idle_s !== undefined &&
+    !(Number.isSafeInteger(im.response_idle_s) && (im.response_idle_s as number) >= 30 && (im.response_idle_s as number) <= 600)
+  ) {
+    bad("response_idle_s is not an integer from 30 to 600");
   }
-  if (!(typeof im.max_count === "number" && Number.isSafeInteger(im.max_count) && im.max_count >= 1)) {
-    bad("max_count is not a positive integer");
+  if (!(Number.isSafeInteger(im.max_count) && (im.max_count as number) >= 1 && (im.max_count as number) <= IMAGE_MAX_COUNT)) {
+    bad(`max_count is not an integer from 1 to ${IMAGE_MAX_COUNT}`);
   }
   if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key)) {
     bad("count_key is not a non-empty string");
   }
-  if (im.param_space !== undefined && !isObject(im.param_space)) bad("param_space is not an object");
+  if (
+    !isObject(im.param_space) ||
+    !Object.values(im.param_space).every((vals) => Array.isArray(vals) && vals.every((x) => typeof x === "string"))
+  ) {
+    bad("param_space is not an object of string lists");
+  }
+  const space = im.param_space as Record<string, string[]>;
   if (!isPinList(im.fixed_pins)) bad("fixed_pins is not a list of [key, value] pairs");
+  for (const [k, v] of im.fixed_pins as [string, unknown][]) {
+    if (!isOffValue(v)) bad(`fixed_pins ${JSON.stringify(k)} is not switched off (only false or [] may be pinned)`);
+  }
   if (!isObject(im.price_list)) bad("price_list is not an object");
   const fixed = new Set([...(im.fixed_pins as [string, unknown][]).map((p) => p[0]), "model", imageCountKey(im)]);
   if (fixed.size !== (im.fixed_pins as unknown[]).length + 2) bad("fixed_pins repeat a key or pin model/count");
@@ -290,11 +331,34 @@ function validateImagesOffer(images: unknown): asserts images is ConfidentialIma
       if (new Set((vv.pins as [string, unknown][]).map((p) => p[0])).size !== (vv.pins as unknown[]).length) {
         bad(`${where} repeats a pinned key`);
       }
+      for (const [k, val] of vv.pins as [string, unknown][]) {
+        if (!IMAGE_VARIANT_PIN_KEYS.has(k)) bad(`${where} pins ${JSON.stringify(k)}, which is not a price tier or the format`);
+        if (typeof val !== "string" || !(space[k] ?? []).includes(val)) {
+          bad(`${where} pins ${k}=${JSON.stringify(val)}, which is not in param_space`);
+        }
+      }
       const price = vv.msat_per_image;
-      if (!(typeof price === "number" && Number.isFinite(price) && price >= 0)) {
-        bad(`${where} msat_per_image is not a non-negative number`);
+      if (!(Number.isSafeInteger(price) && (price as number) > 0)) {
+        bad(`${where} msat_per_image is not a positive whole number of msats`);
+      }
+      if (
+        vv.max_count !== undefined &&
+        !(Number.isSafeInteger(vv.max_count) && (vv.max_count as number) >= 1 && (vv.max_count as number) <= (im.max_count as number))
+      ) {
+        bad(`${where} max_count is not an integer from 1 to the offer's max_count`);
       }
     }
+  }
+}
+
+/** Why a signed offer's `images` block is refused, or `undefined` when it is acceptable. */
+export function imagesOfferProblem(images: unknown, upstreamHost: string): string | undefined {
+  try {
+    validateImagesOffer(images, upstreamHost);
+    return undefined;
+  } catch (error) {
+    if (error instanceof OfferMalformedError) return error.message;
+    throw error;
   }
 }
 
@@ -474,6 +538,14 @@ export function verifyConfidentialOffer(
     }
   }
 
+  if (offer.images !== undefined) {
+    const problem = imagesOfferProblem(offer.images, offer.upstream_host);
+    if (problem) {
+      // Images off for this offer; chat on the same signed terms still works.
+      const { images: _refused, ...rest } = offer;
+      return { ...rest, signedPayload: payload, imagesRefused: problem };
+    }
+  }
   return { ...offer, signedPayload: payload };
 }
 
