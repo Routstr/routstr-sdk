@@ -42,6 +42,38 @@ export interface ConfidentialPriceEntry {
   out: number;
 }
 
+/** One priced way to generate an image with a model (its pinned request keys). */
+export interface ConfidentialImageVariant {
+  id: string;
+  /** Request keys and values the suffix pins for this variant, in order. */
+  pins: [string, unknown][];
+  /** Flat price per generated image (msats, possibly fractional), surcharge included. */
+  msat_per_image: number;
+}
+
+/**
+ * The image-generation capability of a signed offer: a flat price per image,
+ * fixed at setup from pinned request parameters (no usage disclosure).
+ */
+export interface ConfidentialImagesOffer {
+  /** The request head the node writes for an image request ({KEY:n}, {LEN}). */
+  head_template: string;
+  /** `venice` (`{images: [b64]}`) or `openai` (`{data: [{b64_json}]}`). */
+  response_shape: "venice" | "openai";
+  /** Seconds the response may stay silent (image generation sends nothing until done). */
+  response_idle_s?: number;
+  /** Most images per request. */
+  max_count: number;
+  /** The request key that carries the image count (default `variants`). */
+  count_key?: string;
+  /** Key/value pairs pinned on every image request (paid extras off, …). */
+  fixed_pins: [string, unknown][];
+  /** The values each tier key may take (informational). */
+  param_space?: Record<string, unknown[]>;
+  price_list: Record<string, ConfidentialImageVariant[]>;
+  max_response_bytes?: number;
+}
+
 export interface ConfidentialOffer {
   v: number;
   min_v?: number;
@@ -81,6 +113,10 @@ export interface ConfidentialOffer {
    * bill slightly past it); absent when none.
    */
   reserve_margin_tokens?: number;
+  /** What the node serves confidentially (`chat`, `images`); absent: chat only. */
+  capabilities?: string[];
+  /** Image generation terms, present with the `images` capability. */
+  images?: ConfidentialImagesOffer;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
@@ -204,6 +240,89 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.rate_surcharge_pct is not a non-negative number");
   }
+  if (
+    offer.capabilities !== undefined &&
+    (!Array.isArray(offer.capabilities) || !offer.capabilities.every((c) => typeof c === "string"))
+  ) {
+    throw new OfferMalformedError("offer.capabilities is not a list of strings");
+  }
+  if (offer.images !== undefined) validateImagesOffer(offer.images);
+}
+
+function isPinList(v: unknown): v is [string, unknown][] {
+  return (
+    Array.isArray(v) &&
+    v.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && p[0] !== "")
+  );
+}
+
+function validateImagesOffer(images: unknown): asserts images is ConfidentialImagesOffer {
+  const bad = (what: string): never => {
+    throw new OfferMalformedError(`offer.images.${what}`);
+  };
+  if (!isObject(images)) bad("is not an object");
+  const im = images as Record<string, unknown>;
+  if (typeof im.head_template !== "string" || !im.head_template) bad("head_template is not a non-empty string");
+  if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("response_shape is not venice or openai");
+  if (im.response_idle_s !== undefined && !(typeof im.response_idle_s === "number" && im.response_idle_s > 0)) {
+    bad("response_idle_s is not a positive number");
+  }
+  if (!(typeof im.max_count === "number" && Number.isSafeInteger(im.max_count) && im.max_count >= 1)) {
+    bad("max_count is not a positive integer");
+  }
+  if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key)) {
+    bad("count_key is not a non-empty string");
+  }
+  if (im.param_space !== undefined && !isObject(im.param_space)) bad("param_space is not an object");
+  if (!isPinList(im.fixed_pins)) bad("fixed_pins is not a list of [key, value] pairs");
+  if (!isObject(im.price_list)) bad("price_list is not an object");
+  const fixed = new Set([...(im.fixed_pins as [string, unknown][]).map((p) => p[0]), "model", imageCountKey(im)]);
+  if (fixed.size !== (im.fixed_pins as unknown[]).length + 2) bad("fixed_pins repeat a key or pin model/count");
+  for (const [model, variants] of Object.entries(im.price_list as Record<string, unknown>)) {
+    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list[${JSON.stringify(model)}] has no variants`);
+    const ids = new Set<string>();
+    for (const v of variants as unknown[]) {
+      const where = `price_list[${JSON.stringify(model)}]`;
+      if (!isObject(v) || typeof v.id !== "string" || !v.id || ids.has(v.id)) bad(`${where} has a variant without a unique id`);
+      ids.add((v as { id: string }).id);
+      const vv = v as Record<string, unknown>;
+      if (!isPinList(vv.pins) || vv.pins.some((p) => fixed.has(p[0]))) bad(`${where} pins a fixed key`);
+      if (new Set((vv.pins as [string, unknown][]).map((p) => p[0])).size !== (vv.pins as unknown[]).length) {
+        bad(`${where} repeats a pinned key`);
+      }
+      const price = vv.msat_per_image;
+      if (!(typeof price === "number" && Number.isFinite(price) && price >= 0)) {
+        bad(`${where} msat_per_image is not a non-negative number`);
+      }
+    }
+  }
+}
+
+/** The request key that carries the image count. */
+export function imageCountKey(images: { count_key?: unknown }): string {
+  return typeof images.count_key === "string" && images.count_key ? images.count_key : "variants";
+}
+
+/** True when the signed offer serves confidential image generation. */
+export function offerSupportsImages(offer: ConfidentialOffer): boolean {
+  return Array.isArray(offer.capabilities) && offer.capabilities.includes("images") && offer.images !== undefined;
+}
+
+/**
+ * The pinned JSON suffix of an image request, byte for byte as the relay
+ * renders it: model, count, the fixed pins, then the variant's pins, in
+ * compact JSON, closing the request object.
+ */
+export function renderImageSuffix(
+  model: string,
+  count: number,
+  countKey: string,
+  fixedPins: readonly [string, unknown][],
+  pins: readonly [string, unknown][],
+): string {
+  const parts = [`"model":${JSON.stringify(model)}`, `${JSON.stringify(countKey)}:${JSON.stringify(count)}`];
+  for (const [k, v] of [...fixedPins, ...pins]) parts.push(`${JSON.stringify(k)}:${JSON.stringify(v)}`);
+  return `,${parts.join(",")}}`;
 }
 
 function feeValue(fee: unknown): number {
