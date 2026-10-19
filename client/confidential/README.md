@@ -22,8 +22,9 @@ await routeRequests({
 });
 ```
 
-Only `POST /v1/chat/completions` is supported; other endpoints are refused
-before any credential or deposit. Only nodes whose `/v1/models` entry
+`POST /v1/chat/completions` and the image paths `POST /v1/images/generations`
+(OpenAI shape) and `POST /v1/image/generate` (Venice shape) are supported;
+other endpoints are refused before any credential or deposit. Only nodes whose `/v1/models` entry
 advertises `confidential_upstream` for the model are selected. Credentials, top-ups, failover, usage tracking and balance
 accounting are the client's normal ones: `RoutstrClient` runs
 `fetchConfidential` (`transport.ts`) in place of `fetch()`. The Bun/Node
@@ -40,6 +41,24 @@ Confidential requests skip the client's raw request/response log sink unless
 decrypted response to disk. `ConfidentialSession`'s `allowUnsignedSettlement`
 is a test hook, refused unless the process sets
 `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
+
+## Images
+
+A node whose signed offer lists `capabilities: ["chat", "images"]` also
+serves images confidentially. The offer's `images` block carries the head
+template, `count_key`, `fixed_pins`, `param_space`, `max_count` and a
+`price_list` of variants per model (`{id, pins, msat_per_image}`, e.g.
+`1K-webp`). `planImageRequest` splits the caller's body: model, count
+(`n`/`variants`) and the variant (from `resolution`, `quality`, `size` or
+`format`; WebP only; no match is an error, never a substitute) are pinned in
+the suffix (`renderImageSuffix`), everything else (prompt, `aspect_ratio`,
+`seed`, ...) stays private. The session sets up with `kind: "images"`, never
+armed; after the attestation it sends `accept` for a 2xx (no usage proof) or
+discloses the error head for a 4xx/5xx as for chat. `verifyFlatReceipt`
+requires `cost_msats == ceil(msat_per_image × count + session fee)`. The
+response is OpenAI-shaped (`{created, data: [{b64_json}]}`); a node without the
+capability is refused with `offer_no_images`. Image requests never use the
+pre-warm pool. `confidentialImageRequiredSats` sizes the deposit.
 
 ## Protocol version
 
