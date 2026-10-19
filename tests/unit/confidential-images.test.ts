@@ -23,7 +23,7 @@ import {
   isConfidentialImageEndpoint,
   planImageRequest,
 } from "../../client/confidential/transport";
-import { ConfidentialSession } from "../../client/confidential/session";
+import { ConfidentialSession, imageOutcome } from "../../client/confidential/session";
 import { CuProverBackend } from "../../client/confidential/prover";
 import { ConfidentialError, ReceiptVerificationError, SessionProtocolError } from "../../client/confidential/errors";
 import { confidentialImageRequiredSats } from "../../client/RoutstrClient";
@@ -123,8 +123,6 @@ describe("image request split", () => {
         n: 2,
         size: "2048x2048",
         response_format: "b64_json",
-        enhance_prompt: true, // a paid extra: the suffix pins it off
-        stream: false,
       },
       IMAGES,
     );
@@ -142,10 +140,17 @@ describe("image request split", () => {
       format: "webp",
       enhance_prompt: false,
     });
-    // OpenAI-only keys never reach a provider with its own shape.
-    for (const k of ["n", "size", "response_format", "stream"]) expect(body).not.toHaveProperty(k);
-    // The paid extra appears once, in the suffix.
+    // Selector keys choose the variant; they never reach the provider privately.
+    for (const k of ["n", "size", "response_format"]) expect(body).not.toHaveProperty(k);
+    // The paid extra appears once, pinned off in the suffix.
     expect(text.match(/enhance_prompt/g)).toHaveLength(1);
+  });
+
+  it("refuses a caller who sets a key the offer pins, or buys a tier privately", () => {
+    const plan = (r: Record<string, unknown>) => () => planImageRequest({ prompt: "x", ...r }, IMAGES);
+    expect(plan({ model: "z-image-turbo", enhance_prompt: true })).toThrow(/fixed by the node's offer/);
+    expect(plan({ model: "nano-banana-pro", width: 2048, height: 2048 })).toThrow(/priced by resolution tier/);
+    expect(plan({ model: "z-image-turbo", quality: "high" })).toThrow(/no quality tiers/);
   });
 
   it("maps an OpenAI size to its resolution class and picks the cheapest open tier", () => {
@@ -174,6 +179,14 @@ describe("image request split", () => {
     expect(isConfidentialImageEndpoint("GET", "/v1/images/generations")).toBe(false);
     expect(isConfidentialImageEndpoint("POST", "/v1/images/edits")).toBe(false);
     expect(isConfidentialEndpoint("POST", "/v1/images/generations")).toBe(false);
+  });
+});
+
+describe("image outcome", () => {
+  it("accepts only a 2xx, discloses an error head, refuses anything else", () => {
+    for (const s of [200, 201, 299]) expect(imageOutcome(s)).toBe("accept");
+    for (const s of [400, 402, 429, 500, 503, 504]) expect(imageOutcome(s)).toBe("disclose");
+    for (const s of [0, 100, 199, 301, 302, 304, 399]) expect(imageOutcome(s)).toBe("refuse");
   });
 });
 
@@ -239,9 +252,17 @@ describe("node offer defaults and rounding", () => {
 });
 
 describe("image deposit", () => {
-  it("is the dearest variant times the count plus the larger fee", () => {
+  it("is the selected variant times the count plus the larger fee", () => {
     const offer = { images: IMAGES, session_fee_msat: 0, abandon_fee_msat: 2000 } as never;
-    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { n: 2 })).toBe(Math.ceil((2 * 278300 + 2000) / 1000));
+    // No tier asked: the request takes the cheapest (1K), and so does the deposit.
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { n: 2 })).toBe(Math.ceil((2 * 217800 + 2000) / 1000));
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { n: 2, resolution: "2K" })).toBe(
+      Math.ceil((2 * 278300 + 2000) / 1000),
+    );
+    // A request the offer cannot serve is refused later; its deposit is the dearest single image.
+    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { resolution: "4K" })).toBe(
+      Math.ceil((278300 + 2000) / 1000),
+    );
     expect(confidentialImageRequiredSats(offer, "z-image-turbo", {})).toBe(Math.ceil((12100 + 2000) / 1000));
     expect(confidentialImageRequiredSats(offer, "unknown", {})).toBeUndefined();
     expect(confidentialImageRequiredSats(undefined, "z-image-turbo", {})).toBeUndefined();
