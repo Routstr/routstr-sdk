@@ -179,7 +179,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
   });
 
   it("treats the snapshot as available balance instead of deducting reserved twice", async () => {
-    const { client } = createClient();
+    const { client, updateApiKeyBalance } = createClient();
     const balanceManager = client.getBalanceManager();
     vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
       amount: 120_000, // 120 sat *available*: already net of the 30 sat held
@@ -203,6 +203,13 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       amount: 21,
       token: API_KEY,
     });
+    // The stored snapshot stays on the same (available) scale as the deposit:
+    // 120 + 21, with the 30 sat hold carried only as a diagnostic. Writing
+    // `120 - 30 + 21` would put the snapshot on a different scale from the
+    // figure the topup trigger reads back, and re-open the double subtraction.
+    await vi.waitFor(() =>
+      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 141, 30)
+    );
   });
 
   it("applies the 0.21-floor when the shortfall is tiny", async () => {
