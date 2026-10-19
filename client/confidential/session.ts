@@ -563,7 +563,9 @@ export class ConfidentialSession {
   }
 
   private zkUrl(proof: string): string {
-    return `${this.wsBase()}/v1/confidential/zk?proof=${proof}&session_id=${this.sid}`;
+    // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
+    const token = typeof this.ready?.zk_token === "string" ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : "";
+    return `${this.wsBase()}/v1/confidential/zk?proof=${proof}&session_id=${this.sid}${token}`;
   }
 
   /**
