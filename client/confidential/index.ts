@@ -48,6 +48,9 @@ export {
   checkPiNKParams,
   checkPiC2SParams,
   checkPiC3SParams,
+  checkHeadTemplate,
+  headTemplateProblem,
+  type HeadTemplateKind,
 } from "./params";
 
 export {
@@ -56,6 +59,10 @@ export {
   fetchConfidentialOffer,
   verifyConfidentialOffer,
   validateOfferShape,
+  validateImagesOffer,
+  imagesOfferProblem,
+  IMAGE_VARIANT_PIN_KEYS,
+  IMAGE_MAX_COUNT,
   offerSignedPayload,
   offerSessionFeeMsat,
   offerAbandonFeeMsat,
@@ -83,6 +90,7 @@ export {
   IncrementalHttpResponse,
   ChunkedDecoder,
   HOP_BY_HOP_HEADERS,
+  exposedProviderHeader,
   type ParsedHttpResponse,
   type UpstreamUsageEvent,
 } from "./suffix";
@@ -121,6 +129,7 @@ export {
   maxChargeMsats,
   feeOnlyChargeOk,
   checkUpstreamErrorReceipt,
+  errorStatusCharge,
   verifyFlatReceipt,
   type ReceiptVerificationInput,
   type ReceiptVerificationResult,
@@ -128,6 +137,7 @@ export {
 
 export {
   ConfidentialSession,
+  checkImageResponse,
   type ConfidentialSessionOptions,
   type ConfidentialSessionResult,
   type ConfidentialSessionTimings,
