@@ -109,6 +109,13 @@ export interface PerRequestLimits {
  * Tinfoil models carry: the caller-facing effort levels a UI offers as keys,
  * the exact spelling the upstream accepts as values (e.g. DeepSeek V4.1 maps
  * `medium` -> `high` and rejects a literal `medium`).
+ *
+ * `supported_efforts` is *applied*, not merely advertised: routstr-core snaps a
+ * requested level onto its members, so it must only ever be published where it
+ * is a truthful allowlist. Tinfoil models publish `effort_map` alone — the
+ * map's values are the model's spellings for the three coarse levels, not the
+ * set of values it accepts, and deriving an allowlist from them rewrote valid
+ * plaintext requests (`none` -> `low`, `max` -> `xhigh`).
  */
 export interface ModelReasoning {
   mandatory?: boolean | null;
