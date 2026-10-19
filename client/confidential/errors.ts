@@ -23,7 +23,8 @@ export type ConfidentialErrorCode =
   | "timeout"
   | "not_configured"
   | "unsupported_endpoint"
-  | "offer_no_images";
+  | "offer_no_images"
+  | "pinned_parameter";
 
 export class ConfidentialError extends Error {
   readonly code: ConfidentialErrorCode;
