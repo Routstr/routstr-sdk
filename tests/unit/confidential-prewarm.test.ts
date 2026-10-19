@@ -3,6 +3,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { VENICE_CHAT } from "./fixtures/chat";
 
 import {
   chooseBucket,
@@ -428,11 +429,12 @@ describe("body-length buckets", () => {
 });
 
 describe("padPinnedBody", () => {
-  const suffix = canonicalSuffix("deepseek-v4-flash", 64);
+  const suffix = canonicalSuffix(VENICE_CHAT, "deepseek-v4-flash", 64);
   const body = buildPinnedBody(
     { messages: [{ role: "user", content: "hi ✓" }], temperature: 0.2 },
     "deepseek-v4-flash",
     64,
+    VENICE_CHAT,
   );
 
   it("pads to the exact length with the suffix last and valid, identical JSON", () => {

@@ -84,6 +84,11 @@ export {
 
 export {
   canonicalSuffix,
+  chatSuffixKeys,
+  validateChatSuffix,
+  CHAT_CAP_KEYS,
+  CHAT_PROTOCOL_KEYS,
+  type ChatSuffixSpec,
   buildConfidentialBody,
   parseHttpResponse,
   extractUsageDisclosure,

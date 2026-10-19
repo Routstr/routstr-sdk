@@ -26,9 +26,7 @@ import {
   OfferUnsupportedVersionError,
   TrustedHostError,
 } from "./errors";
-
-/** The keys `canonicalSuffix` pins, in order (the sidecar's `SUFFIX_KEYS`). */
-export const CHAT_SUFFIX_KEYS: readonly string[] = ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"];
+import { type ChatSuffixSpec, validateChatSuffix } from "./suffix";
 
 /**
  * Protocol versions this client speaks: only v2 (the two-party handshake).
@@ -92,7 +90,10 @@ export interface ConfidentialOffer {
   key_length: number;
   key_alphabet?: string;
   head_template: string;
+  /** The keys the chat suffix pins, in order (derived from `chat`). */
   suffix_keys: string[];
+  /** How the pinned chat suffix is built (`validateChatSuffix`). */
+  chat: ChatSuffixSpec;
   price_list: Record<string, ConfidentialPriceEntry>;
   mints?: string[];
   prewarm?: boolean;
@@ -208,14 +209,10 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   if (typeof offer.head_template !== "string" || !offer.head_template) {
     throw new OfferMalformedError("offer.head_template is not a non-empty string");
   }
-  if (!Array.isArray(offer.suffix_keys)) {
-    throw new OfferMalformedError("offer.suffix_keys is not an array");
-  }
-  // The keys the canonical suffix pins, in its order: an offer naming others
-  // describes a suffix this client does not send (the sidecar refuses it too).
-  if (offer.suffix_keys.join("\n") !== CHAT_SUFFIX_KEYS.join("\n")) {
-    throw new OfferMalformedError(`offer.suffix_keys ${JSON.stringify(offer.suffix_keys)} are not the keys the suffix pins`);
-  }
+  // The node chooses every pinned value of the chat suffix: only a block
+  // within the policy is accepted, and suffix_keys must list its keys. (An
+  // offer for a version this client does not speak is refused as such.)
+  if (supportedVersion(offer as ConfidentialOffer)) validateChatSuffix(offer.chat, offer.suffix_keys);
   if (!isObject(offer.price_list)) {
     throw new OfferMalformedError("offer.price_list is not an object");
   }
