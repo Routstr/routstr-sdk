@@ -172,3 +172,145 @@ describe("concurrent provider tokens on one wallet", () => {
     });
   });
 });
+
+// Hold a real send so batching tests do not depend on timer scheduling.
+const holdNextSend = (wallet: WalletAdapter) => {
+  const sendToken = wallet.sendToken.bind(wallet);
+  let release!: () => void;
+  let notifyStarted!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = new Promise<void>((resolve) => (notifyStarted = resolve));
+  wallet.sendToken = async (...args) => {
+    wallet.sendToken = sendToken;
+    notifyStarted();
+    await gate;
+    return sendToken(...args);
+  };
+  return { started, release };
+};
+
+const storageWithKey = (key: string): StorageAdapter => ({
+  ...createStorage(),
+  getApiKey: () => ({ baseUrl: PROVIDER, key, balance: 0, lastUsed: null }),
+});
+
+const managerFor = (wallet: WalletAdapter, storage = createStorage()) =>
+  new BalanceManager(wallet, storage, undefined, undefined, noopLogger);
+
+const topUpOptions = { mintUrl: MINT, baseUrl: PROVIDER, amount: 11 };
+
+describe("top-up batch destinations", () => {
+  let deposits: { authorization: string | null; token: string }[];
+
+  beforeEach(() => {
+    deposits = [];
+    vi.stubGlobal("fetch", async (_url: string, init?: RequestInit) => {
+      deposits.push({
+        authorization: new Headers(init?.headers).get("Authorization"),
+        token: JSON.parse(String(init?.body)).cashu_token,
+      });
+      return new Response("{}", { status: 200 });
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["stored", "explicit"])("keeps different %s API keys separate", async (mode) => {
+    const { wallet, total } = createReservingWallet(128, 0);
+    const hold = holdNextSend(wallet);
+    const blocker = managerFor(wallet).createProviderToken({ ...topUpOptions, amount: 3 });
+    await hold.started;
+
+    const requests = ["sk-alice", "sk-bob"].map((key) =>
+      managerFor(wallet, storageWithKey(key)).topUp({
+        ...topUpOptions,
+        ...(mode === "explicit" ? { token: key } : {}),
+      })
+    );
+    hold.release();
+
+    expect((await Promise.all(requests)).every((r) => r.success)).toBe(true);
+    await blocker;
+    expect(deposits).toEqual([
+      { authorization: "Bearer sk-alice", token: "cashuB_11" },
+      { authorization: "Bearer sk-bob", token: "cashuB_11" },
+    ]);
+    expect(total()).toBe(128 - 3 - 22);
+  });
+
+  it("merges stored and explicit references to the same API key", async () => {
+    const { wallet, total } = createReservingWallet(128, 0);
+    const hold = holdNextSend(wallet);
+    const blocker = managerFor(wallet).createProviderToken({ ...topUpOptions, amount: 3 });
+    await hold.started;
+
+    const stored = managerFor(wallet, storageWithKey("sk-alice")).topUp(topUpOptions);
+    const explicit = managerFor(wallet).topUp({ ...topUpOptions, token: "sk-alice" });
+    hold.release();
+
+    expect((await Promise.all([stored, explicit])).every((r) => r.success)).toBe(true);
+    await blocker;
+    expect(deposits).toEqual([{ authorization: "Bearer sk-alice", token: "cashuB_22" }]);
+    expect(total()).toBe(128 - 3 - 22);
+  });
+
+  it("does not merge payments from different wallets to the same key", async () => {
+    const alice = createReservingWallet(128, 0);
+    const bob = createReservingWallet(128, 0);
+    const results = await Promise.all(
+      [alice, bob].map(({ wallet }) =>
+        managerFor(wallet).topUp({ ...topUpOptions, token: "sk-shared" })
+      )
+    );
+
+    expect(results.every((r) => r.success)).toBe(true);
+    expect(deposits).toEqual([
+      { authorization: "Bearer sk-shared", token: "cashuB_11" },
+      { authorization: "Bearer sk-shared", token: "cashuB_11" },
+    ]);
+    expect(alice.total()).toBe(117);
+    expect(bob.total()).toBe(117);
+  });
+
+  it("pins the resolved API key while waiting even if storage changes", async () => {
+    const { wallet } = createReservingWallet(128, 0);
+    const storage = storageWithKey("sk-alice");
+    const manager = managerFor(wallet, storage);
+    const hold = holdNextSend(wallet);
+    const blocker = manager.createProviderToken({ ...topUpOptions, amount: 3 });
+    await hold.started;
+
+    const result = manager.topUp(topUpOptions);
+    storage.getApiKey = storageWithKey("sk-bob").getApiKey;
+    hold.release();
+
+    expect((await result).success).toBe(true);
+    await blocker;
+    expect(deposits).toEqual([{ authorization: "Bearer sk-alice", token: "cashuB_11" }]);
+  });
+
+  it("rejects a missing API key instead of joining another stored-key batch", async () => {
+    const { wallet, total } = createReservingWallet(128, 0);
+    const funded = managerFor(wallet, storageWithKey("sk-alice")).topUp(topUpOptions);
+    const missing = managerFor(wallet).topUp(topUpOptions);
+
+    expect(await missing).toEqual({ success: false, message: "No API key available for top up" });
+    expect((await funded).success).toBe(true);
+    expect(deposits).toEqual([{ authorization: "Bearer sk-alice", token: "cashuB_11" }]);
+    expect(total()).toBe(117);
+  });
+
+  it.each([-11, 0, NaN, Infinity])("rejects invalid amount %s before joining a batch", async (amount) => {
+    const { wallet, total } = createReservingWallet(128, 0);
+    const manager = managerFor(wallet);
+    const funded = manager.topUp({ ...topUpOptions, token: "sk-alice" });
+    const invalid = manager.topUp({ ...topUpOptions, token: "sk-alice", amount });
+
+    expect(await invalid).toEqual({ success: false, message: "Invalid top up amount" });
+    expect((await funded).success).toBe(true);
+    expect(deposits).toEqual([{ authorization: "Bearer sk-alice", token: "cashuB_11" }]);
+    expect(total()).toBe(117);
+  });
+});

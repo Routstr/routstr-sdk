@@ -123,16 +123,18 @@ function runWalletSend<T>(
   return current;
 }
 
+type ResolvedTopUpOptions = TopUpOptions & { token: string };
+
 interface QueuedTopUp {
   amount: number;
   result: Promise<TopUpResult>;
 }
 
 /**
- * A top-up waiting behind another send takes in the top-ups for the same key
- * that arrive meanwhile, so parallel requests make one deposit, not one each.
+ * A top-up waiting behind another send takes in the top-ups from the same
+ * wallet for the same provider and resolved API key that arrive meanwhile.
  */
-const queuedTopUps = new Map<string, QueuedTopUp>();
+const queuedTopUps = new WeakMap<WalletAdapter, Map<string, QueuedTopUp>>();
 
 /**
  * BalanceManager handles token refunds and topups from providers
@@ -606,18 +608,34 @@ export class BalanceManager {
       return { success: false, message: guard.reason };
     }
 
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return { success: false, message: "Invalid top up amount" };
+    }
+
+    // Resolve before batching, and pin this destination even if storage changes
+    // while the top-up waits behind a wallet send.
+    const apiKey = providedToken || this.storageAdapter.getApiKey(baseUrl)?.key;
+    if (!apiKey) {
+      return { success: false, message: "No API key available for top up" };
+    }
+
     this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
-      return await this._queueTopUp({ mintUrl, baseUrl, amount, token: providedToken });
+      return await this._queueTopUp({ mintUrl, baseUrl, amount, token: apiKey });
     } finally {
       this._endProviderWalletOperation(baseUrl, "topup");
     }
   }
 
-  private async _queueTopUp(options: TopUpOptions): Promise<TopUpResult> {
-    const key = `${options.baseUrl}:${options.token}`;
-    let batch = queuedTopUps.get(key);
+  private async _queueTopUp(options: ResolvedTopUpOptions): Promise<TopUpResult> {
+    let walletTopUps = queuedTopUps.get(this.walletAdapter);
+    if (!walletTopUps) {
+      walletTopUps = new Map();
+      queuedTopUps.set(this.walletAdapter, walletTopUps);
+    }
+    const key = JSON.stringify([options.baseUrl, options.token]);
+    let batch = walletTopUps.get(key);
     if (batch) {
       batch.amount += options.amount;
     } else {
@@ -625,12 +643,12 @@ export class BalanceManager {
       const started: QueuedTopUp = {
         amount: options.amount,
         result: sends.then(() => {
-          queuedTopUps.delete(key);
+          walletTopUps.delete(key);
           return this._topUpImpl({ ...options, amount: started.amount });
         }),
       };
       batch = started;
-      queuedTopUps.set(key, batch);
+      walletTopUps.set(key, batch);
     }
 
     const result = await batch.result;
@@ -646,23 +664,10 @@ export class BalanceManager {
   }
 
   private async _topUpImpl(
-    options: TopUpOptions,
+    options: ResolvedTopUpOptions,
     excludeMints: string[] = []
   ): Promise<TopUpResult> {
-    const { mintUrl, baseUrl, amount, token: providedToken } = options;
-
-    if (!amount || amount <= 0) {
-      return { success: false, message: "Invalid top up amount" };
-    }
-
-    const apiKeyEntry = providedToken
-      ? null // providedToken is now the apiKey for apikeys mode
-      : this.storageAdapter.getApiKey(baseUrl);
-    const apiKey = providedToken || apiKeyEntry?.key;
-
-    if (!apiKey) {
-      return { success: false, message: "No API key available for top up" };
-    }
+    const { mintUrl, baseUrl, amount, token: apiKey } = options;
 
     let cashuToken: string | null = null;
     let requestId: string | undefined;
