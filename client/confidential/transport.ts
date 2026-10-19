@@ -17,7 +17,7 @@
  * still sees the error (the rest of the stream is not delayed).
  * `confidentialSettled` carries the same outcome.
  *
- * Only `POST …/chat/completions` is supported: the pinned suffix, the head
+ * Only `POST /v1/chat/completions` is supported: the pinned suffix, the head
  * template and the usage proof are all chat-completions specific.
  */
 
@@ -280,7 +280,7 @@ export async function qualifyConfidentialNode(
 export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
   return (
     (method ?? "POST").toUpperCase() === "POST" &&
-    /(^|\/)chat\/completions\/?$/.test((path ?? "/v1/chat/completions").split("?")[0]!)
+    /^(\/v1)?\/chat\/completions\/?$/.test((path ?? "/v1/chat/completions").split("?")[0]!)
   );
 }
 
@@ -303,8 +303,8 @@ export function buildPinnedBody(
 }
 
 /**
- * The token cap the session pins: the caller's own (`max_tokens`, else
- * `max_completion_tokens`, else `max_output_tokens`), at most the node's cap.
+ * The token cap the session pins: the smallest the caller set (`max_tokens`,
+ * `max_completion_tokens`, `max_output_tokens`), at most the node's cap.
  * `clampedFrom` is the caller's value when the node's cap lowered it, so the
  * response can say the answer may be cut short.
  */
@@ -312,15 +312,16 @@ export function maxTokensFor(
   request: Record<string, unknown>,
   cap: number,
 ): { maxTokens: number; clampedFrom?: number } {
+  let asked: number | undefined;
   for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
     const v = request[k];
     if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-      const asked = Math.trunc(v);
-      const maxTokens = Math.max(1, Math.min(asked, cap));
-      return maxTokens < asked ? { maxTokens, clampedFrom: asked } : { maxTokens };
+      asked = Math.min(asked ?? Infinity, Math.trunc(v));
     }
   }
-  return { maxTokens: cap };
+  if (asked === undefined) return { maxTokens: cap };
+  const maxTokens = Math.max(1, Math.min(asked, cap));
+  return maxTokens < asked ? { maxTokens, clampedFrom: asked } : { maxTokens };
 }
 
 /**
@@ -601,7 +602,9 @@ async function fetchConfidentialOnce(
   } catch (error) {
     session?.close();
     void writer.abort(error).catch(() => {});
-    if (error instanceof SessionRejectedError && isOfferExpired(error)) {
+    // Retried only while nothing can have reached the provider: the node
+    // refuses an expired offer at setup, never after the body went out.
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !session?.bodyReleased) {
       offerCache.delete(baseUrl.replace(/\/$/, ""));
       throw new OfferExpired(error.message);
     }
