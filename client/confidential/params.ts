@@ -298,6 +298,9 @@ export function headTemplateProblem(tpl: string, upstreamHost: string, kind: Hea
   if (!m) return "template is not an HTTP/1.1 POST";
   const path = m[1]!;
   if (/[?#]/.test(path)) return "template path carries a query or fragment";
+  // A canonical path: no dot segments, empty segments, escapes or parameters
+  // a provider might normalise onto another route.
+  if (!/^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/.test(path)) return `template path ${path} is not canonical`;
   if (!TEMPLATE_PATHS[kind].some((end) => path.endsWith(end))) {
     return `template path ${path} is not a ${kind} endpoint`;
   }
