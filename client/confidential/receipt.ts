@@ -148,6 +148,52 @@ export function checkUpstreamErrorReceipt(
   return usageMatch;
 }
 
+/**
+ * A flat-priced (image) receipt: the charge is fixed at setup by the signed
+ * offer, so everything is checked for equality: the model, variant and count
+ * we pinned, the signed price per image, and the cost
+ * `msat_per_image × count + session fee`. Throws on any mismatch.
+ */
+export function verifyFlatReceipt(
+  receipt: ConfidentialReceipt,
+  own: {
+    model: string;
+    variant: string;
+    count: number;
+    /** From the signed offer we verified. */
+    msatPerImage: number;
+    sessionFeeMsat?: number;
+    abandonFeeMsat?: number;
+  },
+): void {
+  const fee = Math.max(0, own.sessionFeeMsat ?? 0);
+  const fail = (what: string): never => {
+    throw new ReceiptVerificationError(`flat receipt: ${what}`);
+  };
+  if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+  if ((receipt.usage as unknown as { flat?: unknown } | undefined)?.flat !== true) fail("usage is not flat");
+  if (receipt.model !== own.model) fail(`model ${String(receipt.model)} is not ${own.model}`);
+  if (receipt.variant !== own.variant) fail(`variant ${String(receipt.variant)} is not ${own.variant}`);
+  if (receipt.count !== own.count) fail(`count ${String(receipt.count)} is not ${own.count}`);
+  if (receipt.msat_per_image !== own.msatPerImage) {
+    fail(`price ${String(receipt.msat_per_image)} msats per image is not the signed ${own.msatPerImage}`);
+  }
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    fail(`session fee ${receipt.session_fee_msat} msats exceeds the signed ${fee}`);
+  }
+  if (
+    typeof receipt.abandon_fee_msat === "number" &&
+    receipt.abandon_fee_msat > Math.max(fee, own.abandonFeeMsat ?? 0)
+  ) {
+    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
+  }
+  // The node charges the price × count plus the fee, rounded up to whole msats.
+  const want = Math.ceil(own.msatPerImage * own.count + fee);
+  if (!isMsatAmount(receipt.cost_msats) || receipt.cost_msats !== want) {
+    fail(`cost ${String(receipt.cost_msats)} msats is not ${want} (price × count + session fee)`);
+  }
+}
+
 export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificationResult {
   const { receipt, ownUsage } = input;
   const receiptJson = input.receiptJson ?? JSON.stringify(receipt);
