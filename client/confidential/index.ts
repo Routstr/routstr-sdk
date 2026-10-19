@@ -32,6 +32,8 @@ export {
   InvalidHostPatternError,
   normalizeHostname,
   parseTrustedHostPattern,
+  parseTrustedHostEntry,
+  DEFAULT_API_BASES,
   matchHostname,
   isTrustedHost,
   encryptedNodeTransport,
@@ -50,6 +52,7 @@ export {
   checkPiC3SParams,
   checkHeadTemplate,
   headTemplateProblem,
+  headRouteProblem,
   type HeadTemplateKind,
 } from "./params";
 

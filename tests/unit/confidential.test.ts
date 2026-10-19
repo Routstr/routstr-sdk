@@ -295,6 +295,36 @@ describe("canonical suffix", () => {
   });
 });
 
+describe("trusted API routes", () => {
+  it("an entry may name the API base; a bare host allows /v1 and /api/v1", () => {
+    const m = new TrustedHostMatcher(["api.venice.ai", "api.groq.com/openai/v1"]);
+    expect(m.apiBases("api.venice.ai")).toEqual(["/v1", "/api/v1"]);
+    expect(m.apiBases("api.groq.com")).toEqual(["/openai/v1"]);
+    expect(m.apiBases("other.example")).toEqual([]);
+    expect(matchHostname("api.groq.com", "api.groq.com/openai/v1")).toBe(true);
+    for (const bad of ["api.x.com/", "api.x.com/v1/", "api.x.com//v1", "api.x.com/v1/../x", "api.x.com/v%31"]) {
+      expect(() => new TrustedHostMatcher([bad])).toThrow(/not a canonical path/);
+    }
+  });
+
+  it("refuses an offer whose head route is not the trusted base plus the endpoint", () => {
+    const tpl = (path: string) =>
+      `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Length: {LEN}\r\n\r\n`;
+    const verify = (path: string, trustedHosts: string[]) => {
+      const { offer } = signedOffer({ head_template: tpl(path) });
+      return () => verifyConfidentialOffer(offer, { allowUnpinned: true, trustedHosts });
+    };
+    expect(verify("/api/v1/chat/completions", ["api.venice.ai"])).not.toThrow();
+    expect(verify("/v1/chat/completions", ["api.venice.ai"])).not.toThrow();
+    expect(verify("/api/v1/chat/completions", ["api.venice.ai/api/v1"])).not.toThrow();
+    // Another route of the same provider that merely ends in the endpoint.
+    expect(verify("/proxy/other-tenant/chat/completions", ["api.venice.ai"])).toThrow(TrustedHostError);
+    expect(verify("/api/v2/chat/completions", ["api.venice.ai"])).toThrow(/not one the trusted host allows/);
+    // An explicit base allows only itself.
+    expect(verify("/v1/chat/completions", ["api.venice.ai/api/v1"])).toThrow(TrustedHostError);
+  });
+});
+
 describe("trusted hostname matcher", () => {
   it("normalizes case and a trailing dot", () => {
     expect(normalizeHostname("API.Venice.AI.")).toBe("api.venice.ai");
