@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { VENICE_CHAT } from "./fixtures/chat";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
@@ -20,6 +21,7 @@ import {
 } from "../../client/confidential/canonical";
 import {
   canonicalSuffix,
+  chatSuffixKeys,
   effectiveModelFromText,
   extractUsageDisclosure,
   parseHttpResponse,
@@ -52,7 +54,12 @@ import {
   isConfidentialEndpoint,
   SseDoneHoldback,
 } from "../../client/confidential/transport";
-import { ProverMissingError, ReceiptVerificationError, SessionRejectedError } from "../../client/confidential/errors";
+import {
+  ConfidentialError,
+  ProverMissingError,
+  ReceiptVerificationError,
+  SessionRejectedError,
+} from "../../client/confidential/errors";
 import { CuProverBackend } from "../../client/confidential/prover";
 import { ConfidentialSession } from "../../client/confidential/session";
 import {
@@ -100,6 +107,7 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
     head_template:
       "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Length: {LEN}\r\n\r\n",
     suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
+    chat: VENICE_CHAT,
     price_list: {
       cheap: { in: 1000, cached_in: 1000, out: 1000 },
       dear: { in: 2000, cached_in: 2000, out: 4000 },
@@ -283,15 +291,15 @@ describe("offer verification + pinning", () => {
 
 describe("canonical suffix", () => {
   it("is byte-exact with the sidecar's reconstruction", () => {
-    expect(canonicalSuffix("deepseek-v4-flash", 12)).toBe(
+    expect(canonicalSuffix(VENICE_CHAT, "deepseek-v4-flash", 12)).toBe(
       ',"model":"deepseek-v4-flash","max_tokens":12,"max_completion_tokens":12,"n":1,' +
         '"stream":true,"stream_options":{"include_usage":true},' +
-        '"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}',
+        '"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}',
     );
   });
 
   it("JSON-escapes the model name", () => {
-    expect(canonicalSuffix('a"b', 1)).toContain('"model":"a\\"b"');
+    expect(canonicalSuffix(VENICE_CHAT, 'a"b', 1)).toContain('"model":"a\\"b"');
   });
 });
 
@@ -633,13 +641,31 @@ describe("confidential transport body handling", () => {
       { model: "evil", max_tokens: 99999, n: 4, messages: [{ role: "user", content: "hi" }], tools: [] },
       "deepseek-v4-flash",
       12,
+      VENICE_CHAT,
     );
     const text = new TextDecoder().decode(body);
-    const suffix = canonicalSuffix("deepseek-v4-flash", 12);
+    const suffix = canonicalSuffix(VENICE_CHAT, "deepseek-v4-flash", 12);
     expect(text.endsWith(suffix)).toBe(true);
     const priv = text.slice(0, -suffix.length);
     expect(priv).toBe('{"messages":[{"role":"user","content":"hi"}],"tools":[]');
     expect(JSON.parse(text).model).toBe("deepseek-v4-flash");
+  });
+
+  it("drops a pinned key the caller set to the pinned value and refuses another value", () => {
+    const messages = [{ role: "user", content: "hi" }];
+    const vp = { enable_web_search: "off", include_venice_system_prompt: false };
+    const body = buildPinnedBody({ messages, venice_parameters: { ...vp } }, "m", 3, VENICE_CHAT);
+    expect(new TextDecoder().decode(body).startsWith('{"messages":[{"role":"user","content":"hi"}],"model"')).toBe(true);
+    let err: unknown;
+    try {
+      buildPinnedBody({ messages, venice_parameters: { ...vp, enable_web_search: "on" } }, "m", 3, VENICE_CHAT);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfidentialError);
+    expect((err as ConfidentialError).code).toBe("pinned_parameter");
+    // The protocol's own keys are always the suffix's, whatever the caller set.
+    expect(() => buildPinnedBody({ messages, stream: false, n: 3, stream_options: {} }, "m", 3, VENICE_CHAT)).not.toThrow();
   });
 
   it("pins the smallest token limit the caller set, clamped to the node's cap", () => {
@@ -739,9 +765,9 @@ describe("security regressions", () => {
   });
 
   it("refuses a body of pinned keys only: the suffix must end the body exactly", () => {
-    expect(() => buildPinnedBody({ model: "m", max_tokens: 3 }, "m", 3)).toThrow(/messages/);
-    const body = buildPinnedBody({ model: "m", max_tokens: 3, messages: [] }, "m", 3);
-    expect(new TextDecoder().decode(body).endsWith(canonicalSuffix("m", 3))).toBe(true);
+    expect(() => buildPinnedBody({ model: "m", max_tokens: 3 }, "m", 3, VENICE_CHAT)).toThrow(/messages/);
+    const body = buildPinnedBody({ model: "m", max_tokens: 3, messages: [] }, "m", 3, VENICE_CHAT);
+    expect(new TextDecoder().decode(body).endsWith(canonicalSuffix(VENICE_CHAT, "m", 3))).toBe(true);
   });
 
   it("supports only POST chat/completions", () => {
@@ -963,13 +989,19 @@ describe("confidential session fee and surcharge in the offer", () => {
     key_length: 42,
     head_template: "POST /",
     suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
+    chat: VENICE_CHAT,
     price_list: {},
   };
 
-  it("refuses suffix_keys other than the ones the suffix pins", () => {
+  it("refuses suffix_keys other than the ones the chat block pins", () => {
     for (const keys of [[], ["model", "max_tokens", "stream"], [...shape.suffix_keys].reverse()]) {
       expect(() => validateOfferShape({ ...shape, suffix_keys: keys })).toThrow(/suffix_keys/);
     }
+  });
+
+  it("refuses an offer without a chat block", () => {
+    const { chat: _chat, ...noChat } = shape;
+    expect(() => validateOfferShape(noChat)).toThrow(/chat/);
   });
 
   it("accepts absent or valid pricing fields and reads the fee", () => {
@@ -1157,7 +1189,7 @@ describe("session construction guards", () => {
   const opts = (extra: Record<string, unknown> = {}) =>
     ({
       baseUrl: "http://127.0.0.1:8010",
-      offer: { v: 2, notary_pubkey: "00".repeat(32) },
+      offer: { v: 2, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
       auth: "sk-x",
       model: "m",
       maxTokens: 10,

@@ -11,19 +11,126 @@
  */
 
 import { concat } from "./advice";
-import { ResponseVerificationError } from "./errors";
+import { canonicalJson } from "./canonical";
+import { OfferMalformedError, ResponseVerificationError } from "./errors";
 
 /**
- * The public JSON suffix that pins every cost-relevant parameter. Byte-exact
- * with the sidecar's reconstruction; a mismatch aborts the session (GAP-1).
+ * The offer's `chat` block: how the pinned suffix of a chat request is built
+ * (routstr-confidential docs/CHAT-SUFFIX.md). The node chooses it, so
+ * `validateChatSuffix` holds it to a narrow policy.
  */
-export function canonicalSuffix(model: string, maxTokens: number): string {
-  return (
-    `,"model":${JSON.stringify(model)},"max_tokens":${maxTokens},` +
-    `"max_completion_tokens":${maxTokens},"n":1,"stream":true,` +
-    `"stream_options":{"include_usage":true},` +
-    `"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}`
-  );
+export interface ChatSuffixSpec {
+  /** Request keys that carry the pinned token cap, after `model`. */
+  cap_keys: string[];
+  /** Pinned in this order after the caps. */
+  fixed_pins: [string, unknown][];
+}
+
+/** The keys a chat suffix may carry the token cap under. */
+export const CHAT_CAP_KEYS: readonly string[] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+/** Request keys the protocol itself sets: never taken from the caller. */
+export const CHAT_PROTOCOL_KEYS: ReadonlySet<string> = new Set(["model", ...CHAT_CAP_KEYS, "n", "stream", "stream_options"]);
+
+/** The most bytes the fixed pins of a chat suffix may render to. */
+export const MAX_CHAT_PINS_LEN = 1024;
+
+const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A value every party serializes to the same bytes. */
+function pinValueOk(v: unknown): boolean {
+  if (typeof v === "boolean") return true;
+  if (typeof v === "number") return Number.isSafeInteger(v);
+  if (typeof v === "string") return /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v);
+  if (Array.isArray(v)) return v.every(pinValueOk);
+  if (typeof v === "object" && v !== null) {
+    return Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x));
+  }
+  return false;
+}
+
+/** A pin that switches something off: `false`, `"off"`, `[]`, or an object of those. */
+function pinIsOff(v: unknown): boolean {
+  if (v === false || v === "off") return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === "object" && v !== null) return Object.values(v).every(pinIsOff);
+  return false;
+}
+
+/** The keys a chat suffix pins, in order. */
+export function chatSuffixKeys(chat: ChatSuffixSpec): string[] {
+  return ["model", ...chat.cap_keys, ...chat.fixed_pins.map((p) => p[0])];
+}
+
+/**
+ * Check the offer's `chat` block against the policy (the sidecar applies the
+ * same one at startup): caps under a known cap key, streaming with usage,
+ * `n` 1, and every other pin switching something off. `suffixKeys` (the
+ * offer's `suffix_keys`) must list the keys it pins. Throws `OfferMalformedError`.
+ */
+export function validateChatSuffix(chat: unknown, suffixKeys: unknown): asserts chat is ChatSuffixSpec {
+  const bad = (what: string): never => {
+    throw new OfferMalformedError(`offer.chat ${what}`);
+  };
+  if (typeof chat !== "object" || chat === null || Array.isArray(chat)) bad("is missing or not an object");
+  const c = chat as Record<string, unknown>;
+  const caps = c.cap_keys;
+  if (!Array.isArray(caps) || caps.length === 0) bad("cap_keys is not a non-empty list");
+  const seen = new Set<string>();
+  for (const k of caps as unknown[]) {
+    if (typeof k !== "string" || !CHAT_CAP_KEYS.includes(k)) bad(`cap key ${JSON.stringify(k)} is not one of ${CHAT_CAP_KEYS.join(", ")}`);
+    if (seen.has(k as string)) bad(`repeats cap key ${JSON.stringify(k)}`);
+    seen.add(k as string);
+  }
+  const pins = c.fixed_pins;
+  if (!Array.isArray(pins) || !pins.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string")) {
+    bad("fixed_pins is not a list of [key, value] pairs");
+  }
+  for (const [k, v] of pins as [string, unknown][]) {
+    if (!PIN_KEY.test(k) || k === "model" || CHAT_CAP_KEYS.includes(k) || seen.has(k)) {
+      bad(`pin key ${JSON.stringify(k)} is malformed, repeated, model or a cap key`);
+    }
+    seen.add(k);
+    if (!pinValueOk(v)) bad(`pin ${JSON.stringify(k)} has a value outside the pin grammar`);
+    let ok: boolean;
+    if (k === "stream") ok = v === true;
+    else if (k === "n") ok = v === 1;
+    else if (k === "stream_options") {
+      ok =
+        typeof v === "object" && v !== null && !Array.isArray(v) &&
+        (v as Record<string, unknown>).include_usage === true &&
+        Object.entries(v).every(([m, x]) => m === "include_usage" || pinIsOff(x));
+    } else ok = pinIsOff(v);
+    if (!ok) bad(`pins ${k}=${JSON.stringify(v)}: only stream=true, n=1, stream_options with include_usage, and pins that switch something off are accepted`);
+  }
+  for (const need of ["stream", "stream_options"]) {
+    if (!seen.has(need)) bad(`does not pin ${need} (the usage proof reads the streamed usage event)`);
+  }
+  if (renderPins((pins as [string, unknown][])).length > MAX_CHAT_PINS_LEN) bad(`fixed_pins render to more than ${MAX_CHAT_PINS_LEN} bytes`);
+  const keys = chatSuffixKeys(c as unknown as ChatSuffixSpec);
+  if (!Array.isArray(suffixKeys) || suffixKeys.join("\n") !== keys.join("\n")) {
+    throw new OfferMalformedError(`offer.suffix_keys ${JSON.stringify(suffixKeys)} are not the keys the chat block pins ${JSON.stringify(keys)}`);
+  }
+}
+
+function renderPins(pins: readonly [string, unknown][]): string {
+  return pins.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",");
+}
+
+/**
+ * The public JSON suffix that pins every cost-relevant parameter, rendered
+ * from the offer's `chat` block. Byte-exact with the sidecar's rendering; a
+ * mismatch aborts the session (GAP-1).
+ */
+export function canonicalSuffix(chat: ChatSuffixSpec, model: string, maxTokens: number): string {
+  const parts = [`"model":${JSON.stringify(model)}`, ...chat.cap_keys.map((k) => `${JSON.stringify(k)}:${maxTokens}`)];
+  if (chat.fixed_pins.length > 0) parts.push(renderPins(chat.fixed_pins));
+  return `,${parts.join(",")}}`;
+}
+
+/** Whether two pin values are the same JSON value. */
+export function samePinValue(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b);
 }
 
 /**
