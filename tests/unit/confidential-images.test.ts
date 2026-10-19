@@ -69,7 +69,7 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
     key_alphabet: "[A-Za-z0-9_-]",
     head_template:
       "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
-    suffix_keys: ["model", "max_tokens", "stream"],
+    suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
     price_list: { cheap: { in: 1000, cached_in: 1000, out: 1000 } },
     capabilities: ["chat", "images"],
     images: IMAGES,
