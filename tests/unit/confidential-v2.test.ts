@@ -91,6 +91,13 @@ describe("π_NK statement rebuild (v2)", () => {
     expect(() =>
       checkPiNKParams(honest(), { ...own, offer: { ...offer, head_template: imageTpl }, kind: "chat" }),
     ).toThrow(/not a chat endpoint/);
+    // A path a provider might normalise onto another route is refused.
+    for (const path of ["/v1/chat/completions/../../image/generate", "/v1/./chat/completions", "//v1/chat/completions", "/v1/%63hat/completions"]) {
+      const t = tpl.replace("/v1/chat/completions", path);
+      expect(() =>
+        checkPiNKParams(honest(), { ...own, offer: { ...offer, head_template: t }, kind: path.endsWith("generate") ? "images" : "chat" }),
+      ).toThrow(/not canonical/);
+    }
   });
 
   it("rejects a K_0 other than the one our 2PC anchored", () => {
