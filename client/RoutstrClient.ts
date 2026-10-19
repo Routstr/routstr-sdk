@@ -297,7 +297,7 @@ function requireConfidentialTransport(): ConfidentialTransport {
 function isConfidentialEndpoint(method: string, path: string): boolean {
   return (
     method.toUpperCase() === "POST" &&
-    /(^|\/)chat\/completions\/?$/.test(path.split("?")[0] ?? "")
+    /^(\/v1)?\/chat\/completions\/?$/.test(path.split("?")[0] ?? "")
   );
 }
 
@@ -377,6 +377,17 @@ export function confidentialReservationMsats(
     msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * factor + (margin * outRate) / 1000);
   }
   return msats + feeMsat;
+}
+
+/**
+ * The smallest output-token limit a request body sets, the cap a
+ * confidential session pins before the node's cap applies.
+ */
+function callerMaxTokens(body: Record<string, unknown>): number | undefined {
+  const limits = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+    .map((k) => body[k])
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+  return limits.length ? Math.min(...limits) : undefined;
 }
 
 /**
@@ -853,7 +864,8 @@ export class RoutstrClient {
               current.modelId,
               current.baseUrl,
               attempted,
-              fundedMints
+              fundedMints,
+              Boolean(current.confidential)
             );
             if (!fallback || attempted.has(fallback)) throw error;
             this._log(
@@ -963,7 +975,10 @@ export class RoutstrClient {
         // (the OpenAI-standard chat field routstrd injects as its default
         // cap) and `max_output_tokens` (Responses API). Undefined prices at
         // the provider's worst-case max_completion_cost.
-        requestMaxTokens = completionCapFromBody(requestBodyForPricing);
+        // A confidential session pins the smallest limit the caller set.
+        requestMaxTokens = params.confidential
+          ? callerMaxTokens(requestBodyForPricing)
+          : completionCapFromBody(requestBodyForPricing);
 
         this._log(
           "DEBUG",
@@ -1206,6 +1221,10 @@ export class RoutstrClient {
       (processedResponse as any).selectedMintUrl =
         (response as any).selectedMintUrl;
       (processedResponse as any).requestResponseLogId = requestResponseLogId;
+      // finalize() awaits a confidential response's settlement through this.
+      (processedResponse as any).confidentialSettled = (
+        response as any
+      ).confidentialSettled;
 
       usagePromise = inspectSSEWebStream(
         inspectStream,
@@ -2569,7 +2588,8 @@ export class RoutstrClient {
             failoverModelId,
             baseUrl,
             failures.attemptedProviders,
-            fundedMintUrlsForFailover
+            fundedMintUrlsForFailover,
+            Boolean(params.confidential)
           );
           if (nextProvider && failures.attemptedProviders.has(nextProvider)) {
             nextProvider = null;
@@ -2739,7 +2759,8 @@ export class RoutstrClient {
                   failoverModelId,
                   baseUrl,
                   attemptedForSpend,
-                  fundedMintUrlsForFailover
+                  fundedMintUrlsForFailover,
+                  Boolean(params.confidential)
                 );
                 if (nextProvider && attemptedForSpend.has(nextProvider)) {
                   nextProvider = null;
