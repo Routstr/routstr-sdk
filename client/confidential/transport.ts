@@ -38,7 +38,13 @@ import {
 } from "./offer";
 import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
-import { canonicalSuffix, exposedProviderHeader } from "./suffix";
+import {
+  CHAT_PROTOCOL_KEYS,
+  type ChatSuffixSpec,
+  canonicalSuffix,
+  exposedProviderHeader,
+  samePinValue,
+} from "./suffix";
 import { encryptedNodeTransport } from "./hosts";
 import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
 import {
@@ -188,18 +194,6 @@ async function availableBalance(info: PoolKeyInfo): Promise<number | undefined> 
   }
 }
 
-/** Request keys the pinned suffix sets; they never come from the caller. */
-const PINNED_KEYS = new Set([
-  "model",
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  "n",
-  "stream",
-  "stream_options",
-  "venice_parameters",
-]);
-
 /** Signed offers by node; every use re-verifies it under the caller's policy. */
 const offerCache = new Map<string, { offer: VerifiedOffer; at: number }>();
 
@@ -336,19 +330,35 @@ export function planImageRequest(
   return { model, variant, count, body: new TextEncoder().encode(prefix + suffix), suffix };
 }
 
-/** The request body as the provider sees it: private part + pinned suffix. */
+/**
+ * The request body as the provider sees it: private part + pinned suffix.
+ * The protocol's own keys (model, caps, n, stream) never come from the
+ * caller. Another key the offer pins is dropped when the caller asked for the
+ * pinned value, and refused when it asked for another: the suffix would
+ * silently override it.
+ */
 export function buildPinnedBody(
   request: Record<string, unknown>,
   model: string,
   maxTokens: number,
+  chat: ChatSuffixSpec,
 ): Uint8Array {
+  const pinned = new Map(chat.fixed_pins);
   const priv: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(request)) {
-    if (!PINNED_KEYS.has(k)) priv[k] = v;
+    if (CHAT_PROTOCOL_KEYS.has(k)) continue;
+    if (pinned.has(k)) {
+      if (samePinValue(v, pinned.get(k))) continue;
+      throw new ConfidentialError(
+        "pinned_parameter",
+        `the node's offer pins ${k} to ${JSON.stringify(pinned.get(k))}; this request sets it to ${JSON.stringify(v)}`,
+      );
+    }
+    priv[k] = v;
   }
   const json = JSON.stringify(priv);
   // Drop the closing brace: the suffix closes the object and wins last.
-  const suffix = canonicalSuffix(model, maxTokens);
+  const suffix = canonicalSuffix(chat, model, maxTokens);
   const prefix = json.slice(0, -1);
   // The pinned suffix begins with a comma and must end the body exactly: a
   // request with no private keys (no messages) cannot be pinned.
@@ -596,7 +606,7 @@ async function fetchConfidentialOnce(
   const model = typeof request.model === "string" ? request.model : "";
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer);
   const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
-  const body = buildPinnedBody(request, model, maxTokens);
+  const body = buildPinnedBody(request, model, maxTokens, offer.chat);
   const wantStream = request.stream === true;
 
   const coldSession = () =>
@@ -615,7 +625,7 @@ async function fetchConfidentialOnce(
 
   // Pre-warm: a stable credential only (a one-off Cashu bearer is
   // spent per request), and a body that ends with the pinned suffix.
-  const suffix = canonicalSuffix(model, maxTokens);
+  const suffix = canonicalSuffix(offer.chat, model, maxTokens);
   const usePool =
     options.prewarm !== undefined &&
     options.prewarm.enabled !== false &&

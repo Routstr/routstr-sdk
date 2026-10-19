@@ -1,0 +1,966 @@
+{
+  "_comment": "Shared byte-for-byte by routstr-sdk (tests/unit/fixtures) and routstr-confidential-web (test/fixtures); the sidecar renders the same bytes (docs/CHAT-SUFFIX.md).",
+  "venice": {
+    "cap_keys": [
+      "max_tokens",
+      "max_completion_tokens"
+    ],
+    "fixed_pins": [
+      [
+        "n",
+        1
+      ],
+      [
+        "stream",
+        true
+      ],
+      [
+        "stream_options",
+        {
+          "include_usage": true
+        }
+      ],
+      [
+        "venice_parameters",
+        {
+          "include_venice_system_prompt": false,
+          "enable_web_search": "off"
+        }
+      ]
+    ]
+  },
+  "accepted": [
+    {
+      "chat": {
+        "cap_keys": [
+          "max_tokens",
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "n",
+            1
+          ],
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "venice_parameters",
+            {
+              "include_venice_system_prompt": false,
+              "enable_web_search": "off"
+            }
+          ]
+        ]
+      },
+      "suffix_keys": [
+        "model",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "stream",
+        "stream_options",
+        "venice_parameters"
+      ],
+      "model": "m",
+      "max_tokens": 5,
+      "suffix": ",\"model\":\"m\",\"max_tokens\":5,\"max_completion_tokens\":5,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"enable_web_search\":\"off\",\"include_venice_system_prompt\":false}}"
+    },
+    {
+      "chat": {
+        "cap_keys": [
+          "max_tokens",
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "n",
+            1
+          ],
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "venice_parameters",
+            {
+              "include_venice_system_prompt": false,
+              "enable_web_search": "off"
+            }
+          ]
+        ]
+      },
+      "suffix_keys": [
+        "model",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "stream",
+        "stream_options",
+        "venice_parameters"
+      ],
+      "model": "mistral-small-3-2-24b-instruct",
+      "max_tokens": 12,
+      "suffix": ",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"max_completion_tokens\":12,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"enable_web_search\":\"off\",\"include_venice_system_prompt\":false}}"
+    },
+    {
+      "chat": {
+        "cap_keys": [
+          "max_tokens",
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "n",
+            1
+          ],
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "venice_parameters",
+            {
+              "include_venice_system_prompt": false,
+              "enable_web_search": "off"
+            }
+          ]
+        ]
+      },
+      "suffix_keys": [
+        "model",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "stream",
+        "stream_options",
+        "venice_parameters"
+      ],
+      "model": "a\"b",
+      "max_tokens": 1,
+      "suffix": ",\"model\":\"a\\\"b\",\"max_tokens\":1,\"max_completion_tokens\":1,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"enable_web_search\":\"off\",\"include_venice_system_prompt\":false}}"
+    },
+    {
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ]
+        ]
+      },
+      "suffix_keys": [
+        "model",
+        "max_completion_tokens",
+        "stream",
+        "stream_options",
+        "parallel_tool_calls"
+      ],
+      "model": "gpt-x",
+      "max_tokens": 64,
+      "suffix": ",\"model\":\"gpt-x\",\"max_completion_tokens\":64,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"parallel_tool_calls\":false}"
+    },
+    {
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "extras",
+            {
+              "tags": [],
+              "search": "off"
+            }
+          ]
+        ]
+      },
+      "suffix_keys": [
+        "model",
+        "max_completion_tokens",
+        "stream",
+        "stream_options",
+        "parallel_tool_calls",
+        "extras"
+      ],
+      "model": "m",
+      "max_tokens": 3,
+      "suffix": ",\"model\":\"m\",\"max_completion_tokens\":3,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"parallel_tool_calls\":false,\"extras\":{\"search\":\"off\",\"tags\":[]}}"
+    }
+  ],
+  "refused": [
+    {
+      "why": "no cap key",
+      "chat": {
+        "cap_keys": [],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "unknown cap key",
+      "chat": {
+        "cap_keys": [
+          "temperature"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "repeated cap key",
+      "chat": {
+        "cap_keys": [
+          "max_tokens",
+          "max_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "stream off",
+      "chat": {
+        "cap_keys": [
+          "max_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            false
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "why": "no stream_options",
+      "chat": {
+        "cap_keys": [
+          "max_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "why": "usage not included",
+      "chat": {
+        "cap_keys": [
+          "max_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "why": "n above 1",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "n",
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "why": "switches something on",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "web_search",
+            "on"
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a sampling value",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "temperature",
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "why": "injects tools",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "tools",
+            [
+              {
+                "type": "function"
+              }
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "why": "injects messages",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "messages",
+            [
+              {
+                "role": "system",
+                "content": "x"
+              }
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "why": "null",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "x",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a fraction",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "x",
+            0.5
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a quote in a string",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "x",
+            "a\"b"
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a non-ASCII string",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "x",
+            "é"
+          ]
+        ]
+      }
+    },
+    {
+      "why": "pins model",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "model",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "pins a cap key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "max_tokens",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "repeats a key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "stream",
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a malformed key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "1x",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "too long",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "big",
+            [
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off",
+              "off"
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}
