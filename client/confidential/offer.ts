@@ -167,8 +167,18 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   if (!isObject(offer.price_list)) {
     throw new OfferMalformedError("offer.price_list is not an object");
   }
-  if (typeof offer.max_tokens_cap !== "number" || offer.max_tokens_cap <= 0) {
-    throw new OfferMalformedError("offer.max_tokens_cap is not a positive number");
+  for (const [model, entry] of Object.entries(offer.price_list)) {
+    const rate = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+    if (!isObject(entry) || !rate(entry.in) || !rate(entry.out) || (entry.cached_in !== undefined && !rate(entry.cached_in))) {
+      throw new OfferMalformedError(`offer.price_list[${JSON.stringify(model)}] is not a set of non-negative rates`);
+    }
+  }
+  if (
+    typeof offer.max_tokens_cap !== "number" ||
+    !Number.isSafeInteger(offer.max_tokens_cap) ||
+    offer.max_tokens_cap <= 0
+  ) {
+    throw new OfferMalformedError("offer.max_tokens_cap is not a positive integer");
   }
   if (
     offer.session_fee_msat !== undefined &&

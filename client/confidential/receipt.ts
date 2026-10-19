@@ -79,6 +79,11 @@ export function maxChargeMsats(
   return Math.max(uncached, withCached) + Math.max(0, sessionFeeMsat);
 }
 
+/** A receipt amount: a non-negative whole number of msats (never absent). */
+function isMsatAmount(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+}
+
 /** A token count as the node reads one (non-negative integer, else 0). */
 function tokenCount(v: unknown): number {
   if (typeof v === "boolean") return 0;
@@ -116,8 +121,8 @@ export function checkUpstreamErrorReceipt(
       `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
     );
   }
-  const cost = receipt.cost_msats ?? 0;
-  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+  const cost = receipt.cost_msats;
+  if (!isMsatAmount(cost)) {
     throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
   }
   const unbilled = status === 503 || (status >= 400 && status < 500);
@@ -149,11 +154,14 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
   const receiptSigOk = verifySchnorrSignature(receiptJson, input.sig, input.pubkey);
 
   const rUsage = receipt.usage as unknown as {
-    usage?: { prompt_tokens?: number; completion_tokens?: number };
+    usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: unknown };
   };
+  const cachedTokens = (u: Record<string, unknown> | undefined) =>
+    tokenCount((u?.prompt_tokens_details as { cached_tokens?: unknown } | undefined)?.cached_tokens);
   const usageMatch =
     rUsage?.usage?.prompt_tokens === ownUsage.usage.prompt_tokens &&
     rUsage?.usage?.completion_tokens === ownUsage.usage.completion_tokens &&
+    cachedTokens(rUsage?.usage as Record<string, unknown> | undefined) === cachedTokens(ownUsage.usage) &&
     receipt.model === ownUsage.model;
 
   // The node may charge less than its signed terms (cached input), never more.
@@ -161,9 +169,9 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
   // so the cost cannot be accepted.
   const fee = Math.max(0, input.sessionFeeMsat ?? 0);
   let costWithinOffer = false;
-  if (input.priceEntry) {
+  if (input.priceEntry && isMsatAmount(receipt.cost_msats)) {
     const maxMsats = maxChargeMsats(input.priceEntry, ownUsage.usage, fee);
-    costWithinOffer = (receipt.cost_msats ?? 0) <= maxMsats;
+    costWithinOffer = receipt.cost_msats <= maxMsats;
   }
   if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
     costWithinOffer = false;
