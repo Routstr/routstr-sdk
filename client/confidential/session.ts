@@ -34,6 +34,7 @@ import {
   ReceiptVerificationError,
   ResponseVerificationError,
   SessionProtocolError,
+  ProverMissingError,
   SessionRejectedError,
 } from "./errors";
 import { concat, hex, sha256 } from "./advice";
@@ -44,8 +45,8 @@ import {
   serverTailEpoch,
   type ServerPostRecord,
 } from "./params";
-import { CuProverBackend } from "./prover";
-import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
+import { CuProverBackend, isExecutable } from "./prover";
+import { resolveTwoPcPath, TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
 import { checkAttestationBinding, checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
@@ -668,6 +669,9 @@ export class ConfidentialSession {
   async arm(): Promise<void> {
     if (this.armStarted) throw new SessionProtocolError("arm() called twice");
     this.armStarted = true;
+    // Before setup: the node reserves funds (and may charge an abandon fee)
+    // as soon as it accepts one, so a missing local binary must fail first.
+    this.checkBinaries();
     await this.open();
     const nonceC = hex(cryptoRandom(32));
     const setup: Record<string, unknown> = {
@@ -690,10 +694,32 @@ export class ConfidentialSession {
     this.sendText(setup);
 
     this.ready = await this.waitT("ready", this.timeouts.ready);
+    // Everything the node signs is checked against this key; refuse a
+    // session announced under another before anything reaches the provider.
+    if (this.expectedPubkey && this.ready.pubkey !== this.expectedPubkey) {
+      throw new SessionProtocolError(
+        `session pubkey ${this.ready.pubkey} differs from the signed offer key ${this.expectedPubkey}`,
+      );
+    }
     this.sid = this.ready.sid;
     this.tReady = Date.now();
     this.event({ ev: "ready", sid: this.sid, head_len: this.ready.head_len, v: this.ready.v });
     return this.armTwoPc();
+  }
+
+  /** Refuse to start when cu-prover or cu-2pc cannot be run. */
+  private checkBinaries(): void {
+    const needed: Array<[string, string]> = [];
+    if (typeof this.prover.path === "string") needed.push(["cu-prover", this.prover.path]);
+    if (!this.twoPcFactory) needed.push(["cu-2pc", resolveTwoPcPath(this.twoPcPath, this.prover.path)]);
+    for (const [name, path] of needed) {
+      if (!isExecutable(path)) {
+        throw new ProverMissingError(
+          `${name} not found or not executable at ${path}`,
+          name === "cu-2pc" ? "set CU_2PC_BIN or put cu-2pc next to cu-prover" : "set CU_PROVER_BIN or the proverPath option",
+        );
+      }
+    }
   }
 
   /**

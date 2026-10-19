@@ -9,6 +9,8 @@
  */
 
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { accessSync, constants as fsConstants } from "node:fs";
+import { delimiter, join } from "node:path";
 import { ProverError, ProverMissingError } from "./errors";
 
 export const CU_PROVER_ENV_VARS = ["CU_PROVER_BIN", "CU_PROVER"] as const;
@@ -44,6 +46,21 @@ export function resolveProverPath(explicit?: string): string {
     return `${dir}/../../../../crypto/zkbench/target/release/cu-prover`;
   }
   return "cu-prover"; // PATH lookup
+}
+
+/** True if `binary` (a path, or a bare name looked up on PATH) can be executed. */
+export function isExecutable(binary: string): boolean {
+  const ok = (p: string) => {
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (binary.includes("/") || binary.includes("\\")) return ok(binary);
+  const dirs = (typeof process !== "undefined" ? process.env.PATH ?? "" : "").split(delimiter);
+  return dirs.some((d) => d !== "" && ok(join(d, binary)));
 }
 
 export class CuProverBackend {
