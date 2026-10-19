@@ -273,6 +273,21 @@ const TEMPLATE_PATHS: Record<HeadTemplateKind, readonly string[]> = {
   images: ["/image/generate", "/images/generations"],
 };
 
+/**
+ * Why a head template's route is not exactly one of the trusted API bases
+ * followed by the kind's endpoint (`/api/v1` + `/chat/completions`), or
+ * `undefined` when it is. The bases come from the caller's trusted-host
+ * entry (`TrustedHostMatcher.apiBases`), not from the node.
+ */
+export function headRouteProblem(tpl: string, bases: readonly string[], kind: HeadTemplateKind): string | undefined {
+  const m = /^POST (\S+) HTTP\/1\.1\r\n/.exec(tpl);
+  if (!m) return "template is not an HTTP/1.1 POST";
+  const allowed = bases.flatMap((b) => TEMPLATE_PATHS[kind].map((end) => b + end));
+  return allowed.includes(m[1]!)
+    ? undefined
+    : `template route ${m[1]} is not one the trusted host allows (${allowed.join(", ")})`;
+}
+
 /** The headers a head template carries: exactly these, each once, nothing else. */
 const TEMPLATE_HEADERS = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
 

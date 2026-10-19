@@ -16,6 +16,13 @@
  *                          `a.example.com` and `a.b.example.com` match (but not
  *                          `example.com`). `**` must occupy a whole label.
  *
+ * An entry may name the provider's API base after the host,
+ * `api.venice.ai/api/v1`: the node's request heads must then use exactly
+ * that base plus the endpoint (`/api/v1/chat/completions`). A bare host
+ * allows the two common bases, `/v1` and `/api/v1` (`DEFAULT_API_BASES`).
+ * A base is a canonical path: `/`-separated segments of `[A-Za-z0-9._~-]`,
+ * no `.`/`..` or empty segment, no trailing slash.
+ *
  * Deliberately rejected (throw at construction):
  *   - the empty pattern, and whitespace-only patterns;
  *   - a bare `*` or `**` (match-everything would defeat the check);
@@ -33,6 +40,27 @@ export class InvalidHostPatternError extends Error {
     super(`invalid trusted host pattern ${JSON.stringify(pattern)}: ${reason}`);
     this.name = "InvalidHostPatternError";
   }
+}
+
+/** The API bases a trusted host without an explicit one allows. */
+export const DEFAULT_API_BASES: readonly string[] = ["/v1", "/api/v1"];
+
+const CANONICAL_BASE = /^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/;
+
+/**
+ * Split a trusted-host entry into its host pattern and optional API base
+ * (`api.venice.ai/api/v1` → `api.venice.ai`, `/api/v1`).
+ */
+export function parseTrustedHostEntry(entry: string): { labels: string[]; base?: string } {
+  if (typeof entry !== "string") throw new InvalidHostPatternError(String(entry), "not a string");
+  const raw = entry.trim();
+  const slash = raw.indexOf("/");
+  if (slash < 0) return { labels: parseTrustedHostPattern(raw) };
+  const base = raw.slice(slash);
+  if (!CANONICAL_BASE.test(base)) {
+    throw new InvalidHostPatternError(entry, `API base ${JSON.stringify(base)} is not a canonical path`);
+  }
+  return { labels: parseTrustedHostPattern(raw.slice(0, slash)), base };
 }
 
 /** Lowercase and strip exactly one trailing dot ("example.com." → "example.com"). */
@@ -121,7 +149,7 @@ function matchLabels(hostLabels: string[], patLabels: string[]): boolean {
 export function matchHostname(host: string, pattern: string): boolean {
   const h = normalizeHostname(host);
   if (!h) return false;
-  const patLabels = parseTrustedHostPattern(pattern);
+  const patLabels = parseTrustedHostEntry(pattern).labels;
   return matchLabels(h.split("."), patLabels);
 }
 
@@ -133,14 +161,19 @@ export function matchHostname(host: string, pattern: string): boolean {
 export class TrustedHostMatcher {
   readonly patterns: readonly string[];
   private readonly parsed: ReadonlyArray<readonly string[]>;
+  private readonly bases: ReadonlyArray<string | undefined>;
 
   constructor(patterns: readonly string[]) {
     const parsed: string[][] = [];
+    const bases: (string | undefined)[] = [];
     for (const pattern of patterns) {
-      parsed.push(parseTrustedHostPattern(pattern));
+      const entry = parseTrustedHostEntry(pattern);
+      parsed.push(entry.labels);
+      bases.push(entry.base);
     }
     this.patterns = [...patterns];
     this.parsed = parsed;
+    this.bases = bases;
   }
 
   /** True when the list is empty (no confidential session may start). */
@@ -153,6 +186,22 @@ export class TrustedHostMatcher {
     if (!h) return false;
     const labels = h.split(".");
     return this.parsed.some((p) => matchLabels(labels, p as string[]));
+  }
+
+  /**
+   * The API bases the entries matching `host` allow (an entry without a base
+   * allows `DEFAULT_API_BASES`); empty when no entry matches.
+   */
+  apiBases(host: string): string[] {
+    const h = normalizeHostname(host);
+    if (!h) return [];
+    const labels = h.split(".");
+    const out = new Set<string>();
+    this.parsed.forEach((p, i) => {
+      if (!matchLabels(labels, p as string[])) return;
+      for (const b of this.bases[i] !== undefined ? [this.bases[i]!] : DEFAULT_API_BASES) out.add(b);
+    });
+    return [...out];
   }
 
   /** Reason string for logs/tests, never includes secrets. */

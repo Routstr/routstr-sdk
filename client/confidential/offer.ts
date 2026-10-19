@@ -16,7 +16,7 @@ import {
   verifySchnorrSignature,
 } from "./canonical";
 import { TrustedHostMatcher } from "./hosts";
-import { headTemplateProblem } from "./params";
+import { headRouteProblem, headTemplateProblem } from "./params";
 import {
   OfferBadSignatureError,
   OfferMalformedError,
@@ -534,6 +534,7 @@ export function verifyConfidentialOffer(
   if (options.trustedHosts === undefined) {
     throw new TrustedHostError("no trusted upstream hosts configured; refusing the offer");
   }
+  let apiBases: string[] = [];
   {
     const matcher =
       options.trustedHosts instanceof TrustedHostMatcher
@@ -544,10 +545,19 @@ export function verifyConfidentialOffer(
         `offer upstream_host not trusted: ${matcher.describe(offer.upstream_host)}`,
       );
     }
+    // The node writes the request head: hold its route to the API base the
+    // caller trusts for that host, so it cannot pick another route of the
+    // same provider that merely ends in the endpoint.
+    apiBases = matcher.apiBases(offer.upstream_host);
+    const route = headRouteProblem(offer.head_template, apiBases, "chat");
+    if (route) throw new TrustedHostError(`offer head_template: ${route}`);
   }
 
   if (offer.images !== undefined) {
-    const problem = imagesOfferProblem(offer.images, offer.upstream_host);
+    const images = offer.images as { head_template?: unknown };
+    const problem =
+      imagesOfferProblem(offer.images, offer.upstream_host) ??
+      headRouteProblem(String(images.head_template), apiBases, "images");
     if (problem) {
       // Images off for this offer; chat on the same signed terms still works.
       const { images: _refused, ...rest } = offer;
