@@ -38,7 +38,7 @@ import {
 } from "./offer";
 import { CuProverBackend } from "./prover";
 import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
-import { canonicalSuffix, HOP_BY_HOP_HEADERS } from "./suffix";
+import { canonicalSuffix, exposedProviderHeader } from "./suffix";
 import { encryptedNodeTransport } from "./hosts";
 import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
 import {
@@ -330,8 +330,10 @@ export function planImageRequest(
   }
   const suffix = renderImageSuffix(model, count, countKey, images.fixed_pins, variant.pins);
   const prefix = JSON.stringify(priv).slice(0, -1);
-  const text = prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix;
-  return { model, variant, count, body: new TextEncoder().encode(text), suffix };
+  // The suffix is its own final record and begins with a comma: a body with
+  // no private keys could not end with it (the prompt is required anyway).
+  if (prefix === "{") throw new ConfidentialError("unsupported_endpoint", "an image request needs a prompt");
+  return { model, variant, count, body: new TextEncoder().encode(prefix + suffix), suffix };
 }
 
 /** The request body as the provider sees it: private part + pinned suffix. */
@@ -345,11 +347,13 @@ export function buildPinnedBody(
     if (!PINNED_KEYS.has(k)) priv[k] = v;
   }
   const json = JSON.stringify(priv);
-  // Drop the closing brace: the suffix closes the object and wins last. With
-  // no private keys the suffix's leading comma must go too.
+  // Drop the closing brace: the suffix closes the object and wins last.
   const suffix = canonicalSuffix(model, maxTokens);
   const prefix = json.slice(0, -1);
-  return new TextEncoder().encode(prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix);
+  // The pinned suffix begins with a comma and must end the body exactly: a
+  // request with no private keys (no messages) cannot be pinned.
+  if (prefix === "{") throw new ConfidentialError("unsupported_endpoint", "a chat request needs messages");
+  return new TextEncoder().encode(prefix + suffix);
 }
 
 /**
@@ -558,11 +562,13 @@ async function fetchConfidentialImageOnce(
   let response: Response;
   if (result.image) {
     headers.set("content-type", "application/json");
+    // What fell short in an accepted response (it was paid at the flat price).
+    if (result.imageWarnings?.length) headers.set("x-routstr-confidential-warnings", result.imageWarnings.join("; "));
     response = new Response(JSON.stringify(result.image), { status: result.http.status, headers });
   } else {
     // An upstream error: its body as the provider sent it.
     for (const [k, v] of Object.entries(result.http.headers)) {
-      if (!HOP_BY_HOP_HEADERS.has(k.toLowerCase()) && !headers.has(k)) headers.set(k, v);
+      if (exposedProviderHeader(k) && !headers.has(k)) headers.set(k, v);
     }
     response = new Response(new Blob([result.http.body as BlobPart]), { status: result.http.status, headers });
   }
@@ -773,7 +779,7 @@ async function fetchConfidentialOnce(
 
   const headers = new Headers();
   for (const [k, v] of Object.entries(head.headers)) {
-    if (!HOP_BY_HOP_HEADERS.has(k.toLowerCase())) headers.set(k, v);
+    if (exposedProviderHeader(k)) headers.set(k, v);
   }
   headers.set("x-routstr-verify", "confidential");
   headers.set("x-routstr-confidential-sid", session.sid);

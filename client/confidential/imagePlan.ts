@@ -52,10 +52,20 @@ export function chooseImageVariant(
     throw new ConfidentialError("offer_malformed", `the node does not generate ${model} images confidentially`);
   }
   const countKey = countKeyOf(images);
-  const rawCount = request[countKey] ?? request.n ?? request.variants ?? request.count ?? 1;
+  // The count may come under any of its names, but they must agree: a request
+  // naming two different counts is refused, not resolved silently.
+  const named = [...new Set([countKey, "n", "variants", "count"])].filter((k) => request[k] !== undefined);
+  const counts = new Set(named.map((k) => request[k]));
+  if (counts.size > 1) {
+    refuseImage(`the request names different image counts (${named.map((k) => `${k}=${String(request[k])}`).join(", ")})`);
+  }
+  const rawCount = named.length ? request[named[0]!] : 1;
   const count = typeof rawCount === "number" ? rawCount : NaN;
   if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
     refuseImage(`confidential image requests take 1 to ${images.max_count} images, not ${String(rawCount)}`);
+  }
+  if (typeof request.prompt !== "string" || !request.prompt.trim()) {
+    refuseImage("an image request needs a non-empty prompt");
   }
   for (const fmt of [request.format, request.output_format]) {
     if (fmt !== undefined && fmt !== "webp") refuseImage(`confidential images are WebP only, not ${String(fmt)}`);
@@ -105,6 +115,15 @@ export function chooseImageVariant(
   }
   // Several match (the caller left a tier open): the cheapest, normally the default tier.
   const variant = matches.reduce((a, b) => (b.msat_per_image < a.msat_per_image ? b : a));
+  if (variant.max_count !== undefined && count > variant.max_count) {
+    refuseImage(`${model} ${variant.id} takes at most ${variant.max_count} image(s) per request, not ${count}`);
+  }
+  // Never let a pin silently override what the caller asked for privately.
+  for (const [k] of variant.pins) {
+    if (!IMAGE_SELECTOR_KEYS.has(k) && request[k] !== undefined) {
+      refuseImage(`${k} is pinned by the ${variant.id} variant and cannot be set in the request`);
+    }
+  }
   return { model, variant, count, countKey };
 }
 
