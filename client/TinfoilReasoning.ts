@@ -1,11 +1,10 @@
 /**
  * Tinfoil reasoning-effort translation, applied before EHBP sealing.
  *
- * Tinfoil publishes a per-model `effort_map` (caller-facing level -> the value
- * the model's chat template accepts). The two layers do not agree on the
- * vocabulary: the gateway's `reasoning_effort` literal set includes `medium`,
- * but DeepSeek V4.1's template only accepts `low`/`high`/`xhigh`/`max` and
- * rejects a literal `medium`:
+ * Tinfoil's gateway and its models do not agree on `reasoning_effort`: the
+ * gateway advertises the OpenAI literals
+ * (`none|minimal|low|medium|high|xhigh|max`), while a model's chat template can
+ * be narrower. DeepSeek V4.1 and GLM 5.3 reject a literal `medium`:
  *
  *   DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, or an
  *   integer within [1, 100] in chat_template_kwargs
@@ -14,10 +13,33 @@
  * and cannot rewrite the field. The translation therefore has to happen here,
  * inside the client, before the request is sealed.
  *
- * The map is advertised by the node on `/v1/models` (`reasoning.effort_map`;
- * see the Tinfoil `fetch_models` in routstr-core). When it is absent — an older
- * node, or a model with no effort levels — the body is forwarded unchanged
- * rather than guessed at.
+ * Nodes running routstr-core#848 publish the per-model map on `/v1/models`
+ * (`reasoning.effort_map`): the caller-facing levels a UI offers
+ * (`low`/`medium`/`high`) as keys, the spelling the model's template accepts as
+ * values.
+ *
+ * This deliberately mirrors the node's own readable-body translation in
+ * `TinfoilUpstreamProvider._apply_reasoning_effort`, because the same model
+ * must behave the same whether its body reaches the enclave plaintext or sealed
+ * through EHBP. Two rules follow from that:
+ *
+ * - Only levels the model *rejects* are translated. A value that is already one
+ *   of the model's own spellings is left exactly as sent: the map's keys
+ *   overlap its values (DeepSeek maps `high` -> `xhigh` while also accepting
+ *   `high`), so a key must never win over a value that is already legal.
+ *   Otherwise a caller asking for `high` silently gets `xhigh`.
+ * - Levels the map does not mention (`none`, `max`, `minimal`, integers) pass
+ *   through unchanged. `none` disables reasoning and `max` outranks `xhigh`, so
+ *   reshaping either would change what the caller asked for.
+ *
+ * Tinfoil publishes `effort_map` alone, with no `supported_efforts`, and one
+ * must not be derived from the map's values: routstr-core *applies* that field
+ * by snapping a request onto its members, which is what turned a deliberate
+ * `none` into `low` and downgraded `max`. The map's values are the model's
+ * spellings for the three coarse levels, not the set of values it accepts.
+ *
+ * When the map is absent — an older node, or a model whose reasoning is a plain
+ * on/off toggle — the body is forwarded unchanged rather than guessed at.
  */
 
 import type { ModelReasoning } from "../core/types";
@@ -46,19 +68,50 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizeEffort(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/**
+ * The model's own spellings — the map's values. A body carrying one of these is
+ * already native and must not be rewritten, even when the same string is also a
+ * map key: DeepSeek publishes `high` as both a key (-> `xhigh`) and a value, and
+ * a caller who asked for `high` means the native level, not the coarse key.
+ */
+function nativeEfforts(
+  effortMap: Readonly<Record<string, unknown>>,
+): ReadonlySet<string> {
+  const native = new Set<string>();
+  for (const value of Object.values(effortMap)) {
+    if (typeof value === "string" && value.trim() !== "") {
+      native.add(normalizeEffort(value));
+    }
+  }
+  return native;
+}
+
 function mappedEffort(
   effort: string,
   effortMap: Readonly<Record<string, unknown>>,
+  native: ReadonlySet<string>,
 ): string | null {
-  const requested = effort.trim().toLowerCase();
+  const requested = normalizeEffort(effort);
   if (requested === "") {
     return null;
   }
-  const mapped = effortMap[requested];
-  if (typeof mapped !== "string" || mapped.trim() === "") {
+  // Already legal for this model: leave it exactly as sent.
+  if (native.has(requested)) {
     return null;
   }
-  return mapped;
+  const mapped = effortMap[requested];
+  if (typeof mapped !== "string") {
+    return null;
+  }
+  const nativeValue = mapped.trim();
+  if (nativeValue === "" || nativeValue === effort) {
+    return null;
+  }
+  return nativeValue;
 }
 
 /**
@@ -73,6 +126,7 @@ function rewriteAtSite(
   body: Record<string, unknown>,
   site: EffortSite,
   effortMap: Readonly<Record<string, unknown>>,
+  native: ReadonlySet<string>,
 ): Record<string, unknown> | null {
   const container = site.parent === null ? body : body[site.parent];
   if (!isPlainObject(container)) {
@@ -84,7 +138,7 @@ function rewriteAtSite(
     return null;
   }
 
-  const mapped = mappedEffort(current, effortMap);
+  const mapped = mappedEffort(current, effortMap, native);
   if (mapped === null || mapped === current) {
     return null;
   }
@@ -104,6 +158,10 @@ function rewriteAtSite(
  * enclave validates whichever ones it reads. A body carrying two shapes
  * therefore comes out fully native rather than half-translated.
  *
+ * Only levels the model rejects are translated: a value that is already one of
+ * the model's own spellings, or one the map does not cover (`none`, `max`, an
+ * integer), is forwarded untouched.
+ *
  * Returns the original body object when nothing has to change — no map, a
  * non-object body, no effort field, a value the map does not cover, or a value
  * that is already native (`high`, `xhigh`, ...). Each value is written back to
@@ -120,12 +178,14 @@ export function applyTinfoilReasoningEffort(
     return body;
   }
 
+  const native = nativeEfforts(effortMap);
+
   // Thread each rewrite into the next site's read, so a body with several
   // shapes is fully translated in one pass. Each `rewriteAtSite` copies only
   // the containers on its own path, so untouched siblings keep their identity.
   let next: Record<string, unknown> = body;
   for (const site of EFFORT_SITES) {
-    const rewritten = rewriteAtSite(next, site, effortMap);
+    const rewritten = rewriteAtSite(next, site, effortMap, native);
     if (rewritten !== null) {
       next = rewritten;
     }

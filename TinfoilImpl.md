@@ -75,27 +75,48 @@ integer 1-100) inside `chat_template_kwargs` and rejects a literal `medium` with
 
 Because EHBP encrypts the body end to end, the Routstr proxy is a blind relay
 and cannot rewrite the field, so the translation happens here, before sealing.
-Nodes running routstr-core with routstr#848 publish the mapping per model on
+Nodes running routstr-core with routstr#848 publish the map per model on
 `/v1/models`:
 
 ```json
 {
   "reasoning": {
-    "supported_efforts": ["xhigh", "high", "low"],
     "effort_map": { "low": "low", "medium": "high", "high": "xhigh" },
     "mandatory": false
   }
 }
 ```
 
+The map's keys are the coarse levels a UI offers; its values are the spellings
+the model's template accepts. `effort_map` is published alone — Tinfoil
+publishes no `supported_efforts`, and the SDK must not derive one from the
+map's values, because routstr-core *applies* that field by snapping requests
+onto it (that is how a deliberate `none` used to become `low` and `max` was
+downgraded to `xhigh`).
+
 `applyTinfoilReasoningEffort` rewrites all three shapes a caller may use —
 `reasoning_effort`, `reasoning.effort`, and `chat_template_kwargs.reasoning_effort`
 — in one pass, each in the shape it was sent (copy-on-write, so retries still
 rebuild from the caller's untouched body). A body that carries more than one
-shape has every one of them translated, not just the first. It runs per attempt,
-so a failover target's own map is respected. Values the map does not cover are
-forwarded unchanged: without published metadata the SDK does not guess. Models with no effort levels (a plain on/off reasoning toggle) publish no
-`reasoning` object and are unaffected.
+shape has every one of them translated, not just the first.
+
+Only levels the model rejects are translated:
+
+- A value that is already one of the model's own spellings is left exactly as
+  sent. Keys overlap values (DeepSeek maps `high` -> `xhigh` while accepting
+  `high`), so a key never wins over an already-legal value — otherwise a caller
+  asking for `high` would silently get `xhigh`.
+- Levels the map does not mention (`none`, `max`, `minimal`, integers) pass
+  through unchanged, since `none` disables reasoning and `max` outranks `xhigh`.
+
+This mirrors the node's own readable-body translation, so a model behaves the
+same whether its body is plaintext or sealed. The mapping runs per attempt: a
+failover target applies its own map. When the target does not advertise the
+model it publishes no map, and the retry forwards the caller's effort untouched
+rather than reusing the failed node's vocabulary — `effort_map` describes one
+node's enclave. Without metadata the SDK does not guess. Models with no effort
+levels (a plain on/off reasoning toggle) publish no `reasoning` object and are
+unaffected.
 
 ## Proxy-side error handling
 

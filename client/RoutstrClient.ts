@@ -2113,12 +2113,22 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${failoverModelId}`
         );
-        // Get new model for this provider
+        // Get new model for this provider. When the target does not advertise
+        // the model it publishes no effort map of its own, so drop the failed
+        // node's instead of inheriting it: `reasoning.effort_map` describes the
+        // vocabulary *that* node's enclave serves, and the retry is sealed
+        // against a different enclave. Translating with the old map would send
+        // node B an effort spelled for node A. Everything else about the model
+        // (pricing, per-request limits) still falls back as before.
+        const failoverModel = await this.providerManager.getModelForProvider(
+          nextProvider,
+          failoverModelId
+        );
         newModel =
-          (await this.providerManager.getModelForProvider(
-            nextProvider,
-            failoverModelId
-          )) ?? selectedModel;
+          failoverModel ??
+          (params.tinfoilEnabled
+            ? { ...selectedModel, reasoning: undefined }
+            : selectedModel);
 
         const messagesForPricing = Array.isArray(
           (body as { messages?: unknown })?.messages

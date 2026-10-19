@@ -43,10 +43,25 @@ const KEY = "sk-test-key";
 const CALLER_MODEL = "tinfoil-deepseek-v4-1-flash";
 const WIRE_MODEL = "deepseek-v4-1-flash";
 
-/** What routstr-core publishes for DeepSeek V4.1 after the metadata change. */
+/**
+ * What routstr-core#848 publishes for DeepSeek V4.1 (live `fetch_models`).
+ *
+ * `effort_map` alone: core deliberately publishes no `supported_efforts`,
+ * because that field is not just advertised, it is *applied* (readable bodies
+ * are snapped onto its members) and the map's values are not an allowlist —
+ * `none`, `max` and integers are valid too.
+ *
+ * `high` is both a key and a value here: the case that used to rewrite an
+ * already-native `high` into `xhigh`.
+ */
 const DEEPSEEK_REASONING: ModelReasoning = {
-  supported_efforts: ["xhigh", "high", "low"],
   effort_map: { low: "low", medium: "high", high: "xhigh" },
+  mandatory: false,
+};
+
+/** A second node's vocabulary, so "per attempt" is observable. */
+const OTHER_NODE_REASONING: ModelReasoning = {
+  effort_map: { low: "low", medium: "xhigh", high: "max" },
   mandatory: false,
 };
 
@@ -191,8 +206,9 @@ describe("applyTinfoilReasoningEffort", () => {
       chat_template_kwargs: { thinking: true, reasoning_effort: "high" },
     });
 
-    // All three at once, each mapping differently: `low` -> `low`,
-    // `medium` -> `high`, `high` -> `xhigh`.
+    // All three at once. `low` maps to itself, `medium` -> `high`, and `high`
+    // is already native so it stays put even though the map also has a `high`
+    // key: a key never wins over a value the model already accepts.
     expect(
       applyTinfoilReasoningEffort(
         {
@@ -207,8 +223,25 @@ describe("applyTinfoilReasoningEffort", () => {
       model: WIRE_MODEL,
       reasoning_effort: "low",
       reasoning: { effort: "high", exclude: true },
-      chat_template_kwargs: { reasoning_effort: "xhigh" },
+      chat_template_kwargs: { reasoning_effort: "high" },
     });
+  });
+
+  it("does not rewrite a level that is already native, even when the map keys it", () => {
+    // DeepSeek publishes `high` as both a key (-> `xhigh`) and a native value.
+    // A caller who sent `high` asked for the native level; bumping it to
+    // `xhigh` changed the request behind their back, and diverged from what
+    // the node does with the same body on the readable path.
+    const body = { model: WIRE_MODEL, reasoning_effort: "high" };
+    expect(applyTinfoilReasoningEffort(body, DEEPSEEK_REASONING)).toBe(body);
+
+    const nested = {
+      model: WIRE_MODEL,
+      chat_template_kwargs: { reasoning_effort: "high" },
+    };
+    expect(applyTinfoilReasoningEffort(nested, DEEPSEEK_REASONING)).toBe(
+      nested,
+    );
   });
 
   it("leaves the caller's nested containers untouched when rewriting them", () => {
@@ -236,10 +269,12 @@ describe("applyTinfoilReasoningEffort", () => {
       native,
     );
 
-    const unmapped = { model: WIRE_MODEL, reasoning_effort: "minimal" };
-    expect(applyTinfoilReasoningEffort(unmapped, DEEPSEEK_REASONING)).toBe(
-      unmapped,
-    );
+    // Not map keys, but legal for the model: `none` disables reasoning and
+    // `max` outranks `xhigh`, so neither may be reshaped.
+    for (const effort of ["minimal", "none", "max"]) {
+      const body = { model: WIRE_MODEL, reasoning_effort: effort };
+      expect(applyTinfoilReasoningEffort(body, DEEPSEEK_REASONING)).toBe(body);
+    }
   });
 
   it("is a no-op without published metadata", () => {
@@ -341,11 +376,7 @@ describe("_handleErrorResponse Tinfoil failover effort mapping", () => {
     },
   });
 
-  it("re-maps the caller effort on the failover retry", async () => {
-    const { client, providerManager } = setup();
-    providerManager.getModelForProvider.mockResolvedValue(
-      model(CALLER_MODEL, DEEPSEEK_REASONING),
-    );
+  const respondOk = () =>
     fetchTinfoil.mockResolvedValue(
       new Response("{}", {
         status: 200,
@@ -353,7 +384,8 @@ describe("_handleErrorResponse Tinfoil failover effort mapping", () => {
       }),
     );
 
-    await (client as any)._handleErrorResponse(
+  const failOver = (client: RoutstrClient) =>
+    (client as any)._handleErrorResponse(
       params,
       KEY,
       400,
@@ -363,6 +395,17 @@ describe("_handleErrorResponse Tinfoil failover effort mapping", () => {
       0,
     );
 
+  it("re-maps the caller effort against the failover target's own map", async () => {
+    const { client, providerManager } = setup();
+    // Node B spells the same coarse level differently. Reusing node A's map
+    // would seal `high`; only node B's own map produces `xhigh`.
+    providerManager.getModelForProvider.mockResolvedValue(
+      model(CALLER_MODEL, OTHER_NODE_REASONING),
+    );
+    respondOk();
+
+    await failOver(client);
+
     // Only the failover retry reaches the wire. The bare id is #103's
     // invariant (asserted here because the retry is the only path that
     // rebuilds it); the mapped effort is this PR's: node B's own effort map
@@ -370,7 +413,30 @@ describe("_handleErrorResponse Tinfoil failover effort mapping", () => {
     expect(fetchTinfoil).toHaveBeenCalledTimes(1);
     expect(sealedBody()).toMatchObject({
       model: WIRE_MODEL,
-      reasoning_effort: "high",
+      reasoning_effort: "xhigh",
     });
+  });
+
+  it("forwards the caller effort untouched when the target publishes no map", async () => {
+    const { client, providerManager } = setup();
+    providerManager.getModelForProvider.mockResolvedValue(model(CALLER_MODEL));
+    respondOk();
+
+    await failOver(client);
+
+    expect(sealedBody().reasoning_effort).toBe("medium");
+  });
+
+  it("does not reuse the failed node's map when the target does not list the model", async () => {
+    const { client, providerManager } = setup();
+    providerManager.getModelForProvider.mockResolvedValue(null);
+    respondOk();
+
+    await failOver(client);
+
+    // `selectedModel` for the retry falls back to node A's model, but its
+    // `effort_map` describes node A's enclave. Inheriting it would seal `high`
+    // here; the caller's value must reach node B untouched instead.
+    expect(sealedBody().reasoning_effort).toBe("medium");
   });
 });
