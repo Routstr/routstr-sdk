@@ -5,6 +5,7 @@
  * provider based on model pricing, with automatic Cashu token handling.
  */
 
+import { ConfidentialError } from "./client/confidential/errors";
 import type { ConfidentialRequestOptions } from "./client/confidential/transport";
 import type { Model, Message, SdkLogger } from "./core/types";
 import type { DiscoveryAdapter } from "./discovery/interfaces";
@@ -274,7 +275,7 @@ export async function routeRequests(
   } catch (error) {
     // Preserve typed SDK errors so callers (e.g. routstrd) can instanceof-check
     // them and map to the correct HTTP status (e.g. 402 for InsufficientBalanceError).
-    if (error instanceof InsufficientBalanceError) {
+    if (error instanceof InsufficientBalanceError || error instanceof ConfidentialError) {
       throw error;
     }
 
