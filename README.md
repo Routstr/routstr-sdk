@@ -91,7 +91,7 @@ const currentMode = client.getMode(); // Returns the active mode
 
 `routeRequests({ …, confidential: { trustedHosts, nodePubkeys, proverPath } })`
 runs the request so the node relays ciphertext and never sees the prompt or the
-response. Only nodes advertising `confidential_upstream` for the model are
+response; chat completions and, on nodes that offer them, image generation. Only nodes advertising `confidential_upstream` for the model are
 used; credentials and balance accounting are unchanged. See
 [`client/confidential/README.md`](client/confidential/README.md).
 
