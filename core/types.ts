@@ -102,6 +102,23 @@ export interface PerRequestLimits {
   readonly [key: string]: number | undefined;
 }
 
+/**
+ * Per-model reasoning metadata, as a node advertises it on `/v1/models`.
+ *
+ * OpenRouter publishes the flat fields; `effort_map` is the Routstr extension
+ * Tinfoil models carry: the caller-facing effort levels a UI offers as keys,
+ * the exact spelling the upstream accepts as values (e.g. DeepSeek V4.1 maps
+ * `medium` -> `high` and rejects a literal `medium`).
+ */
+export interface ModelReasoning {
+  mandatory?: boolean | null;
+  default_enabled?: boolean | null;
+  supported_efforts?: readonly string[] | null;
+  default_effort?: string | null;
+  supports_max_tokens?: boolean | null;
+  effort_map?: Readonly<Record<string, string>> | null;
+}
+
 export interface Model {
   id: string;
   name: string;
@@ -112,6 +129,11 @@ export interface Model {
   pricing?: ModelPricing;
   sats_pricing: ModelSatsPricing;
   per_request_limits?: PerRequestLimits;
+  /**
+   * Reasoning-effort metadata published by the node. Absent for models without
+   * effort levels, and for nodes that do not advertise it yet.
+   */
+  reasoning?: ModelReasoning | null;
   /**
    * Alternative IDs the provider accepts for this model (OpenRouter-style).
    * Used together with kind 38426 model ID mappings to resolve non-canonical

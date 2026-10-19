@@ -61,6 +61,41 @@ Client SDK                         Routstr Provider / Proxy              Tinfoil
   happens inside the Tinfoil EHBP fetch path.
 - EHBP key-config mismatch responses still trigger one fresh attestation and one
   retry, matching stock `SecureClient.fetch` key-rotation behavior.
+- The caller's reasoning effort is translated to the model's own vocabulary
+  before sealing (see below).
+
+## Reasoning effort
+
+Tinfoil's gateway and its models do not agree on the `reasoning_effort`
+vocabulary. The gateway accepts
+`none|minimal|low|medium|high|xhigh|max`, but a model's chat template can be
+narrower: DeepSeek V4.1 only accepts `low`, `high`, `xhigh`, `max` (or an
+integer 1-100) inside `chat_template_kwargs` and rejects a literal `medium` with
+`400 invalid_request_error`.
+
+Because EHBP encrypts the body end to end, the Routstr proxy is a blind relay
+and cannot rewrite the field, so the translation happens here, before sealing.
+Nodes running routstr-core with routstr#848 publish the mapping per model on
+`/v1/models`:
+
+```json
+{
+  "reasoning": {
+    "supported_efforts": ["xhigh", "high", "low"],
+    "effort_map": { "low": "low", "medium": "high", "high": "xhigh" },
+    "mandatory": false
+  }
+}
+```
+
+`applyTinfoilReasoningEffort` rewrites all three shapes a caller may use —
+`reasoning_effort`, `reasoning.effort`, and `chat_template_kwargs.reasoning_effort`
+— in one pass, each in the shape it was sent (copy-on-write, so retries still
+rebuild from the caller's untouched body). A body that carries more than one
+shape has every one of them translated, not just the first. It runs per attempt,
+so a failover target's own map is respected. Values the map does not cover are
+forwarded unchanged: without published metadata the SDK does not guess. Models with no effort levels (a plain on/off reasoning toggle) publish no
+`reasoning` object and are unaffected.
 
 ## Proxy-side error handling
 
