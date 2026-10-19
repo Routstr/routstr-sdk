@@ -79,6 +79,7 @@ import type {
   ConfidentialRequestOptions,
 } from "./confidential/transport";
 import type { ConfidentialOffer } from "./confidential/offer";
+import { chooseImageVariant } from "./confidential/imagePlan";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -260,10 +261,18 @@ export function confidentialImageRequiredSats(
   const images = offer?.images;
   const variants = images?.price_list?.[model];
   if (!images || !Array.isArray(variants) || variants.length === 0) return undefined;
-  const countKey = typeof images.count_key === "string" && images.count_key ? images.count_key : "variants";
-  const raw = body[countKey] ?? body.n ?? body.variants ?? 1;
-  const count = typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0 ? raw : 1;
-  const price = Math.max(...variants.map((v) => v.msat_per_image));
+  // The variant and count the request itself will ask for. A request the
+  // offer cannot serve is refused later anyway; size it for the dearest.
+  let price: number;
+  let count: number;
+  try {
+    const chosen = chooseImageVariant({ ...body, model }, images);
+    price = chosen.variant.msat_per_image;
+    count = chosen.count;
+  } catch {
+    price = Math.max(...variants.map((v) => v.msat_per_image));
+    count = 1;
+  }
   const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
   const msats = Math.ceil(price * count) + Math.max(fee(offer!.session_fee_msat), fee(offer!.abandon_fee_msat));
   return Math.ceil(msats / 1000);
