@@ -27,6 +27,10 @@
  * a warm session most of the prompt is billed at the cache rate, which can be
  * 5-10x cheaper than the prompt rate.
  *
+ * Routing prices WARM_COST_BASKET; DEFAULT_COST_BASKET is the cold basket the
+ * old `prompt + completion` key implied, kept so the two orderings can be
+ * compared.
+ *
  * Pure: no I/O, no selection policy. ProviderManager ranks on it.
  */
 
@@ -66,6 +70,28 @@ export const DEFAULT_COST_BASKET: CostBasket = {
   promptTokens: 1_000_000,
   outputTokens: 1_000_000,
   cacheHitRate: 0,
+  cacheWriteRate: 0,
+};
+
+/**
+ * The basket routing prices a request against.
+ *
+ * A warm session: 90% of the prompt is served from the upstream cache, so the
+ * prompt is billed mostly at the cache rate — which is 5-10x cheaper than the
+ * prompt rate — instead of at the prompt rate. Ranking on this picks the route
+ * a continuing conversation would actually be billed on, rather than the route
+ * with the cheapest cold `prompt + completion` sum.
+ *
+ * The token counts are a chat-sized warm turn, not a measured one: deriving
+ * them from the request (prompt tokens, `max_tokens`, a hit rate measured from
+ * the session) is the follow-up, and this constant is where that lands. Keep
+ * `outputTokens` small relative to `promptTokens` — a large output weight
+ * dilutes the cache-rate signal into the completion rate.
+ */
+export const WARM_COST_BASKET: CostBasket = {
+  promptTokens: 100_000,
+  outputTokens: 2_000,
+  cacheHitRate: 0.9,
   cacheWriteRate: 0,
 };
 
