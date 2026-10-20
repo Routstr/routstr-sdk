@@ -213,11 +213,13 @@ async function main(): Promise<void> {
     const { breakdown, rates, basket } = cheapest;
     console.error(
       `Cost ${cheapest.cost.toFixed(2)} sats for ${basket.promptTokens} prompt @ ` +
-        `${(basket.cacheHitRate * 100).toFixed(0)}% cache hit + ${basket.outputTokens} output ` +
+        `${(basket.cacheHitRate * 100).toFixed(0)}% cache hit / ` +
+        `${(basket.cacheWriteRate * 100).toFixed(0)}% cache write + ${basket.outputTokens} output ` +
         `(fresh=${breakdown.freshInputSats.toFixed(2)} cache-read=${breakdown.cacheReadSats.toFixed(2)} ` +
-        `out=${breakdown.outputSats.toFixed(2)} request=${breakdown.requestSats.toFixed(2)}); ` +
+        `cache-write=${breakdown.cacheWriteSats.toFixed(2)} out=${breakdown.outputSats.toFixed(2)}); ` +
         `rates prompt=${rates.prompt} cache-read=${rates.cacheRead} (${rates.cacheReadSource}) ` +
-        `completion=${rates.completion}`
+        `cache-write=${rates.cacheWrite} (${rates.cacheWriteSource}) completion=${rates.completion} ` +
+        `request=${breakdown.requestSats.toFixed(2)} (reserved, not billed)`
     );
   }
 

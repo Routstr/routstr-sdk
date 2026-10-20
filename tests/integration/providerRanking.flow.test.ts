@@ -235,9 +235,10 @@ describe("provider ranking integration flow", () => {
     expect(ranking).toHaveLength(2);
 
     // Cheapest provider (1+1 = 2 sats/token on the default basket) first.
-    // The default basket is 1M prompt + 1M completion at a 0% cache hit, so
-    // the cost is the same prompt+completion per-million sum the ranking
-    // used before, with the per-request fee added.
+    // The default basket is 1M prompt + 1M completion, all fresh, so the cost
+    // is exactly the prompt+completion per-million sum the ranking used
+    // before. Any per-request fee is reported, not billed, so it cannot move
+    // this order.
     expect(ranking[0].baseUrl).toBe(`${PROVIDER_B_URL}/`);
     expect(ranking[0].cost).toBe(2_000_000);
     expect(ranking[0].breakdown.freshInputSats).toBe(1_000_000);

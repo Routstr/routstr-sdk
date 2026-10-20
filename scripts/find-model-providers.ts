@@ -39,7 +39,8 @@ async function main(): Promise<void> {
 
   const { basket } = ranking[0];
   console.log(
-    `Basket: ${basket.promptTokens} prompt @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit, ${basket.outputTokens} output`
+    `Basket: ${basket.promptTokens} prompt @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit / ` +
+      `${(basket.cacheWriteRate * 100).toFixed(0)}% cache write, ${basket.outputTokens} output`
   );
 
   for (const entry of ranking) {
@@ -48,10 +49,11 @@ async function main(): Promise<void> {
       `${entry.baseUrl} cost=${entry.cost.toFixed(2)} sats ` +
         `(fresh=${breakdown.freshInputSats.toFixed(2)} ` +
         `cache-read=${breakdown.cacheReadSats.toFixed(2)} ` +
-        `out=${breakdown.outputSats.toFixed(2)} ` +
-        `request=${breakdown.requestSats.toFixed(2)}) ` +
+        `cache-write=${breakdown.cacheWriteSats.toFixed(2)} ` +
+        `out=${breakdown.outputSats.toFixed(2)}) ` +
         `rates: prompt=${rates.prompt} cache-read=${rates.cacheRead} (${rates.cacheReadSource}) ` +
-        `cache-write=${rates.cacheWrite} completion=${rates.completion}`
+        `cache-write=${rates.cacheWrite} (${rates.cacheWriteSource}) completion=${rates.completion} ` +
+        `request=${breakdown.requestSats.toFixed(2)} (reserved, not billed)`
     );
   }
 }
