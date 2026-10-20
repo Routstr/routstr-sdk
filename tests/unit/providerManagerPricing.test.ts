@@ -3,6 +3,7 @@ import {
   ProviderManager,
   completionCapFromBody,
 } from "../../client/ProviderManager";
+import { estimateCost } from "../../client/costEstimate";
 import {
   clearModelPathsCache,
   DEEPSEEK_AUTO_NODE_URLS,
@@ -143,7 +144,7 @@ describe("ProviderManager", () => {
       expect(manager.getBestProviderForModel("gpt-4o-mini")).toBeNull();
     });
 
-    it("returns calculated per-million prices in ranking", () => {
+    it("prices the default basket per token class", () => {
       const registry = createRegistry({
         getCachedModels: () => ({
           "https://alpha.example.com/": [
@@ -158,9 +159,19 @@ describe("ProviderManager", () => {
       const manager = new ProviderManager(registry);
       const [entry] = manager.getProviderPriceRankingForModel("gpt-4o-mini");
 
-      expect(entry.promptPerMillion).toBe(150_000);
-      expect(entry.completionPerMillion).toBe(600_000);
-      expect(entry.totalPerMillion).toBe(750_000);
+      // 1M prompt (cold: all fresh, billed at the prompt rate) + 1M output.
+      expect(entry.basket).toEqual({
+        promptTokens: 1_000_000,
+        outputTokens: 1_000_000,
+        cacheHitRate: 0,
+        cacheWriteRate: 0,
+      });
+      expect(entry.breakdown.freshInputTokens).toBe(1_000_000);
+      expect(entry.breakdown.cacheReadTokens).toBe(0);
+      expect(entry.breakdown.cacheWriteTokens).toBe(0);
+      expect(entry.breakdown.freshInputSats).toBe(150_000);
+      expect(entry.breakdown.outputSats).toBe(600_000);
+      expect(entry.cost).toBe(750_000);
     });
 
     it("skips providers without sats_pricing", () => {
@@ -200,6 +211,245 @@ describe("ProviderManager", () => {
       expect(
         manager.getProviderPriceRankingForModel("gpt-4o-mini")
       ).toHaveLength(1);
+    });
+
+    it("orders exactly like prompt+completion per million on the default basket", () => {
+      // Real sats-per-token rates, i.e. the small fractions a node publishes,
+      // not per-million integers.
+      const routes = {
+        "https://a.example.com/": { prompt: 0.000332, completion: 0.015921 },
+        "https://b.example.com/": { prompt: 0.002708, completion: 0.013541 },
+        "https://c.example.com/": { prompt: 0.000453, completion: 0.02171 },
+        "https://d.example.com/": { prompt: 0.005002, completion: 0.025009 },
+        "https://e.example.com/": { prompt: 0.004897, completion: 0.024485 },
+      };
+      const registry = createRegistry({
+        getCachedModels: () =>
+          Object.fromEntries(
+            Object.entries(routes).map(([baseUrl, sats_pricing]) => [
+              baseUrl,
+              [{ id: "kimi-k3", sats_pricing }],
+            ])
+          ) as any,
+      });
+
+      const ranking = new ProviderManager(
+        registry
+      ).getProviderPriceRankingForModel("kimi-k3");
+
+      const legacy = Object.entries(routes)
+        .map(([baseUrl, p]) => ({
+          baseUrl,
+          total: (p.prompt + p.completion) * 1_000_000,
+        }))
+        .sort((x, y) => x.total - y.total || x.baseUrl.localeCompare(y.baseUrl));
+      expect(ranking.map((entry) => entry.baseUrl)).toEqual(
+        legacy.map((entry) => entry.baseUrl)
+      );
+      ranking.forEach((entry, index) => {
+        expect(entry.cost).toBeCloseTo(legacy[index]!.total, 6);
+      });
+    });
+
+    it("reports the per-request fee without ranking on it", () => {
+      // `sats_pricing.request` sizes the node's deposit ceiling; it is not part
+      // of the settled charge, so it must not decide an otherwise equal
+      // ranking. Every routstr-core node publishes a non-zero value there, so
+      // ranking on it would order routes by their reservation policy.
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://alpha.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1, request: 0 } },
+          ],
+          "https://zulu.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1, request: 50 } },
+          ],
+          "https://mid.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1 } },
+          ],
+        }) as any,
+      });
+
+      const ranking = new ProviderManager(
+        registry
+      ).getProviderPriceRankingForModel("gpt-4o-mini");
+
+      // A rate tie falls through to the URL tiebreak, fee or no fee.
+      expect(ranking.map((entry) => entry.baseUrl)).toEqual([
+        "https://alpha.example.com/",
+        "https://mid.example.com/",
+        "https://zulu.example.com/",
+      ]);
+      expect(ranking.map((entry) => entry.cost)).toEqual([
+        2_000_000, 2_000_000, 2_000_000,
+      ]);
+      // ... while the fee stays visible on the entry.
+      expect(ranking.map((entry) => entry.breakdown.requestSats)).toEqual([
+        0, 0, 50,
+      ]);
+    });
+
+    it("skips routes whose published rates are not prices", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          // A negative prompt rate would win every comparison; a NaN poisons
+          // the sort. Neither is a price, so neither is a candidate.
+          "https://negative.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: -1, completion: 1 } },
+          ],
+          "https://nan.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: Number.NaN, completion: 1 } },
+          ],
+          "https://infinite.example.com/": [
+            {
+              id: "gpt-4o-mini",
+              sats_pricing: { prompt: 1, completion: Number.POSITIVE_INFINITY },
+            },
+          ],
+          "https://sane.example.com/": [
+            { id: "gpt-4o-mini", sats_pricing: { prompt: 1, completion: 1 } },
+          ],
+        }) as any,
+      });
+
+      const ranking = new ProviderManager(
+        registry
+      ).getProviderPriceRankingForModel("gpt-4o-mini");
+      expect(ranking.map((entry) => entry.baseUrl)).toEqual([
+        "https://sane.example.com/",
+      ]);
+    });
+
+    it("ranks a warm basket by the bill, not by the prompt rate", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          // Cheapest prompt rate, expensive cache reads: wins cold.
+          "https://prompt-cheap.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 1, completion: 5, input_cache_read: 10 },
+            },
+          ],
+          // Expensive prompt rate, cheap cache reads: wins warm.
+          "https://cache-cheap.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 5, input_cache_read: 0.5 },
+            },
+          ],
+        }) as any,
+      });
+      const manager = new ProviderManager(registry);
+      const basket = { promptTokens: 100_000, outputTokens: 2_000, cacheHitRate: 0.9 };
+
+      expect(
+        manager
+          .getProviderPriceRankingForModel("kimi-k3")
+          .map((entry) => entry.baseUrl)
+      ).toEqual(["https://prompt-cheap.example.com/", "https://cache-cheap.example.com/"]);
+
+      const warm = manager.getProviderPriceRankingForModel("kimi-k3", { basket });
+      expect(warm.map((entry) => entry.baseUrl)).toEqual([
+        "https://cache-cheap.example.com/",
+        "https://prompt-cheap.example.com/",
+      ]);
+      expect(warm.map((entry) => entry.cost)).toEqual([105_000, 920_000]);
+      // The entry carries the resolved basket, so an unset share is explicit.
+      expect(warm[0].basket).toEqual({ ...basket, cacheWriteRate: 0 });
+      expect(warm[0].rates.cacheReadSource).toBe("advertised");
+      expect(warm[0].breakdown.cacheReadTokens).toBe(90_000);
+    });
+
+    it("does not let a route that publishes no cache rate win a warm basket", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://unannounced.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 10, input_cache_read: 0 },
+            },
+          ],
+          "https://advertised.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: { prompt: 5, completion: 10, input_cache_read: 0.5 },
+            },
+          ],
+        }) as any,
+      });
+      const manager = new ProviderManager(registry);
+      const basket = { promptTokens: 100_000, outputTokens: 2_000, cacheHitRate: 0.9 };
+
+      // 0 means "not announced": bill those tokens at the prompt rate, so the
+      // unverifiable claim cannot outrank a route that published a rate.
+      const selfReported = manager.getProviderPriceRankingForModel("kimi-k3", {
+        basket,
+      });
+      expect(selfReported.map((entry) => entry.baseUrl)).toEqual([
+        "https://advertised.example.com/",
+        "https://unannounced.example.com/",
+      ]);
+      expect(selfReported[1].rates.cacheReadSource).toBe("prompt");
+      expect(selfReported[1].cost).toBe(520_000);
+
+      // Ranking the other way round would need 0 read as free (70_000 here),
+      // which is the price the node does *not* charge.
+      expect(
+        estimateCost({ prompt: 5, completion: 10 }, basket).total
+      ).toBe(520_000);
+    });
+
+    it("orders a cache-writing basket by the write rate it would be billed", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://cheap-write.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: {
+                prompt: 1,
+                completion: 5,
+                input_cache_read: 0.1,
+                input_cache_write: 1,
+              },
+            },
+          ],
+          "https://dear-write.example.com/": [
+            {
+              id: "kimi-k3",
+              sats_pricing: {
+                prompt: 1,
+                completion: 5,
+                input_cache_read: 0.1,
+                input_cache_write: 4,
+              },
+            },
+          ],
+        }) as any,
+      });
+      const manager = new ProviderManager(registry);
+      const cold = { promptTokens: 100_000, outputTokens: 2_000, cacheHitRate: 0 };
+      const writing = { ...cold, cacheWriteRate: 0.5 };
+
+      // Equal on every other class, so a cold basket ties and falls back to
+      // the URL tiebreak...
+      const tied = manager.getProviderPriceRankingForModel("kimi-k3", {
+        basket: cold,
+      });
+      expect(tied.map((entry) => entry.baseUrl)).toEqual([
+        "https://cheap-write.example.com/",
+        "https://dear-write.example.com/",
+      ]);
+      expect(tied[0]!.cost).toBe(tied[1]!.cost);
+
+      // ...whereas a basket that writes half its prompt pays for the premium.
+      const warm = manager.getProviderPriceRankingForModel("kimi-k3", {
+        basket: writing,
+      });
+      expect(warm[0]!.baseUrl).toBe("https://cheap-write.example.com/");
+      expect(warm[0]!.breakdown.cacheWriteTokens).toBe(50_000);
+      expect(warm[0]!.breakdown.cacheWriteSats).toBe(50_000);
+      expect(warm[1]!.breakdown.cacheWriteSats).toBe(200_000);
+      expect(warm[1]!.cost - warm[0]!.cost).toBe(150_000);
     });
 
     it("alphabetical tiebreak when total prices are equal", () => {

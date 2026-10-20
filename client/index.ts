@@ -1,6 +1,7 @@
 // Client classes
 export * from "./RoutstrClient";
 export * from "./ProviderManager";
+export * from "./costEstimate";
 export * from "./StreamProcessor";
 export * from "./sse";
 export * from "./TinfoilSecure";

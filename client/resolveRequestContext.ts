@@ -14,6 +14,7 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
+import { WARM_COST_BASKET } from "./costEstimate";
 import { canonicalizeModelId, findModelForId, type ModelIdMappings } from "../core/modelMappings";
 import {
   RoutstrClient,
@@ -334,7 +335,7 @@ export async function resolveRequestContext(
     } else {
       const fallback = providerManager.getProviderPriceRankingForModel(
         modelId,
-        { torMode, includeDisabled: false }
+        { torMode, includeDisabled: false, basket: WARM_COST_BASKET }
       );
       if (fallback.length === 0) {
         throw new Error(`No providers found for model: ${modelId}`);
@@ -344,9 +345,12 @@ export async function resolveRequestContext(
       selectedModel = fallbackBest.model;
     }
   } else {
+    // Ranked on a warm basket: a continuing session is billed mostly at the
+    // cache rate, which is what the route should be chosen on.
     const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
       torMode,
       includeDisabled: false,
+      basket: WARM_COST_BASKET,
     });
     if (ranking.length === 0) {
       throw new Error(`No providers found for model: ${modelId}`);

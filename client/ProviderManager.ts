@@ -33,6 +33,14 @@ import {
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+import {
+  estimateCost,
+  hasUsableTokenRates,
+  resolveBasket,
+  type CostBasket,
+  type CostEstimate,
+  type CostRates,
+} from "./costEstimate";
 
 /**
  * Upper bound one auto-pin ranking waits for any single node's model paths.
@@ -174,12 +182,41 @@ const fetchProviderInfo = async (
   }
 };
 
+/**
+ * One provider priced against an explicit request basket.
+ *
+ * `cost` is what the basket would actually cost on this provider and is the
+ * ranking key. `rates` and `breakdown` are kept so the decision stays
+ * inspectable: which cache rate was used, whether the node advertised it, and
+ * how the sats split across token classes.
+ */
 export interface ModelProviderPrice {
   baseUrl: string;
   model: Model;
-  promptPerMillion: number;
-  completionPerMillion: number;
-  totalPerMillion: number;
+  /** Sats the node would settle for the whole basket. */
+  cost: number;
+  /** The rates the cost was computed from, with provenance. */
+  rates: CostRates;
+  /** Per-class sats for the basket, plus the same `rates` it used. */
+  breakdown: CostEstimate;
+  /** The basket this entry was priced against. */
+  basket: CostBasket;
+}
+
+/** Options shared by the price ranking and best-provider selection. */
+export interface ProviderRankingOptions {
+  torMode?: boolean;
+  includeDisabled?: boolean;
+  /**
+   * Token split to price. Defaults to DEFAULT_COST_BASKET, which reproduces
+   * the old prompt+completion per-million ordering exactly — pass a measured
+   * basket to rank on what a real request costs.
+   *
+   * `cacheWriteRate` defaults to 0: a client cannot know how much of a prompt
+   * an upstream will write to its cache, and the node only charges the write
+   * rate for the tokens upstream reports as cache creation.
+   */
+  basket?: Partial<CostBasket>;
 }
 
 /**
@@ -1759,15 +1796,33 @@ export class ProviderManager {
   }
 
   /**
-   * Get providers for a model sorted by prompt+completion pricing
+   * Get providers for a model, ranked by what one request basket costs.
+   *
+   * The cost of the basket (DEFAULT_COST_BASKET unless the caller passes one)
+   * is what the node would settle for it, billing each token class at the rate
+   * that class is charged: fresh input at the prompt rate, cache reads at the
+   * cache-read rate, cache writes at the cache-write rate, output at the
+   * completion rate. Routes that publish no usable cache rate are billed those
+   * tokens at the prompt rate — which is what the node charges — rather than
+   * ranked as though cache were free, so a published 0 cannot win.
+   *
+   * The per-request fee is not part of the ranking key: the node settles token
+   * classes only and uses that fee to size the deposit ceiling. It is reported
+   * in `breakdown.requestSats`.
+   *
+   * The default basket is the one this ranking implied before the key changed
+   * (1M prompt + 1M completion, no cache participation), so the ordering here
+   * is exactly the prompt+completion per-million ordering. Pass a measured
+   * basket to rank on what a real request costs.
    */
   getProviderPriceRankingForModel(
     modelId: string,
-    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+    options: ProviderRankingOptions = {}
   ): ModelProviderPrice[] {
     modelId = this.canonicalizeModelId(modelId);
     const includeDisabled = options.includeDisabled ?? false;
     const torMode = options.torMode ?? false;
+    const basket = resolveBasket(options.basket);
     const disabledProviders = new Set(this.discoveryAdapter.getDisabledProviders());
     const allModels = this.discoveryAdapter.getCachedModels();
     const results: ModelProviderPrice[] = [];
@@ -1785,37 +1840,50 @@ export class ProviderManager {
       const match = findModelForId(models, modelId, this.getModelIdMappings());
       if (!match?.sats_pricing) continue;
 
-      const prompt = match.sats_pricing.prompt;
-      const completion = match.sats_pricing.completion;
-      if (typeof prompt !== "number" || typeof completion !== "number") {
-        continue;
-      }
+      // A route whose only published rates are not prices (NaN, ±inf,
+      // negative) cannot be ranked on: a negative one wins every comparison
+      // and a NaN poisons the sort.
+      if (!hasUsableTokenRates(match.sats_pricing)) continue;
 
-      const promptPerMillion = prompt * 1_000_000;
-      const completionPerMillion = completion * 1_000_000;
-      const totalPerMillion = promptPerMillion + completionPerMillion;
+      const breakdown = estimateCost(match.sats_pricing, basket);
 
       results.push({
         baseUrl,
         model: match,
-        promptPerMillion,
-        completionPerMillion,
-        totalPerMillion,
+        cost: breakdown.total,
+        rates: breakdown.rates,
+        breakdown,
+        basket,
       });
     }
 
     results.sort((a, b) => {
-      if (a.totalPerMillion !== b.totalPerMillion) {
-        return a.totalPerMillion - b.totalPerMillion;
+      if (a.cost !== b.cost) {
+        return a.cost - b.cost;
       }
       return a.baseUrl.localeCompare(b.baseUrl);
     });
 
     if (results.length > 0) {
       const ranking = results
-        .map((r, i) => `  ${i + 1}. ${r.baseUrl} total=${r.totalPerMillion.toFixed(2)} sats/M (prompt=${r.promptPerMillion.toFixed(2)} completion=${r.completionPerMillion.toFixed(2)})`)
+        .map(
+          (r, i) =>
+            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats ` +
+            `(fresh=${r.breakdown.freshInputSats.toFixed(2)} ` +
+            `cache-read=${r.breakdown.cacheReadSats.toFixed(2)} ` +
+            `cache-write=${r.breakdown.cacheWriteSats.toFixed(2)} ` +
+            `out=${r.breakdown.outputSats.toFixed(2)}; ` +
+            `rates prompt=${r.rates.prompt} cache-read=${r.rates.cacheRead} ${r.rates.cacheReadSource} ` +
+            `cache-write=${r.rates.cacheWrite} ${r.rates.cacheWriteSource} completion=${r.rates.completion}; ` +
+            `request=${r.breakdown.requestSats.toFixed(2)} sats reserved, not billed)`
+        )
         .join("\n");
-      this.logger.log(`getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers):\n${ranking}`);
+      this.logger.log(
+        `getProviderPriceRankingForModel: ${modelId} ranking (${results.length} providers, ` +
+          `${basket.promptTokens} in @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit / ` +
+          `${(basket.cacheWriteRate * 100).toFixed(0)}% cache write, ` +
+          `${basket.outputTokens} out):\n${ranking}`
+      );
     } else {
       this.logger.log(`getProviderPriceRankingForModel: ${modelId} no providers found`);
     }
@@ -1828,7 +1896,7 @@ export class ProviderManager {
    */
   getBestProviderForModel(
     modelId: string,
-    options: { torMode?: boolean; includeDisabled?: boolean } = {}
+    options: ProviderRankingOptions = {}
   ): string | null {
     const ranking = this.getProviderPriceRankingForModel(modelId, options);
     return ranking[0]?.baseUrl ?? null;

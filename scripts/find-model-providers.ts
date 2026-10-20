@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   const providerManager = new ProviderManager(adapter);
   logStep("Bootstrapped providers and fetched models.");
 
-  logStep("Ranking providers by pricing...");
+  logStep("Ranking providers by request cost...");
   const ranking = providerManager.getProviderPriceRankingForModel(modelId);
   logStep(`Ranked ${ranking.length} matching providers.`);
 
@@ -37,12 +37,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  const { basket } = ranking[0];
+  console.log(
+    `Basket: ${basket.promptTokens} prompt @ ${(basket.cacheHitRate * 100).toFixed(0)}% cache hit / ` +
+      `${(basket.cacheWriteRate * 100).toFixed(0)}% cache write, ${basket.outputTokens} output`
+  );
+
   for (const entry of ranking) {
-    const prompt = entry.promptPerMillion.toFixed(2);
-    const completion = entry.completionPerMillion.toFixed(2);
-    const total = entry.totalPerMillion.toFixed(2);
+    const { breakdown, rates } = entry;
     console.log(
-      `${entry.baseUrl} prompt=${prompt} sats/M completion=${completion} sats/M total=${total} sats/M`
+      `${entry.baseUrl} cost=${entry.cost.toFixed(2)} sats ` +
+        `(fresh=${breakdown.freshInputSats.toFixed(2)} ` +
+        `cache-read=${breakdown.cacheReadSats.toFixed(2)} ` +
+        `cache-write=${breakdown.cacheWriteSats.toFixed(2)} ` +
+        `out=${breakdown.outputSats.toFixed(2)}) ` +
+        `rates: prompt=${rates.prompt} cache-read=${rates.cacheRead} (${rates.cacheReadSource}) ` +
+        `cache-write=${rates.cacheWrite} (${rates.cacheWriteSource}) completion=${rates.completion} ` +
+        `request=${breakdown.requestSats.toFixed(2)} (reserved, not billed)`
     );
   }
 }
