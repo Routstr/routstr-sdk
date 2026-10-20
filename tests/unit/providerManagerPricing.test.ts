@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ProviderManager } from "../../client/ProviderManager";
+import {
+  ProviderManager,
+  completionCapFromBody,
+} from "../../client/ProviderManager";
 import { estimateCost } from "../../client/costEstimate";
 import {
   clearModelPathsCache,
@@ -2466,7 +2469,7 @@ describe("ProviderManager", () => {
       ).toBe(60);
     });
 
-    it("does not discount a Responses max_output_tokens budget", () => {
+    it("discounts a Responses max_output_tokens budget", () => {
       const manager = new ProviderManager(createRegistry());
       const model = gateModel();
       const body = {
@@ -2483,12 +2486,50 @@ describe("ProviderManager", () => {
         max_output_tokens: 4096,
       };
 
-      // The call site forwards max_output_tokens as maxTokens, but the node
-      // only discounts `max_tokens`, so the gate stays at the envelope.
-      // core: 59.372 — the old estimate was 43.277.
+      // The node's gate discounts every completion-cap spelling, so a Codex
+      // request is priced on its declared 4096-token budget instead of the
+      // whole envelope. core: 50.860 sats; the SDK reserves 53.374 (its
+      // prompt heuristic lands a hair under the node's, and the 5% margin
+      // keeps the deposit above the gate).
       expect(
         manager.getRequiredSatsForModel(model, body.messages ?? [], 4096, body)
-      ).toBe(60);
+      ).toBeCloseTo(53.374, 3);
+    });
+
+    it("discounts a modern chat max_completion_tokens budget", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_completion_tokens: 4096,
+      };
+
+      // routstrd injects max_completion_tokens as its default chat cap, so
+      // ignoring the field would reserve the full envelope for every request
+      // that omits max_tokens. core: 50.781.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.32, 3);
+    });
+
+    it("reserves against the largest declared cap, matching the node", () => {
+      const manager = new ProviderManager(createRegistry());
+      const model = gateModel();
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 4096,
+        max_completion_tokens: 256,
+      };
+
+      // Upstream precedence between the fields varies by provider, so the
+      // node reserves against the largest (4096), not the modern spelling
+      // (256). Pricing the smaller cap would drop the gate to ~13 sats and
+      // under-cover what the upstream could bill. core: 50.784.
+      expect(
+        manager.getRequiredSatsForModel(model, body.messages, 4096, body)
+      ).toBeCloseTo(53.323, 3);
     });
 
     it("applies the node's prompt discount to small text requests", () => {
@@ -2552,6 +2593,43 @@ describe("ProviderManager", () => {
       expect(
         manager.getRequiredSatsForModel(model, body.messages, 4096, body)
       ).toBe(60);
+    });
+  });
+
+  describe("completionCapFromBody", () => {
+    it("returns undefined when the request declares no cap", () => {
+      expect(completionCapFromBody({})).toBeUndefined();
+      expect(completionCapFromBody(undefined)).toBeUndefined();
+      expect(completionCapFromBody({ max_tokens: "nope" })).toBeUndefined();
+    });
+
+    it("accepts every spelling of the cap", () => {
+      expect(completionCapFromBody({ max_tokens: 10 })).toBe(10);
+      expect(completionCapFromBody({ max_completion_tokens: 20 })).toBe(20);
+      expect(completionCapFromBody({ max_output_tokens: 30 })).toBe(30);
+    });
+
+    it("takes the largest cap when a request declares more than one", () => {
+      expect(
+        completionCapFromBody({
+          max_tokens: 4096,
+          max_completion_tokens: 256,
+        })
+      ).toBe(4096);
+      expect(
+        completionCapFromBody({
+          max_tokens: 256,
+          max_completion_tokens: 4096,
+          max_output_tokens: 512,
+        })
+      ).toBe(4096);
+    });
+
+    it("parses numeric strings, the form some clients send", () => {
+      expect(completionCapFromBody({ max_tokens: "4096" })).toBe(4096);
+      expect(
+        completionCapFromBody({ max_tokens: "4096", max_completion_tokens: 8192 })
+      ).toBe(8192);
     });
   });
 
