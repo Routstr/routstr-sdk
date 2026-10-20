@@ -348,6 +348,8 @@ describe("discovery store reads", () => {
     expect(ranking.map((entry) => entry.baseUrl).sort()).toEqual(
       [...bases].sort(),
     );
-    expect(ranking[0]!.completionPerMillion).toBe(71 * 1_000_000);
+    // Sorted by basket cost: prompt is equal across these providers, so the
+    // cheapest completion rate wins (bases are priced 100 - i).
+    expect(ranking[0]!.rates.completion).toBe(71);
   });
 });

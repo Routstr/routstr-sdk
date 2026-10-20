@@ -77,6 +77,19 @@ export interface ModelPricing {
   image: number;
   web_search: number;
   internal_reasoning: number;
+  /**
+   * Sats per token for prompt tokens served from the upstream cache.
+   * Optional: a node with no cache pricing for a route omits the field or
+   * sends 0, and 0 means "not announced", not "free" — reading it as free
+   * would let that route win every ranking (see client/costEstimate.ts).
+   */
+  input_cache_read?: number;
+  /**
+   * Sats per token for prompt tokens written into the upstream cache. Omitted
+   * or 0 means "not announced"; a warm request is then billed at the prompt
+   * rate for its fresh tokens.
+   */
+  input_cache_write?: number;
 }
 
 export interface ModelSatsPricing extends ModelPricing {
