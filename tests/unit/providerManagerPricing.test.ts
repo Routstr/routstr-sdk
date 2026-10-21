@@ -1596,6 +1596,24 @@ describe("ProviderManager", () => {
       updated_at: null,
     });
 
+    /** /v1/models/paths payload with full per-route pricing (null = none). */
+    const pricedPathsPayload = (
+      routes: Array<[string, Record<string, number> | null]>
+    ) => ({
+      data: [
+        {
+          id: MODEL_ID,
+          paths: routes.map(([path, pricing]) => ({
+            path,
+            provider: { slug: "openrouter", type: "openrouter" },
+            endpoint: null,
+            model: pricing === null ? undefined : { sats_pricing: pricing },
+          })),
+        },
+      ],
+      updated_at: null,
+    });
+
     const stubPathsFetch = (byNode: Record<string, unknown | Error>) => {
       const fn = vi.fn(async (input: unknown) => {
         const url = String(input);
@@ -1666,7 +1684,7 @@ describe("ProviderManager", () => {
       expect(fetch.mock.calls.length).toBe(callsAfterFirst);
     });
 
-    it("ranks whitelisted nodes by per-route completion price", async () => {
+    it("ranks whitelisted nodes by their cheapest warm-basket route cost", async () => {
       stubPathsFetch({
         [NODE_A]: pathsPayload([
           { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
@@ -1693,6 +1711,111 @@ describe("ProviderManager", () => {
       // Per-route pricing rides along with the selectors.
       expect(ranking[1].satsPricing[0]?.completion).toBe(0.0013);
       expect(ranking[1].satsPricing[1]?.completion).toBe(0.0007);
+    });
+
+    it("ranks on the warm-basket cost of the best route, not its completion rate", async () => {
+      // Live shape from deepseek-v4.1-flash on ai.redsh1ft.com (sats per M
+      // tokens): the node with the cheaper completion rate is NOT the node a
+      // warm session bills cheaper, because 90% of a warm prompt is billed at
+      // the cache-read rate. Routing ranks on the warm basket
+      // (getProviderPriceRankingForModel, both resolveRequestContext paths),
+      // so the auto-pin ranking must agree on the same node.
+      const completionCheap = {
+        prompt: 115.47,
+        completion: 230.95,
+        input_cache_read: 23.09,
+      };
+      const warmCheap = {
+        prompt: 62.87,
+        completion: 481.15,
+        input_cache_read: 1.51,
+      };
+      // The two keys disagree, so this cannot pass by accident.
+      expect(completionCheap.completion).toBeLessThan(warmCheap.completion);
+      expect(estimateCost(warmCheap, WARM_COST_BASKET).total).toBeLessThan(
+        estimateCost(completionCheap, WARM_COST_BASKET).total
+      );
+
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, completionCheap],
+          [FIREWORKS_SELECTOR, completionCheap],
+        ]),
+        [NODE_B]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, warmCheap],
+          [FIREWORKS_SELECTOR, warmCheap],
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      // NODE_B is completion-order second and warm-basket first.
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_B}/`,
+        `${NODE_A}/`,
+      ]);
+      // Both nodes keep every route they advertise, in whitelist order.
+      expect(ranking.map((c) => c.selectors)).toEqual([
+        [DEEPSEEK_SELECTOR, FIREWORKS_SELECTOR],
+        [DEEPSEEK_SELECTOR, FIREWORKS_SELECTOR],
+      ]);
+    });
+
+    it("does not let a route whose rates are not prices win the ranking", async () => {
+      // A negative rate yields a negative cost and would beat every real
+      // route; it is not a price, so it cannot rank. Such a node stays
+      // rankable (it is still a failover candidate) but sorts last.
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, { prompt: 1, completion: -5 }],
+        ]),
+        [NODE_B]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, { prompt: 1, completion: 5 }],
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_B}/`,
+        `${NODE_A}/`,
+      ]);
+    });
+
+    it("ranks a route that publishes no pricing on the catalog model's rates", async () => {
+      // A route with no sats_pricing of its own is priced by the node's
+      // /v1/models entry, not treated as unrankable: dropping it to +inf
+      // would demote a node that really does have a published rate.
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+        [NODE_B]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, { prompt: 1, completion: 1 }],
+        ]),
+      });
+      const manager = new ProviderManager(
+        createRegistry({
+          getCachedModels: () => ({
+            [`${NODE_A}/`]: [
+              {
+                id: MODEL_ID,
+                sats_pricing: { prompt: 0.001, completion: 0.001 },
+              } as any,
+            ],
+            [`${NODE_B}/`]: [
+              { id: MODEL_ID, sats_pricing: { prompt: 1, completion: 1 } } as any,
+            ],
+          }),
+        })
+      );
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_A}/`,
+        `${NODE_B}/`,
+      ]);
     });
 
     it("skips a node whose model-scoped cooldown is live, keeps a path-scoped one", async () => {

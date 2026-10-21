@@ -1468,12 +1468,14 @@ export class ProviderManager {
    *
    * One entry per whitelisted node that (a) is enabled and not cooled down
    * for the model, and (b) advertises at least one whitelisted route for it
-   * on GET /v1/models/paths. Entries are sorted by the per-route completion
-   * price of the node's best available route; within an entry, `selectors`
-   * and `satsPricing` are in whitelist preference order with cooled-down
-   * routes (and `excludeModelPaths` candidates) removed — the failover
-   * chain is node-major: every route of the cheapest node before the next
-   * node.
+   * on GET /v1/models/paths. Entries are sorted by what the node's best
+   * available route costs for WARM_COST_BASKET — the same key
+   * getProviderPriceRankingForModel (and therefore the fallback ranking
+   * routing lands on) sorts on, so the pinned node and the unpinned pick
+   * agree. Ties break on baseUrl. Within an entry, `selectors` and
+   * `satsPricing` are in whitelist preference order with cooled-down routes
+   * (and `excludeModelPaths` candidates) removed — the failover chain is
+   * node-major: every route of the cheapest node before the next node.
    */
   async getModelPathProviderRanking(
     modelId: string,
@@ -1571,19 +1573,31 @@ export class ProviderManager {
         }
         if (available.length === 0) return null;
 
-        // Rank by the price of the node's best available route —
-        // deliberately BEFORE the request-scoped excludeModelPaths filter.
-        // The failover chain is node-major (every route of the cheapest node
-        // before the next node), so a node's position must stay fixed as the
-        // request walks the chain and excludes candidates hop by hop;
-        // re-ranking on the cheapest remaining route would interleave the
+        // Rank by what the node's best available route costs for the warm
+        // basket — the key getProviderPriceRankingForModel ranks on, so the
+        // auto-pinned node is the node the fallback ranking would have picked
+        // first — deliberately BEFORE the request-scoped excludeModelPaths
+        // filter. The failover chain is node-major (every route of the
+        // cheapest node before the next node), so a node's position must stay
+        // fixed as the request walks the chain and excludes candidates hop by
+        // hop; re-ranking on the cheapest remaining route would interleave the
         // nodes (e.g. node1:deepseek -> node2:deepseek -> node1:fireworks
         // whenever node2's first route undercuts node1's second).
-        const price =
+        //
+        // `estimateCost(...).total` is the billed token classes only: the
+        // node's per-request fee sizes the deposit ceiling and is not part of
+        // what it charges, so it is not part of this key either. A route
+        // publishing rates that are not prices (NaN, ±inf, negative) cannot
+        // rank — a negative one wins every comparison and a NaN poisons the
+        // sort — matching getProviderPriceRankingForModel, which skips such
+        // nodes outright.
+        const pricing =
           available[0].pricing ??
-          available.find((a) => a.pricing != null)?.pricing;
-        const cost =
-          price?.completion ?? model.sats_pricing?.completion ?? Infinity;
+          available.find((a) => a.pricing != null)?.pricing ??
+          model.sats_pricing;
+        const cost = hasUsableTokenRates(pricing)
+          ? estimateCost(pricing, WARM_COST_BASKET).total
+          : Number.POSITIVE_INFINITY;
 
         const remaining = available.filter(
           (a) =>
@@ -1600,7 +1614,9 @@ export class ProviderManager {
       .filter(
         (c): c is NonNullable<typeof c> => c !== null
       )
-      .sort((a, b) => a.cost - b.cost)
+      // Same tiebreak as getProviderPriceRankingForModel: equal costs must
+      // not depend on the order the nodes happened to be fetched in.
+      .sort((a, b) => a.cost - b.cost || a.baseUrl.localeCompare(b.baseUrl))
       .map(({ cost: _cost, ...candidate }) => candidate);
   }
 
