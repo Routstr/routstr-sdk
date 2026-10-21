@@ -245,6 +245,19 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(response.status).toBe(200);
   });
 
+  it("keeps the key and the model on a 404 for an image sent to a text-only model", async () => {
+    const { client, providerManager, refund } = setup();
+    const fetchMock = stubFetch({ status: 404, statusText: "Not Found", body: JSON.stringify({ error: { type: "upstream_error", message: "No endpoints found that support image input" } }) }, okResponse());
+    const response = await client.routeRequest({
+      path: "/v1/messages", method: "POST", baseUrl, mintUrl, modelId: model.id, headers: {},
+      body: { model: model.id, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] }] },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(refund).not.toHaveBeenCalled();
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+  });
+
   it("deduplicates identical rejections across providers", async () => {
     const { client, providerManager, refund, spend, finalize } = setup();
     const fetchMock = stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody });

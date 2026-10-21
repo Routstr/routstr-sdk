@@ -146,6 +146,15 @@ function forwardableErrorHeaders(headers: Headers): Record<string, string> {
   return captured;
 }
 
+function hasImageInput(body: unknown): boolean {
+  const { messages, input } = (body ?? {}) as { messages?: unknown; input?: unknown };
+  return [messages, input]
+    .filter(Array.isArray)
+    .flat()
+    .flatMap((item: any) => [item, ...(Array.isArray(item?.content) ? item.content : [])])
+    .some((part: any) => ["image", "image_url", "input_image"].includes(part?.type));
+}
+
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
@@ -1229,7 +1238,11 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
 
-    const upstreamRequestError = isUpstreamRequestError(status, parsedError);
+    const upstreamRequestError =
+      isUpstreamRequestError(status, parsedError) ||
+      (status === 404 &&
+        hasImageInput(body) &&
+        !selectedModel?.architecture?.input_modalities?.includes("image"));
     const unknownPathError = isUnknownPathError(status, parsedError);
     const aggregateFailure = upstreamRequestError || status >= 500 ||
       status === 424 || status === 429 || status === -1;
