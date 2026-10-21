@@ -44,6 +44,8 @@ export interface RouteRequestOptions {
   path?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
+  /** Optional: abort the in-flight request and stream consumption. */
+  signal?: AbortSignal;
   /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; explicit path headers still work. */
   autoModelPath?: boolean;
   /**
@@ -244,6 +246,7 @@ export async function routeRequests(
       mintUrl,
       modelId,
       userCacheSecret: options.userCacheSecret,
+      signal: options.signal,
       // The forced provider is a pin: it must reach _handleErrorResponse so a
       // failed request is not silently re-sent to a different node.
       pinnedProvider,
