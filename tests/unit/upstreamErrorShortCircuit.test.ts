@@ -166,6 +166,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     const { client, refund } = setup();
     const registry = {
       getCachedModels: () => ({ [baseUrl]: [model], [nextUrl]: [model], [thirdUrl]: [model] }),
+      getCachedMints: () => ({}),
       getDisabledProviders: () => [],
     } as unknown as DiscoveryAdapter;
     const manager = new ProviderManager(registry);

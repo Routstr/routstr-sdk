@@ -3,7 +3,7 @@ import {
   ProviderManager,
   completionCapFromBody,
 } from "../../client/ProviderManager";
-import { estimateCost } from "../../client/costEstimate";
+import { estimateCost, WARM_COST_BASKET } from "../../client/costEstimate";
 import {
   clearModelPathsCache,
   DEEPSEEK_AUTO_NODE_URLS,
@@ -681,6 +681,80 @@ describe("ProviderManager", () => {
       expect(
         manager.findNextBestProvider("gpt-4o-mini", "https://some-other.example.com/")
       ).toBe("https://cheap.example.com/");
+    });
+
+    it("ranks on the request basket, not on the completion rate alone", () => {
+      // old key (completion only): output-heavy wins, so B (1) beat A (100).
+      // cold basket (1M prompt + 1M completion): B (100M) still beat A (101M).
+      // warm basket: A is prompt-cheap, which is the class a warm session
+      // mostly sends, so A (300k) beats B (5.1M). Failover must agree with
+      // the ranking that selected the node we are failing over from.
+      const outputHeavy = makeModel({
+        sats_pricing: { prompt: 1, completion: 100, max_cost: 100 },
+      } as Partial<Model>);
+      const balanced = makeModel({
+        sats_pricing: { prompt: 50, completion: 50, max_cost: 100 },
+      } as Partial<Model>);
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://output-heavy.example.com/": [outputHeavy],
+          "https://balanced.example.com/": [balanced],
+        }),
+      });
+
+      const manager = new ProviderManager(registry);
+      expect(
+        manager.findNextBestProvider("gpt-4o-mini", "https://current.example.com/")
+      ).toBe("https://output-heavy.example.com/");
+    });
+
+    it("picks the same provider the price ranking puts first", () => {
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://a.example.com/": [
+            makeModel({ sats_pricing: { prompt: 3, completion: 1 } } as Partial<Model>),
+          ],
+          "https://b.example.com/": [
+            makeModel({ sats_pricing: { prompt: 1, completion: 3 } } as Partial<Model>),
+          ],
+          "https://c.example.com/": [
+            makeModel({ sats_pricing: { prompt: 2, completion: 2 } } as Partial<Model>),
+          ],
+        }),
+      });
+
+      const manager = new ProviderManager(registry);
+      const ranking = manager.getProviderPriceRankingForModel("gpt-4o-mini", {
+        basket: WARM_COST_BASKET,
+      });
+      expect(ranking.length).toBe(3);
+
+      // Skipping the ranking head must yield the ranking's next entry: one
+      // algorithm, one order, and the exclusions only filter it.
+      expect(
+        manager.findNextBestProvider("gpt-4o-mini", ranking[0].baseUrl)
+      ).toBe(ranking[1].baseUrl);
+      const attempted = new Set([ranking[0].baseUrl, ranking[1].baseUrl]);
+      expect(
+        manager.findNextBestProvider("gpt-4o-mini", "https://else.example.com/", attempted)
+      ).toBe(ranking[2].baseUrl);
+    });
+
+    it("skips a provider that publishes no rates", () => {
+      // Used to rank as cost 0 and win every failover.
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://unpriced.example.com/": [{ id: "gpt-4o-mini" } as any],
+          "https://priced.example.com/": [
+            makeModel({ sats_pricing: { prompt: 5, completion: 5 } } as Partial<Model>),
+          ],
+        }),
+      });
+
+      const manager = new ProviderManager(registry);
+      expect(
+        manager.findNextBestProvider("gpt-4o-mini", "https://current.example.com/")
+      ).toBe("https://priced.example.com/");
     });
 
     it("skips the current provider", () => {

@@ -37,6 +37,7 @@ import {
   estimateCost,
   hasUsableTokenRates,
   resolveBasket,
+  WARM_COST_BASKET,
   type CostBasket,
   type CostEstimate,
   type CostRates,
@@ -823,15 +824,6 @@ function nodeGateSats(
 }
 
 /**
- * Candidate provider for failover
- */
-interface CandidateProvider {
-  baseUrl: string;
-  model: Model;
-  cost: number;
-}
-
-/**
  * A cooldown entry. When `modelId` is present, only that model is cooled
  * down on the provider; other models on the same provider stay selectable.
  * When `modelId` is undefined, the whole provider is on cooldown.
@@ -1395,7 +1387,16 @@ export class ProviderManager {
   }
 
   /**
-   * Find the next best provider for a model
+   * Find the next best provider for a model.
+   *
+   * Failover ranks exactly like initial selection: it asks
+   * `getProviderPriceRankingForModel` for the ranking and then filters that
+   * list down to the candidates this request can still use — the node being
+   * failed over from, nodes already attempted, and nodes whose advertised
+   * mints the wallet cannot fund. Filtering preserves the ranking's order, so
+   * the first survivor is the cheapest usable provider under the same basket
+   * and the same tiebreak routing uses.
+   *
    * @param modelId The model ID to find a provider for
    * @param currentBaseUrl The current provider to exclude
    * @param attemptedProviders Request-local exclusions to prevent revisiting nodes
@@ -1407,81 +1408,24 @@ export class ProviderManager {
     attemptedProviders: ReadonlySet<string> = new Set(),
     options: { acceptableMintUrls?: string[] } = {}
   ): string | null {
-    modelId = this.canonicalizeModelId(modelId);
     try {
-      const torMode = isTorContext();
-      const disabledProviders = new Set(
-        this.discoveryAdapter.getDisabledProviders()
-      );
-
-      // When the caller knows which mints the wallet can fund, prefer a
-      // provider that accepts at least one of them. Providers with no
-      // cached mint list are left in play (fail open) so a cold cache never
-      // blocks failover.
+      // Empty when the wallet knows no funded mint; providerAcceptsAnyMint
+      // then fails open, so a cold wallet never blocks failover.
       const acceptableMints = options.acceptableMintUrls ?? [];
 
-      // Get all providers with their models
-      const allProviders = this.discoveryAdapter.getCachedModels();
+      const next = this.getProviderPriceRankingForModel(modelId, {
+        torMode: isTorContext(),
+        // The same basket routing ranks on, so a failover hop and the initial
+        // pick agree on which node is cheapest.
+        basket: WARM_COST_BASKET,
+      }).find(
+        ({ baseUrl }) =>
+          baseUrl !== currentBaseUrl &&
+          !attemptedProviders.has(baseUrl) &&
+          this.providerAcceptsAnyMint(baseUrl, acceptableMints)
+      );
 
-      // Find all candidate providers
-      const candidates: CandidateProvider[] = [];
-
-      for (const [baseUrl, models] of Object.entries(allProviders)) {
-        // Skip current, failed, disabled, and cooldown providers
-        if (baseUrl === currentBaseUrl || attemptedProviders.has(baseUrl)) {
-          continue;
-        }
-        // if (this.failedProviders.has(baseUrl)) {
-        //   console.log(`[findNextBestProvider:${this.instanceId}] SKIP (failed): ${baseUrl}`);
-        //   skippedFailed++;
-        //   continue;
-        // }
-        if (disabledProviders.has(baseUrl)) {
-          continue;
-        }
-        if (this.isOnCooldown(baseUrl, modelId)) {
-          continue;
-        }
-
-        // Skip a provider that advertises a mint list disjoint from the
-        // wallet's funded mints: spending there cannot succeed. An empty
-        // cached list means "unknown", so keep it (fail open).
-        if (acceptableMints.length > 0) {
-          const providerMints =
-            this.discoveryAdapter.getCachedMints()[baseUrl] || [];
-          if (
-            providerMints.length > 0 &&
-            !providerMints.some((mint) => acceptableMints.includes(mint))
-          ) {
-            continue;
-          }
-        }
-
-        // Skip onion URLs if not in Tor mode
-        if (!torMode && isOnionUrl(baseUrl)) {
-          continue;
-        }
-
-        // Find the model in this provider's list (by native id or a
-        // mapped variant/alias of it)
-        const model = findModelForId(models, modelId, this.getModelIdMappings());
-        if (!model) {
-          continue;
-        }
-
-        // Calculate cost (using completion price as the metric)
-        const cost = model.sats_pricing?.completion ?? 0;
-        candidates.push({ baseUrl, model, cost });
-      }
-
-      // Sort by price (lowest first)
-      candidates.sort((a, b) => a.cost - b.cost);
-
-      if (candidates.length > 0) {
-        return candidates[0].baseUrl;
-      } else {
-        return null;
-      }
+      return next?.baseUrl ?? null;
     } catch (error) {
       this.logger.error("findNextBestProvider error:", error);
       return null;
