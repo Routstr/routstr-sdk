@@ -735,7 +735,8 @@ export class BalanceManager {
           topUpResult.parsedError?.type === CoreErrorType.MINT_RATE_LIMITED
         ) {
           const skip = rateLimitedMints.get(this.walletAdapter) ?? new Map();
-          skip.set(`${baseUrl}|${tokenResult.selectedMintUrl}`, Date.now() + RATE_LIMITED_MINT_SKIP_MS);
+          const skipMs = topUpResult.retryAfterSeconds ? topUpResult.retryAfterSeconds * 1000 : RATE_LIMITED_MINT_SKIP_MS;
+          skip.set(`${baseUrl}|${tokenResult.selectedMintUrl}`, Date.now() + skipMs);
           rateLimitedMints.set(this.walletAdapter, skip);
         }
 
@@ -1178,6 +1179,7 @@ export class BalanceManager {
     requestId?: string;
     error?: string;
     parsedError?: ParsedCoreError;
+    retryAfterSeconds?: number;
   }> {
     if (!baseUrl) {
       return {
@@ -1240,6 +1242,7 @@ export class BalanceManager {
           requestId: resolvedRequestId,
           error: conciseDetail,
           parsedError,
+          retryAfterSeconds: Number(response.headers.get("retry-after")) || undefined,
         };
       }
 
