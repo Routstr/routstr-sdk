@@ -207,6 +207,21 @@ describe("client attribution for Anthropic-transport requests", () => {
     expect(JSON.stringify(sent.headers)).not.toContain(CLIENT_KEY);
   });
 
+  it("forwards anthropic-beta but no other inbound header", async () => {
+    const client = makeClient();
+    const beta = "context-management-2025-06-27,thinking-display-updates-2026-08-18";
+
+    const sent = await routeToTransportBoundary(client, {
+      "x-api-key": CLIENT_KEY,
+      cookie: "session=secret",
+      "anthropic-beta": beta,
+    });
+
+    expect(sent.headers["anthropic-beta"]).toBe(beta);
+    expect(JSON.stringify(sent.headers)).not.toContain(CLIENT_KEY);
+    expect(JSON.stringify(sent.headers)).not.toContain("session=secret");
+  });
+
   /** Record one usage row through the real tracking path and return it. */
   async function recordedUsageRow(inboundHeaders: Record<string, string>) {
     const entries: Array<Record<string, unknown>> = [];

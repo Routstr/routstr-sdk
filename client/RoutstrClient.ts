@@ -628,6 +628,12 @@ export class RoutstrClient {
     if (modelPathSelector) {
       baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
     }
+    // anthropic-beta describes the body, not the caller: without it a node's
+    // native Anthropic upstream rejects beta fields (context_management,
+    // safeguards, thinking.display "updates", ...) with a 400.
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() === "anthropic-beta") baseHeaders[name] = value;
+    }
 
     // Forward the provider-native model id when selection resolved through a
     // static mapping: mapped providers only know their own id, so the
