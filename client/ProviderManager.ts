@@ -1763,39 +1763,6 @@ export class ProviderManager {
   }
 
   /**
-   * Get all available providers for a model
-   * Returns sorted list by price
-   */
-  getAllProvidersForModel(modelId: string): Array<{
-    baseUrl: string;
-    model: Model;
-    cost: number;
-  }> {
-    modelId = this.canonicalizeModelId(modelId);
-    const candidates: CandidateProvider[] = [];
-    const allProviders = this.discoveryAdapter.getCachedModels();
-    const disabledProviders = new Set(
-      this.discoveryAdapter.getDisabledProviders()
-    );
-    const torMode = isTorContext();
-
-    for (const [baseUrl, models] of Object.entries(allProviders)) {
-      if (disabledProviders.has(baseUrl)) continue;
-      if (this.isOnCooldown(baseUrl, modelId)) continue;
-      if (!torMode && isOnionUrl(baseUrl))
-        continue;
-
-      const model = findModelForId(models, modelId, this.getModelIdMappings());
-      if (!model) continue;
-
-      const cost = model.sats_pricing?.completion ?? 0;
-      candidates.push({ baseUrl, model, cost });
-    }
-
-    return candidates.sort((a, b) => a.cost - b.cost);
-  }
-
-  /**
    * Get providers for a model, ranked by what one request basket costs.
    *
    * The cost of the basket (DEFAULT_COST_BASKET unless the caller passes one)

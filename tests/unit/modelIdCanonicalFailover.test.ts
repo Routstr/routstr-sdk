@@ -173,12 +173,12 @@ describe("ProviderManager canonicalizes model ids", () => {
     expect(manager.isOnCooldown(CYPHER, REQUESTED)).toBe(false);
   });
 
-  it("findNextBestProvider and getAllProvidersForModel accept either spelling", () => {
+  it("findNextBestProvider and getProviderPriceRankingForModel accept either spelling", () => {
     const { manager } = setup();
     expect(manager.findNextBestProvider(NATIVE, CYPHER, new Set([REDSH1FT, OTRTA]))).toBe(PPQ);
     expect(manager.findNextBestProvider(REQUESTED, CYPHER, new Set([REDSH1FT, OTRTA]))).toBe(PPQ);
-    const viaNative = manager.getAllProvidersForModel(NATIVE).map((p) => p.baseUrl);
-    const viaRequested = manager.getAllProvidersForModel(REQUESTED).map((p) => p.baseUrl);
+    const viaNative = manager.getProviderPriceRankingForModel(NATIVE).map((p) => p.baseUrl);
+    const viaRequested = manager.getProviderPriceRankingForModel(REQUESTED).map((p) => p.baseUrl);
     expect(viaNative).toEqual(viaRequested);
     expect(viaNative).toContain(PPQ);
   });
@@ -192,7 +192,7 @@ describe("ProviderManager canonicalizes model ids", () => {
     }
     // Failover ordering uses the cheaper canonical entry, not the -5-5 one.
     const ranked = manager
-      .getAllProvidersForModel(NATIVE)
+      .getProviderPriceRankingForModel(NATIVE)
       .filter((p) => p.baseUrl !== CYPHER);
     expect(ranked.map((p) => [p.baseUrl, p.model.id])).toEqual([
       [REDSH1FT, REQUESTED],

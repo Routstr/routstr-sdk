@@ -487,32 +487,6 @@ describe("ProviderManager", () => {
     beforeEach(() => stubClearnetWindow());
     afterEach(() => vi.unstubAllGlobals());
 
-    it("filters onion URLs when not in tor mode (getAllProvidersForModel)", () => {
-      const registry = createRegistry({
-        getCachedModels: () => ({
-          "https://alpha.example.com/": [
-            {
-              id: "gpt-4o-mini",
-              sats_pricing: { prompt: 1, completion: 1 },
-            } as any,
-          ],
-          "http://onionaddress.onion/": [
-            {
-              id: "gpt-4o-mini",
-              sats_pricing: { prompt: 0.1, completion: 0.1 },
-            } as any,
-          ],
-        }),
-      });
-
-      const manager = new ProviderManager(registry);
-      const providers = manager.getAllProvidersForModel("gpt-4o-mini");
-
-      expect(providers.map((e) => e.baseUrl)).toEqual([
-        "https://alpha.example.com/",
-      ]);
-    });
-
     it("filters onion URLs in getProviderPriceRankingForModel", () => {
       const registry = createRegistry({
         getCachedModels: () => ({
@@ -607,7 +581,7 @@ describe("ProviderManager", () => {
       });
 
       const manager = new ProviderManager(registry);
-      const providers = manager.getAllProvidersForModel("gpt-4o-mini");
+      const providers = manager.getProviderPriceRankingForModel("gpt-4o-mini");
 
       expect(providers).toHaveLength(1);
       expect(providers[0].baseUrl).toBe("https://enabled.example.com/");
@@ -671,7 +645,7 @@ describe("ProviderManager", () => {
       manager.markFailed("https://beta.example.com/");
 
       // Beta should be excluded, leaving only alpha
-      const providers = manager.getAllProvidersForModel("gpt-4o-mini");
+      const providers = manager.getProviderPriceRankingForModel("gpt-4o-mini");
       expect(providers).toHaveLength(1);
       expect(providers[0].baseUrl).toBe("https://alpha.example.com/");
 
@@ -1082,13 +1056,13 @@ describe("ProviderManager", () => {
       expect(manager.isOnCooldown("https://alpha.example.com/")).toBe(false);
 
       // The provider stays in ranking/selection for its other model
-      const providers = manager.getAllProvidersForModel("claude-3");
+      const providers = manager.getProviderPriceRankingForModel("claude-3");
       expect(providers.map((p) => p.baseUrl)).toEqual([
         "https://alpha.example.com/",
         "https://beta.example.com/",
       ]);
       // But is excluded for the cooled model
-      const cooled = manager.getAllProvidersForModel("gpt-4o-mini");
+      const cooled = manager.getProviderPriceRankingForModel("gpt-4o-mini");
       expect(cooled.map((p) => p.baseUrl)).toEqual(["https://beta.example.com/"]);
 
       vi.useRealTimers();
@@ -1379,7 +1353,7 @@ describe("ProviderManager", () => {
       expect(manager.isOnCooldown(P)).toBe(false);
 
       // Unpinned model ranking is unaffected by path-scoped entries
-      const providers = manager.getAllProvidersForModel("deepseek-v4.1-flash");
+      const providers = manager.getProviderPriceRankingForModel("deepseek-v4.1-flash");
       expect(providers.map((p) => p.baseUrl)).toEqual([
         "https://alpha.example.com/",
         "https://beta.example.com/",
