@@ -275,23 +275,44 @@ const DEFAULT_TIMEOUTS = {
   proof: 60_000,
 };
 
+/** Frames of one type the node may send ahead of the wait for them. */
+const BUS_MAX_PENDING_PER_TYPE = 16;
+/** Frames of all types queued at once. */
+const BUS_MAX_PENDING = 256;
+/** Most entries the session's event log keeps (later ones are dropped). */
+const MAX_SESSION_EVENTS = 10_000;
+/** A session id as the sidecar makes it (a SHA-256, hex). */
+const SID_RE = /^[0-9a-f]{64}$/;
+
 class Bus {
   private pending = new Map<string, unknown[]>();
   private waiters = new Map<string, ((m: unknown) => void)[]>();
+  private queued = 0;
+
+  /** `onOverflow` fails the session: the node sent more frames than it may. */
+  constructor(private readonly onOverflow: (type: string) => void) {}
 
   emit(msg: { type: string }): void {
     const w = this.waiters.get(msg.type);
     if (w && w.length) w.shift()!(msg);
     else {
       const p = this.pending.get(msg.type) ?? [];
+      if (p.length >= BUS_MAX_PENDING_PER_TYPE || this.queued >= BUS_MAX_PENDING) {
+        this.onOverflow(msg.type);
+        return;
+      }
       p.push(msg);
+      this.queued += 1;
       this.pending.set(msg.type, p);
     }
   }
 
   wait(type: string): Promise<unknown> {
     const p = this.pending.get(type);
-    if (p && p.length) return Promise.resolve(p.shift());
+    if (p && p.length) {
+      this.queued -= 1;
+      return Promise.resolve(p.shift());
+    }
     return new Promise((res) => {
       const w = this.waiters.get(type) ?? [];
       w.push(res);
@@ -370,7 +391,9 @@ export class ConfidentialSession {
   private wsReady: Promise<void>;
   private wsResolve!: () => void;
   private outbox: Uint8Array[] = [];
-  private bus = new Bus();
+  private bus = new Bus((type) =>
+    this.errRej(new SessionProtocolError(`node sent too many unanswered ${JSON.stringify(type).slice(0, 64)} frames`)),
+  );
   private errRej!: (e: Error) => void;
   private errP!: Promise<never>;
   private tls!: TlsHandle;
@@ -433,6 +456,8 @@ export class ConfidentialSession {
   private tArmed = 0;
   private finished = false;
   private events: string[] = [];
+  /** π_C2S failed (it runs off the response's critical path). */
+  private piC2Failed = false;
 
   constructor(options: ConfidentialSessionOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
@@ -559,7 +584,7 @@ export class ConfidentialSession {
 
   private event(ev: Record<string, unknown>): void {
     const line = JSON.stringify(ev);
-    this.events.push(line);
+    if (this.events.length < MAX_SESSION_EVENTS) this.events.push(line);
     this.onEvent?.(ev);
   }
 
@@ -574,7 +599,7 @@ export class ConfidentialSession {
   private zkUrl(proof: string): string {
     // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
     const token = typeof this.ready?.zk_token === "string" ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : "";
-    return `${this.wsBase()}/v1/confidential/zk?proof=${proof}&session_id=${this.sid}${token}`;
+    return `${this.wsBase()}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&session_id=${encodeURIComponent(this.sid)}${token}`;
   }
 
   /**
@@ -623,6 +648,10 @@ export class ConfidentialSession {
           m = JSON.parse(d);
         } catch {
           this.errRej(new SessionProtocolError("non-JSON control frame"));
+          return;
+        }
+        if (typeof m !== "object" || m === null || typeof m.type !== "string") {
+          this.errRej(new SessionProtocolError("control frame without a type"));
           return;
         }
         this.event({ ev: "frame", in: m.type });
@@ -809,6 +838,11 @@ export class ConfidentialSession {
       throw new SessionProtocolError(
         `session pubkey ${this.ready.pubkey} differs from the signed offer key ${this.expectedPubkey}`,
       );
+    }
+    // The sid goes into URLs and headers and is bound into the attestation
+    // and the receipt: only the sidecar's format is accepted.
+    if (typeof this.ready?.sid !== "string" || !SID_RE.test(this.ready.sid)) {
+      throw new SessionProtocolError("node announced a malformed session id");
     }
     this.sid = this.ready.sid;
     this.tReady = Date.now();
@@ -1020,7 +1054,10 @@ export class ConfidentialSession {
         () => this.event({ ev: "pi_c2_ok" }),
         // Handle now (no unhandled rejection while we wait for attestation);
         // the failure is re-raised below before π_C3S.
-        (e: unknown) => this.event({ ev: "pi_c2_fail", err: String(e) }),
+        (e: unknown) => {
+          this.piC2Failed = true;
+          this.event({ ev: "pi_c2_fail", err: String(e) });
+        },
       );
 
     // The node attests after the provider closes the response, so this wait
@@ -1055,7 +1092,7 @@ export class ConfidentialSession {
     // π_C2S must finish before π_C3S: the node refuses to settle without it,
     // and π_C2S is off the response critical path.
     await c2Promise;
-    if (this.events.some((l) => l.includes('"pi_c2_fail"'))) {
+    if (this.piC2Failed) {
       throw new SessionProtocolError("π_C2S failed; the node will not settle without it");
     }
 

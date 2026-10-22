@@ -49,12 +49,58 @@ function pinValueOk(v: unknown): boolean {
   return false;
 }
 
-/** A pin that switches something off: `false`, `"off"`, `[]`, or an object of those. */
+/**
+ * A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty
+ * object of those (`{}` switches nothing off: a provider may read it as "on,
+ * with defaults").
+ */
 function pinIsOff(v: unknown): boolean {
   if (v === false || v === "off") return true;
   if (Array.isArray(v)) return v.length === 0;
-  if (typeof v === "object" && v !== null) return Object.values(v).every(pinIsOff);
+  if (typeof v === "object" && v !== null) {
+    const members = Object.values(v);
+    return members.length > 0 && members.every(pinIsOff);
+  }
   return false;
+}
+
+/** Key prefixes that negate a feature: `false` under them switches it on. */
+export const PIN_NEGATING_PREFIXES: readonly string[] = ["disable", "no_", "skip", "without", "exclude", "omit", "hide"];
+
+/**
+ * Key fragments that name a protection: pinning one can only switch it off,
+ * so it is left to the caller and the provider's default.
+ */
+export const PIN_PROTECTION_WORDS: readonly string[] = ["safe", "moderat", "filter", "nsfw", "censor", "guard"];
+
+/**
+ * Why a pinned key (a top-level pin key, or a member key at any depth of its
+ * value) may not be pinned, or `undefined`. Shared by chat and image pins.
+ */
+export function pinKeyProblem(key: string, value: unknown): string | undefined {
+  const k = key.toLowerCase();
+  if (PIN_NEGATING_PREFIXES.some((p) => k.startsWith(p))) {
+    return `key ${JSON.stringify(key)} negates a feature (false under it switches it on)`;
+  }
+  if (PIN_PROTECTION_WORDS.some((w) => k.includes(w))) {
+    return `key ${JSON.stringify(key)} names a protection, which a pin could only switch off`;
+  }
+  return pinMembersProblem(value);
+}
+
+function pinMembersProblem(v: unknown): string | undefined {
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const p = pinMembersProblem(x);
+      if (p) return p;
+    }
+  } else if (typeof v === "object" && v !== null) {
+    for (const [m, x] of Object.entries(v)) {
+      const p = pinKeyProblem(m, x);
+      if (p) return p;
+    }
+  }
+  return undefined;
 }
 
 /** The keys a chat suffix pins, in order. */
@@ -65,8 +111,10 @@ export function chatSuffixKeys(chat: ChatSuffixSpec): string[] {
 /**
  * Check the offer's `chat` block against the policy (the sidecar applies the
  * same one at startup): caps under a known cap key, streaming with usage,
- * `n` 1, and every other pin switching something off. `suffixKeys` (the
- * offer's `suffix_keys`) must list the keys it pins. Throws `OfferMalformedError`.
+ * `n` 1, and every other pin switching something off, under no key that
+ * negates a feature or names a protection (`pinKeyProblem`). `suffixKeys`
+ * (the offer's `suffix_keys`) must list the keys it pins. Throws
+ * `OfferMalformedError`.
  */
 export function validateChatSuffix(chat: unknown, suffixKeys: unknown): asserts chat is ChatSuffixSpec {
   const bad = (what: string): never => {
@@ -92,16 +140,17 @@ export function validateChatSuffix(chat: unknown, suffixKeys: unknown): asserts 
     }
     seen.add(k);
     if (!pinValueOk(v)) bad(`pin ${JSON.stringify(k)} has a value outside the pin grammar`);
+    const keyProblem = pinKeyProblem(k, v);
+    if (keyProblem) bad(`pin ${JSON.stringify(k)}: ${keyProblem}`);
     let ok: boolean;
     if (k === "stream") ok = v === true;
     else if (k === "n") ok = v === 1;
     else if (k === "stream_options") {
       ok =
         typeof v === "object" && v !== null && !Array.isArray(v) &&
-        (v as Record<string, unknown>).include_usage === true &&
-        Object.entries(v).every(([m, x]) => m === "include_usage" || pinIsOff(x));
+        Object.keys(v).length === 1 && (v as Record<string, unknown>).include_usage === true;
     } else ok = pinIsOff(v);
-    if (!ok) bad(`pins ${k}=${JSON.stringify(v)}: only stream=true, n=1, stream_options with include_usage, and pins that switch something off are accepted`);
+    if (!ok) bad(`pins ${k}=${JSON.stringify(v)}: only stream=true, n=1, stream_options {"include_usage":true}, and pins that switch something off are accepted`);
   }
   for (const need of ["stream", "stream_options"]) {
     if (!seen.has(need)) bad(`does not pin ${need} (the usage proof reads the streamed usage event)`);
