@@ -26,7 +26,7 @@ import {
   OfferUnsupportedVersionError,
   TrustedHostError,
 } from "./errors";
-import { type ChatSuffixSpec, validateChatSuffix } from "./suffix";
+import { type ChatSuffixSpec, pinKeyProblem, validateChatSuffix } from "./suffix";
 
 /**
  * Protocol versions this client speaks: only v2 (the two-party handshake).
@@ -40,6 +40,8 @@ export interface ConfidentialPriceEntry {
   in: number;
   /** msats per 1k cached input tokens. */
   cached_in?: number;
+  /** msats per 1k prompt tokens written to the provider's prompt cache. */
+  cache_write?: number;
   /** msats per 1k output tokens. */
   out: number;
 }
@@ -218,7 +220,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   }
   for (const [model, entry] of Object.entries(offer.price_list)) {
     const rate = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
-    if (!isObject(entry) || !rate(entry.in) || !rate(entry.out) || (entry.cached_in !== undefined && !rate(entry.cached_in))) {
+    const optional = (v: unknown) => v === undefined || rate(v);
+    if (!isObject(entry) || !rate(entry.in) || !rate(entry.out) || !optional(entry.cached_in) || !optional(entry.cache_write)) {
       throw new OfferMalformedError(`offer.price_list[${JSON.stringify(model)}] is not a set of non-negative rates`);
     }
   }
@@ -283,10 +286,11 @@ function isOffValue(v: unknown): boolean {
 
 /**
  * Check a signed offer's `images` block. The node chooses every pinned value,
- * so the client holds it to a narrow shape: fixed pins only switch extras off,
- * variant pins only choose a price tier or the format among the published
- * values, the head is a plain request to the image endpoint, and the numbers
- * are bounded. Throws `OfferMalformedError`.
+ * so the client holds it to a narrow shape: fixed pins only switch extras off
+ * (under no key that negates a feature or names a protection), variant pins
+ * only choose a price tier or the format among the published values, the
+ * head is a plain request to the image endpoint, and the numbers are
+ * bounded. Throws `OfferMalformedError`.
  */
 export function validateImagesOffer(images: unknown, upstreamHost: string): asserts images is ConfidentialImagesOffer {
   const bad = (what: string): never => {
@@ -320,6 +324,8 @@ export function validateImagesOffer(images: unknown, upstreamHost: string): asse
   if (!isPinList(im.fixed_pins)) bad("fixed_pins is not a list of [key, value] pairs");
   for (const [k, v] of im.fixed_pins as [string, unknown][]) {
     if (!isOffValue(v)) bad(`fixed_pins ${JSON.stringify(k)} is not switched off (only false or [] may be pinned)`);
+    const keyProblem = pinKeyProblem(k, v);
+    if (keyProblem) bad(`fixed_pins ${JSON.stringify(k)}: ${keyProblem}`);
   }
   if (!isObject(im.price_list)) bad("price_list is not an object");
   const fixed = new Set([...(im.fixed_pins as [string, unknown][]).map((p) => p[0]), "model", imageCountKey(im)]);
@@ -525,6 +531,11 @@ export function verifyConfidentialOffer(
       "no pinnedPubkey configured and allowUnpinned is not set",
     );
   }
+
+  // The node writes the chat request head too: the same syntax as the image
+  // head, checked before any setup (π_NK checks it again per session).
+  const tplProblem = headTemplateProblem(offer.head_template, offer.upstream_host, "chat");
+  if (tplProblem) throw new OfferMalformedError(`offer.head_template: ${tplProblem}`);
 
   // Fail closed at runtime too (plain-JS callers bypass the TS type): an
   // offer is only usable for an upstream host the caller trusts.

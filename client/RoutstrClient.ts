@@ -1456,6 +1456,9 @@ export class RoutstrClient {
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
+      (processedResponse as any).requestResponseLogSuppressed = (
+        response as any
+      ).requestResponseLogSuppressed;
       // finalize() awaits a confidential response's settlement through this.
       (processedResponse as any).confidentialSettled = (
         response as any
@@ -3051,7 +3054,12 @@ export class RoutstrClient {
           // Never spend on a node that would refuse the session: qualify its
           // signed offer first, and move on to the next node if it fails.
           try {
-            failoverOffer = await qualifyConfidentialNode(nextProvider, newModel.id, params.confidential);
+            failoverOffer = await qualifyConfidentialNode(
+              nextProvider,
+              newModel.id,
+              params.confidential,
+              confidentialKind(params.path) === "images" ? "images" : "chat"
+            );
           } catch (error) {
             this._log(
               "WARN",

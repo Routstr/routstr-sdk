@@ -19,7 +19,7 @@
 
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ProverError, ProverMissingError } from "./errors";
-import { resolveProverPath } from "./prover";
+import { resolveProverPath, StdinBudget } from "./prover";
 import {
   encodeTwoPcFrame,
   TWOPC_CHANNEL_CONTROL,
@@ -71,6 +71,7 @@ export class ProofChannel {
   private decoder = new TwoPcFrameDecoder();
   private pending = new Map<number, Pending>();
   private nextId = 1;
+  private stdinBudget = new StdinBudget();
   private failureErr: Error | undefined;
   private closed = false;
   private readyP: Promise<void>;
@@ -146,8 +147,11 @@ export class ProofChannel {
   }
 
   private writeChild(channel: number, payload: Uint8Array): void {
+    if (!this.child || this.failureErr) return;
     try {
-      this.child?.stdin.write(encodeTwoPcFrame(channel, payload));
+      if (!this.stdinBudget.write(this.child.stdin, encodeTwoPcFrame(channel, payload))) {
+        this.fail(new ProverError(`cu-prover stdin: more than ${this.stdinBudget.limit} bytes not yet read`));
+      }
     } catch (e) {
       this.fail(new ProverError(`cu-prover stdin: ${e instanceof Error ? e.message : e}`));
     }
@@ -202,6 +206,17 @@ export class ProofChannel {
     this.readyRej(e);
     for (const w of this.pending.values()) w.rej(e);
     this.pending.clear();
+    // Nothing more runs on this channel: drop the socket and the process now.
+    try {
+      this.ws?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.child?.kill();
+    } catch {
+      /* ignore */
+    }
   }
 
   /** True once the process or its socket failed. */

@@ -961,6 +961,171 @@
           ]
         ]
       }
+    },
+    {
+      "why": "an empty object",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "web_search_options",
+            {}
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a negating member key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "reasoning",
+            {
+              "exclude": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a negating key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "disable_thinking",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a negating key inside an object",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "venice_parameters",
+            {
+              "disable_thinking": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "why": "stream_options with another member",
+      "chat": {
+        "cap_keys": [
+          "max_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true,
+              "include_obfuscation": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "why": "a protection key",
+      "chat": {
+        "cap_keys": [
+          "max_completion_tokens"
+        ],
+        "fixed_pins": [
+          [
+            "stream",
+            true
+          ],
+          [
+            "stream_options",
+            {
+              "include_usage": true
+            }
+          ],
+          [
+            "parallel_tool_calls",
+            false
+          ],
+          [
+            "safe_mode",
+            false
+          ]
+        ]
+      }
     }
   ]
 }
