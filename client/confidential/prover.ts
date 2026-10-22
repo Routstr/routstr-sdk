@@ -15,6 +15,43 @@ import { ProverError, ProverMissingError } from "./errors";
 
 export const CU_PROVER_ENV_VARS = ["CU_PROVER_BIN", "CU_PROVER"] as const;
 
+/**
+ * Most bytes written to a helper process's stdin and not yet flushed. The
+ * node's websocket feeds that stdin; past this the process is not keeping up
+ * (or the node floods it) and the session fails instead of buffering on.
+ */
+export const MAX_UNFLUSHED_STDIN = 32 << 20;
+
+/** The part of a child's stdin the budget writes to. */
+interface StdinLike {
+  write(chunk: Uint8Array, cb: (error?: Error | null) => void): unknown;
+}
+
+/**
+ * Counts the bytes written to a child's stdin until their write callback
+ * runs. (Not `writableLength`: Bun reports 0 there.)
+ */
+export class StdinBudget {
+  private unflushed = 0;
+
+  constructor(readonly limit: number = MAX_UNFLUSHED_STDIN) {}
+
+  /** Bytes written and not yet flushed. */
+  get pending(): number {
+    return this.unflushed;
+  }
+
+  /** Write `bytes`, or return false (writing nothing) when they would exceed the budget. */
+  write(stdin: StdinLike, bytes: Uint8Array): boolean {
+    if (this.unflushed + bytes.length > this.limit) return false;
+    this.unflushed += bytes.length;
+    stdin.write(bytes, () => {
+      this.unflushed -= bytes.length;
+    });
+    return true;
+  }
+}
+
 export interface ProverBackendOptions {
   /** Explicit path to the cu-prover binary. Highest precedence. */
   binaryPath?: string;
@@ -132,11 +169,17 @@ export class CuProverBackend {
           wsOpen = true;
           for (const chunk of pending) ws.send(chunk);
           pending.length = 0;
+          // The node's bytes are bounded by what cu-prover has read: a node
+          // outrunning it fails the proof instead of growing the buffer.
+          const budget = new StdinBudget();
           ws.onmessage = (ev: MessageEvent) => {
             const data = ev.data as ArrayBuffer | ArrayBufferView;
-            if (data instanceof ArrayBuffer) child.stdin.write(Buffer.from(data));
-            else if (ArrayBuffer.isView(data)) {
-              child.stdin.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+            let bytes: Buffer;
+            if (data instanceof ArrayBuffer) bytes = Buffer.from(data);
+            else if (ArrayBuffer.isView(data)) bytes = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+            else return;
+            if (!budget.write(child.stdin, bytes)) {
+              reject(new ProverError(`cu-prover stdin: more than ${budget.limit} bytes not yet read for ${job.proof}`));
             }
           };
           ws.onerror = () => reject(new ProverError(`zk ws error for ${job.proof}`));

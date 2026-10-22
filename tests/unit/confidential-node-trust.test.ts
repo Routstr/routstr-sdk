@@ -26,6 +26,8 @@ describe("provider error charges", () => {
     expect(errorStatusCharge(404)).toBe("abandon_fee");
     expect(errorStatusCharge(429)).toBe("session_fee");
     expect(errorStatusCharge(503)).toBe("session_fee");
+    // The node's own provider key or account: not the client's fault.
+    for (const s of [401, 402, 403]) expect(errorStatusCharge(s)).toBe("session_fee");
     expect(errorStatusCharge(500)).toBe("reservation");
     // 400: up to max(session fee, abandon fee).
     expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 2000 }), 400, 0, { abandonFeeMsat: 2000 })).toBe(true);

@@ -291,14 +291,18 @@ export function headRouteProblem(tpl: string, bases: readonly string[], kind: He
 /** The headers a head template carries: exactly these, each once, nothing else. */
 const TEMPLATE_HEADERS = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
 
+/** One header line of a head template. */
+const TEMPLATE_HEADER_LINE = /^([A-Za-z0-9-]+): ([\x21-\x7e]+(?: [\x21-\x7e]+)*)$/;
+
 /**
  * Why a published head template is not acceptable, or `undefined` when it is.
  * It must be one HTTP/1.1 POST head to the offer's upstream host, for the
  * kind's endpoint path (no query string: a node must not steer the request to
  * another provider feature), with exactly the headers a plain JSON request
  * needs and nothing that changes how the provider answers (`Expect`, `TE`,
- * `Upgrade`, compression, keep-alive): the node writes this head, so this is
- * what π_NK lets the client hold it to.
+ * `Upgrade`, compression, keep-alive), each line in the plain `Name: value`
+ * form ending in CR LF and no other control byte: the node writes this head,
+ * so this is what π_NK lets the client hold it to.
  */
 export function headTemplateProblem(tpl: string, upstreamHost: string, kind: HeadTemplateKind): string | undefined {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
@@ -308,6 +312,9 @@ export function headTemplateProblem(tpl: string, upstreamHost: string, kind: Hea
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
     return "template is not exactly one request head";
   }
+  // No control byte but the CR LF that ends each line (no bare CR or LF, no
+  // tab, no NUL): a provider and a proxy may split such a head differently.
+  if (/[\x00-\x1f\x7f]/.test(tpl.replace(/\r\n/g, ""))) return "template carries a control byte";
   const lines = tpl.slice(0, -4).split("\r\n");
   const m = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1$/.exec(lines[0] ?? "");
   if (!m) return "template is not an HTTP/1.1 POST";
@@ -321,12 +328,14 @@ export function headTemplateProblem(tpl: string, upstreamHost: string, kind: Hea
   }
   const seen = new Map<string, string>();
   for (const h of lines.slice(1)) {
-    const i = h.indexOf(":");
-    if (i <= 0) return "template carries a malformed header line";
-    const name = h.slice(0, i).trim().toLowerCase();
+    // `Name: value`: no space before the colon, one after it, no leading or
+    // trailing whitespace, no folded continuation line.
+    const hm = TEMPLATE_HEADER_LINE.exec(h);
+    if (!hm) return "template carries a malformed header line";
+    const name = hm[1]!.toLowerCase();
     if (!TEMPLATE_HEADERS.includes(name)) return `template sets the header ${name}`;
     if (seen.has(name)) return `template repeats the header ${name}`;
-    seen.set(name, h.slice(i + 1).trim());
+    seen.set(name, hm[2]!);
   }
   for (const name of TEMPLATE_HEADERS) {
     if (!seen.has(name)) return `template lacks the header ${name}`;
@@ -334,7 +343,7 @@ export function headTemplateProblem(tpl: string, upstreamHost: string, kind: Hea
   if (!upstreamHost || seen.get("host")!.toLowerCase() !== upstreamHost.toLowerCase()) {
     return "template Host is not the offer's upstream host";
   }
-  if (!/\{KEY:\d+\}/.test(seen.get("authorization")!)) return "template Authorization does not carry the key";
+  if (!/^Bearer \{KEY:\d+\}$/.test(seen.get("authorization")!)) return "template Authorization is not Bearer {KEY:n}";
   if (seen.get("content-type")!.toLowerCase() !== "application/json") return "template Content-Type is not application/json";
   if (seen.get("accept-encoding")!.toLowerCase() !== "identity") return "template Accept-Encoding is not identity";
   if (seen.get("connection")!.toLowerCase() !== "close") return "template Connection is not close";

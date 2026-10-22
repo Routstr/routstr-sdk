@@ -24,7 +24,7 @@ export interface ReceiptVerificationInput {
   /** Our own usage event parsed from the π_C3 disclosure. */
   ownUsage: UpstreamUsageEvent;
   /** The model's rates from the *signed* offer. */
-  priceEntry?: { in: number; out: number; cached_in?: number };
+  priceEntry?: { in: number; out: number; cached_in?: number; cache_write?: number };
   /** The signed offer's session fee (msats); 0 or absent when none. */
   sessionFeeMsat?: number;
   /** The signed offer's abandon fee (msats); a receipt may not name more. */
@@ -47,15 +47,20 @@ export interface ReceiptVerificationResult {
  * ceil((in·prompt + out·completion)/1000) + the session fee. The rates already
  * include any surcharge (the node signs the surcharged price list).
  *
- * Cached prompt tokens may be billed at `cached_in` (never above `in`), so
- * the honest charge is at most this bound. The node computes its charge as
- * ceil((in·(prompt−cached) + min(cached_in, in)·cached + out·completion)/1000)
- * in floating point, which can round one msat above the uncached formula when
- * the two are mathematically equal; the bound is the larger of both, so an
- * honest receipt is never refused for that rounding.
+ * Cached prompt tokens may be billed at `cached_in` (never above `in`), and
+ * prompt-cache writes at `cache_write` (`in` when the offer has none). The
+ * node computes its charge as
+ * ceil((in·(prompt−cached−written) + min(cached_in, in)·cached
+ *       + cache_write·written + out·completion)/1000)
+ * in floating point, `written` being the first positive count of
+ * `prompt_tokens_details.{cache_creation_input_tokens, cache_write_tokens,
+ * cache_creation_tokens}` or the top-level `cache_creation_input_tokens`
+ * (at most prompt−cached). The bound is the largest of that formula, the one
+ * without writes and the uncached one, so an honest receipt is never refused
+ * for rounding or for a count the node did not read.
  */
 export function maxChargeMsats(
-  priceEntry: { in: number; out: number; cached_in?: number },
+  priceEntry: { in: number; out: number; cached_in?: number; cache_write?: number },
   usage: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -76,7 +81,35 @@ export function maxChargeMsats(
     cached > 0 && Number.isFinite(cachedRate)
       ? Math.ceil((inRate * (prompt - cached) + cachedRate * cached + outRate * completion) / 1000)
       : uncached;
-  return Math.max(uncached, withCached) + Math.max(0, sessionFeeMsat);
+  const written = Math.min(cacheWriteTokens(usage, details), prompt - cached);
+  const writeRate = Number(priceEntry.cache_write ?? inRate);
+  const withWrites =
+    written > 0 && Number.isFinite(writeRate) && Number.isFinite(cachedRate)
+      ? Math.ceil(
+          (inRate * (prompt - cached - written) +
+            cachedRate * cached +
+            writeRate * written +
+            outRate * completion) /
+            1000,
+        )
+      : withCached;
+  return Math.max(uncached, withCached, withWrites) + Math.max(0, sessionFeeMsat);
+}
+
+/** Prompt-cache writes as the node reads them: nested names first, then
+ *  Anthropic's top-level one; the first positive count. */
+function cacheWriteTokens(usage: Record<string, unknown>, details: unknown): number {
+  const d = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
+  for (const v of [
+    d.cache_creation_input_tokens,
+    d.cache_write_tokens,
+    d.cache_creation_tokens,
+    usage.cache_creation_input_tokens,
+  ]) {
+    const n = tokenCount(v);
+    if (n > 0) return n;
+  }
+  return 0;
 }
 
 /** A receipt amount: a non-negative whole number of msats (never absent). */
@@ -93,7 +126,7 @@ function tokenCount(v: unknown): number {
 
 /**
  * A charge without usage: at most the given signed fee (the session fee for a
- * provider refusal, 4xx/503; the abandon fee for a session that ended without
+ * provider refusal, 429/503/401/402/403; the abandon fee for a session that ended without
  * a request reaching the provider).
  */
 export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 0): boolean {
@@ -101,13 +134,14 @@ export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 
 }
 
 /**
- * What a provider error costs, by status: a request the provider refused for
- * its own content (4xx other than 429) is the client's, so it pays the
- * abandon fee (the node ran the 2PC for it); a refusal for capacity (429, 503)
- * costs the session fee; any other error the session's reservation.
+ * What a provider error costs, by status: a refusal for capacity (429, 503) or
+ * for the node's own key or account (401, 402, 403) costs the session fee; any
+ * other 4xx is a request the provider refused for its own content, so the
+ * client pays the abandon fee (the node ran the 2PC for it); any other error
+ * the session's reservation.
  */
 export function errorStatusCharge(status: number): "abandon_fee" | "session_fee" | "reservation" {
-  if (status === 429 || status === 503) return "session_fee";
+  if ([401, 402, 403, 429, 503].includes(status)) return "session_fee";
   if (status >= 400 && status < 500) return "abandon_fee";
   return "reservation";
 }
