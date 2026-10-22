@@ -16,7 +16,7 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fromHex, hex } from "./advice";
 import { ProverError, ProverMissingError } from "./errors";
-import { resolveProverPath } from "./prover";
+import { resolveProverPath, StdinBudget } from "./prover";
 
 export const CU_2PC_ENV_VARS = ["CU_2PC_BIN", "CU_2PC"] as const;
 
@@ -151,6 +151,7 @@ export class TwoPcSession {
   private decoder = new TwoPcFrameDecoder();
   private waiters = new Map<string, Waiter>();
   private queued = new Map<string, Record<string, unknown>>();
+  private stdinBudget = new StdinBudget();
   private failureErr: Error | undefined;
   private closed = false;
   /** Phase B delivered: the node closing the 2PC socket afterwards is normal. */
@@ -213,8 +214,11 @@ export class TwoPcSession {
   }
 
   private writeChild(channel: number, payload: Uint8Array): void {
+    if (!this.child || this.failureErr) return;
     try {
-      this.child?.stdin.write(encodeTwoPcFrame(channel, payload));
+      if (!this.stdinBudget.write(this.child.stdin, encodeTwoPcFrame(channel, payload))) {
+        this.fail(new ProverError(`cu-2pc stdin: more than ${this.stdinBudget.limit} bytes not yet read`));
+      }
     } catch (e) {
       this.fail(new ProverError(`cu-2pc stdin: ${e instanceof Error ? e.message : e}`));
     }
@@ -273,6 +277,17 @@ export class TwoPcSession {
     this.failureErr = e;
     for (const w of this.waiters.values()) w.rej(e);
     this.waiters.clear();
+    // Nothing more runs on this 2PC: drop the socket and the process now.
+    try {
+      this.ws?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.child?.kill();
+    } catch {
+      /* ignore */
+    }
   }
 
   private wait(ev: string, ms: number): Promise<Record<string, unknown>> {

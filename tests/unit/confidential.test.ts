@@ -105,7 +105,8 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
     key_length: 42,
     key_alphabet: "[A-Za-z0-9_-]",
     head_template:
-      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Length: {LEN}\r\n\r\n",
+      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\n" +
+      "Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
     suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
     chat: VENICE_CHAT,
     price_list: {
@@ -317,7 +318,8 @@ describe("trusted API routes", () => {
 
   it("refuses an offer whose head route is not the trusted base plus the endpoint", () => {
     const tpl = (path: string) =>
-      `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Length: {LEN}\r\n\r\n`;
+      `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\n` +
+      `Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n`;
     const verify = (path: string, trustedHosts: string[]) => {
       const { offer } = signedOffer({ head_template: tpl(path) });
       return () => verifyConfidentialOffer(offer, { allowUnpinned: true, trustedHosts });
@@ -517,6 +519,23 @@ describe("receipt verification", () => {
       priceEntry,
     });
     expect(r.costWithinOffer).toBe(true);
+    // Prompt-cache writes at the signed cache_write rate (same vectors as the node).
+    const rates = { in: 10_000, cached_in: 2_500, cache_write: 12_500, out: 100_000 };
+    const venice = {
+      prompt_tokens: 1000,
+      completion_tokens: 8,
+      prompt_tokens_details: { cached_tokens: 200, cache_creation_input_tokens: 600 },
+      cache_creation_input_tokens: 600,
+    };
+    expect(maxChargeMsats(rates, venice)).toBe(10_800);
+    expect(maxChargeMsats(rates, { ...venice, prompt_tokens_details: { cached_tokens: 200, cache_write_tokens: 600 } })).toBe(10_800);
+    expect(maxChargeMsats(rates, { ...venice, prompt_tokens_details: { cached_tokens: 200 } })).toBe(10_800);
+    // Writes above the uncached bound: 1000·12.5 + 8·100.
+    const allWritten = { ...venice, prompt_tokens_details: { cache_creation_input_tokens: 1000 } };
+    expect(maxChargeMsats(rates, allWritten)).toBe(13_300);
+    // Without a signed cache_write rate the writes bound at `in` (the uncached formula).
+    const { cache_write: _cw, ...old } = rates;
+    expect(maxChargeMsats(old, allWritten)).toBe(10_800);
   });
 
   it("allows the signed session fee on top of the usage, never more", () => {
