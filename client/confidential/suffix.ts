@@ -1,0 +1,605 @@
+/**
+ * Body/suffix construction and everything the client proves or checks about
+ * its own request and the upstream response:
+ *
+ *  - `canonicalSuffix` — the byte-exact JSON suffix the sidecar reconstructs
+ *    and requires (GAP-1). Must match `crypto/relay/src/main.rs::canonical_suffix`.
+ *  - `buildConfidentialBody` — a body whose last bytes are that suffix.
+ *  - `parseHttpResponse` — split the decrypted upstream bytes into status,
+ *    headers and body (the TLS fork has already verified every GCM tag).
+ *  - `extractUsageDisclosure` — locate the π_C3S disclosure window `R`.
+ */
+
+import { concat } from "./advice";
+import { canonicalJson } from "./canonical";
+import { OfferMalformedError, ResponseVerificationError } from "./errors";
+
+/**
+ * The offer's `chat` block: how the pinned suffix of a chat request is built
+ * (routstr-confidential docs/CHAT-SUFFIX.md). The node chooses it, so
+ * `validateChatSuffix` holds it to a narrow policy.
+ */
+export interface ChatSuffixSpec {
+  /** Request keys that carry the pinned token cap, after `model`. */
+  cap_keys: string[];
+  /** Pinned in this order after the caps. */
+  fixed_pins: [string, unknown][];
+}
+
+/** The keys a chat suffix may carry the token cap under. */
+export const CHAT_CAP_KEYS: readonly string[] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+/** Request keys the protocol itself sets: never taken from the caller. */
+export const CHAT_PROTOCOL_KEYS: ReadonlySet<string> = new Set(["model", ...CHAT_CAP_KEYS, "n", "stream", "stream_options"]);
+
+/** The most bytes the fixed pins of a chat suffix may render to. */
+export const MAX_CHAT_PINS_LEN = 1024;
+
+const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A value every party serializes to the same bytes. */
+function pinValueOk(v: unknown): boolean {
+  if (typeof v === "boolean") return true;
+  if (typeof v === "number") return Number.isSafeInteger(v);
+  if (typeof v === "string") return /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v);
+  if (Array.isArray(v)) return v.every(pinValueOk);
+  if (typeof v === "object" && v !== null) {
+    return Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x));
+  }
+  return false;
+}
+
+/**
+ * A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty
+ * object of those (`{}` switches nothing off: a provider may read it as "on,
+ * with defaults").
+ */
+function pinIsOff(v: unknown): boolean {
+  if (v === false || v === "off") return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === "object" && v !== null) {
+    const members = Object.values(v);
+    return members.length > 0 && members.every(pinIsOff);
+  }
+  return false;
+}
+
+/** Key prefixes that negate a feature: `false` under them switches it on. */
+export const PIN_NEGATING_PREFIXES: readonly string[] = ["disable", "no_", "skip", "without", "exclude", "omit", "hide"];
+
+/**
+ * Key fragments that name a protection: pinning one can only switch it off,
+ * so it is left to the caller and the provider's default.
+ */
+export const PIN_PROTECTION_WORDS: readonly string[] = ["safe", "moderat", "filter", "nsfw", "censor", "guard"];
+
+/**
+ * Why a pinned key (a top-level pin key, or a member key at any depth of its
+ * value) may not be pinned, or `undefined`. Shared by chat and image pins.
+ */
+export function pinKeyProblem(key: string, value: unknown): string | undefined {
+  const k = key.toLowerCase();
+  if (PIN_NEGATING_PREFIXES.some((p) => k.startsWith(p))) {
+    return `key ${JSON.stringify(key)} negates a feature (false under it switches it on)`;
+  }
+  if (PIN_PROTECTION_WORDS.some((w) => k.includes(w))) {
+    return `key ${JSON.stringify(key)} names a protection, which a pin could only switch off`;
+  }
+  return pinMembersProblem(value);
+}
+
+function pinMembersProblem(v: unknown): string | undefined {
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const p = pinMembersProblem(x);
+      if (p) return p;
+    }
+  } else if (typeof v === "object" && v !== null) {
+    for (const [m, x] of Object.entries(v)) {
+      const p = pinKeyProblem(m, x);
+      if (p) return p;
+    }
+  }
+  return undefined;
+}
+
+/** The keys a chat suffix pins, in order. */
+export function chatSuffixKeys(chat: ChatSuffixSpec): string[] {
+  return ["model", ...chat.cap_keys, ...chat.fixed_pins.map((p) => p[0])];
+}
+
+/**
+ * Check the offer's `chat` block against the policy (the sidecar applies the
+ * same one at startup): caps under a known cap key, streaming with usage,
+ * `n` 1, and every other pin switching something off, under no key that
+ * negates a feature or names a protection (`pinKeyProblem`). `suffixKeys`
+ * (the offer's `suffix_keys`) must list the keys it pins. Throws
+ * `OfferMalformedError`.
+ */
+export function validateChatSuffix(chat: unknown, suffixKeys: unknown): asserts chat is ChatSuffixSpec {
+  const bad = (what: string): never => {
+    throw new OfferMalformedError(`offer.chat ${what}`);
+  };
+  if (typeof chat !== "object" || chat === null || Array.isArray(chat)) bad("is missing or not an object");
+  const c = chat as Record<string, unknown>;
+  const caps = c.cap_keys;
+  if (!Array.isArray(caps) || caps.length === 0) bad("cap_keys is not a non-empty list");
+  const seen = new Set<string>();
+  for (const k of caps as unknown[]) {
+    if (typeof k !== "string" || !CHAT_CAP_KEYS.includes(k)) bad(`cap key ${JSON.stringify(k)} is not one of ${CHAT_CAP_KEYS.join(", ")}`);
+    if (seen.has(k as string)) bad(`repeats cap key ${JSON.stringify(k)}`);
+    seen.add(k as string);
+  }
+  const pins = c.fixed_pins;
+  if (!Array.isArray(pins) || !pins.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string")) {
+    bad("fixed_pins is not a list of [key, value] pairs");
+  }
+  for (const [k, v] of pins as [string, unknown][]) {
+    if (!PIN_KEY.test(k) || k === "model" || CHAT_CAP_KEYS.includes(k) || seen.has(k)) {
+      bad(`pin key ${JSON.stringify(k)} is malformed, repeated, model or a cap key`);
+    }
+    seen.add(k);
+    if (!pinValueOk(v)) bad(`pin ${JSON.stringify(k)} has a value outside the pin grammar`);
+    const keyProblem = pinKeyProblem(k, v);
+    if (keyProblem) bad(`pin ${JSON.stringify(k)}: ${keyProblem}`);
+    let ok: boolean;
+    if (k === "stream") ok = v === true;
+    else if (k === "n") ok = v === 1;
+    else if (k === "stream_options") {
+      ok =
+        typeof v === "object" && v !== null && !Array.isArray(v) &&
+        Object.keys(v).length === 1 && (v as Record<string, unknown>).include_usage === true;
+    } else ok = pinIsOff(v);
+    if (!ok) bad(`pins ${k}=${JSON.stringify(v)}: only stream=true, n=1, stream_options {"include_usage":true}, and pins that switch something off are accepted`);
+  }
+  for (const need of ["stream", "stream_options"]) {
+    if (!seen.has(need)) bad(`does not pin ${need} (the usage proof reads the streamed usage event)`);
+  }
+  if (renderPins((pins as [string, unknown][])).length > MAX_CHAT_PINS_LEN) bad(`fixed_pins render to more than ${MAX_CHAT_PINS_LEN} bytes`);
+  const keys = chatSuffixKeys(c as unknown as ChatSuffixSpec);
+  if (!Array.isArray(suffixKeys) || suffixKeys.join("\n") !== keys.join("\n")) {
+    throw new OfferMalformedError(`offer.suffix_keys ${JSON.stringify(suffixKeys)} are not the keys the chat block pins ${JSON.stringify(keys)}`);
+  }
+}
+
+function renderPins(pins: readonly [string, unknown][]): string {
+  return pins.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",");
+}
+
+/**
+ * The public JSON suffix that pins every cost-relevant parameter, rendered
+ * from the offer's `chat` block. Byte-exact with the sidecar's rendering; a
+ * mismatch aborts the session (GAP-1).
+ */
+export function canonicalSuffix(chat: ChatSuffixSpec, model: string, maxTokens: number): string {
+  const parts = [`"model":${JSON.stringify(model)}`, ...chat.cap_keys.map((k) => `${JSON.stringify(k)}:${maxTokens}`)];
+  if (chat.fixed_pins.length > 0) parts.push(renderPins(chat.fixed_pins));
+  return `,${parts.join(",")}}`;
+}
+
+/** Whether two pin values are the same JSON value. */
+export function samePinValue(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+/**
+ * Build a confidential request body: an object whose *last* bytes are the
+ * canonical suffix. `privateJson` is the JSON text of the private part up to
+ * (and excluding) its closing brace, e.g. `{"messages":[{"role":"user",...}]`.
+ * Duplicate keys in the private part are harmless: the provider keeps the last
+ * occurrence, which is always the suffix.
+ */
+export function buildConfidentialBody(
+  privateJson: string,
+  suffix: string,
+  encoder: TextEncoder = new TextEncoder(),
+): Uint8Array {
+  return encoder.encode(privateJson + suffix);
+}
+
+// ─── HTTP response parsing (plaintext after TLS) ────────────────────────────
+
+export interface ParsedHttpResponse {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  /** Raw decrypted plaintext, including status line + headers. */
+  raw: Uint8Array;
+  /** Body bytes (after the header terminator). */
+  body: Uint8Array;
+  bodyText: string;
+  contentType: string;
+  /** The body is complete by its framing (chunked terminator or Content-Length). */
+  complete: boolean;
+}
+
+/** Split the decrypted upstream plaintext into an HTTP/1.1 response. */
+export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
+  let start = 0;
+  for (;;) {
+    const head = parseHead(bytes, start);
+    // A 1xx interim head (100 Continue, 103 Early Hints) is not the answer:
+    // the final status follows it. (101 switches protocols and is final.)
+    if (head.status >= 100 && head.status < 200 && head.status !== 101) {
+      start = head.end;
+      continue;
+    }
+    return finishResponse(bytes, head);
+  }
+}
+
+interface ParsedHead {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  /** Offset just past the head's blank line. */
+  end: number;
+}
+
+function parseHead(bytes: Uint8Array, from: number): ParsedHead {
+  let headerEnd = -1;
+  for (let i = from; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) {
+      headerEnd = i;
+      break;
+    }
+  }
+  if (headerEnd < 0) {
+    throw new ResponseVerificationError("upstream response has no HTTP header terminator");
+  }
+  const headText = Buffer.from(bytes.subarray(from, headerEnd)).toString("latin1");
+  const lines = headText.split("\r\n");
+  const statusLine = lines.shift() ?? "";
+  const m = /^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/.exec(statusLine);
+  if (!m) {
+    throw new ResponseVerificationError(`malformed status line: ${JSON.stringify(statusLine)}`);
+  }
+  const status = Number(m[1]);
+  const statusText = m[2] ?? "";
+  const headers: Record<string, string> = {};
+  for (const line of lines) {
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+  }
+  return { status, statusText, headers, end: headerEnd + 4 };
+}
+
+function finishResponse(bytes: Uint8Array, head: ParsedHead): ParsedHttpResponse {
+  const { status, statusText, headers } = head;
+  const rawBody = bytes.subarray(head.end);
+  let body: Uint8Array;
+  let complete: boolean;
+  if (/chunked/i.test(headers["transfer-encoding"] ?? "")) {
+    const decoder = new ChunkedDecoder();
+    const parts = decoder.push(rawBody);
+    body = joinParts(parts);
+    complete = decoder.done;
+  } else {
+    body = rawBody;
+    const declared = headers["content-length"];
+    complete = declared === undefined || (/^\d+$/.test(declared) && Number(declared) === rawBody.length);
+  }
+  const parsed = {
+    status,
+    statusText,
+    headers,
+    raw: bytes,
+    body,
+    contentType: headers["content-type"] ?? "",
+    complete,
+  } as ParsedHttpResponse;
+  // Decoded on first use: an image body is megabytes, and most callers never
+  // read it as text.
+  let text: string | undefined;
+  Object.defineProperty(parsed, "bodyText", {
+    enumerable: true,
+    get: () => (text ??= Buffer.from(body).toString("utf8")),
+  });
+  return parsed;
+}
+
+// ─── π_C3 disclosure extraction (chunked transfer encoding) ─────────────────
+
+interface Chunk {
+  start: number;
+  data: Uint8Array;
+}
+
+function parseChunks(b: Uint8Array): Chunk[] | null {
+  let off = 0;
+  const out: Chunk[] = [];
+  for (;;) {
+    let nl = -1;
+    for (let i = off; i + 1 < b.length; i++) {
+      if (b[i] === 13 && b[i + 1] === 10) {
+        nl = i;
+        break;
+      }
+    }
+    if (nl < 0) return null;
+    const line = Buffer.from(b.subarray(off, nl)).toString("ascii").trim();
+    if (!/^[0-9a-fA-F]+$/.test(line)) return null;
+    const len = parseInt(line, 16);
+    const dataStart = nl + 2;
+    if (len === 0) {
+      if (b.length !== dataStart + 2) return null;
+      return out;
+    }
+    if (b.length < dataStart + len + 2) return null;
+    if (b[dataStart + len] !== 13 || b[dataStart + len + 1] !== 10) return null;
+    out.push({ start: off, data: b.subarray(dataStart, dataStart + len) });
+    off = dataStart + len + 2;
+  }
+}
+
+function endsWithUsageEvent(joined: Uint8Array): boolean {
+  const text = Buffer.from(joined).toString("utf8");
+  const tail = "data: [DONE]\n\n";
+  if (!text.endsWith(tail)) return false;
+  const before = text.slice(0, text.length - tail.length);
+  const idx = before.lastIndexOf("data: ");
+  const evText = (idx >= 0 ? before.slice(idx + 6) : before).trim();
+  if (!evText) return false;
+  try {
+    const v = JSON.parse(evText) as { choices?: unknown[]; usage?: { prompt_tokens?: number } };
+    return Array.isArray(v.choices) && v.choices.length === 0 && !!v.usage && v.usage.prompt_tokens !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The SSE data carried by a disclosure window `R`: either `R` starts at a
+ * chunk-size line, or at an event line inside a chunk (a raw LF, then
+ * `data: `), whose data runs to the first CRLF (SSE data carries no CR).
+ */
+export function dechunkDisclosure(r: Uint8Array): Uint8Array | null {
+  const lineStart = [10, 100, 97, 116, 97, 58, 32]; // "\ndata: "
+  if (r.length >= lineStart.length && lineStart.every((b, i) => r[i] === b)) {
+    let end = -1;
+    for (let i = 0; i + 1 < r.length; i++) {
+      if (r[i] === 13 && r[i + 1] === 10) {
+        end = i;
+        break;
+      }
+    }
+    if (end < 0) return null;
+    const rest = parseChunks(r.subarray(end + 2));
+    if (!rest) return null;
+    return concat(r.subarray(1, end), ...rest.map((c) => c.data));
+  }
+  const chunks = parseChunks(r);
+  return chunks ? concat(...chunks.map((c) => c.data)) : null;
+}
+
+/**
+ * Locate the minimal suffix of the chunked body that still ends with the final
+ * usage event + `[DONE]` — the π_C3 disclosure window `R`. It starts at the
+ * usage event's own line when the provider (or a CDN) put the end of the
+ * stream in one large chunk, so the proof's work follows the usage event,
+ * not the chunk size.
+ */
+export function extractUsageDisclosure(responseBytes: Uint8Array): Uint8Array | null {
+  const parsedBodyStart = findBodyStart(responseBytes);
+  const body = responseBytes.subarray(parsedBodyStart);
+  const all = parseChunks(body);
+  if (!all) return null;
+  // The last "\ndata: " whose tail is exactly the usage event and [DONE].
+  for (let i = body.length - 7; i >= 0; i--) {
+    if (body[i] !== 10 || body[i + 1] !== 100) continue;
+    const r = body.subarray(i);
+    const joined = dechunkDisclosure(r);
+    if (joined && endsWithUsageEvent(joined) && startsWithOneEvent(joined)) return r;
+    if (body.length - i > 1 << 16) break;
+  }
+  for (let i = all.length - 1; i >= 0; i--) {
+    const r = body.subarray(all[i]!.start);
+    const chunks = parseChunks(r);
+    if (!chunks) continue;
+    const joined = concat(...chunks.map((c) => c.data));
+    if (endsWithUsageEvent(joined)) return r;
+  }
+  return null;
+}
+
+/** The data is the usage event, then `[DONE]`, and nothing before them. */
+function startsWithOneEvent(joined: Uint8Array): boolean {
+  const text = Buffer.from(joined).toString("utf8");
+  return text.startsWith("data: ") && text.indexOf("\n\ndata: ") === text.lastIndexOf("\n\ndata: ");
+}
+
+function findBodyStart(b: Uint8Array): number {
+  for (let i = 0; i + 3 < b.length; i++) {
+    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i + 4;
+  }
+  return 0;
+}
+
+/** Parse the usage event out of a disclosure window (the node's pricing key). */
+export interface UpstreamUsageEvent {
+  model: string;
+  usage: { prompt_tokens: number; completion_tokens: number; [k: string]: unknown };
+  cost?: unknown;
+  [k: string]: unknown;
+}
+
+export function usageEventFromDisclosure(r: Uint8Array): UpstreamUsageEvent | null {
+  // Decode the chunk framing first: an event may be split across HTTP chunks
+  // (the provider or a CDN chunks wherever it likes). Fall back to the raw text
+  // for an unchunked window.
+  const joined = dechunkDisclosure(r);
+  const text = joined ? Buffer.from(joined).toString("utf8") : Buffer.from(r).toString("utf8");
+  const tail = "data: [DONE]\n\n";
+  const before = text.endsWith(tail) ? text.slice(0, text.length - tail.length) : text;
+  const idx = before.lastIndexOf("data: ");
+  const seg = idx >= 0 ? before.slice(idx + 6) : before;
+  try {
+    const parsed = JSON.parse(seg.split("\r\n")[0]!.trim());
+    if (typeof parsed?.model !== "string" || !parsed?.usage) return null;
+    return parsed as UpstreamUsageEvent;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The tail record ciphertext lengths (content + inner type byte) covering `R`,
+ * taken from the end of the response record list. Mirrors the reference
+ * client's computation.
+ */
+export function disclosureTailLens(responseChunkLens: number[], rLength: number): number[] {
+  const tailLens: number[] = [];
+  let acc = 0;
+  for (let i = responseChunkLens.length - 1; i >= 0 && acc < rLength; i--) {
+    const len = responseChunkLens[i]! + 1;
+    tailLens.push(len);
+    acc += responseChunkLens[i]!;
+  }
+  return tailLens;
+}
+
+/** Best-effort effective model from the streamed plaintext (last `"model":"…"`). */
+export function effectiveModelFromText(text: string): string | undefined {
+  const matches = [...text.matchAll(/"model"\s*:\s*"([^"]+)"/g)].map((m) => m[1]!);
+  return matches[matches.length - 1];
+}
+
+
+/** Hop-by-hop / framing headers that must not be copied onto a rebuilt response. */
+export const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "content-length",
+  "te",
+  "trailer",
+  "upgrade",
+  "proxy-connection",
+]);
+
+/**
+ * Whether a provider response header is passed on to the caller: not a
+ * hop-by-hop header, and not the provider account's own state (its balance
+ * and rate-limit counters belong to the node operator; the client can read
+ * them in the decrypted response, but they are not handed on).
+ */
+export function exposedProviderHeader(name: string): boolean {
+  const n = name.toLowerCase();
+  return !HOP_BY_HOP_HEADERS.has(n) && !n.startsWith("x-venice-balance-") && !n.startsWith("x-ratelimit-");
+}
+
+function joinParts(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/**
+ * Incremental HTTP/1.1 response decoder: feed decrypted TLS application data,
+ * get the parsed head once and the (de-chunked) body bytes as they arrive.
+ * Used to stream a confidential response to the caller while the session's
+ * proofs and settlement are still running.
+ */
+export class IncrementalHttpResponse {
+  private buf = new Uint8Array(0);
+  private headDone = false;
+  private chunked = false;
+  private decoder = new ChunkedDecoder();
+  head?: { status: number; statusText: string; headers: Record<string, string> };
+
+  /** Returns body bytes made available by this push (possibly empty). */
+  push(data: Uint8Array): Uint8Array[] {
+    if (this.headDone) return this.chunked ? this.decoder.push(data) : [data];
+    const merged = new Uint8Array(this.buf.length + data.length);
+    merged.set(this.buf);
+    merged.set(data, this.buf.length);
+    this.buf = merged;
+    for (let i = 0; i + 3 < merged.length; i++) {
+      if (merged[i] === 13 && merged[i + 1] === 10 && merged[i + 2] === 13 && merged[i + 3] === 10) {
+        const interim = parseHead(merged, 0);
+        if (interim.status >= 100 && interim.status < 200 && interim.status !== 101) {
+          // An interim head: the answer's head follows it.
+          this.buf = new Uint8Array(0);
+          return this.push(merged.subarray(i + 4));
+        }
+        const parsed = parseHttpResponse(merged.subarray(0, i + 4));
+        this.head = { status: parsed.status, statusText: parsed.statusText, headers: parsed.headers };
+        this.chunked = /chunked/i.test(parsed.headers["transfer-encoding"] ?? "");
+        this.headDone = true;
+        const rest = merged.subarray(i + 4);
+        this.buf = new Uint8Array(0);
+        if (rest.length === 0) return [];
+        return this.chunked ? this.decoder.push(rest) : [rest];
+      }
+    }
+    return [];
+  }
+
+  get complete(): boolean {
+    return this.headDone && (!this.chunked || this.decoder.done);
+  }
+}
+
+/** Streaming `Transfer-Encoding: chunked` decoder. */
+export class ChunkedDecoder {
+  private pending = new Uint8Array(0);
+  private remaining = -1; // bytes left in the current chunk; -1 = expecting a size line
+  private needCrlf = false;
+  done = false;
+
+  push(data: Uint8Array): Uint8Array[] {
+    const out: Uint8Array[] = [];
+    let buf = new Uint8Array(this.pending.length + data.length);
+    buf.set(this.pending);
+    buf.set(data, this.pending.length);
+    let off = 0;
+    while (off < buf.length && !this.done) {
+      if (this.needCrlf) {
+        if (buf.length - off < 2) break;
+        if (buf[off] !== 13 || buf[off + 1] !== 10) {
+          throw new ResponseVerificationError("chunked body: missing CRLF after chunk data");
+        }
+        off += 2;
+        this.needCrlf = false;
+        continue;
+      }
+      if (this.remaining < 0) {
+        let nl = -1;
+        for (let i = off; i + 1 < buf.length; i++) {
+          if (buf[i] === 13 && buf[i + 1] === 10) {
+            nl = i;
+            break;
+          }
+        }
+        if (nl < 0) break;
+        const line = Buffer.from(buf.subarray(off, nl)).toString("latin1").split(";")[0]!.trim();
+        const size = Number.parseInt(line, 16);
+        if (!Number.isFinite(size) || size < 0 || !/^[0-9a-fA-F]+$/.test(line)) {
+          throw new ResponseVerificationError(`chunked body: bad chunk size ${JSON.stringify(line)}`);
+        }
+        off = nl + 2;
+        if (size === 0) {
+          this.done = true; // trailers (if any) are ignored
+          break;
+        }
+        this.remaining = size;
+        continue;
+      }
+      const take = Math.min(this.remaining, buf.length - off);
+      out.push(buf.slice(off, off + take));
+      off += take;
+      this.remaining -= take;
+      if (this.remaining === 0) {
+        this.remaining = -1;
+        this.needCrlf = true;
+      }
+    }
+    this.pending = buf.slice(off);
+    return out;
+  }
+}
