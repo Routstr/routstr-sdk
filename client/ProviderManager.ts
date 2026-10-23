@@ -713,6 +713,102 @@ export function completionCapFromBody(
   return cap;
 }
 
+const PICTURE_MEGAPIXELS: Readonly<Record<string, number>> = {
+  "512": 0.25,
+  "1K": 1,
+  "2K": 4,
+  "4K": 16,
+};
+const PICTURE_REFERENCE_FIELDS = [
+  "input_references",
+  "reference_images",
+  "style_references",
+  "image",
+  "image_url",
+];
+
+function pictureEdges(body: Record<string, unknown>): number[] {
+  if (typeof body.size === "string" && body.size.toLowerCase().includes("x")) {
+    const edges = body.size.toLowerCase().split("x").map(Number);
+    return edges.every(Number.isInteger) ? edges : [];
+  }
+  return [body.width, body.height].filter((edge): edge is number =>
+    Number.isInteger(edge)
+  );
+}
+
+function pictureResolution(body: Record<string, unknown>): string | undefined {
+  if (typeof body.resolution === "string" && body.resolution)
+    return body.resolution.toUpperCase();
+  const edges = pictureEdges(body);
+  if (edges.length === 0) return undefined;
+  const area = edges.reduce((product, edge) => product * edge, 1);
+  return area < 2 * 1024 * 1024 ? "1K" : area < 2 * 2048 * 2048 ? "2K" : "4K";
+}
+
+function pictureTierUsd(book: any, body: Record<string, unknown>): number {
+  const resolution = pictureResolution(body);
+  const quality =
+    typeof body.quality === "string" && body.quality
+      ? body.quality.toLowerCase()
+      : undefined;
+  const declared = (
+    values: string[] | undefined,
+    value: string | undefined,
+    normal: (v: string) => string
+  ) => !value || !values?.length || values.map(normal).includes(value);
+  if (!declared(book.resolutions, resolution, (v) => v.toUpperCase()))
+    return book.max_usd;
+  if (!declared(book.qualities, quality, (v) => v.toLowerCase()))
+    return book.max_usd;
+  const wanted = resolution ?? book.default_resolution ?? null;
+  for (const wantedQuality of [quality ?? book.default_quality ?? null, null]) {
+    const tier = (book.tiers ?? []).find(
+      (t: any) =>
+        (t.resolution ?? null) === wanted &&
+        (t.quality ?? null) === wantedQuality
+    );
+    if (tier) return tier.usd;
+  }
+  return book.max_usd;
+}
+
+function pictureHoldSats(
+  model: Model,
+  body: Record<string, unknown>
+): number | undefined {
+  const outputs = model.architecture?.output_modalities;
+  const ceiling = (model.sats_pricing as any)?.image_output;
+  if (outputs?.length !== 1 || outputs[0] !== "image" || !(ceiling > 0))
+    return undefined;
+  if (PICTURE_REFERENCE_FIELDS.some((field) => body[field])) return undefined;
+
+  let perPicture = ceiling;
+  const book = (model as any).image_pricing;
+  if (book?.max_usd > 0) {
+    const satsPerUsd = ceiling / book.max_usd;
+    if (book.unit === "image") {
+      perPicture = satsPerUsd * pictureTierUsd(book, body);
+    } else if (
+      book.unit === "megapixel" &&
+      book.megapixel_usd > 0 &&
+      !("steps" in body)
+    ) {
+      const edges = pictureEdges(body);
+      const megapixels =
+        edges.length > 0
+          ? (edges[0] * (edges[1] ?? edges[0])) / 1_000_000
+          : (PICTURE_MEGAPIXELS[pictureResolution(body) ?? "1K"] ?? 1);
+      perPicture = satsPerUsd * megapixels * book.megapixel_usd;
+    } else {
+      return undefined;
+    }
+  }
+  return (
+    Math.max(1, Number(body.n) || 1, Number(body.variants) || 1) * perPicture
+  );
+}
+
 /**
  * Port of the node's minimum-balance gate
  * (`routstr/payment/helpers.py:calculate_discounted_max_cost`), in sats.
@@ -1906,6 +2002,9 @@ export class ProviderManager {
         } as unknown as Model;
       }
       const body = requestBody ?? {};
+
+      const pictureSats = pictureHoldSats(model, body);
+      if (pictureSats !== undefined) return pictureSats * 1.05;
 
       let imageTokens = 0;
       let textChars = 0;
