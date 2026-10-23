@@ -136,16 +136,31 @@ interface QueuedTopUp {
  */
 const queuedTopUps = new WeakMap<WalletAdapter, Map<string, QueuedTopUp>>();
 
+type ProviderWalletOperation = {
+  type: "topup" | "refund";
+  startTime: number;
+  endTime?: number;
+};
+
+/** Per-provider wallet mutations (topup / refund) of each wallet */
+const providerWalletOperations = new WeakMap<
+  WalletAdapter,
+  Map<string, ProviderWalletOperation>
+>();
+
 /**
  * BalanceManager handles token refunds and topups from providers
  */
 export class BalanceManager {
   private cashuSpender: CashuSpender;
-  /** In-memory guard for per-provider wallet mutations (topup / refund) */
-  private providerWalletOps: Map<
-    string,
-    { type: "topup" | "refund"; startTime: number; endTime?: number }
-  > = new Map();
+  private get providerWalletOps(): Map<string, ProviderWalletOperation> {
+    let operations = providerWalletOperations.get(this.walletAdapter);
+    if (!operations) {
+      operations = new Map();
+      providerWalletOperations.set(this.walletAdapter, operations);
+    }
+    return operations;
+  }
   /** Cooldown (ms) between opposite operations on the same provider */
   private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
   /** Providers that have timed out during the current refund cascade. */
