@@ -252,6 +252,25 @@ describe("session id and node frames", () => {
     });
   });
 
+  it("fails the session when the node queues more than 32 MiB of TLS bytes", async () => {
+    const Ws = fakeControlSocket(ready("ab".repeat(32)));
+    await withSocket(Ws, async () => {
+      const session = new ConfidentialSession(
+        opts({
+          twoPcFactory: () =>
+            ({ start() {}, keyShare: () => new Promise(() => {}), failed: false, close() {} }) as never,
+        }),
+      );
+      const armed = session.arm();
+      armed.catch(() => {});
+      await tick(20);
+      const MiB = new ArrayBuffer(1 << 20);
+      const ws = Ws.last as unknown as { onmessage: (ev: { data: unknown }) => void };
+      for (let i = 0; i < 33; i++) ws.onmessage({ data: MiB });
+      await expect(armed).rejects.toThrow(/faster than they could be processed/);
+    });
+  });
+
   it("fails the session on a frame without a type, and caps the event log", async () => {
     const Ws = fakeControlSocket(ready("ef".repeat(32)));
     await withSocket(Ws, async () => {
