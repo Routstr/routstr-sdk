@@ -1781,9 +1781,13 @@ export class RoutstrClient {
       // The node rejected the path before charging: the key is untouched
       // and still serves the paths this node allows, so keep it.
       !unknownPathError &&
-      // An upstream 400/422 rejects the request, not the API key: nothing was
+      // An upstream error rejects the request, not the API key: nothing was
       // charged, so the key keeps its balance for the next request.
-      !(this.mode === "apikeys" && upstreamRequestError)
+      !(
+        this.mode === "apikeys" &&
+        (upstreamRequestError ||
+          upstream?.headers["x-routstr-error-scope"] === "upstream")
+      )
     ) {
       this._log(
         "DEBUG",
