@@ -2567,6 +2567,114 @@ describe("ProviderManager", () => {
       );
       expect(responsesCost).toBeGreaterThan(36000 * 0.5 * 1.05);
     });
+
+    const picture = (sats_pricing: object, image_pricing?: object) =>
+      ({
+        id: "picture",
+        name: "picture",
+        architecture: { output_modalities: ["image"] },
+        sats_pricing,
+        image_pricing,
+      }) as unknown as Model;
+    const nanoBanana = picture(
+      {
+        prompt: 0,
+        completion: 0,
+        image_output: 249.7,
+        max_completion_cost: 998.8,
+        max_cost: 998.8,
+      },
+      {
+        max_usd: 0.19,
+        tiers: [
+          { resolution: "1K", quality: null, usd: 0.1 },
+          { resolution: "2K", quality: null, usd: 0.14 },
+          { resolution: "4K", quality: null, usd: 0.19 },
+        ],
+        default_resolution: "1K",
+        resolutions: ["1K", "2K", "4K"],
+        unit: "image",
+      }
+    );
+    const gptImage = picture(
+      {
+        prompt: 0,
+        completion: 0,
+        image_output: 1103.9,
+        max_completion_cost: 4415.7,
+        max_cost: 4415.7,
+      },
+      {
+        max_usd: 0.84,
+        tiers: [
+          { resolution: "1K", quality: "high", usd: 0.26 },
+          { resolution: "1K", quality: "low", usd: 0.02 },
+        ],
+        default_resolution: "1K",
+        default_quality: "high",
+        resolutions: ["1K", "2K", "4K"],
+        qualities: ["low", "medium", "high"],
+        unit: "image",
+      }
+    );
+    const flux = picture(
+      {
+        prompt: 0,
+        completion: 0,
+        image_output: 157.7,
+        max_completion_cost: 630.8,
+        max_cost: 630.8,
+      },
+      {
+        max_usd: 0.12,
+        megapixel_usd: 0.03,
+        default_resolution: "1K",
+        unit: "megapixel",
+      }
+    );
+    const flat = picture({
+      prompt: 0,
+      completion: 0,
+      image_output: 40.4,
+      max_completion_cost: 161.6,
+      max_cost: 161.6,
+    });
+
+    it.each([
+      ["the default tier", nanoBanana, {}, 249.7 * (0.1 / 0.19)],
+      ["a named resolution", nanoBanana, { resolution: "4K" }, 249.7],
+      ["a pixel size", nanoBanana, { size: "2048x2048" }, 249.7 * (0.14 / 0.19)],
+      ["every picture asked for", nanoBanana, { n: 2 }, 2 * 249.7 * (0.1 / 0.19)],
+      [
+        "a tier the book does not list at the ceiling",
+        nanoBanana,
+        { resolution: "8K" },
+        249.7,
+      ],
+      ["the default quality", gptImage, {}, 1103.9 * (0.26 / 0.84)],
+      ["a named quality", gptImage, { quality: "low" }, 1103.9 * (0.02 / 0.84)],
+      [
+        "the requested area on a megapixel book",
+        flux,
+        { size: "512x512" },
+        157.7 * ((0.262144 * 0.03) / 0.12),
+      ],
+      ["the listed price without a book", flat, {}, 40.4],
+      [
+        "the envelope when reference images make it unbounded",
+        nanoBanana,
+        { image: "data:image/png;base64,AA" },
+        998.8 / 1.05,
+      ],
+    ])("sizes a picture deposit from %s", (_, model, body, sats) => {
+      const manager = new ProviderManager(createRegistry());
+      const required = manager.getRequiredSatsForModel(model, [], undefined, {
+        model: "picture",
+        prompt: "a red bicycle",
+        ...body,
+      });
+      expect(required).toBeCloseTo(sats * 1.05, 6);
+    });
   });
 
   // ---- node gate (minimum-balance reserve) ----
