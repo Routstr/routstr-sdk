@@ -216,7 +216,7 @@ describe("BalanceManager provider wallet collision guard", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("blocks refund while topup is in-flight for the same provider", async () => {
+  it("blocks refund while topup is in-flight for the same provider, from another client of the wallet", async () => {
     let topupResolve!: () => void;
     const topupPromise = new Promise<void>((resolve) => {
       topupResolve = resolve;
@@ -249,7 +249,7 @@ describe("BalanceManager provider wallet collision guard", () => {
     });
 
     // Attempt refund while topup is in-flight
-    const refundResult = await manager.refundApiKey({
+    const refundResult = await new BalanceManager(wallet, storage).refundApiKey({
       mintUrl: "https://mint.example.com",
       baseUrl: BASE_URL,
       apiKey: "test-key",
