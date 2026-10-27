@@ -710,6 +710,8 @@ export class RoutstrClient {
       }
     }
 
+    this._abortIfCancelled(params.signal);
+
     // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
     if (tinfoilEnabled) {
       this._log(
@@ -734,6 +736,8 @@ export class RoutstrClient {
         };
       }
     }
+
+    this._abortIfCancelled(params.signal);
 
     // Spend tokens for the actual request
     const spendResult = await this._spendToken({
@@ -787,6 +791,7 @@ export class RoutstrClient {
       selectedMintUrl,
       maxTokens: requestMaxTokens,
       tinfoilEnabled,
+      tinfoilOutputCap,
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
@@ -947,6 +952,14 @@ export class RoutstrClient {
     retryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /**
+     * The cap decision made when the request was prepared. Carried so retries
+     * and failover reuse it instead of re-deriving from sanitized headers: a
+     * caller `Connection` nomination suppresses the header, and the SDK's
+     * outbound allowlist drops `Connection`, so re-deriving would resurrect a
+     * cap the caller asked to strip.
+     */
+    tinfoilOutputCap?: TinfoilOutputCapResolution;
     /** Secret scoping Tinfoil's prompt cache for this request. */
     userCacheSecret?: string;
     /** File path for the persisted default secret (client-level). */
@@ -994,12 +1007,14 @@ export class RoutstrClient {
       // against. Idempotent — an existing value (the caller's, or the one
       // attached when the request was prepared) is never duplicated, because
       // the enclave rejects two values.
-      const attemptHeaders = tinfoilEnabled && method !== "GET"
-        ? withTinfoilOutputCapHeader(
-            headers,
-            resolveTinfoilOutputCap({ path, body: attemptBody, headers })
-          )
-        : headers;
+      const attemptHeaders =
+        tinfoilEnabled && method !== "GET"
+          ? withTinfoilOutputCapHeader(
+              headers,
+              params.tinfoilOutputCap ??
+                resolveTinfoilOutputCap({ path, body: attemptBody, headers })
+            )
+          : headers;
       const requestLogId = await this.requestResponseLogSink?.logRequest?.({
         method,
         url,
@@ -1236,6 +1251,8 @@ export class RoutstrClient {
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
+      /** Prepared cap decision (see _makeRequest): reused, never re-derived. */
+      tinfoilOutputCap?: TinfoilOutputCapResolution;
       signal?: AbortSignal;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
@@ -2211,6 +2228,8 @@ export class RoutstrClient {
             )
           );
 
+        this._abortIfCancelled(params.signal);
+
         if (params.tinfoilEnabled) {
           this._log(
             "DEBUG",
@@ -2218,6 +2237,8 @@ export class RoutstrClient {
           );
           await prepareTinfoilClient({ baseUrl: nextProvider });
         }
+
+        this._abortIfCancelled(params.signal);
 
         this._log(
           "DEBUG",
@@ -3409,6 +3430,17 @@ export class RoutstrClient {
    * sealed body. An older node ignores the header, holds the whole envelope,
    * and would answer a cap-sized deposit with 402 `insufficient_balance`.
    */
+  /**
+   * Stop before spending when the caller has already gone away. Cancellation
+   * is not an "unsupported node": it must surface as AbortError, and the
+   * request must not attest or spend after it.
+   */
+  private _abortIfCancelled(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+  }
+
   private async _sealedOutputCapForReserve(
     tinfoilEnabled: boolean,
     baseUrl: string,

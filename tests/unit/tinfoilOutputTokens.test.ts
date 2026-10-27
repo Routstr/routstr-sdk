@@ -1183,19 +1183,259 @@ describe("node capability advertisement", () => {
       await vi.advanceTimersByTimeAsync(11_000);
       expect(await probe).toBe(false);
 
-      // Caller cancellation is observed without waiting for the timeout.
+      // Caller cancellation races independently of fetch and must throw,
+      // not downgrade to "unsupported". Attach the rejection assertion before
+      // aborting so the rejection is never unobserved.
       const controller = new AbortController();
-      const aborted = manager.supportsSealedOutputTokenReservation(
-        FIRST,
-        "/v1/chat/completions",
-        controller.signal
-      );
+      const aborted = expect(
+        manager.supportsSealedOutputTokenReservation(
+          FIRST,
+          "/v1/chat/completions",
+          controller.signal
+        )
+      ).rejects.toMatchObject({ name: "AbortError" });
       controller.abort();
       await vi.advanceTimersByTimeAsync(0);
-      expect(await aborted).toBe(false);
+      await aborted;
+
+      // An already-aborted signal throws without any network work at all.
+      const preAborted = new AbortController();
+      preAborted.abort();
+      await expect(
+        manager.supportsSealedOutputTokenReservation(
+          FIRST,
+          "/v1/chat/completions",
+          preAborted.signal
+        )
+      ).rejects.toMatchObject({ name: "AbortError" });
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("cancellation, cache integrity, and suppression through the transport", () => {
+  const chat = "/v1/chat/completions";
+
+  /** A registry whose provider-info/mint caches are actually mutable. */
+  function coldRegistry() {
+    let info: Record<string, any> = {};
+    let mints: Record<string, string[]> = {};
+    const registry = createRegistry({}, {
+      [FIRST]: [sealedModel({ id: CALLER_MODEL })],
+      [NEXT]: [sealedModel({ id: CALLER_MODEL })],
+    });
+    (registry as any).getCachedProviderInfo = () => info;
+    (registry as any).setCachedProviderInfo = (value: Record<string, any>) => {
+      info = value;
+    };
+    (registry as any).getCachedMints = () => mints;
+    (registry as any).setCachedMints = (value: Record<string, string[]>) => {
+      mints = value;
+    };
+    return {
+      registry,
+      read: () => ({ info, mints }),
+      seed: (nextInfo: Record<string, any>, nextMints: Record<string, string[]>) => {
+        info = nextInfo;
+        mints = nextMints;
+      },
+    };
+  }
+
+  function realClient(registry: DiscoveryAdapter) {
+    const providerManager = new ProviderManager(registry);
+    const client = new RoutstrClient(
+      createWallet(),
+      createStorage(),
+      registry,
+      "max",
+      "apikeys",
+      { providerManager, logger }
+    );
+    const balance = client.getBalanceManager();
+    vi.spyOn(balance, "getTokenBalance").mockResolvedValue({
+      amount: 399_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: KEY,
+    });
+    vi.spyOn(balance, "refundApiKey").mockResolvedValue({
+      success: true,
+      message: "refunded",
+      amount: 399,
+    } as any);
+    vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
+    const spend = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: KEY,
+      tokenBalance: 399,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    return { client, providerManager, spend };
+  }
+
+  /** A `/v1/info` fetch that ignores its signal (worst-case transport). */
+  function stubbornFetch() {
+    return vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+  }
+
+  it("aborts before attestation or spend when cancelled during a cold probe", async () => {
+    const { registry } = coldRegistry();
+    const { client, spend } = realClient(registry);
+    vi.stubGlobal("fetch", stubbornFetch());
+
+    try {
+      const controller = new AbortController();
+      const pending = expect(
+        client.routeRequest({
+          path: chat,
+          method: "POST",
+          body: { model: WIRE_MODEL, messages: [], max_completion_tokens: 64 },
+          headers: {},
+          baseUrl: FIRST,
+          mintUrl: MINT,
+          modelId: CALLER_MODEL,
+          signal: controller.signal,
+        })
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      // Abort while the (stubborn) metadata probe is still outstanding.
+      controller.abort();
+      await pending;
+
+      // The abort must race the probe, not wait for the 10s deadline.
+      expect(prepareTinfoilMock).not.toHaveBeenCalled();
+      expect(spend).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("aborts before attestation or spend on a failover cold probe", async () => {
+    const { registry } = coldRegistry();
+    const { client, providerManager, spend } = realClient(registry);
+    vi.spyOn(providerManager, "findNextBestProvider").mockReturnValue(NEXT);
+    vi.stubGlobal("fetch", stubbornFetch());
+
+    try {
+      const controller = new AbortController();
+      const pending = expect(
+        (client as any)._handleErrorResponse(
+          {
+            path: chat,
+            method: "POST",
+            body: { model: WIRE_MODEL, messages: [], max_completion_tokens: 64 },
+            selectedModel: sealedModel({ id: CALLER_MODEL }),
+            baseUrl: FIRST,
+            mintUrl: MINT,
+            token: KEY,
+            requiredSats: 10,
+            headers: { "X-Routstr-Model": CALLER_MODEL },
+            baseHeaders: {},
+            tinfoilEnabled: true,
+            requestedModelId: CALLER_MODEL,
+            signal: controller.signal,
+          },
+          KEY,
+          429,
+          "req-429",
+          undefined,
+          JSON.stringify({
+            error: { message: "rate limited", type: "rate_limited", code: 429 },
+          }),
+          0
+        )
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      controller.abort();
+      await pending;
+
+      expect(prepareTinfoilMock).not.toHaveBeenCalled();
+      expect(spend).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not publish a timed-out response over fresher capability state", async () => {
+    const state = coldRegistry();
+    const manager = new ProviderManager(state.registry);
+
+    let resolveLate!: (value: Response) => void;
+    const lateFetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveLate = resolve;
+        })
+    );
+    vi.stubGlobal("fetch", lateFetch);
+
+    vi.useFakeTimers();
+    try {
+      const probe = manager.supportsSealedOutputTokenReservation(FIRST, chat);
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(await probe).toBe(false);
+
+      // A fresher snapshot lands after the timeout: the node does not support
+      // the discount, and it accepts a specific mint.
+      const fresherMints = { [FIRST]: ["https://mint.fresh.example/"] };
+      state.seed({ [FIRST]: { features: {} } }, fresherMints);
+
+      // The abandoned request finally resolves with the OLD capabilities.
+      resolveLate(
+        new Response(
+          JSON.stringify({
+            mints: ["https://mint.stale.example/"],
+            features: {
+              ehbp_output_token_reservation: true,
+              ehbp_output_token_reservation_total_cap: true,
+              ehbp_output_token_reservation_routes: ["chat/completions"],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        )
+      );
+      await vi.runAllTimersAsync();
+
+      // Neither the capability cache nor the mint restrictions were rewritten.
+      expect(state.read().info).toEqual({ [FIRST]: { features: {} } });
+      expect(state.read().mints).toEqual(fresherMints);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not resurrect a Connection-suppressed cap in the transport wrapper", async () => {
+    const { client } = setup();
+    prepareTinfoilMock.mockResolvedValue({
+      verification: {
+        enclaveHost: "enclave.tinfoil.test",
+        codeFingerprint: "ab".repeat(32),
+      },
+      secureClient: {},
+    });
+    fetchTinfoilMock.mockResolvedValue(
+      new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+
+    await routeRequest(client, {
+      body: {
+        model: WIRE_MODEL,
+        messages: [],
+        max_completion_tokens: 64,
+      },
+      headers: { Connection: HEADER },
+    });
+
+    // The prepared resolution suppressed the header (Connection nomination);
+    // the transport wrapper must reuse that decision rather than re-deriving
+    // from the sanitized headers the allowlist produced.
+    expect(headerValues(sealedInit().headers)).toEqual([]);
   });
 });

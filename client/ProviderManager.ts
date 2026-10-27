@@ -161,18 +161,24 @@ const fetchProviderInfo = async (
       throw new Error(`Failed ${response.status}`);
     }
     const info = (await response.json()) as ProviderInfo;
-    adapter.setCachedProviderInfo({
-      ...adapter.getCachedProviderInfo(),
-      [normalized]: info,
-    });
+    // The deadline helper requires the operation it wraps to return data only:
+    // a response that arrives after the deadline (or after the caller aborted)
+    // must not publish anything. Publishing here would overwrite a fresher
+    // capability/mint snapshot with a stale one — the exact way a timed-out
+    // probe could resurrect an old "supported" flag.
+    if (signal?.aborted) return null;
     // `/v1/info` also advertises the mints the provider accepts. Keep the
     // mint cache in sync here so consumers that only fetched provider info
     // still see the advertised mint list (and never spend a rejected mint).
     const advertisedMints = Array.isArray(info?.mints) ? info.mints : [];
-    if (advertisedMints.length > 0) {
-      const normalizedMints = advertisedMints.map((mint) =>
-        mint.endsWith("/") ? mint.slice(0, -1) : mint,
-      );
+    const normalizedMints = advertisedMints.map((mint) =>
+      mint.endsWith("/") ? mint.slice(0, -1) : mint,
+    );
+    adapter.setCachedProviderInfo({
+      ...adapter.getCachedProviderInfo(),
+      [normalized]: info,
+    });
+    if (normalizedMints.length > 0) {
       adapter.setCachedMints({
         ...adapter.getCachedMints(),
         [normalized]: normalizedMints,
@@ -2057,19 +2063,40 @@ export class ProviderManager {
     requestPath: string,
     signal?: AbortSignal
   ): Promise<boolean> {
+    const abortError = () =>
+      new DOMException("The operation was aborted.", "AbortError");
+    if (signal?.aborted) throw abortError();
+
+    // Race the caller's abort independently of fetch: an implementation that
+    // ignores the signal must not hold the probe until the deadline, and a
+    // cancelled request must throw rather than quietly downgrade to "the node
+    // does not support the cap".
+    let onAbort: (() => void) | undefined;
+    const callerAborted = new Promise<never>((_resolve, reject) => {
+      if (!signal) return;
+      onAbort = () => reject(abortError());
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
     try {
       // A cold `/v1/info` must never stall inference: bound the whole probe and
-      // fail closed to the full envelope on timeout or caller cancellation.
-      const info = await withProviderDeadline(
-        async (deadlineSignal) =>
-          fetchProviderInfo(
-            this.discoveryAdapter,
-            baseUrl,
-            this.logger,
-            signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal
-          ),
-        INFO_PROBE_TIMEOUT_MS
-      );
+      // fail closed to the full envelope on a deadline or network failure.
+      const info = await Promise.race([
+        withProviderDeadline(
+          async (deadlineSignal) =>
+            fetchProviderInfo(
+              this.discoveryAdapter,
+              baseUrl,
+              this.logger,
+              signal
+                ? AbortSignal.any([signal, deadlineSignal])
+                : deadlineSignal
+            ),
+          INFO_PROBE_TIMEOUT_MS
+        ),
+        callerAborted,
+      ]);
+      if (signal?.aborted) throw abortError();
       if (!info) return false;
 
       const features = (info as any)?.features;
@@ -2104,11 +2131,16 @@ export class ProviderManager {
 
       return true;
     } catch (error) {
-      // Timeout / abort / malformed info: full reserve is the safe failure.
+      if (signal?.aborted || (error as Error)?.name === "AbortError") {
+        throw abortError();
+      }
+      // Deadline / network / malformed info: full reserve is the safe failure.
       this.logger.debug(
         `[ProviderManager] ${baseUrl} sealed output-cap probe failed (${error instanceof Error ? error.message : String(error)}); full reserve`
       );
       return false;
+    } finally {
+      if (onAbort && signal) signal.removeEventListener("abort", onAbort);
     }
   }
 
