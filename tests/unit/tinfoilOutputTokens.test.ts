@@ -315,13 +315,16 @@ describe("tinfoil output cap resolution", () => {
 // 2. Reservation: core's cap-aware sealed formula, mirrored
 // ---------------------------------------------------------------------------
 
-const createRegistry = (providerInfo: Record<string, unknown> = {}) =>
+const createRegistry = (
+  providerInfo: Record<string, unknown> = {},
+  models: Record<string, Model[]> = {}
+) =>
   ({
     getModelIdMappings: () => null,
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
     setModelIdMappingsEvent: () => {},
-    getCachedModels: () => ({}),
+    getCachedModels: () => models,
     setCachedModels: () => {},
     getCachedMints: () => ({}),
     setCachedMints: () => {},
@@ -922,6 +925,90 @@ describe("X-Tinfoil-Max-Output-Tokens across retries and failover", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("reservation stays disabled until the cap is a request-total bound", () => {
+  /** A client wired to a REAL ProviderManager, so pricing is the real thing. */
+  function setupRealPricing(featureFlags: Record<string, unknown>) {
+    const registry = createRegistry(
+      { [FIRST]: { features: featureFlags } },
+      { [FIRST]: [sealedModel()] }
+    );
+    const providerManager = new ProviderManager(registry);
+    const client = new RoutstrClient(
+      createWallet(),
+      createStorage(),
+      registry,
+      "max",
+      "apikeys",
+      { providerManager, logger }
+    );
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 399_000,
+      reserved: 0,
+      unit: "msat",
+      apiKey: KEY,
+    });
+    vi.spyOn(balanceManager, "refundApiKey").mockResolvedValue({
+      success: true,
+      message: "refunded",
+      amount: 399,
+    } as any);
+    vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
+    const spend = vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: KEY,
+      tokenBalance: 399,
+      tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+
+    return { client, spend };
+  }
+
+  const request = (client: RoutstrClient) =>
+    routeRequest(client, {
+      modelId: "tinfoil-kimi-k2-6",
+      body: {
+        model: "kimi-k2-6",
+        messages: [{ role: "user", content: "Hi" }],
+        max_completion_tokens: 64,
+      },
+    });
+
+  it("reserves the full envelope when only the reservation flag is advertised", async () => {
+    // Today's real-world node: it discounts from the header, but the cap is
+    // per choice, so quoting it would under-fund n>1 requests from any client.
+    // The deposit must be the whole envelope (20 sats), not the capped hold.
+    const { client, spend } = setupRealPricing({
+      ehbp_output_token_reservation: true,
+    });
+
+    await request(client);
+
+    expect(spend.mock.calls[0][0].amount).toBe(20);
+  });
+
+  it("reserves the full envelope when no feature is advertised", async () => {
+    const { client, spend } = setupRealPricing({});
+
+    await request(client);
+
+    expect(spend.mock.calls[0][0].amount).toBe(20);
+  });
+
+  it("quotes the cap only once the total-cap guarantee is advertised too", async () => {
+    // Locks in the wiring for the day the enclave bounds the whole request:
+    // the same request then reserves the capped hold instead of the envelope.
+    const { client, spend } = setupRealPricing({
+      ehbp_output_token_reservation: true,
+      ehbp_output_token_reservation_total_cap: true,
+    });
+
+    await request(client);
+
+    expect(spend.mock.calls[0][0].amount).toBeCloseTo(11.0607, 3);
   });
 });
 

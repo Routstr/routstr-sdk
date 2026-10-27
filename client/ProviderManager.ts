@@ -626,6 +626,25 @@ function countResponsesInputTextChars(input: any[]): number {
 const NODE_TOLERANCE_PERCENT = 1;
 
 /**
+ * `/v1/info` capability keys for the visible Tinfoil output cap.
+ *
+ * `RESERVATION` says the node reads `X-Tinfoil-Max-Output-Tokens` and trims its
+ * sealed-body reservation with it. `RESERVATION_TOTAL_CAP` says the enclave's
+ * cap bounds the *whole request* rather than each of `n` choices — the
+ * precondition that makes the first one sound, because a sealed body hides `n`
+ * from the node.
+ *
+ * No node advertises `RESERVATION_TOTAL_CAP` today (the live enclave caps per
+ * choice), so no cap is quoted and the SDK reserves the full envelope
+ * everywhere. Do not relax this on the strength of the client-side `n` guard:
+ * that guard only protects our own callers, while core's hold has to survive a
+ * direct adversarial EHBP client.
+ */
+const EHBP_RESERVATION_FEATURE = "ehbp_output_token_reservation";
+const EHBP_RESERVATION_TOTAL_CAP_FEATURE =
+  "ehbp_output_token_reservation_total_cap";
+
+/**
  * Sum the length of every string in a value tree, keys included.
  *
  * Port of routstr-core `_sum_string_chars`. Nothing is excluded, because the
@@ -2017,10 +2036,18 @@ export class ProviderManager {
       this.logger
     );
     const features = (info as any)?.features;
-    return (
-      features?.ehbp_output_token_reservation === true &&
-      features?.ehbp_output_token_reservation_total_cap === true
-    );
+    const reservation = features?.[EHBP_RESERVATION_FEATURE] === true;
+    const totalCap = features?.[EHBP_RESERVATION_TOTAL_CAP_FEATURE] === true;
+    if (reservation && !totalCap) {
+      // The node discounts from the visible cap, but the cap only bounds one of
+      // `n` choices. Quoting it would under-fund the request, so the discount
+      // stays off until the enclave guarantees a request-total (or
+      // single-choice) cap and the node advertises that guarantee.
+      this.logger.debug(
+        `[ProviderManager] ${baseUrl} advertises ${EHBP_RESERVATION_FEATURE} without ${EHBP_RESERVATION_TOTAL_CAP_FEATURE}; sealed output-cap discount stays disabled (full reserve)`
+      );
+    }
+    return reservation && totalCap;
   }
 
   /**

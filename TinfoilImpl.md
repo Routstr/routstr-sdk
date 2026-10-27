@@ -128,6 +128,25 @@ whole `max_cost` envelope for every Tinfoil request, even a 64-token answer.
 makes the cap visible in a request header that travels *outside* the EHBP body
 and that the enclave enforces **in place of** any body cap, larger or smaller.
 
+> **State of this feature — read this first.**
+>
+> - **Header forwarding is live.** On a single-choice (`n <= 1`) sealed request
+>   to `chat/completions` or `responses`, the SDK derives and sends
+>   `X-Tinfoil-Max-Output-Tokens` today, and the enclave enforces it today. The
+>   caller's output limit is therefore applied end to end even though the body
+>   stays sealed.
+> - **The reservation discount is DISABLED.** No node advertises
+>   `features.ehbp_output_token_reservation_total_cap`, because the enclave's
+>   cap is enforced *per choice* (probe-verified), so it does not bound the
+>   request total that a direct adversarial EHBP client can ask for. Until the
+>   enclave guarantees a request-total (or single-choice) cap, the SDK reserves
+>   the **full `max_cost` envelope**, exactly as it did before this feature.
+>   Enabling the discount is a `/v1/info` flag away, not a code change.
+>
+> The client-side `n > 1` guard below does **not** justify turning the discount
+> on: it only protects callers of this SDK, while the node's hold has to survive
+> any EHBP client.
+
 The SDK therefore derives the header before sealing, on sealed (`tinfoil-*`)
 requests only:
 
@@ -184,9 +203,13 @@ The second key is the precondition for the first being sound. Today the cap is
 per choice, so an adversarial EHBP client (which can send any `n` inside the
 sealed body) could be billed up to `n × cap` against a hold sized for one
 completion. Until the enclave divides the cap across choices, rejects `n > 1`
-alongside the header, or exposes `n` in a form it validates, neither key pair is
-advertised and the SDK keeps the full-envelope reserve — the same posture as an
-old node.
+alongside the header, or exposes `n` in a form it validates, no node advertises
+the pair and the SDK keeps the full-envelope reserve — the same posture as an
+old node. A node that advertises the first key alone is logged and still
+reserves the full envelope: `supportsSealedOutputTokenReservation()` requires
+both, and the tests pin the resulting deposit at the envelope (`tests/unit/
+tinfoilOutputTokens.test.ts`, "reservation stays disabled until the cap is a
+request-total bound").
 
 When a node advertises both, `getRequiredSatsForModel` prices a sealed request
 from the cap using routstr-core's worst case over the whole context window —
@@ -348,4 +371,6 @@ neither Routstr nor any network observer ever sees it. Resolution order:
   proxying, `tinfoil-*` requests will fail.
 - `X-Tinfoil-Max-Output-Tokens` is a plaintext header, so the node sees the
   request's output limit even though the prompt stays sealed. It carries no
-  content — only the cap the caller already declared in the body.
+  content — only the cap the caller already declared in the body. It is sent
+  **today**; the reservation discount that would ride on it stays **off** until
+  the enclave's cap bounds the whole request (see "Output-token cap" above).
