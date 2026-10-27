@@ -1439,3 +1439,48 @@ describe("cancellation, cache integrity, and suppression through the transport",
     expect(headerValues(sealedInit().headers)).toEqual([]);
   });
 });
+
+describe("Connection suppression survives a routed failover", () => {
+  it("quotes nothing and sends no cap header on either hop (429 failover)", async () => {
+    // Node advertises the full capability set, so a re-derived cap WOULD be
+    // quoted here — that is exactly the regression: the prepared decision is
+    // suppressed (Connection nomination), and both pricing and the transport
+    // must keep it suppressed across failover.
+    const { client, providerManager } = setup({ advertisesCap: true });
+    fetchTinfoilMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: { message: "rate limited", type: "rate_limited", code: 429 },
+          }),
+          { status: 429, headers: { "content-type": "application/json" } }
+        )
+      )
+      .mockResolvedValue(
+        new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
+      );
+
+    await routeRequest(client, {
+      body: {
+        model: WIRE_MODEL,
+        messages: [],
+        max_completion_tokens: 64,
+      },
+      headers: { Connection: HEADER },
+    });
+
+    // Both hops happened, and neither carried the suppressed header.
+    expect(fetchTinfoilMock.mock.calls.length).toBe(2);
+    expect(headerValues(sealedInit(0).headers)).toEqual([]);
+    expect(headerValues(sealedInit(1).headers)).toEqual([]);
+
+    // Neither hop was priced against the cap: no discounted reserve for a
+    // request whose cap header was nominated for stripping.
+    for (const call of providerManager.getRequiredSatsForModel.mock.calls) {
+      expect(call[5]).toBeUndefined();
+    }
+  });
+});

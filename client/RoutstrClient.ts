@@ -2202,12 +2202,20 @@ export class RoutstrClient {
 
         // The cap is the caller's, so it survives failover unchanged; whether
         // the *new* node prices it is node-local, so ask that node.
+        //
+        // Reuse the decision made when the request was prepared. `params.headers`
+        // are the sanitized outbound headers — the allowlist already dropped
+        // `Connection` — so re-resolving here would resurrect a cap the caller
+        // nominated for stripping: a discounted reserve against a header the
+        // enclave never receives. Fall back only when no decision was prepared
+        // (a host that drives _makeRequest directly).
         const failoverOutputCap = params.tinfoilEnabled
-          ? resolveTinfoilOutputCap({
+          ? (params.tinfoilOutputCap ??
+            resolveTinfoilOutputCap({
               path,
               body,
               headers: params.headers,
-            })
+            }))
           : undefined;
 
         newRequiredSats =
