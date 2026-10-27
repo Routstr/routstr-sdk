@@ -19,10 +19,12 @@
  *   `/v1/chat/completions`, `/v1/responses` (and `/v1/completions`, which the
  *   deployed enclaves currently 404 — see `TINFOIL_OUTPUT_CAP_ENDPOINTS`).
  *   Every other path ignores it.
- * - Exactly ONE header value is allowed. Zero, negative, fractional,
+ * - Exactly ONE header value is allowed. The enclave parses it with Go's
+ *   `strconv.ParseInt` (base 10, so it tolerates a `+` sign and leading zeros)
+ *   and then requires a positive value, so zero, negatives, fractions,
  *   comma-lists, empty strings and duplicates are rejected with a 400 *by the
- *   enclave*, so the SDK must never emit a second value for a header the
- *   caller already set.
+ *   enclave*. The SDK must never emit a second value for a header the caller
+ *   already set.
  * - On a valid value the enclave deletes every body field it would otherwise
  *   read and writes its own cap field, so the body cap the SDK leaves behind
  *   can only ever agree with the header (it is deleted first).
@@ -116,8 +118,14 @@ function trimAsciiWhitespace(value: string): string {
  * base-10 digits only (`^[1-9][0-9]*$`) after ASCII-whitespace trimming, no
  * sign, no separators, and within the range the node is willing to discount.
  *
- * Deliberately stricter than `Number()`: `" 16 "` is accepted, but `"+16"`,
- * `"16.0"`, `"1e3"` and `"16,32"` are not, because the enclave rejects them.
+ * Deliberately stricter than both `Number()` and the enclave: Go's
+ * `strconv.ParseInt` accepts a leading `+` and leading zeros (`"+16"`, `"007"`),
+ * but routstr-core quotes only canonical digits and an unquoted cap cannot
+ * shrink the node's reservation, so accepting those here would let the SDK
+ * price a cap the node refuses to honour. Nothing is lost: the SDK only ever
+ * *emits* canonical values (`String(cap)`), so this affects only a caller's own
+ * header, which is forwarded verbatim either way. `" 16 "` is accepted because
+ * both the enclave and the node strip space/tab first.
  */
 export function parseTinfoilOutputCapHeader(
   value: string
@@ -197,10 +205,12 @@ export function tinfoilMultiChoiceRequest(body: unknown): boolean {
  *   not `max_output_tokens`).
  * - responses: `max_output_tokens` only.
  *
- * A field that is *present but unusable* (`null`, `"64"`, `0`, `1.5`) stops
- * the search instead of falling through: choosing the next field would
- * reinterpret the request, and the caller's own value is what the engine sees
- * when the SDK sends no header.
+ * `null`/`undefined` means "not set" and the search continues with the next
+ * field, which is how a JSON client clears a default. Any other present value
+ * must be a positive integer: if it is not (`"64"`, `0`, `1.5`, `-1`) the
+ * endpoint has no usable cap at all and the search stops — falling through to
+ * the next field would reinterpret the request, and whichever value the engine
+ * ends up seeing is not one the SDK can predict or price.
  */
 export function bodyOutputCap(
   endpoint: TinfoilOutputCapEndpoint,

@@ -120,6 +120,25 @@ describe("tinfoil output cap resolution", () => {
     expect(bodyOutputCap("responses", { max_tokens: 8 })).toBeUndefined();
   });
 
+  it("continues past a null field and stops at an unusable value", () => {
+    // `null` is how a JSON client clears a default: it is "not set", so the
+    // next field still decides.
+    expect(
+      bodyOutputCap("chat", { max_completion_tokens: null, max_tokens: 4096 })
+    ).toBe(4096);
+    expect(
+      bodyOutputCap("chat", { max_completion_tokens: undefined, max_tokens: 8 })
+    ).toBe(8);
+    // Any other unusable value ends the search: the engine would see a value
+    // the SDK cannot predict, so no header is derived.
+    expect(
+      bodyOutputCap("chat", { max_completion_tokens: 0, max_tokens: 4096 })
+    ).toBeUndefined();
+    expect(
+      bodyOutputCap("chat", { max_completion_tokens: "64", max_tokens: 4096 })
+    ).toBeUndefined();
+  });
+
   it("does not reinterpret a body cap the engine would not honour", () => {
     // Present but unusable: falling through to the next field (or coercing
     // the value) would change what the caller asked for.
@@ -137,7 +156,7 @@ describe("tinfoil output cap resolution", () => {
     expect(bodyOutputCap("chat", undefined)).toBeUndefined();
   });
 
-  it("accepts exactly the header grammar the enclave and core accept", () => {
+  it("accepts exactly the header grammar core quotes", () => {
     expect(parseTinfoilOutputCapHeader("64")).toBe(64);
     expect(parseTinfoilOutputCapHeader(" 16 ")).toBe(16);
     expect(parseTinfoilOutputCapHeader("\t32 ")).toBe(32);
@@ -149,15 +168,18 @@ describe("tinfoil output cap resolution", () => {
       " ",
       "0",
       "-1",
-      "+16",
       "12.5",
       "1e3",
       "64,128",
       "abc",
-      "007",
     ]) {
       expect(parseTinfoilOutputCapHeader(rejected)).toBeUndefined();
     }
+    // Stricter than the enclave on purpose: Go's ParseInt accepts these, but
+    // core does not quote them, so pricing them would desynchronise the
+    // reservation from the node's hold.
+    expect(parseTinfoilOutputCapHeader("+16")).toBeUndefined();
+    expect(parseTinfoilOutputCapHeader("007")).toBeUndefined();
     // Above the bound core is willing to discount: emitting it would only
     // desynchronise the header from the reservation.
     expect(parseTinfoilOutputCapHeader("2147483648")).toBeUndefined();
@@ -904,25 +926,36 @@ describe("X-Tinfoil-Max-Output-Tokens across retries and failover", () => {
 });
 
 describe("node capability advertisement", () => {
-  it("reads features.ehbp_output_token_reservation from /v1/info", async () => {
-    const withFeature = new ProviderManager(
-      createRegistry({
-        [FIRST]: { features: { ehbp_output_token_reservation: true } },
-      })
-    );
-    const withoutFeature = new ProviderManager(
-      createRegistry({ [FIRST]: { features: {} } })
-    );
-    const oldNode = new ProviderManager(createRegistry({ [FIRST]: {} }));
+  const features = (f: Record<string, unknown>) =>
+    new ProviderManager(createRegistry({ [FIRST]: { features: f } }));
 
-    expect(await withFeature.supportsSealedOutputTokenReservation(FIRST)).toBe(
-      true
-    );
+  it("requires the cap to bound the whole request, not each choice", async () => {
+    // Discounting is only sound once the enclave's cap is a request-total
+    // bound. The probe showed it is per choice today, so the first key alone
+    // must not be enough.
     expect(
-      await withoutFeature.supportsSealedOutputTokenReservation(FIRST)
+      await features({
+        ehbp_output_token_reservation: true,
+        ehbp_output_token_reservation_total_cap: true,
+      }).supportsSealedOutputTokenReservation(FIRST)
+    ).toBe(true);
+    expect(
+      await features({
+        ehbp_output_token_reservation: true,
+      }).supportsSealedOutputTokenReservation(FIRST)
     ).toBe(false);
-    expect(await oldNode.supportsSealedOutputTokenReservation(FIRST)).toBe(
+    expect(
+      await features({
+        ehbp_output_token_reservation_total_cap: true,
+      }).supportsSealedOutputTokenReservation(FIRST)
+    ).toBe(false);
+    expect(await features({}).supportsSealedOutputTokenReservation(FIRST)).toBe(
       false
     );
+    // Old node: no `features` object at all.
+    expect(
+      await new ProviderManager(createRegistry({ [FIRST]: {} }))
+        .supportsSealedOutputTokenReservation(FIRST)
+    ).toBe(false);
   });
 });

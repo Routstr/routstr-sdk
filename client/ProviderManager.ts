@@ -1975,14 +1975,34 @@ export class ProviderManager {
   }
 
   /**
-   * Whether this node reserves against the visible Tinfoil output cap.
+   * Whether this node reserves against the visible Tinfoil output cap *safely*.
    *
-   * Nodes advertise `features.ehbp_output_token_reservation` on `/v1/info`
-   * when `calculate_discounted_max_cost` reads `X-Tinfoil-Max-Output-Tokens`
-   * for a sealed body. Older nodes ignore both the header and the feature, and
-   * hold the entire `max_cost` envelope — reserving against the cap there would
-   * under-fund the request and turn it into a 402 top-up loop, so an
-   * unadvertised node is treated as unsupported (full reserve).
+   * Two additive capability keys are required, and both are advisory only — a
+   * client cannot verify either, so they are a compatibility signal, not a
+   * security boundary:
+   *
+   * - `features.ehbp_output_token_reservation` — the node reads
+   *   `X-Tinfoil-Max-Output-Tokens` and trims its sealed-body reservation with
+   *   it (`calculate_discounted_max_cost`, tinfoil path). Older nodes ignore
+   *   both the header and the feature and hold the whole `max_cost` envelope,
+   *   so reserving against a cap there would under-fund the request and turn it
+   *   into a 402 top-up loop.
+   * - `features.ehbp_output_token_reservation_total_cap` — the enclave's cap
+   *   bounds the **whole request**, not each of `n` choices. Live probe
+   *   (`tinfoil/probe-n-multi-choice.mjs`, router-0.tinfoil.sh): header `8`
+   *   with `n=3` billed 24 completion tokens, so today the cap is per choice.
+   *   A sealed body hides `n` from the node, which means the node's cap-based
+   *   hold bounds nothing: a direct adversarial EHBP client can ask for `n`
+   *   choices and be billed up to `n * cap` against a hold sized for one. Until
+   *   the enclave either divides the cap across choices, rejects `n > 1` with
+   *   the header, or exposes `n` in a way it can validate, no cap-based hold is
+   *   sound — so no cap is quoted.
+   *
+   * Requiring the second key means the SDK keeps the full-envelope reserve by
+   * default and starts discounting only once the node advertises that the
+   * precondition actually holds. On an old node both keys are absent; on a node
+   * that discounts without the precondition the second is. Either way the SDK
+   * holds the full envelope, which is the safe failure.
    *
    * `/v1/info` is already fetched lazily (and cached) on this path for mint and
    * model discovery, so this is normally a cache read. A node we cannot reach
@@ -1997,7 +2017,10 @@ export class ProviderManager {
       this.logger
     );
     const features = (info as any)?.features;
-    return features?.ehbp_output_token_reservation === true;
+    return (
+      features?.ehbp_output_token_reservation === true &&
+      features?.ehbp_output_token_reservation_total_cap === true
+    );
   }
 
   /**

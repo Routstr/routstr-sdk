@@ -155,12 +155,13 @@ Rules, all mirroring the enclave and routstr-core exactly:
 - **No body rewrite.** The enclave deletes the body caps itself when the header
   is present, and leaving them untouched keeps old nodes — which ignore the
   header and read the body — working unchanged.
-- **Multi-choice requests are excluded.** With `n > 1` (or `best_of > 1`) the
-  cap applies *per choice*, and `n` is invisible to the node behind the sealed
-  body, so quoting one cap would let the enclave bill up to `n * cap` against a
-  hold sized for a single completion. The SDK emits no derived header and quotes
-  nothing there — a caller-supplied header is still forwarded, just not priced —
-  so such requests keep the full-envelope reserve they had before this feature.
+- **Multi-choice requests are excluded.** The cap applies *per choice*
+  (probe-verified: header `8` with `n=3` billed 24 completion tokens), and `n`
+  is invisible to the node behind the sealed body, so quoting one cap would let
+  the enclave bill up to `n * cap` against a hold sized for a single completion.
+  With `n > 1` (or `best_of > 1`) the SDK emits no derived header and quotes
+  nothing — a caller-supplied header is still forwarded, just not priced — so
+  those requests keep the full-envelope reserve they had before this feature.
 
 The header is attached when the request is prepared (so retries and failover
 inherit it from `baseHeaders`) and re-asserted in `_makeRequest`, the last stop
@@ -170,11 +171,27 @@ before the EHBP transport.
 
 Emitting the header is unconditional; *reserving* against it is not.
 
-Node support is advertised additively as `features.ehbp_output_token_reservation`
-on `GET /v1/info`. When a node advertises it, `getRequiredSatsForModel` prices a
-sealed request from the cap using routstr-core's worst case over the whole
-context window — never with the plaintext subtraction, which would spend an
-input allowance the node cannot see:
+Quoting a cap needs **two** additive `/v1/info` capability keys, because a
+client cannot verify either and only one of them describes what the enclave
+actually enforces:
+
+| Key | Meaning |
+|---|---|
+| `features.ehbp_output_token_reservation` | the node trims its sealed-body reservation from `X-Tinfoil-Max-Output-Tokens` |
+| `features.ehbp_output_token_reservation_total_cap` | the enclave's cap bounds the **whole request**, not each of `n` choices |
+
+The second key is the precondition for the first being sound. Today the cap is
+per choice, so an adversarial EHBP client (which can send any `n` inside the
+sealed body) could be billed up to `n × cap` against a hold sized for one
+completion. Until the enclave divides the cap across choices, rejects `n > 1`
+alongside the header, or exposes `n` in a form it validates, neither key pair is
+advertised and the SDK keeps the full-envelope reserve — the same posture as an
+old node.
+
+When a node advertises both, `getRequiredSatsForModel` prices a sealed request
+from the cap using routstr-core's worst case over the whole context window —
+never with the plaintext subtraction, which would spend an input allowance the
+node cannot see:
 
 ```
 W     = max((window - cap) * promptPrice + cap * completionPrice, window * promptPrice)
@@ -185,11 +202,11 @@ hold  = max(min_request_msat, min(base_msats, ceil(W * 1000 * tolerance)))
 else `context_length`; an unknown window, a cap that already covers it, or an
 unusable (non-finite/negative) rate keeps the full envelope.
 
-When the node does **not** advertise the feature — an older node — the SDK keeps
-the full-envelope reserve even though the header is sent: that node ignores the
-header, holds the whole envelope, and would answer a cap-sized deposit with 402
-`insufficient_balance`. A fallback provider that ignores the header is re-priced
-the same way on failover.
+When the node advertises neither key — an older node, or a node whose discount
+is not yet sound — the SDK keeps the full-envelope reserve even though the
+header is sent: such a node ignores the header (or would answer a cap-sized
+deposit with 402 `insufficient_balance`). A fallback provider that ignores the
+header is re-priced the same way on failover.
 
 Settlement is unaffected: billing still comes from actual usage
 (`X-Tinfoil-Usage-Metrics`), never from the cap.
