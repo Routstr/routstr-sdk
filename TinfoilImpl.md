@@ -141,7 +141,15 @@ and that the enclave enforces **in place of** any body cap, larger or smaller.
 >   request total that a direct adversarial EHBP client can ask for. Until the
 >   enclave guarantees a request-total (or single-choice) cap, the SDK reserves
 >   the **full `max_cost` envelope**, exactly as it did before this feature.
->   Enabling the discount is a `/v1/info` flag away, not a code change.
+> - **Enabling it is not an operator flag toggle.** The `/v1/info` keys are a
+>   *statement of capability*, not a switch: a node may only advertise them once
+>   the enclave itself enforces a request-total (or single-choice-only) cap and
+>   that enforcement has been attested and verified against a deployed enclave.
+>   Until then, flipping the flag would claim a guarantee that does not exist —
+>   it would move the risk onto the node's balance without changing what the
+>   enclave bills. The upstream enforcement change (confidential-model-router)
+>   plus attestation/verification must land first; only then does core advertise,
+>   and only then does the SDK quote a cap.
 >
 > The client-side `n > 1` guard below does **not** justify turning the discount
 > on: it only protects callers of this SDK, while the node's hold has to survive
