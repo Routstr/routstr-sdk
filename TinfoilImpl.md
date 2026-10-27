@@ -132,9 +132,9 @@ and that the enclave enforces **in place of** any body cap, larger or smaller.
 >
 > - **Header forwarding is live.** On a single-choice (`n <= 1`) sealed request
 >   to `chat/completions` or `responses`, the SDK derives and sends
->   `X-Tinfoil-Max-Output-Tokens` today, and the enclave enforces it today. The
->   caller's output limit is therefore applied end to end even though the body
->   stays sealed.
+>   `X-Tinfoil-Max-Output-Tokens` today, and the deployed enclave honors it today
+>   per choice (probe-verified). The caller's output limit is therefore applied
+>   end to end even though the body stays sealed.
 > - **The reservation discount is DISABLED.** No node advertises
 >   `features.ehbp_output_token_reservation_total_cap`, because the enclave's
 >   cap is enforced *per choice* (probe-verified), so it does not bound the
@@ -142,14 +142,21 @@ and that the enclave enforces **in place of** any body cap, larger or smaller.
 >   enclave guarantees a request-total (or single-choice) cap, the SDK reserves
 >   the **full `max_cost` envelope**, exactly as it did before this feature.
 > - **Enabling it is not an operator flag toggle.** The `/v1/info` keys are a
->   *statement of capability*, not a switch: a node may only advertise them once
->   the enclave itself enforces a request-total (or single-choice-only) cap and
->   that enforcement has been attested and verified against a deployed enclave.
->   Until then, flipping the flag would claim a guarantee that does not exist —
->   it would move the risk onto the node's balance without changing what the
->   enclave bills. The upstream enforcement change (confidential-model-router)
->   plus attestation/verification must land first; only then does core advertise,
->   and only then does the SDK quote a cap.
+>   *statement of capability*, not a switch. Advertising them is a future
+>   prerequisite: the guarantee must be implemented in an attested router version
+>   and verified against the deployed enclave, including adversarial
+>   multi-choice/`best_of` probes. Until that lands, flipping the flag would
+>   claim a guarantee that does not exist — it would move the risk onto the
+>   node's balance without changing what the enclave bills. The upstream
+>   enforcement change (confidential-model-router) plus attestation and
+>   verification must land first; only then does core advertise, and only then
+>   does the SDK quote a cap.
+> - **What the current evidence does and does not show.** Attestation establishes
+>   code/version identity; probes corroborate behavior but do not alone prove
+>   every budget path. The probes we have prove the *unsafety* of the per-choice
+>   cap (`header=8` with `n=3` billed 24 completion tokens), not the safety of a
+>   total cap. A successful `n=1` request does not prove a total cap, and no
+>   probe yet proves safety. That is why nothing is discounted today.
 >
 > The client-side `n > 1` guard below does **not** justify turning the discount
 > on: it only protects callers of this SDK, while the node's hold has to survive
