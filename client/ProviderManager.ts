@@ -33,6 +33,7 @@ import {
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+import { withProviderDeadline } from "../discovery/providerDeadline";
 import {
   estimateCost,
   hasUsableTokenRates,
@@ -149,12 +150,13 @@ const fetchProviderInfo = async (
   adapter: DiscoveryAdapter,
   baseUrl: string,
   logger: SdkLogger,
+  signal?: AbortSignal,
 ): Promise<ProviderInfo | null> => {
   const normalized = normalizeBaseUrl(baseUrl);
   const cached = adapter.getCachedProviderInfo()[normalized];
   if (cached) return cached;
   try {
-    const response = await fetch(`${normalized}v1/info`);
+    const response = await fetch(`${normalized}v1/info`, { signal });
     if (!response.ok) {
       throw new Error(`Failed ${response.status}`);
     }
@@ -625,6 +627,25 @@ function countResponsesInputTextChars(input: any[]): number {
  */
 const NODE_TOLERANCE_PERCENT = 1;
 
+/** Bound the cold `/v1/info` probe on the request path (no inference stall). */
+const INFO_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * The canonical route name routstr-core publishes in
+ * `ehbp_output_token_reservation_routes` (`chat/completions`, `responses`, ...).
+ * The SDK path may be `/v1/chat/completions?x=y`; this collapses it to the
+ * exact string core compares against.
+ */
+function canonicalReservationRoute(path: string | undefined): string | null {
+  if (!path) return null;
+  const normalized = path
+    .split(/[?#]/)[0]
+    .replace(/\/+$/, "")
+    .replace(/^\/?v1\//, "")
+    .replace(/^\/+/, "");
+  return normalized === "" ? null : normalized;
+}
+
 /**
  * `/v1/info` capability keys for the visible Tinfoil output cap.
  *
@@ -643,6 +664,7 @@ const NODE_TOLERANCE_PERCENT = 1;
 const EHBP_RESERVATION_FEATURE = "ehbp_output_token_reservation";
 const EHBP_RESERVATION_TOTAL_CAP_FEATURE =
   "ehbp_output_token_reservation_total_cap";
+const EHBP_RESERVATION_ROUTES_FEATURE = "ehbp_output_token_reservation_routes";
 
 /**
  * Sum the length of every string in a value tree, keys included.
@@ -758,21 +780,24 @@ function tokenLimit(raw: unknown): number | null {
 
 /**
  * The token window core bounds the worst case with
- * (`_model_token_window`): `top_provider.context_length`, then
- * `top_provider.max_completion_tokens` (a model that only advertises a
- * completion cap is bounded by it), then the bare `context_length`. `0` means
- * "unknown", in which case core keeps the full envelope.
+ * (`_model_token_window`): `top_provider.context_length`, then the bare
+ * `model.context_length`. `0` means "unknown", in which case core keeps the
+ * full envelope.
+ *
+ * A completion-only cap (`top_provider.max_completion_tokens`) is NOT a
+ * context window: a model can advertise a 10k completion cap inside a 100k
+ * window, and using 10k as the window under-reserves every request longer than
+ * that. Example: window 100k, cap 1k, prompt .001/sat, completion .004/sat.
+ * Using the 10k completion cap as the window yields a 13-sat hold, while a 30k
+ * input + 1k output request actually costs 34 sats. The real 100k window yields
+ * a 100-sat hold, which covers the request. If neither context field is a
+ * usable positive integer, return 0 (unknown => full envelope).
  */
 function sealedContextWindow(model: Model): number {
   const topProvider: any = (model as any)?.top_provider;
   if (topProvider !== null && topProvider !== undefined) {
-    for (const candidate of [
-      topProvider.context_length,
-      topProvider.max_completion_tokens,
-    ]) {
-      const limit = tokenLimit(candidate);
-      if (limit !== null) return limit;
-    }
+    const limit = tokenLimit(topProvider.context_length);
+    if (limit !== null) return limit;
   }
   return tokenLimit((model as any)?.context_length) ?? 0;
 }
@@ -2028,26 +2053,63 @@ export class ProviderManager {
    * is also "unsupported": choosing the larger reservation is the safe failure.
    */
   async supportsSealedOutputTokenReservation(
-    baseUrl: string
+    baseUrl: string,
+    requestPath: string,
+    signal?: AbortSignal
   ): Promise<boolean> {
-    const info = await fetchProviderInfo(
-      this.discoveryAdapter,
-      baseUrl,
-      this.logger
-    );
-    const features = (info as any)?.features;
-    const reservation = features?.[EHBP_RESERVATION_FEATURE] === true;
-    const totalCap = features?.[EHBP_RESERVATION_TOTAL_CAP_FEATURE] === true;
-    if (reservation && !totalCap) {
-      // The node discounts from the visible cap, but the cap only bounds one of
-      // `n` choices. Quoting it would under-fund the request, so the discount
-      // stays off until the enclave guarantees a request-total (or
-      // single-choice) cap and the node advertises that guarantee.
-      this.logger.debug(
-        `[ProviderManager] ${baseUrl} advertises ${EHBP_RESERVATION_FEATURE} without ${EHBP_RESERVATION_TOTAL_CAP_FEATURE}; sealed output-cap discount stays disabled (full reserve)`
+    try {
+      // A cold `/v1/info` must never stall inference: bound the whole probe and
+      // fail closed to the full envelope on timeout or caller cancellation.
+      const info = await withProviderDeadline(
+        async (deadlineSignal) =>
+          fetchProviderInfo(
+            this.discoveryAdapter,
+            baseUrl,
+            this.logger,
+            signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal
+          ),
+        INFO_PROBE_TIMEOUT_MS
       );
+      if (!info) return false;
+
+      const features = (info as any)?.features;
+      const reservation = features?.[EHBP_RESERVATION_FEATURE] === true;
+      const totalCap = features?.[EHBP_RESERVATION_TOTAL_CAP_FEATURE] === true;
+      if (!reservation || !totalCap) {
+        if (reservation && !totalCap) {
+          this.logger.debug(
+            `[ProviderManager] ${baseUrl} advertises ${EHBP_RESERVATION_FEATURE} without ${EHBP_RESERVATION_TOTAL_CAP_FEATURE}; sealed output-cap discount stays disabled (full reserve)`
+          );
+        }
+        return false;
+      }
+
+      // The node publishes the authoritative route set for its quote. A route
+      // outside it gets the full envelope even when both booleans are true, or
+      // the SDK would under-fund a request the node prices at max_cost (402).
+      // Missing/malformed/empty list is a capability we cannot trust: fail
+      // closed rather than assume "all routes".
+      const routes = features?.[EHBP_RESERVATION_ROUTES_FEATURE];
+      const route = canonicalReservationRoute(requestPath);
+      const usableRoutes =
+        Array.isArray(routes) &&
+        routes.length > 0 &&
+        routes.every((r) => typeof r === "string" && r.trim() !== "");
+      if (!usableRoutes || route === null || !routes.includes(route)) {
+        this.logger.debug(
+          `[ProviderManager] ${baseUrl} sealed output-cap route ${requestPath} not in advertised routes ${JSON.stringify(routes)}; full reserve`
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      // Timeout / abort / malformed info: full reserve is the safe failure.
+      this.logger.debug(
+        `[ProviderManager] ${baseUrl} sealed output-cap probe failed (${error instanceof Error ? error.message : String(error)}); full reserve`
+      );
+      return false;
     }
-    return reservation && totalCap;
   }
 
   /**

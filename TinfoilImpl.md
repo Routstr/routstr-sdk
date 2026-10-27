@@ -205,28 +205,30 @@ before the EHBP transport.
 
 Emitting the header is unconditional; *reserving* against it is not.
 
-Quoting a cap needs **two** additive `/v1/info` capability keys, because a
-client cannot verify either and only one of them describes what the enclave
-actually enforces:
+Quoting a cap needs three additive `/v1/info` capability values, because a
+client can verify none of them and only one describes what the enclave actually
+enforces:
 
 | Key | Meaning |
 |---|---|
 | `features.ehbp_output_token_reservation` | the node trims its sealed-body reservation from `X-Tinfoil-Max-Output-Tokens` |
 | `features.ehbp_output_token_reservation_total_cap` | the enclave's cap bounds the **whole request**, not each of `n` choices |
+| `features.ehbp_output_token_reservation_routes` | the exact canonical routes the node will quote (`chat/completions`, `responses`, ...). **Authoritative**: a route outside it keeps the full envelope even when both booleans are true, or the SDK would under-fund a request the node prices at `max_cost` (402) |
 
 The second key is the precondition for the first being sound. Today the cap is
 per choice, so an adversarial EHBP client (which can send any `n` inside the
 sealed body) could be billed up to `n × cap` against a hold sized for one
 completion. Until the enclave divides the cap across choices, rejects `n > 1`
 alongside the header, or exposes `n` in a form it validates, no node advertises
-the pair and the SDK keeps the full-envelope reserve — the same posture as an
-old node. A node that advertises the first key alone is logged and still
-reserves the full envelope: `supportsSealedOutputTokenReservation()` requires
-both, and the tests pin the resulting deposit at the envelope (`tests/unit/
+the whole set and the SDK keeps the full-envelope reserve — the same posture as
+an old node. A node that advertises a partial set is logged and still reserves
+the full envelope: `supportsSealedOutputTokenReservation()` requires both
+booleans *and* a usable route list containing the request's canonical route,
+and the tests pin the resulting deposit at the envelope (`tests/unit/
 tinfoilOutputTokens.test.ts`, "reservation stays disabled until the cap is a
-request-total bound").
+request-total bound" and "gates on the advertised route set").
 
-When a node advertises both, `getRequiredSatsForModel` prices a sealed request
+When a node advertises the full set, `getRequiredSatsForModel` prices a sealed request
 from the cap using routstr-core's worst case over the whole context window —
 never with the plaintext subtraction, which would spend an input allowance the
 node cannot see:
@@ -236,13 +238,28 @@ W     = max((window - cap) * promptPrice + cap * completionPrice, window * promp
 hold  = max(min_request_msat, min(base_msats, ceil(W * 1000 * tolerance)))
 ```
 
-`window` is `top_provider.context_length`, else `top_provider.max_completion_tokens`,
-else `context_length`; an unknown window, a cap that already covers it, or an
-unusable (non-finite/negative) rate keeps the full envelope.
+`window` is `top_provider.context_length`, else `model.context_length`. A
+completion-only limit (`top_provider.max_completion_tokens`) is **never** used
+as the window: a model can advertise a 10k completion cap inside a 100k
+window, and treating 10k as the window under-reserves every longer request
+(13-sat hold vs a 34-sat true cost for 30k input + 1k output). An unknown
+window, a cap that already covers it, or an unusable (non-finite/negative) rate
+keeps the full envelope.
 
-When the node advertises neither key — an older node, or a node whose discount
-is not yet sound — the SDK keeps the full-envelope reserve even though the
-header is sent: such a node ignores the header (or would answer a cap-sized
+Two more fail-closed conditions apply to the quote itself:
+
+- **Missing/malformed/empty route list** — a capability we cannot trust is not
+  permission to quote every route; the full envelope is kept.
+- **Caller nominates the cap header in `Connection`** — the hop strips the field
+  before the enclave sees it, so a quote computed from it is not a bound. The
+  SDK keeps the full envelope (core refuses the quote on its side too), and a
+  cold `/v1/info` probe is bounded by a deadline (10s) with caller cancellation
+  threaded through, so a stalled discovery can never block inference or hold a
+  request past its abort.
+
+When the node advertises less than the full set — an older node, a node whose
+discount is not yet sound, or one that quotes only some routes — the SDK keeps
+the full-envelope reserve even though the header is sent: such a node ignores the header (or would answer a cap-sized
 deposit with 402 `insufficient_balance`). A fallback provider that ignores the
 header is re-priced the same way on failover.
 
@@ -389,3 +406,12 @@ neither Routstr nor any network observer ever sees it. Resolution order:
   content — only the cap the caller already declared in the body. It is sent
   **today**; the reservation discount that would ride on it stays **off** until
   the enclave's cap bounds the whole request (see "Output-token cap" above).
+- **A `Connection` header nomination strips the cap header.** If the request
+  names `X-Tinfoil-Max-Output-Tokens` in its `Connection` header, the hop that
+  honors that nomination removes the field before the enclave sees it. The
+  quote was already computed from the stripped value, so the reservation no
+  longer matches what the enclave will enforce. The SDK cannot fix node-side
+  security: the node must refuse to quote when the cap header is nominated in
+  `Connection`, or refuse the request outright. Until it does, a caller that
+  sets such a nomination gets an over- or under-reserve against a header the
+  enclave never received — a node-side integrity gap this client cannot close.

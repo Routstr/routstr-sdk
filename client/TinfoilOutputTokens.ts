@@ -259,6 +259,12 @@ export function resolveTinfoilOutputCap(options: {
   headers?: Record<string, string>;
 }): TinfoilOutputCapResolution {
   const endpoint = tinfoilOutputCapEndpoint(options.path);
+  // A `Connection` nomination strips the header before the enclave sees it, so
+  // no cap can be quoted from it. Interval: the node's own sanitizer refuses
+  // the quote too (core does), but the full reserve is the same outcome here.
+  if (capHeaderNominatedInConnection(options.headers)) {
+    return { endpoint, source: "none", callerHeaderInvalid: false };
+  }
   const existing = findHeader(options.headers, TINFOIL_MAX_OUTPUT_TOKENS_HEADER);
 
   if (existing) {
@@ -343,6 +349,30 @@ export function withTinfoilOutputCapHeader(
     ...headers,
     [TINFOIL_MAX_OUTPUT_TOKENS_HEADER]: resolution.injectValue,
   };
+}
+
+/**
+ * Whether a hop is told to strip the cap header before it reaches the enclave.
+ *
+ * `Connection: X-Tinfoil-Max-Output-Tokens` nominates the field for removal at
+ * the hop that honors `Connection`. A quote computed from a header the enclave
+ * never receives is not a bound: the enclave would fall back to the body cap
+ * (or no cap), while the node reserved against a smaller number it can no
+ * longer enforce. The SDK therefore fails closed for such requests — no quote,
+ * full envelope — and does not rely on the node's own sanitizer.
+ */
+export function capHeaderNominatedInConnection(
+  headers: Record<string, string> | undefined
+): boolean {
+  if (!headers) return false;
+  const wanted = TINFOIL_MAX_OUTPUT_TOKENS_HEADER.toLowerCase();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== "connection") continue;
+    for (const token of String(value).split(",")) {
+      if (trimAsciiWhitespace(token).toLowerCase() === wanted) return true;
+    }
+  }
+  return false;
 }
 
 /**

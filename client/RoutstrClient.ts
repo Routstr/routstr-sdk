@@ -629,7 +629,9 @@ export class RoutstrClient {
           await this._sealedOutputCapForReserve(
             tinfoilEnabled,
             baseUrl,
-            tinfoilOutputCap
+            requestPath,
+            tinfoilOutputCap,
+            params.signal
           )
         );
       }
@@ -2203,7 +2205,9 @@ export class RoutstrClient {
             await this._sealedOutputCapForReserve(
               Boolean(params.tinfoilEnabled),
               nextProvider,
-              failoverOutputCap
+              path,
+              failoverOutputCap,
+              params.signal
             )
           );
 
@@ -3408,14 +3412,21 @@ export class RoutstrClient {
   private async _sealedOutputCapForReserve(
     tinfoilEnabled: boolean,
     baseUrl: string,
-    resolution?: TinfoilOutputCapResolution
+    requestPath: string,
+    resolution?: TinfoilOutputCapResolution,
+    signal?: AbortSignal
   ): Promise<number | undefined> {
     if (!tinfoilEnabled || resolution?.cap === undefined) return undefined;
     // A host app may inject its own provider manager; one without the
     // capability probe cannot discount, so keep the full reserve.
     const probe = this.providerManager?.supportsSealedOutputTokenReservation;
     if (typeof probe !== "function") return undefined;
-    const supported = await probe.call(this.providerManager, baseUrl);
+    const supported = await probe.call(
+      this.providerManager,
+      baseUrl,
+      requestPath,
+      signal
+    );
     return supported ? resolution.cap : undefined;
   }
 

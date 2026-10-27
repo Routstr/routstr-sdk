@@ -281,6 +281,41 @@ describe("tinfoil output cap resolution", () => {
     }
   });
 
+  it("fails closed when the cap header is nominated in Connection", () => {
+    // The hop that honors `Connection` removes the field before the enclave
+    // sees it, so a quote computed from it is not a bound.
+    for (const conn of [
+      HEADER,
+      HEADER.toLowerCase(),
+      `keep-alive, ${HEADER}`,
+      `  ${HEADER}  `,
+    ]) {
+      const resolution = resolveTinfoilOutputCap({
+        path: "/v1/chat/completions",
+        body: { max_completion_tokens: 64 },
+        headers: { Connection: conn },
+      });
+      expect(resolution.cap).toBeUndefined();
+      expect(resolution.injectValue).toBeUndefined();
+
+      const callerHeader = resolveTinfoilOutputCap({
+        path: "/v1/chat/completions",
+        body: {},
+        headers: { Connection: conn, [HEADER]: "8" },
+      });
+      expect(callerHeader.cap).toBeUndefined();
+    }
+
+    // A Connection header naming something else changes nothing.
+    expect(
+      resolveTinfoilOutputCap({
+        path: "/v1/chat/completions",
+        body: { max_completion_tokens: 64 },
+        headers: { Connection: "keep-alive" },
+      }).cap
+    ).toBe(64);
+  });
+
   it("never adds a second value when the header is already present", () => {
     const headers = { [HEADER]: "8" };
     const resolution = resolveTinfoilOutputCap({
@@ -421,26 +456,49 @@ describe("sealed reservation mirrors core's cap-aware EHBP hold", () => {
     ).toBe(20);
   });
 
-  it("bounds the window the way core does (top_provider, then context_length)", () => {
-    // Core reads top_provider.context_length, then top_provider's
-    // max_completion_tokens, then the bare context_length. A tinfoil-shaped
-    // model that publishes only a completion cap is bounded by that cap, not
-    // by a larger catalog context_length — using the wrong window would
-    // reserve ~20 sats instead of ~11.43.
-    const completionCapWindow = sealedModel({
-      top_provider: { max_completion_tokens: 1000 } as any,
-      context_length: 5000,
+  it("uses top_provider.context_length, then model.context_length — never a completion cap as the window", () => {
+    // A completion-only cap is not a context window. Using one under-reserves:
+    // window 10k, cap 1k, rates .001/.004 -> 13-sat hold, while 30k input +
+    // 1k output actually costs 34 sats. The real window (100k) yields a hold
+    // that covers the request. Core must use context_length for the window and
+    // ignore max_completion_tokens entirely.
+    const completionCapOnly = sealedModel({
+      top_provider: { max_completion_tokens: 10_000 } as any,
+      context_length: 100_000,
+      sats_pricing: {
+        prompt: 0.001,
+        completion: 0.004,
+        max_prompt_cost: 10,
+        max_completion_cost: 20,
+        max_cost: 20,
+      },
+    });
+    // The 100k window wins over the 10k completion cap. With a 1k cap the
+    // worst case is (100k - 1k) * .001 + 1k * .004 = 103 sats, so the gate is
+    // 103 sats, not the 13 sats the completion cap would produce. max_cost
+    // (20) caps the deposit, so assert against the uncapped gate by using a
+    // model whose max_cost is large enough to expose the difference.
+    const largeEnvelope = sealedModel({
+      top_provider: { max_completion_tokens: 10_000 } as any,
+      context_length: 100_000,
+      sats_pricing: {
+        prompt: 0.001,
+        completion: 0.004,
+        max_prompt_cost: 10,
+        max_completion_cost: 20,
+        max_cost: 1000,
+      },
     });
     expect(
       manager().getRequiredSatsForModel(
-        completionCapWindow,
+        largeEnvelope,
         MESSAGES,
         undefined,
         {},
         undefined,
-        100
+        1000
       )
-    ).toBeCloseTo(11.4345, 4);
+    ).toBeCloseTo(107.0685, 2); // 103-sat worst case x 1.05; a 10k window gives ~13.13
 
     const providerWindow = sealedModel({
       top_provider: { context_length: 1000 } as any,
@@ -456,6 +514,21 @@ describe("sealed reservation mirrors core's cap-aware EHBP hold", () => {
         100
       )
     ).toBeCloseTo(11.4345, 4);
+
+    const modelWindow = sealedModel({
+      top_provider: undefined,
+      context_length: 5000,
+    });
+    expect(
+      manager().getRequiredSatsForModel(
+        modelWindow,
+        MESSAGES,
+        undefined,
+        {},
+        undefined,
+        100
+      )
+    ).toBeCloseTo(20, 2); // 5k window gate exceeds max_cost (20), so capped at 20
   });
 
   it("keeps the full envelope when a rate is not a rate", () => {
@@ -1004,6 +1077,7 @@ describe("reservation stays disabled until the cap is a request-total bound", ()
     const { client, spend } = setupRealPricing({
       ehbp_output_token_reservation: true,
       ehbp_output_token_reservation_total_cap: true,
+      ehbp_output_token_reservation_routes: ["chat/completions"],
     });
 
     await request(client);
@@ -1016,6 +1090,8 @@ describe("node capability advertisement", () => {
   const features = (f: Record<string, unknown>) =>
     new ProviderManager(createRegistry({ [FIRST]: { features: f } }));
 
+  const chat = "/v1/chat/completions";
+
   it("requires the cap to bound the whole request, not each choice", async () => {
     // Discounting is only sound once the enclave's cap is a request-total
     // bound. The probe showed it is per choice today, so the first key alone
@@ -1024,25 +1100,102 @@ describe("node capability advertisement", () => {
       await features({
         ehbp_output_token_reservation: true,
         ehbp_output_token_reservation_total_cap: true,
-      }).supportsSealedOutputTokenReservation(FIRST)
+        ehbp_output_token_reservation_routes: ["chat/completions"],
+      }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(true);
     expect(
       await features({
         ehbp_output_token_reservation: true,
-      }).supportsSealedOutputTokenReservation(FIRST)
+      }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
     expect(
       await features({
         ehbp_output_token_reservation_total_cap: true,
-      }).supportsSealedOutputTokenReservation(FIRST)
+      }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
-    expect(await features({}).supportsSealedOutputTokenReservation(FIRST)).toBe(
-      false
-    );
+    expect(
+      await features({}).supportsSealedOutputTokenReservation(FIRST, chat)
+    ).toBe(false);
     // Old node: no `features` object at all.
     expect(
       await new ProviderManager(createRegistry({ [FIRST]: {} }))
-        .supportsSealedOutputTokenReservation(FIRST)
+        .supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
+  });
+
+  it("gates on the advertised route set, and fails closed without one", async () => {
+    // Core publishes the authoritative route set for its quote. Chat is not in
+    // a responses-only list, so quoting it would under-fund the node (402).
+    expect(
+      await features({
+        ehbp_output_token_reservation: true,
+        ehbp_output_token_reservation_total_cap: true,
+        ehbp_output_token_reservation_routes: ["responses"],
+      }).supportsSealedOutputTokenReservation(FIRST, chat)
+    ).toBe(false);
+    expect(
+      await features({
+        ehbp_output_token_reservation: true,
+        ehbp_output_token_reservation_total_cap: true,
+        ehbp_output_token_reservation_routes: ["responses"],
+      }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
+    ).toBe(true);
+
+    // Missing / malformed / empty list: no quotable route.
+    for (const routes of [undefined, [], ["response"], [42], [""]]) {
+      expect(
+        await features({
+          ehbp_output_token_reservation: true,
+          ehbp_output_token_reservation_total_cap: true,
+          ehbp_output_token_reservation_routes: routes,
+        }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
+      ).toBe(false);
+    }
+  });
+
+  it("bounds a cold /v1/info probe and fails closed on a stall or cancel", async () => {
+    // Cold info: nothing cached, so the probe must hit /v1/info.
+    const registry = createRegistry({});
+    const manager = new ProviderManager(registry);
+
+    // A request-path fetch that never settles but honors its abort signal.
+    const stallingFetch = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError"))
+          );
+        })
+    );
+    vi.stubGlobal("fetch", stallingFetch);
+
+    vi.useFakeTimers();
+    try {
+      const probe = manager.supportsSealedOutputTokenReservation(
+        FIRST,
+        "/v1/chat/completions"
+      );
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(await probe).toBe(false);
+
+      // Caller cancellation is observed without waiting for the timeout.
+      const controller = new AbortController();
+      const aborted = manager.supportsSealedOutputTokenReservation(
+        FIRST,
+        "/v1/chat/completions",
+        controller.signal
+      );
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 });
