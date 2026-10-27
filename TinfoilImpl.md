@@ -20,6 +20,7 @@ routing without parsing the encrypted body.
 |---|---|
 | `client/TinfoilSecure.ts` | Tinfoil model detection, `SecureClient` creation/cache, attestation helpers, EHBP fetch wrapper that preserves plaintext proxy errors |
 | `client/TinfoilCacheSecret.ts` | `user_cache_secret` resolution (option → env → persisted default) and splice-injection into eligible request bodies before EHBP sealing |
+| `client/TinfoilOutputTokens.ts` | Visible output-token cap (`X-Tinfoil-Max-Output-Tokens`): endpoint/field precedence, strict value grammar, caller-header passthrough, never duplicated |
 | `client/RoutstrClient.ts` | Detects `tinfoil-*`, attests before token spend, uses the Tinfoil EHBP fetch wrapper for the request |
 | `client/index.ts` | Re-exports Tinfoil helpers |
 
@@ -117,6 +118,75 @@ rather than reusing the failed node's vocabulary — `effort_map` describes one
 node's enclave. Without metadata the SDK does not guess. Models with no effort
 levels (a plain on/off reasoning toggle) publish no `reasoning` object and are
 unaffected.
+
+## Output-token cap (`X-Tinfoil-Max-Output-Tokens`)
+
+A sealed body is opaque to the node: it cannot read `max_tokens` /
+`max_completion_tokens` / `max_output_tokens`, so it used to hold the model's
+whole `max_cost` envelope for every Tinfoil request, even a 64-token answer.
+[tinfoilsh/confidential-model-router#518](https://github.com/tinfoilsh/confidential-model-router/pull/518)
+makes the cap visible in a request header that travels *outside* the EHBP body
+and that the enclave enforces **in place of** any body cap, larger or smaller.
+
+The SDK therefore derives the header before sealing, on sealed (`tinfoil-*`)
+requests only:
+
+| Endpoint | Fields the engine reads (precedence) | Header emitted |
+|---|---|---|
+| `/v1/chat/completions` | `max_completion_tokens`, then `max_tokens` (`max_output_tokens` is ignored) | yes |
+| `/v1/responses` | `max_output_tokens` | yes |
+| `/v1/completions` | — | no: deployed enclaves 404 it and routstr-core does not discount it |
+| every other route | — | no: the enclave ignores the header there |
+
+Rules, all mirroring the enclave and routstr-core exactly:
+
+- **The caller's header wins.** If the caller set the header it is forwarded
+  verbatim and the body cap is ignored for pricing, because the enclave ignores
+  it too. The SDK never emits a second value: two values (a repeated header, a
+  comma list, or one the caller spelled twice) are a 400.
+- **Strict grammar.** Only `^[1-9][0-9]*$` after stripping space/tab, at most
+  `2147483647`, becomes a header. `0`, negatives, fractions, `"+16"`, `"1e3"`,
+  numeric strings and newline-padded values emit **nothing** and leave the
+  request exactly as it was, so a caller whose body cap the engine would have
+  ignored (or rejected) does not start getting 400s from the SDK.
+- **A cap the engine would not read is never invented.** A chat body carrying
+  only `max_output_tokens` gets no header; a present-but-unusable preferred
+  field does not fall through to the next one.
+- **No body rewrite.** The enclave deletes the body caps itself when the header
+  is present, and leaving them untouched keeps old nodes — which ignore the
+  header and read the body — working unchanged.
+
+The header is attached when the request is prepared (so retries and failover
+inherit it from `baseHeaders`) and re-asserted in `_makeRequest`, the last stop
+before the EHBP transport.
+
+### Reservation
+
+Emitting the header is unconditional; *reserving* against it is not.
+
+Node support is advertised additively as `features.ehbp_output_token_reservation`
+on `GET /v1/info`. When a node advertises it, `getRequiredSatsForModel` prices a
+sealed request from the cap using routstr-core's worst case over the whole
+context window — never with the plaintext subtraction, which would spend an
+input allowance the node cannot see:
+
+```
+W     = max((window - cap) * promptPrice + cap * completionPrice, window * promptPrice)
+hold  = max(min_request_msat, min(base_msats, ceil(W * 1000 * tolerance)))
+```
+
+`window` is `top_provider.context_length`, else `top_provider.max_completion_tokens`,
+else `context_length`; an unknown window, a cap that already covers it, or an
+unusable (non-finite/negative) rate keeps the full envelope.
+
+When the node does **not** advertise the feature — an older node — the SDK keeps
+the full-envelope reserve even though the header is sent: that node ignores the
+header, holds the whole envelope, and would answer a cap-sized deposit with 402
+`insufficient_balance`. A fallback provider that ignores the header is re-priced
+the same way on failover.
+
+Settlement is unaffected: billing still comes from actual usage
+(`X-Tinfoil-Usage-Metrics`), never from the cap.
 
 ## Proxy-side error handling
 
@@ -253,3 +323,6 @@ neither Routstr nor any network observer ever sees it. Resolution order:
 - Provider/proxy infrastructure must understand EHBP-wrapped requests and forward
   them to the attested Tinfoil enclave. If a provider does not support Tinfoil
   proxying, `tinfoil-*` requests will fail.
+- `X-Tinfoil-Max-Output-Tokens` is a plaintext header, so the node sees the
+  request's output limit even though the prompt stays sealed. It carries no
+  content — only the cap the caller already declared in the body.
