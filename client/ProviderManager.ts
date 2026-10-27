@@ -33,6 +33,7 @@ import {
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
+import { withProviderDeadline } from "../discovery/providerDeadline";
 import {
   estimateCost,
   hasUsableTokenRates,
@@ -149,28 +150,35 @@ const fetchProviderInfo = async (
   adapter: DiscoveryAdapter,
   baseUrl: string,
   logger: SdkLogger,
+  signal?: AbortSignal,
 ): Promise<ProviderInfo | null> => {
   const normalized = normalizeBaseUrl(baseUrl);
   const cached = adapter.getCachedProviderInfo()[normalized];
   if (cached) return cached;
   try {
-    const response = await fetch(`${normalized}v1/info`);
+    const response = await fetch(`${normalized}v1/info`, { signal });
     if (!response.ok) {
       throw new Error(`Failed ${response.status}`);
     }
     const info = (await response.json()) as ProviderInfo;
-    adapter.setCachedProviderInfo({
-      ...adapter.getCachedProviderInfo(),
-      [normalized]: info,
-    });
+    // The deadline helper requires the operation it wraps to return data only:
+    // a response that arrives after the deadline (or after the caller aborted)
+    // must not publish anything. Publishing here would overwrite a fresher
+    // capability/mint snapshot with a stale one — the exact way a timed-out
+    // probe could resurrect an old "supported" flag.
+    if (signal?.aborted) return null;
     // `/v1/info` also advertises the mints the provider accepts. Keep the
     // mint cache in sync here so consumers that only fetched provider info
     // still see the advertised mint list (and never spend a rejected mint).
     const advertisedMints = Array.isArray(info?.mints) ? info.mints : [];
-    if (advertisedMints.length > 0) {
-      const normalizedMints = advertisedMints.map((mint) =>
-        mint.endsWith("/") ? mint.slice(0, -1) : mint,
-      );
+    const normalizedMints = advertisedMints.map((mint) =>
+      mint.endsWith("/") ? mint.slice(0, -1) : mint,
+    );
+    adapter.setCachedProviderInfo({
+      ...adapter.getCachedProviderInfo(),
+      [normalized]: info,
+    });
+    if (normalizedMints.length > 0) {
       adapter.setCachedMints({
         ...adapter.getCachedMints(),
         [normalized]: normalizedMints,
@@ -625,6 +633,45 @@ function countResponsesInputTextChars(input: any[]): number {
  */
 const NODE_TOLERANCE_PERCENT = 1;
 
+/** Bound the cold `/v1/info` probe on the request path (no inference stall). */
+const INFO_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * The canonical route name routstr-core publishes in
+ * `ehbp_output_token_reservation_routes` (`chat/completions`, `responses`, ...).
+ * The SDK path may be `/v1/chat/completions?x=y`; this collapses it to the
+ * exact string core compares against.
+ */
+function canonicalReservationRoute(path: string | undefined): string | null {
+  if (!path) return null;
+  const normalized = path
+    .split(/[?#]/)[0]
+    .replace(/\/+$/, "")
+    .replace(/^\/?v1\//, "")
+    .replace(/^\/+/, "");
+  return normalized === "" ? null : normalized;
+}
+
+/**
+ * `/v1/info` capability keys for the visible Tinfoil output cap.
+ *
+ * `RESERVATION` says the node reads `X-Tinfoil-Max-Output-Tokens` and trims its
+ * sealed-body reservation with it. `RESERVATION_TOTAL_CAP` says the enclave's
+ * cap bounds the *whole request* rather than each of `n` choices — the
+ * precondition that makes the first one sound, because a sealed body hides `n`
+ * from the node.
+ *
+ * No node advertises `RESERVATION_TOTAL_CAP` today (the live enclave caps per
+ * choice), so no cap is quoted and the SDK reserves the full envelope
+ * everywhere. Do not relax this on the strength of the client-side `n` guard:
+ * that guard only protects our own callers, while core's hold has to survive a
+ * direct adversarial EHBP client.
+ */
+const EHBP_RESERVATION_FEATURE = "ehbp_output_token_reservation";
+const EHBP_RESERVATION_TOTAL_CAP_FEATURE =
+  "ehbp_output_token_reservation_total_cap";
+const EHBP_RESERVATION_ROUTES_FEATURE = "ehbp_output_token_reservation_routes";
+
 /**
  * Sum the length of every string in a value tree, keys included.
  *
@@ -714,6 +761,122 @@ export function completionCapFromBody(
 }
 
 /**
+ * How a sealed (EHBP/Tinfoil) body has to be priced.
+ *
+ * `cap` is the output-token limit the enclave will enforce, taken from the
+ * visible `X-Tinfoil-Max-Output-Tokens` header (see `TinfoilOutputTokens`).
+ * Absent means "no visible cap", which is also every request to a node that
+ * does not advertise `features.ehbp_output_token_reservation` — those nodes
+ * cannot discount a sealed body at all, so the SDK must not either.
+ */
+interface SealedBodyPricing {
+  cap?: number;
+}
+
+/** A positive integer token limit from model metadata, or null. */
+function tokenLimit(raw: unknown): number | null {
+  if (raw === undefined || raw === null || typeof raw === "boolean") {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  const limit = Math.trunc(value);
+  return limit > 0 ? limit : null;
+}
+
+/**
+ * The token window core bounds the worst case with
+ * (`_model_token_window`): `top_provider.context_length`, then the bare
+ * `model.context_length`. `0` means "unknown", in which case core keeps the
+ * full envelope.
+ *
+ * A completion-only cap (`top_provider.max_completion_tokens`) is NOT a
+ * context window: a model can advertise a 10k completion cap inside a 100k
+ * window, and using 10k as the window under-reserves every request longer than
+ * that. Example: window 100k, cap 1k, prompt .001/sat, completion .004/sat.
+ * Using the 10k completion cap as the window yields a 13-sat hold, while a 30k
+ * input + 1k output request actually costs 34 sats. The real 100k window yields
+ * a 100-sat hold, which covers the request. If neither context field is a
+ * usable positive integer, return 0 (unknown => full envelope).
+ */
+function sealedContextWindow(model: Model): number {
+  const topProvider: any = (model as any)?.top_provider;
+  if (topProvider !== null && topProvider !== undefined) {
+    const limit = tokenLimit(topProvider.context_length);
+    if (limit !== null) return limit;
+  }
+  return tokenLimit((model as any)?.context_length) ?? 0;
+}
+
+/**
+ * The node's hold for a sealed body, mirroring routstr-core's cap-aware EHBP
+ * reservation (`calculate_discounted_max_cost` on the tinfoil path).
+ *
+ * A sealed body is opaque, so neither term of the plaintext formula applies:
+ * no prompt discount (the node cannot count the hidden input) and no
+ * `max_completion_cost - cap * price` subtraction, which would drop the whole
+ * input reserve along with the completion allowance and collapse the hold to
+ * `cap * completion`. Core instead computes the worst case the enforced cap
+ * still permits over the whole context:
+ *
+ *     W = max((context - cap) * prompt + cap * completion, context * prompt)
+ *     hold = max(min_request_msat, min(base_msats, ceil(W * 1000 * tol)))
+ *
+ * `W` keeps `(context - cap)` input tokens in the hold, so the hidden prompt is
+ * still covered. Above the context window (`cap >= context`) the two collapse
+ * and there is nothing to discount.
+ */
+function sealedBodyGateSats(
+  model: Model,
+  satsPricing: any,
+  sealed: SealedBodyPricing
+): number {
+  const maxCost = satsPricing?.max_cost;
+  if (typeof maxCost !== "number" || !Number.isFinite(maxCost)) return 0;
+
+  const toleranceFactor = 1 - NODE_TOLERANCE_PERCENT / 100;
+  const baseMsats = Math.max(1, Math.floor(maxCost * 1000 * toleranceFactor));
+
+  const cap = sealed.cap;
+  if (cap === undefined) return baseMsats / 1000;
+
+  // Same coercion core applies (`float(x or 0.0)`): a missing rate is free, a
+  // malformed one is not a rate at all. A rate that is not finite and
+  // non-negative would poison the worst case into an under-reserve, so it
+  // keeps the full envelope instead.
+  const asRate = (raw: unknown): number => {
+    if (raw === undefined || raw === null || raw === "") return 0;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : NaN;
+  };
+  const promptPrice = asRate(satsPricing?.prompt);
+  const completionPrice = asRate(satsPricing?.completion);
+  if (
+    !Number.isFinite(promptPrice) ||
+    promptPrice < 0 ||
+    !Number.isFinite(completionPrice) ||
+    completionPrice < 0
+  ) {
+    return baseMsats / 1000;
+  }
+
+  const contextLength = sealedContextWindow(model);
+
+  // No derivable window, or a cap that already covers it: nothing to discount.
+  if (contextLength === 0 || cap >= contextLength) {
+    return baseMsats / 1000;
+  }
+
+  const worstCaseSats = Math.max(
+    Math.max(0, contextLength - cap) * promptPrice + cap * completionPrice,
+    contextLength * promptPrice
+  );
+  const cappedMsats = Math.ceil(worstCaseSats * 1000 * toleranceFactor);
+
+  return Math.max(1, Math.min(baseMsats, cappedMsats)) / 1000;
+}
+
+/**
  * Port of the node's minimum-balance gate
  * (`routstr/payment/helpers.py:calculate_discounted_max_cost`), in sats.
  *
@@ -744,10 +907,16 @@ function nodeGateSats(
   model: Model,
   satsPricing: any,
   requestBody: Record<string, unknown>,
-  imageTokens: number
+  imageTokens: number,
+  sealed?: SealedBodyPricing
 ): number {
   const maxCost = satsPricing?.max_cost;
   if (typeof maxCost !== "number" || !Number.isFinite(maxCost)) return 0;
+
+  // A sealed body never gets the plaintext discounts: the node sees ciphertext,
+  // so it cannot count the prompt or read a body cap. Only the visible header
+  // can shrink its hold.
+  if (sealed) return sealedBodyGateSats(model, satsPricing, sealed);
 
   const toleranceFactor = 1 - NODE_TOLERANCE_PERCENT / 100;
   const promptPrice =
@@ -801,16 +970,15 @@ function nodeGateSats(
   }
 
   // Completion budget: the largest cap the request declares, across all
-  // three interchangeable spellings. EHBP/Tinfoil bodies are sealed, so the
-  // node cannot read a budget out of them at all.
+  // three interchangeable spellings. (Sealed bodies returned above — the node
+  // cannot read a budget out of them.)
   const parsedMaxTokens = completionCapFromBody(requestBody);
 
   if (
     parsedMaxTokens !== undefined &&
     parsedMaxTokens > 0 &&
     typeof satsPricing?.max_completion_cost === "number" &&
-    completionPrice > 0 &&
-    !isTinfoilModel(model.id)
+    completionPrice > 0
   ) {
     const unusedCompletionBudget =
       satsPricing.max_completion_cost * toleranceFactor -
@@ -1857,6 +2025,126 @@ export class ProviderManager {
   }
 
   /**
+   * Whether this node reserves against the visible Tinfoil output cap *safely*.
+   *
+   * Two additive capability keys are required, and both are advisory only — a
+   * client cannot verify either, so they are a compatibility signal, not a
+   * security boundary:
+   *
+   * - `features.ehbp_output_token_reservation` — the node reads
+   *   `X-Tinfoil-Max-Output-Tokens` and trims its sealed-body reservation with
+   *   it (`calculate_discounted_max_cost`, tinfoil path). Older nodes ignore
+   *   both the header and the feature and hold the whole `max_cost` envelope,
+   *   so reserving against a cap there would under-fund the request and turn it
+   *   into a 402 top-up loop.
+   * - `features.ehbp_output_token_reservation_total_cap` — the enclave's cap
+   *   bounds the **whole request**, not each of `n` choices. Live probe
+   *   (`tinfoil/probe-n-multi-choice.mjs`, router-0.tinfoil.sh): header `8`
+   *   with `n=3` billed 24 completion tokens, so today the cap is per choice.
+   *   A sealed body hides `n` from the node, which means the node's cap-based
+   *   hold bounds nothing: a direct adversarial EHBP client can ask for `n`
+   *   choices and be billed up to `n * cap` against a hold sized for one. Until
+   *   the enclave either divides the cap across choices, rejects `n > 1` with
+   *   the header, or exposes `n` in a way it can validate, no cap-based hold is
+   *   sound — so no cap is quoted.
+   *
+   * Requiring the second key means the SDK keeps the full-envelope reserve by
+   * default and starts discounting only once the node advertises that the
+   * precondition actually holds. On an old node both keys are absent; on a node
+   * that discounts without the precondition the second is. Either way the SDK
+   * holds the full envelope, which is the safe failure.
+   *
+   * `/v1/info` is already fetched lazily (and cached) on this path for mint and
+   * model discovery, so this is normally a cache read. A node we cannot reach
+   * is also "unsupported": choosing the larger reservation is the safe failure.
+   */
+  async supportsSealedOutputTokenReservation(
+    baseUrl: string,
+    requestPath: string,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    const abortError = () =>
+      new DOMException("The operation was aborted.", "AbortError");
+    if (signal?.aborted) throw abortError();
+
+    // Race the caller's abort independently of fetch: an implementation that
+    // ignores the signal must not hold the probe until the deadline, and a
+    // cancelled request must throw rather than quietly downgrade to "the node
+    // does not support the cap".
+    let onAbort: (() => void) | undefined;
+    const callerAborted = new Promise<never>((_resolve, reject) => {
+      if (!signal) return;
+      onAbort = () => reject(abortError());
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+    try {
+      // A cold `/v1/info` must never stall inference: bound the whole probe and
+      // fail closed to the full envelope on a deadline or network failure.
+      const info = await Promise.race([
+        withProviderDeadline(
+          async (deadlineSignal) =>
+            fetchProviderInfo(
+              this.discoveryAdapter,
+              baseUrl,
+              this.logger,
+              signal
+                ? AbortSignal.any([signal, deadlineSignal])
+                : deadlineSignal
+            ),
+          INFO_PROBE_TIMEOUT_MS
+        ),
+        callerAborted,
+      ]);
+      if (signal?.aborted) throw abortError();
+      if (!info) return false;
+
+      const features = (info as any)?.features;
+      const reservation = features?.[EHBP_RESERVATION_FEATURE] === true;
+      const totalCap = features?.[EHBP_RESERVATION_TOTAL_CAP_FEATURE] === true;
+      if (!reservation || !totalCap) {
+        if (reservation && !totalCap) {
+          this.logger.debug(
+            `[ProviderManager] ${baseUrl} advertises ${EHBP_RESERVATION_FEATURE} without ${EHBP_RESERVATION_TOTAL_CAP_FEATURE}; sealed output-cap discount stays disabled (full reserve)`
+          );
+        }
+        return false;
+      }
+
+      // The node publishes the authoritative route set for its quote. A route
+      // outside it gets the full envelope even when both booleans are true, or
+      // the SDK would under-fund a request the node prices at max_cost (402).
+      // Missing/malformed/empty list is a capability we cannot trust: fail
+      // closed rather than assume "all routes".
+      const routes = features?.[EHBP_RESERVATION_ROUTES_FEATURE];
+      const route = canonicalReservationRoute(requestPath);
+      const usableRoutes =
+        Array.isArray(routes) &&
+        routes.length > 0 &&
+        routes.every((r) => typeof r === "string" && r.trim() !== "");
+      if (!usableRoutes || route === null || !routes.includes(route)) {
+        this.logger.debug(
+          `[ProviderManager] ${baseUrl} sealed output-cap route ${requestPath} not in advertised routes ${JSON.stringify(routes)}; full reserve`
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      if (signal?.aborted || (error as Error)?.name === "AbortError") {
+        throw abortError();
+      }
+      // Deadline / network / malformed info: full reserve is the safe failure.
+      this.logger.debug(
+        `[ProviderManager] ${baseUrl} sealed output-cap probe failed (${error instanceof Error ? error.message : String(error)}); full reserve`
+      );
+      return false;
+    } finally {
+      if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /**
    * Get required sats for a model based on the request body shape.
    *
    * Estimates the deposit the node will demand before forwarding: the
@@ -1868,16 +2156,25 @@ export class ProviderManager {
    * @param apiMessages chat-completions `messages` array (Responses
    *   requests pass [])
    * @param maxTokens the request's completion cap (see
-   *   `completionCapFromBody`); the largest of the three spellings
+   *   `completionCapFromBody`); the largest of the three spellings. Ignored on
+   *   sealed (Tinfoil) bodies, which the node cannot decrypt — pass
+   *   `sealedOutputCap` for those.
    * @param requestBody the full request body, used to count Responses
    *   input/instructions and tools definitions on both APIs
+   * @param sealedOutputCap the output-token cap a Tinfoil enclave enforces
+   *   through the visible `X-Tinfoil-Max-Output-Tokens` header, when the node
+   *   advertises that it reserves against it (see
+   *   `supportsSealedOutputTokenReservation`). Leave it undefined for a node
+   *   that does not advertise support: such a node holds the full envelope, so
+   *   the SDK must reserve the full envelope too.
    */
   getRequiredSatsForModel(
     model: Model,
     apiMessages: any[],
     maxTokens?: number,
     requestBody?: Record<string, unknown>,
-    pathPricing?: ModelPathSatsPricing
+    pathPricing?: ModelPathSatsPricing,
+    sealedOutputCap?: number
   ): number {
     try {
       // A pinned model path prices itself: the node advertises a full
@@ -1993,12 +2290,14 @@ export class ProviderManager {
       const requestFee = sp.request || 0;
       const promptCosts = (sp.prompt || 0) * totalInputTokens;
       let completionCost = sp.max_completion_cost;
-      // Tinfoil/EHBP models encrypt the request body client-side, so the
-      // proxy/enclave cannot enforce an output cap yet. Never apply the
-      // maxTokens completion discount for these models — always reserve
-      // max_completion_cost.
-      if (maxTokens !== undefined && sp.completion && !isTinfoilModel(model.id)) {
-        completionCost = sp.completion * maxTokens;
+      // A sealed (Tinfoil/EHBP) body's own cap never counts: the node cannot
+      // read it. Only the cap the enclave enforces through the visible header
+      // can shrink the reservation, and only when the node prices it (see
+      // sealedBodyGateSats).
+      const sealed = isTinfoilModel(model.id);
+      const completionCap = sealed ? sealedOutputCap : maxTokens;
+      if (completionCap !== undefined && sp.completion) {
+        completionCost = sp.completion * completionCap;
       }
       const componentEstimate = (promptCosts + completionCost + requestFee) * 1.05;
 
@@ -2009,7 +2308,14 @@ export class ProviderManager {
       // image (see nodeGateSats). Reserve the larger of the two, keeping the
       // same 5% margin the component estimate uses so the node's configured
       // tolerance (which the SDK cannot read) cannot eat the whole reserve.
-      const gateEstimate = nodeGateSats(model, sp, body, imageTokens) * 1.05;
+      const gateEstimate =
+        nodeGateSats(
+          model,
+          sp,
+          body,
+          imageTokens,
+          sealed ? { cap: sealedOutputCap } : undefined
+        ) * 1.05;
       let totalEstimatedCosts = Math.max(componentEstimate, gateEstimate);
 
       // Cap at the pricing envelope. The node's gate is always <= max_cost

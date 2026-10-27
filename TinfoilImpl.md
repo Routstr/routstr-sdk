@@ -20,6 +20,7 @@ routing without parsing the encrypted body.
 |---|---|
 | `client/TinfoilSecure.ts` | Tinfoil model detection, `SecureClient` creation/cache, attestation helpers, EHBP fetch wrapper that preserves plaintext proxy errors |
 | `client/TinfoilCacheSecret.ts` | `user_cache_secret` resolution (option → env → persisted default) and splice-injection into eligible request bodies before EHBP sealing |
+| `client/TinfoilOutputTokens.ts` | Visible output-token cap (`X-Tinfoil-Max-Output-Tokens`): endpoint/field precedence, strict value grammar, caller-header passthrough, never duplicated |
 | `client/RoutstrClient.ts` | Detects `tinfoil-*`, attests before token spend, uses the Tinfoil EHBP fetch wrapper for the request |
 | `client/index.ts` | Re-exports Tinfoil helpers |
 
@@ -117,6 +118,153 @@ rather than reusing the failed node's vocabulary — `effort_map` describes one
 node's enclave. Without metadata the SDK does not guess. Models with no effort
 levels (a plain on/off reasoning toggle) publish no `reasoning` object and are
 unaffected.
+
+## Output-token cap (`X-Tinfoil-Max-Output-Tokens`)
+
+A sealed body is opaque to the node: it cannot read `max_tokens` /
+`max_completion_tokens` / `max_output_tokens`, so it used to hold the model's
+whole `max_cost` envelope for every Tinfoil request, even a 64-token answer.
+[tinfoilsh/confidential-model-router#518](https://github.com/tinfoilsh/confidential-model-router/pull/518)
+makes the cap visible in a request header that travels *outside* the EHBP body
+and that the enclave enforces **in place of** any body cap, larger or smaller.
+
+> **State of this feature — read this first.**
+>
+> - **Header forwarding is live.** On a single-choice (`n <= 1`) sealed request
+>   to `chat/completions` or `responses`, the SDK derives and sends
+>   `X-Tinfoil-Max-Output-Tokens` today, and the deployed enclave honors it today
+>   per choice (probe-verified). The caller's output limit is therefore applied
+>   end to end even though the body stays sealed.
+> - **The reservation discount is DISABLED.** No node advertises
+>   `features.ehbp_output_token_reservation_total_cap`, because the enclave's
+>   cap is enforced *per choice* (probe-verified), so it does not bound the
+>   request total that a direct adversarial EHBP client can ask for. Until the
+>   enclave guarantees a request-total (or single-choice) cap, the SDK reserves
+>   the **full `max_cost` envelope**, exactly as it did before this feature.
+> - **Enabling it is not an operator flag toggle.** The `/v1/info` keys are a
+>   *statement of capability*, not a switch. Advertising them is a future
+>   prerequisite: the guarantee must be implemented in an attested router version
+>   and verified against the deployed enclave, including adversarial
+>   multi-choice/`best_of` probes. Until that lands, flipping the flag would
+>   claim a guarantee that does not exist — it would move the risk onto the
+>   node's balance without changing what the enclave bills. The upstream
+>   enforcement change (confidential-model-router) plus attestation and
+>   verification must land first; only then does core advertise, and only then
+>   does the SDK quote a cap.
+> - **What the current evidence does and does not show.** Attestation establishes
+>   code/version identity; probes corroborate behavior but do not alone prove
+>   every budget path. The probes we have prove the *unsafety* of the per-choice
+>   cap (`header=8` with `n=3` billed 24 completion tokens), not the safety of a
+>   total cap. A successful `n=1` request does not prove a total cap, and no
+>   probe yet proves safety. That is why nothing is discounted today.
+>
+> The client-side `n > 1` guard below does **not** justify turning the discount
+> on: it only protects callers of this SDK, while the node's hold has to survive
+> any EHBP client.
+
+The SDK therefore derives the header before sealing, on sealed (`tinfoil-*`)
+requests only:
+
+| Endpoint | Fields the engine reads (precedence) | Header emitted |
+|---|---|---|
+| `/v1/chat/completions` | `max_completion_tokens`, then `max_tokens` (`max_output_tokens` is ignored) | yes |
+| `/v1/responses` | `max_output_tokens` | yes |
+| `/v1/completions` | — | no: deployed enclaves 404 it and routstr-core does not discount it |
+| every other route | — | no: the enclave ignores the header there |
+
+Rules, all mirroring the enclave and routstr-core exactly:
+
+- **The caller's header wins.** If the caller set the header it is forwarded
+  verbatim and the body cap is ignored for pricing, because the enclave ignores
+  it too. The SDK never emits a second value: two values (a repeated header, a
+  comma list, or one the caller spelled twice) are a 400.
+- **Strict grammar.** Only `^[1-9][0-9]*$` after stripping space/tab, at most
+  `2147483647`, becomes a header. `0`, negatives, fractions, `"+16"`, `"1e3"`,
+  numeric strings and newline-padded values emit **nothing** and leave the
+  request exactly as it was, so a caller whose body cap the engine would have
+  ignored (or rejected) does not start getting 400s from the SDK.
+- **A cap the engine would not read is never invented.** A chat body carrying
+  only `max_output_tokens` gets no header; a present-but-unusable preferred
+  field does not fall through to the next one.
+- **No body rewrite.** The enclave deletes the body caps itself when the header
+  is present, and leaving them untouched keeps old nodes — which ignore the
+  header and read the body — working unchanged.
+- **Multi-choice requests are excluded.** The cap applies *per choice*
+  (probe-verified: header `8` with `n=3` billed 24 completion tokens), and `n`
+  is invisible to the node behind the sealed body, so quoting one cap would let
+  the enclave bill up to `n * cap` against a hold sized for a single completion.
+  With `n > 1` (or `best_of > 1`) the SDK emits no derived header and quotes
+  nothing — a caller-supplied header is still forwarded, just not priced — so
+  those requests keep the full-envelope reserve they had before this feature.
+
+The header is attached when the request is prepared (so retries and failover
+inherit it from `baseHeaders`) and re-asserted in `_makeRequest`, the last stop
+before the EHBP transport.
+
+### Reservation
+
+Emitting the header is unconditional; *reserving* against it is not.
+
+Quoting a cap needs three additive `/v1/info` capability values, because a
+client can verify none of them and only one describes what the enclave actually
+enforces:
+
+| Key | Meaning |
+|---|---|
+| `features.ehbp_output_token_reservation` | the node trims its sealed-body reservation from `X-Tinfoil-Max-Output-Tokens` |
+| `features.ehbp_output_token_reservation_total_cap` | the enclave's cap bounds the **whole request**, not each of `n` choices |
+| `features.ehbp_output_token_reservation_routes` | the exact canonical routes the node will quote (`chat/completions`, `responses`, ...). **Authoritative**: a route outside it keeps the full envelope even when both booleans are true, or the SDK would under-fund a request the node prices at `max_cost` (402) |
+
+The second key is the precondition for the first being sound. Today the cap is
+per choice, so an adversarial EHBP client (which can send any `n` inside the
+sealed body) could be billed up to `n × cap` against a hold sized for one
+completion. Until the enclave divides the cap across choices, rejects `n > 1`
+alongside the header, or exposes `n` in a form it validates, no node advertises
+the whole set and the SDK keeps the full-envelope reserve — the same posture as
+an old node. A node that advertises a partial set is logged and still reserves
+the full envelope: `supportsSealedOutputTokenReservation()` requires both
+booleans *and* a usable route list containing the request's canonical route,
+and the tests pin the resulting deposit at the envelope (`tests/unit/
+tinfoilOutputTokens.test.ts`, "reservation stays disabled until the cap is a
+request-total bound" and "gates on the advertised route set").
+
+When a node advertises the full set, `getRequiredSatsForModel` prices a sealed request
+from the cap using routstr-core's worst case over the whole context window —
+never with the plaintext subtraction, which would spend an input allowance the
+node cannot see:
+
+```
+W     = max((window - cap) * promptPrice + cap * completionPrice, window * promptPrice)
+hold  = max(min_request_msat, min(base_msats, ceil(W * 1000 * tolerance)))
+```
+
+`window` is `top_provider.context_length`, else `model.context_length`. A
+completion-only limit (`top_provider.max_completion_tokens`) is **never** used
+as the window: a model can advertise a 10k completion cap inside a 100k
+window, and treating 10k as the window under-reserves every longer request
+(13-sat hold vs a 34-sat true cost for 30k input + 1k output). An unknown
+window, a cap that already covers it, or an unusable (non-finite/negative) rate
+keeps the full envelope.
+
+Two more fail-closed conditions apply to the quote itself:
+
+- **Missing/malformed/empty route list** — a capability we cannot trust is not
+  permission to quote every route; the full envelope is kept.
+- **Caller nominates the cap header in `Connection`** — the hop strips the field
+  before the enclave sees it, so a quote computed from it is not a bound. The
+  SDK keeps the full envelope (core refuses the quote on its side too), and a
+  cold `/v1/info` probe is bounded by a deadline (10s) with caller cancellation
+  threaded through, so a stalled discovery can never block inference or hold a
+  request past its abort.
+
+When the node advertises less than the full set — an older node, a node whose
+discount is not yet sound, or one that quotes only some routes — the SDK keeps
+the full-envelope reserve even though the header is sent: such a node ignores the header (or would answer a cap-sized
+deposit with 402 `insufficient_balance`). A fallback provider that ignores the
+header is re-priced the same way on failover.
+
+Settlement is unaffected: billing still comes from actual usage
+(`X-Tinfoil-Usage-Metrics`), never from the cap.
 
 ## Proxy-side error handling
 
@@ -253,3 +401,17 @@ neither Routstr nor any network observer ever sees it. Resolution order:
 - Provider/proxy infrastructure must understand EHBP-wrapped requests and forward
   them to the attested Tinfoil enclave. If a provider does not support Tinfoil
   proxying, `tinfoil-*` requests will fail.
+- `X-Tinfoil-Max-Output-Tokens` is a plaintext header, so the node sees the
+  request's output limit even though the prompt stays sealed. It carries no
+  content — only the cap the caller already declared in the body. It is sent
+  **today**; the reservation discount that would ride on it stays **off** until
+  the enclave's cap bounds the whole request (see "Output-token cap" above).
+- **A `Connection` header nomination strips the cap header.** If the request
+  names `X-Tinfoil-Max-Output-Tokens` in its `Connection` header, the hop that
+  honors that nomination removes the field before the enclave sees it. The
+  quote was already computed from the stripped value, so the reservation no
+  longer matches what the enclave will enforce. The SDK cannot fix node-side
+  security: the node must refuse to quote when the cap header is nominated in
+  `Connection`, or refuse the request outright. Until it does, a caller that
+  sets such a nomination gets an over- or under-reserve against a header the
+  enclave never received — a node-side integrity gap this client cannot close.

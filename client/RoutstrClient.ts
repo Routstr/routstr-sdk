@@ -81,6 +81,12 @@ import {
   fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
 import { applyTinfoilReasoningEffort } from "./TinfoilReasoning";
+import {
+  forwardCallerTinfoilOutputCapHeaders,
+  resolveTinfoilOutputCap,
+  withTinfoilOutputCapHeader,
+  type TinfoilOutputCapResolution,
+} from "./TinfoilOutputTokens";
 import { isOpenAiJsonBodyPath } from "../utils/openAiEndpoints";
 
 /**
@@ -565,6 +571,25 @@ export class RoutstrClient {
     let requiredSats = 1;
     let selectedModel: Model | undefined;
     let requestMaxTokens: number | undefined;
+    // EHBP sealing is decided by the caller-facing id, so it is known before
+    // any pricing happens (the whole request rides the sealed transport).
+    const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
+    // The output cap the enclave will actually enforce: the caller's visible
+    // header if they set one, else the cap the body declares for this endpoint.
+    // EHBP lets the enclave see the header but not the body, so this is the
+    // only cap the node can price a sealed request against.
+    const tinfoilOutputCap: TinfoilOutputCapResolution | undefined =
+      tinfoilEnabled
+        ? resolveTinfoilOutputCap({ path: requestPath, body, headers })
+        : undefined;
+    if (tinfoilOutputCap) {
+      this._log("DEBUG", "[RoutstrClient] Tinfoil output cap", {
+        endpoint: tinfoilOutputCap.endpoint,
+        source: tinfoilOutputCap.source,
+        cap: tinfoilOutputCap.cap,
+        callerHeaderInvalid: tinfoilOutputCap.callerHeaderInvalid,
+      });
+    }
     if (modelId) {
       const providerModel = await this.providerManager.getModelForProvider(
         baseUrl,
@@ -600,7 +625,14 @@ export class RoutstrClient {
           requestMessages,
           requestMaxTokens,
           requestBodyForPricing,
-          params.autoModelPath?.satsPricing
+          params.autoModelPath?.satsPricing,
+          await this._sealedOutputCapForReserve(
+            tinfoilEnabled,
+            baseUrl,
+            requestPath,
+            tinfoilOutputCap,
+            params.signal
+          )
         );
       }
     }
@@ -634,6 +666,20 @@ export class RoutstrClient {
     for (const [name, value] of Object.entries(headers)) {
       if (name.toLowerCase() === "anthropic-beta") baseHeaders[name] = value;
     }
+    // The visible Tinfoil output cap belongs on the sealed (tinfoil-*) path
+    // only: it is the one figure the enclave enforces and the node reserves
+    // against, and both sides must see the same value. A caller-supplied
+    // header is forwarded verbatim (never duplicated — two values are a 400);
+    // otherwise the cap is derived from the body for the endpoint the enclave
+    // applies it to. Retries and failover rebuild from `baseHeaders`, so this
+    // is the one place the header is decided.
+    if (tinfoilEnabled && tinfoilOutputCap) {
+      forwardCallerTinfoilOutputCapHeaders(headers, baseHeaders);
+      Object.assign(
+        baseHeaders,
+        withTinfoilOutputCapHeader(baseHeaders, tinfoilOutputCap)
+      );
+    }
 
     // Forward the provider-native model id when selection resolved through a
     // static mapping: mapped providers only know their own id, so the
@@ -664,9 +710,9 @@ export class RoutstrClient {
       }
     }
 
-    // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
-    const tinfoilEnabled = Boolean(modelId && isTinfoilModel(modelId));
+    this._abortIfCancelled(params.signal);
 
+    // ─── Tinfoil EHBP: attest BEFORE spending tokens ──────
     if (tinfoilEnabled) {
       this._log(
         "DEBUG",
@@ -690,6 +736,8 @@ export class RoutstrClient {
         };
       }
     }
+
+    this._abortIfCancelled(params.signal);
 
     // Spend tokens for the actual request
     const spendResult = await this._spendToken({
@@ -743,6 +791,7 @@ export class RoutstrClient {
       selectedMintUrl,
       maxTokens: requestMaxTokens,
       tinfoilEnabled,
+      tinfoilOutputCap,
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
@@ -903,6 +952,14 @@ export class RoutstrClient {
     retryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /**
+     * The cap decision made when the request was prepared. Carried so retries
+     * and failover reuse it instead of re-deriving from sanitized headers: a
+     * caller `Connection` nomination suppresses the header, and the SDK's
+     * outbound allowlist drops `Connection`, so re-deriving would resurrect a
+     * cap the caller asked to strip.
+     */
+    tinfoilOutputCap?: TinfoilOutputCapResolution;
     /** Secret scoping Tinfoil's prompt cache for this request. */
     userCacheSecret?: string;
     /** File path for the persisted default secret (client-level). */
@@ -944,12 +1001,26 @@ export class RoutstrClient {
         attemptBody === undefined || method === "GET"
           ? undefined
           : JSON.stringify(attemptBody);
+      // Every sealed attempt leaves through here, so the visible output cap is
+      // re-asserted at the last moment: a retry or failover that rebuilt its
+      // headers without it still ships the cap the reservation was priced
+      // against. Idempotent — an existing value (the caller's, or the one
+      // attached when the request was prepared) is never duplicated, because
+      // the enclave rejects two values.
+      const attemptHeaders =
+        tinfoilEnabled && method !== "GET"
+          ? withTinfoilOutputCapHeader(
+              headers,
+              params.tinfoilOutputCap ??
+                resolveTinfoilOutputCap({ path, body: attemptBody, headers })
+            )
+          : headers;
       const requestLogId = await this.requestResponseLogSink?.logRequest?.({
         method,
         url,
         path,
         baseUrl,
-        headers,
+        headers: attemptHeaders,
         body: attemptBody,
         rawBody: requestBodyText,
       });
@@ -967,14 +1038,14 @@ export class RoutstrClient {
             url,
             {
               method,
-              headers,
+              headers: attemptHeaders,
               body: requestBodyText,
               signal,
             }
           )
         : await fetch(url, {
             method,
-            headers,
+            headers: attemptHeaders,
             body: requestBodyText,
             signal,
           });
@@ -1180,6 +1251,8 @@ export class RoutstrClient {
       headers: Record<string, string>;
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
+      /** Prepared cap decision (see _makeRequest): reused, never re-derived. */
+      tinfoilOutputCap?: TinfoilOutputCapResolution;
       signal?: AbortSignal;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
@@ -2127,6 +2200,24 @@ export class RoutstrClient {
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
 
+        // The cap is the caller's, so it survives failover unchanged; whether
+        // the *new* node prices it is node-local, so ask that node.
+        //
+        // Reuse the decision made when the request was prepared. `params.headers`
+        // are the sanitized outbound headers — the allowlist already dropped
+        // `Connection` — so re-resolving here would resurrect a cap the caller
+        // nominated for stripping: a discounted reserve against a header the
+        // enclave never receives. Fall back only when no decision was prepared
+        // (a host that drives _makeRequest directly).
+        const failoverOutputCap = params.tinfoilEnabled
+          ? (params.tinfoilOutputCap ??
+            resolveTinfoilOutputCap({
+              path,
+              body,
+              headers: params.headers,
+            }))
+          : undefined;
+
         newRequiredSats =
           this.providerManager.getRequiredSatsForModel(
             newModel,
@@ -2135,8 +2226,17 @@ export class RoutstrClient {
             body && typeof body === "object"
               ? (body as Record<string, unknown>)
               : undefined,
-            nextModelPathPricing
+            nextModelPathPricing,
+            await this._sealedOutputCapForReserve(
+              Boolean(params.tinfoilEnabled),
+              nextProvider,
+              path,
+              failoverOutputCap,
+              params.signal
+            )
           );
+
+        this._abortIfCancelled(params.signal);
 
         if (params.tinfoilEnabled) {
           this._log(
@@ -2145,6 +2245,8 @@ export class RoutstrClient {
           );
           await prepareTinfoilClient({ baseUrl: nextProvider });
         }
+
+        this._abortIfCancelled(params.signal);
 
         this._log(
           "DEBUG",
@@ -3324,6 +3426,48 @@ export class RoutstrClient {
       if (name.toLowerCase() === MODEL_PATH_HEADER) return value;
     }
     return undefined;
+  }
+
+  /**
+   * The cap to price a sealed (Tinfoil) request against, or `undefined` to keep
+   * the full-envelope reserve.
+   *
+   * Emitting the header is unconditional (the enclave enforces it whether or
+   * not the node understands it), but *reserving* against it is not: only a
+   * node that advertises `features.ehbp_output_token_reservation` discounts a
+   * sealed body. An older node ignores the header, holds the whole envelope,
+   * and would answer a cap-sized deposit with 402 `insufficient_balance`.
+   */
+  /**
+   * Stop before spending when the caller has already gone away. Cancellation
+   * is not an "unsupported node": it must surface as AbortError, and the
+   * request must not attest or spend after it.
+   */
+  private _abortIfCancelled(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+  }
+
+  private async _sealedOutputCapForReserve(
+    tinfoilEnabled: boolean,
+    baseUrl: string,
+    requestPath: string,
+    resolution?: TinfoilOutputCapResolution,
+    signal?: AbortSignal
+  ): Promise<number | undefined> {
+    if (!tinfoilEnabled || resolution?.cap === undefined) return undefined;
+    // A host app may inject its own provider manager; one without the
+    // capability probe cannot discount, so keep the full reserve.
+    const probe = this.providerManager?.supportsSealedOutputTokenReservation;
+    if (typeof probe !== "function") return undefined;
+    const supported = await probe.call(
+      this.providerManager,
+      baseUrl,
+      requestPath,
+      signal
+    );
+    return supported ? resolution.cap : undefined;
   }
 
   /**
