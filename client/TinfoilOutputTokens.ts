@@ -163,6 +163,29 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** A count that may legitimately exceed one, read loosely (`5` or `"5"`). */
+function countAboveOne(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return false;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(value) && value > 1;
+}
+
+/**
+ * Whether the request asks for more than one completion.
+ *
+ * The header's cap is applied per choice, not to the request total: a probe
+ * confirmed the completion count for a single-choice request, and nothing
+ * confirms that `n` choices are covered by one cap rather than `n` times it. A
+ * sealed body hides `n` from the node, so quoting the cap would let the enclave
+ * bill up to `n * cap` against a hold sized for `cap` — the one direction that
+ * must never happen. Multi-choice requests therefore keep the old behaviour
+ * entirely: no header derived from the body, and no cap quoted.
+ */
+export function tinfoilMultiChoiceRequest(body: unknown): boolean {
+  if (!isPlainObject(body)) return false;
+  return countAboveOne(body.n) || countAboveOne(body.best_of);
+}
+
 /**
  * The cap the enclave's engine reads out of the body for this endpoint.
  *
@@ -236,6 +259,12 @@ export function resolveTinfoilOutputCap(options: {
     if (!endpoint) {
       return { endpoint: null, source: "none", callerHeaderInvalid: false };
     }
+    // Multi-choice requests keep the full reserve even behind the caller's own
+    // header: the cap may apply per choice, and the node cannot see `n` through
+    // the sealed body.
+    if (tinfoilMultiChoiceRequest(options.body)) {
+      return { endpoint, source: "none", callerHeaderInvalid: false };
+    }
     // Two values (e.g. the caller spelled the header twice in different case)
     // are rejected by the enclave; never add a third.
     const cap =
@@ -258,6 +287,13 @@ export function resolveTinfoilOutputCap(options: {
 
   if (!endpoint) {
     return { endpoint: null, source: "none", callerHeaderInvalid: false };
+  }
+
+  // No derived header for a multi-choice request: the enclave's cap is per
+  // choice, so injecting one here would hand the node a quote that bounds only
+  // one of the `n` completions it may bill for.
+  if (tinfoilMultiChoiceRequest(options.body)) {
+    return { endpoint, source: "none", callerHeaderInvalid: false };
   }
 
   const cap = bodyOutputCap(endpoint, options.body);

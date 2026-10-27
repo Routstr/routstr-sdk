@@ -21,6 +21,7 @@ import {
   bodyOutputCap,
   parseTinfoilOutputCapHeader,
   resolveTinfoilOutputCap,
+  tinfoilMultiChoiceRequest,
   tinfoilOutputCapEndpoint,
   withTinfoilOutputCapHeader,
 } from "../../client/TinfoilOutputTokens";
@@ -210,6 +211,37 @@ describe("tinfoil output cap resolution", () => {
       "X-Tinfoil-Max-Output-Tokens": "8",
       "x-tinfoil-max-output-tokens": "300",
     });
+  });
+
+  it("treats a multi-choice request as unpriceable through a per-choice cap", () => {
+    // The cap applies per choice, and `n` is invisible to the node behind the
+    // sealed body: quoting it would let the enclave bill n * cap.
+    expect(tinfoilMultiChoiceRequest({ n: 5 })).toBe(true);
+    expect(tinfoilMultiChoiceRequest({ n: "5" })).toBe(true);
+    expect(tinfoilMultiChoiceRequest({ best_of: 2 })).toBe(true);
+    expect(tinfoilMultiChoiceRequest({ n: 1 })).toBe(false);
+    expect(tinfoilMultiChoiceRequest({ n: 0 })).toBe(false);
+    expect(tinfoilMultiChoiceRequest({ n: "1" })).toBe(false);
+    expect(tinfoilMultiChoiceRequest({})).toBe(false);
+    expect(tinfoilMultiChoiceRequest(undefined)).toBe(false);
+
+    // No derived header…
+    const derived = resolveTinfoilOutputCap({
+      path: "/v1/chat/completions",
+      body: { max_completion_tokens: 64, n: 5 },
+    });
+    expect(derived.cap).toBeUndefined();
+    expect(derived.injectValue).toBeUndefined();
+
+    // …and no quote even behind the caller's own header (still forwarded).
+    const callerHeader = resolveTinfoilOutputCap({
+      path: "/v1/chat/completions",
+      body: { n: 3 },
+      headers: { [HEADER]: "64" },
+    });
+    expect(callerHeader.cap).toBeUndefined();
+    expect(callerHeader.endpoint).toBe("chat");
+    expect(callerHeader.callerHeaderInvalid).toBe(false);
   });
 
   it("does not quote a caller header on an endpoint the enclave ignores", () => {
@@ -815,6 +847,40 @@ describe("X-Tinfoil-Max-Output-Tokens across retries and failover", () => {
     // Forwarded verbatim (the enclave owns the verdict)…
     expect(headerValues(sealedInit().headers)).toEqual(["8"]);
     // …but never quoted: an ignored header cannot bound a bill.
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("sends no derived header and keeps the full reserve when n > 1", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+
+    await routeRequest(client, {
+      body: { model: WIRE_MODEL, messages: [], max_completion_tokens: 64, n: 5 },
+    });
+
+    expect(headerValues(sealedInit().headers)).toEqual([]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("still quotes a cap on a single-choice request", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+
+    await routeRequest(client, {
+      body: { model: WIRE_MODEL, messages: [], max_completion_tokens: 64, n: 1 },
+    });
+
+    expect(headerValues(sealedInit().headers)).toEqual(["64"]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBe(64);
+  });
+
+  it("forwards a caller header with n > 1 but quotes nothing", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+
+    await routeRequest(client, {
+      body: { model: WIRE_MODEL, messages: [], n: 3 },
+      headers: { [HEADER]: "64" },
+    });
+
+    expect(headerValues(sealedInit().headers)).toEqual(["64"]);
     expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
   });
 

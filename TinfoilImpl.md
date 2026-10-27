@@ -155,6 +155,12 @@ Rules, all mirroring the enclave and routstr-core exactly:
 - **No body rewrite.** The enclave deletes the body caps itself when the header
   is present, and leaving them untouched keeps old nodes — which ignore the
   header and read the body — working unchanged.
+- **Multi-choice requests are excluded.** With `n > 1` (or `best_of > 1`) the
+  cap applies *per choice*, and `n` is invisible to the node behind the sealed
+  body, so quoting one cap would let the enclave bill up to `n * cap` against a
+  hold sized for a single completion. The SDK emits no derived header and quotes
+  nothing there — a caller-supplied header is still forwarded, just not priced —
+  so such requests keep the full-envelope reserve they had before this feature.
 
 The header is attached when the request is prepared (so retries and failover
 inherit it from `baseHeaders`) and re-asserted in `_makeRequest`, the last stop
