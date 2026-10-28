@@ -361,13 +361,8 @@ describe("warmModelPathCaches", () => {
       { torMode: false }
     );
     expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
-    // Every node advertises the same route at the same rates here, so the
-    // basket costs tie and the ranking falls back to its baseUrl tiebreak
-    // (the same one getProviderPriceRankingForModel uses) rather than the
-    // whitelist order.
-    const expected = [A, B, C]
-      .map((node) => `${node}/`)
-      .sort((a, b) => a.localeCompare(b));
+    // Equal-cost nodes preserve runtime policy priority, not URL lexical order.
+    const expected = [A, B, C].map(node => `${node}/`);
     expect(ranking.map((r) => r.baseUrl)).toEqual(expected);
     expect(ranking[0].selectors).toEqual([PPQ]);
   });

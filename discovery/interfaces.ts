@@ -5,6 +5,7 @@
 
 import type { Model, ProviderInfo } from "../core/types";
 import type { ModelIdMappings } from "../core/modelMappings";
+import type { ModelPathWhitelist } from "../core/modelPathWhitelist";
 export { ProviderInfo };
 
 /**
@@ -157,12 +158,19 @@ export interface DiscoveryAdapter {
 
   /** Trusted kind 38426 snapshot, or null before the first successful fetch. */
   getModelIdMappings(): ModelIdMappings | null;
+  /** Trusted kind 38427 policy; null before the first accepted snapshot. */
+  getModelPathWhitelist(): ModelPathWhitelist | null;
   setModelIdMappings(mappings: ModelIdMappings | null): void;
+  setModelPathWhitelist(mappings: ModelPathWhitelist | null): void;
   /** Persist the last accepted signed snapshot even without a SQLite event store. */
   getModelIdMappingsEvent(): import("applesauce-core/helpers").NostrEvent | null;
+  getModelPathWhitelistEvent(): import("applesauce-core/helpers").NostrEvent | null;
   setModelIdMappingsEvent(event: import("applesauce-core/helpers").NostrEvent): void;
+  setModelPathWhitelistEvent(event: import("applesauce-core/helpers").NostrEvent | null): void;
   getModelIdMappingsLastUpdate?(): number | null;
+  getModelPathWhitelistLastUpdate?(): number | null;
   setModelIdMappingsLastUpdate?(timestamp: number): void;
+  setModelPathWhitelistLastUpdate?(timestamp: number): void;
 
   /**
    * Get list of routstr21 models

@@ -178,3 +178,36 @@ projection and queries the newly configured author.
 `getModelIdMappingsEvent`, and `setModelIdMappingsEvent`. Persist the signed event
 and retain the parsed projection for synchronous routing. Missing methods produce
 an explicit initialization error rather than silently retaining static mappings.
+
+
+### Nostr model-path policy snapshots
+
+With `autoModelPath: true`, routing uses signed kind `38427` events, `d` tag
+`model-path-whitelist`, authored by `routstrModelsPubkey` (or `routstrPubkey`). Content
+is a complete replacement, for example:
+
+```json
+{"version":1,"models":{"canonical-model-id":{"routes":[{"url":"https://upstream.example/v1"}],"nodes":["https://node.example"]}}}
+```
+
+Route order defines preference. Optional `nodes` restricts/prioritizes the enabled
+discovered set; omitted or empty means any eligible node advertising a matching route.
+Only the target node's verbatim advertised selector is sent. Forcing a provider keeps
+requests on that provider, whether auto-pinning succeeds or not. Metadata-less routes
+retain existing model-level pricing/deposit fallback behavior.
+
+`{"models":{}}` is a persistent kill switch. No valid snapshot on a fresh offline install
+uses the bundled bootstrap policy; invalid events or relay outages retain the last good
+policy. Accepted signed evidence prevents older relay events rolling policy back.
+Mappings are hydrated before whitelist validation; mapping-induced collisions retain
+the last accepted projection and signed high-water mark, including across restarts.
+Routing reads the snapshot synchronously; only bootstrap/refresh accesses relays.
+
+**Breaking custom adapter migration:** implement `getModelPathWhitelist`,
+`setModelPathWhitelist`, `getModelPathWhitelistEvent`, and `setModelPathWhitelistEvent`.
+Both setters accept `null` for author/trust purges. Persist the JSON-safe policy record
+and signed event (including an empty policy), not just a timestamp. Optionally implement
+`getModelPathWhitelistLastUpdate` / `setModelPathWhitelistLastUpdate` for cache TTLs.
+Missing required methods cause an explicit `ModelManager` initialization error. Both
+built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
+resolver wrappers remain bootstrap-only compatibility APIs, not runtime policy accessors.

@@ -10,6 +10,7 @@
  * Extracted from utils/apiUtils.ts findNextBestProvider and related logic
  */
 
+import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor, type ModelPathWhitelist, type ModelPathPolicy } from "../core/modelPathWhitelist";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
@@ -24,12 +25,10 @@ import type { SdkStore } from "../storage/store";
 import { isOnionUrl, isTorContext, normalizeProviderUrl } from "../utils/torUtils";
 import {
   canonicalModelPath,
-  DEEPSEEK_AUTO_MODEL_ID,
-  DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPathsForModel,
   MODEL_PATHS_FETCH_TIMEOUT_MS,
   modelPathCandidateKey,
-  resolveDeepSeekModelPathSelectors,
+  resolveModelPathSelectors,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 import { isTinfoilModel } from "./TinfoilSecure";
@@ -921,6 +920,14 @@ export class ProviderManager {
   }
 
   /** Active signed snapshot; null/missing getter alone enables bootstrap fallback. */
+  getModelPathWhitelist(): ModelPathWhitelist {
+    return this.discoveryAdapter.getModelPathWhitelist?.() ?? MODEL_PATH_BOOTSTRAP;
+  }
+
+  private modelPathNodes(policy: ModelPathPolicy): readonly string[] {
+    return policy.nodes?.length ? policy.nodes : Object.keys(this.discoveryAdapter.getCachedModels());
+  }
+
   getModelIdMappings(): ModelIdMappings {
     return this.discoveryAdapter.getModelIdMappings?.() ?? MODEL_ID_MAPPINGS;
   }
@@ -1499,7 +1506,10 @@ export class ProviderManager {
       model: Model;
     }>
   > {
-    modelId = this.canonicalizeModelId(modelId);
+    const mappings = this.getModelIdMappings();
+    modelId = canonicalizeModelId(modelId, mappings);
+    const policy = modelPathPolicyFor(modelId, this.getModelPathWhitelist(), mappings);
+    if (!policy) return [];
     const torMode = options.torMode ?? isTorContext();
     const excludedModelPaths = new Set(options.excludeModelPaths ?? []);
     const disabledProviders = new Set(
@@ -1507,8 +1517,9 @@ export class ProviderManager {
     );
     const allModels = this.discoveryAdapter.getCachedModels();
 
+    this.logger.debug("Model-path ranking candidates", this.modelPathNodes(policy).length);
     const candidates = await Promise.all(
-      DEEPSEEK_AUTO_NODE_URLS.map(async (nodeUrl) => {
+      this.modelPathNodes(policy).map(async (nodeUrl) => {
         const baseUrl = normalizeProviderUrl(nodeUrl);
         if (!baseUrl) return null;
         if (options.excludeBaseUrl && baseUrl === options.excludeBaseUrl) {
@@ -1530,7 +1541,7 @@ export class ProviderManager {
         if (this.isOnCooldown(baseUrl, modelId)) return null;
 
         const model = findModelForId(
-          allModels[baseUrl] || [], modelId, this.getModelIdMappings()
+          allModels[baseUrl] || [], modelId, mappings
         );
         if (!model) return null;
 
@@ -1541,16 +1552,17 @@ export class ProviderManager {
         // fetch keeps running and fills the cache for the next request.
         const nodePaths = await withBudget(
           getNodeModelPathsForModel(baseUrl, modelId, {
-            mappings: this.getModelIdMappings(),
+            mappings,
             extraSpellings: [model.id, ...(model.alias_ids ?? [])],
           }),
           MODEL_PATH_RANKING_BUDGET_MS
         );
         if (!nodePaths) return null;
-        const resolved = resolveDeepSeekModelPathSelectors(
+        const resolved = resolveModelPathSelectors(
           nodePaths,
           modelId,
-          this.getModelIdMappings()
+          policy.routes,
+          mappings
         );
         if (!resolved) return null;
 
@@ -1616,7 +1628,8 @@ export class ProviderManager {
       )
       // Same tiebreak as getProviderPriceRankingForModel: equal costs must
       // not depend on the order the nodes happened to be fetched in.
-      .sort((a, b) => a.cost - b.cost || a.baseUrl.localeCompare(b.baseUrl))
+      // Stable sort preserves policy node priority when costs tie.
+      .sort((a, b) => a.cost - b.cost)
       .map(({ cost: _cost, ...candidate }) => candidate);
   }
 
@@ -1639,16 +1652,18 @@ export class ProviderManager {
    */
   async warmModelPathCaches(
     options: {
-      /** Models to warm; defaults to the auto-pinned model. */
+      /** Active policy models to warm; defaults to all runtime policy keys. */
       modelIds?: readonly string[];
       torMode?: boolean;
       budgetMs?: number;
     } = {}
   ): Promise<ModelPathWarmResult[]> {
+    const whitelist = this.getModelPathWhitelist();
+    const mappings = this.getModelIdMappings();
     const modelIds = [
       ...new Set(
-        (options.modelIds ?? [DEEPSEEK_AUTO_MODEL_ID]).map((id) =>
-          this.canonicalizeModelId(id)
+        (options.modelIds ?? Object.keys(whitelist)).map((id) =>
+          canonicalizeModelId(id, mappings)
         )
       ),
     ];
@@ -1660,8 +1675,10 @@ export class ProviderManager {
     const allModels = this.discoveryAdapter.getCachedModels();
 
     const entries = await Promise.all(
-      DEEPSEEK_AUTO_NODE_URLS.flatMap((nodeUrl) =>
-        modelIds.map(async (modelId): Promise<ModelPathWarmResult> => {
+      modelIds.flatMap(modelId => {
+        const policy = modelPathPolicyFor(modelId, whitelist, mappings);
+        if (!policy) return [];
+        return this.modelPathNodes(policy).map(async (nodeUrl): Promise<ModelPathWarmResult> => {
           const startedAt = Date.now();
           const baseUrl = normalizeProviderUrl(nodeUrl);
           const report = (
@@ -1687,13 +1704,13 @@ export class ProviderManager {
           const model = findModelForId(
             allModels[baseUrl] || [],
             modelId,
-            this.getModelIdMappings()
+            mappings
           );
           if (!model) return report({ reason: "no-catalog-model" });
 
           const nodePaths = await withBudget(
             getNodeModelPathsForModel(baseUrl, modelId, {
-              mappings: this.getModelIdMappings(),
+              mappings,
               extraSpellings: [model.id, ...(model.alias_ids ?? [])],
               force: true,
             }),
@@ -1701,10 +1718,11 @@ export class ProviderManager {
           );
           if (!nodePaths) return report({ reason: "unreachable" });
 
-          const resolved = resolveDeepSeekModelPathSelectors(
+          const resolved = resolveModelPathSelectors(
             nodePaths,
             modelId,
-            this.getModelIdMappings()
+            policy.routes,
+            mappings
           );
           return report({
             paths: new Set(
@@ -1716,8 +1734,8 @@ export class ProviderManager {
               (selector): selector is string => !!selector
             ).length,
           });
-        })
-      )
+        });
+      })
     );
     return entries.flat();
   }

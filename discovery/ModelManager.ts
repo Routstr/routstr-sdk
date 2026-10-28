@@ -7,6 +7,7 @@
 import type { Model, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
+import { MODEL_PATH_BOOTSTRAP, parseModelPathWhitelist, type ModelPathWhitelist } from "../core/modelPathWhitelist";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import { withProviderDeadline } from "./providerDeadline";
 import {
@@ -135,7 +136,7 @@ const NOSTR_QUERY_TIMEOUT_MS = 5000;
 const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
 
 /** Kinds whose persisted events are discovery evidence. */
-const DISCOVERY_KINDS = [38421, 38423, 38425, 38426];
+const DISCOVERY_KINDS = [38421, 38423, 38425, 38426, 38427];
 
 /** Address of the authoritative replaceable model mapping snapshot. */
 const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";
@@ -163,7 +164,7 @@ export interface ModelManagerConfig {
   /** Nostr pubkey for routstr-21 models (38423) and model ID mappings (38426). Falls back to routstrPubkey. */
   routstrModelsPubkey?: string;
   /** Nostr relay URLs for provider/model discovery.
-   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425, 38426).
+   * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425, 38426, 38427).
    * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
   nostrRelays?: string[];
   /** Optional injectable logger */
@@ -294,6 +295,30 @@ export class ModelManager {
     const saved = adapter.getModelIdMappingsEvent();
     adapter.setModelIdMappings(saved && this.isModelIdMappingEvent(saved)
       ? this.parseModelIdMappings(saved) : null);
+
+    for (const method of ["getModelPathWhitelist", "setModelPathWhitelist",
+      "getModelPathWhitelistEvent", "setModelPathWhitelistEvent"] as const) {
+      if (typeof adapter[method] !== "function") {
+        throw new Error(`DiscoveryAdapter must implement ${method} for the Nostr model-path whitelist`);
+      }
+    }
+    const policyEvent = adapter.getModelPathWhitelistEvent();
+    if (!policyEvent || !this.isModelPathWhitelistEvidence(policyEvent)) {
+      adapter.setModelPathWhitelist(null);
+      adapter.setModelPathWhitelistEvent(null);
+    } else {
+      try {
+        adapter.setModelPathWhitelist(parseModelPathWhitelist(policyEvent.content, this.getModelIdMappings()));
+      } catch (error) {
+        // Only a mapping-induced collision may retain accepted state. Schema
+        // failures or corrupt persisted content must not authorize a projection.
+        if (!(error instanceof Error && error.message === "colliding model keys" &&
+            adapter.getModelPathWhitelist() !== null)) {
+          adapter.setModelPathWhitelist(null);
+          adapter.setModelPathWhitelistEvent(null);
+        }
+      }
+    }
 
   }
 
@@ -439,7 +464,8 @@ export class ModelManager {
       group.sort(
         (a, b) =>
           b.created_at - a.created_at ||
-          (a.id === b.id ? 0 : a.id < b.id ? 1 : -1)
+          (a.kind === 38427 ? a.id.localeCompare(b.id) :
+            (a.id === b.id ? 0 : a.id < b.id ? 1 : -1))
       )
     );
   }
@@ -459,6 +485,15 @@ export class ModelManager {
       if (winner) latest.push(winner);
     }
     return latest;
+  }
+
+  private storeDiscoveryEvent(store: EventStore, event: NostrEvent): NostrEvent | null {
+    // Applesauce otherwise keeps first arrival on timestamp ties. Retain
+    // policy history for deterministic lowest-ID reads and later pruning.
+    const keepOldVersions = store.keepOldVersions;
+    if (event.kind === 38427) store.keepOldVersions = true;
+    try { return store.add(event); }
+    finally { store.keepOldVersions = keepOldVersions; }
   }
 
   /**
@@ -498,7 +533,7 @@ export class ModelManager {
           // Relay noise that this query cannot use is not evidence, so it is
           // not persisted and does not renew the query cache.
           if (accept && !accept(event)) return;
-          const stored = eventStore.add(event);
+          const stored = this.storeDiscoveryEvent(eventStore, event);
           if (!stored || stored.id !== event.id) return;
           received.add(event.id);
           onEvent?.(event);
@@ -587,7 +622,7 @@ export class ModelManager {
 
   /**
    * Fetch current events from live Nostr relays for all tracked kinds
-   * (38421 providers, 38425 reviews, 38423 routstr21 models, 38426 mappings) and persist them
+   * (38421 providers, 38425 reviews, 38423 routstr21 models, 38426 mappings, 38427 path policy) and persist them
    * into the event store. Existing events are not replaced — new events are
    * merged in. Call this periodically (e.g. every 21 min) to discover new
    * providers, reviews, model lists, and mappings published since the last fetch.
@@ -613,7 +648,7 @@ export class ModelManager {
       this.getNostrEvents(
         { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] }, true
       ),
-      this.fetchModelIdMappings(true),
+      this.fetchModelPathWhitelist(true),
     ]);
 
     // Per-scheduled-pass chatter: the caller reports the pass outcome, so the
@@ -673,7 +708,7 @@ export class ModelManager {
           );
           await Promise.all([
             this.fetchRoutstr21Models(forceRefresh),
-            this.fetchModelIdMappings(forceRefresh),
+            this.fetchModelPathWhitelist(forceRefresh),
             this.syncReviewedProvidersFromNostr(filteredCachedUrls),
           ]);
           return filteredCachedUrls;
@@ -683,14 +718,14 @@ export class ModelManager {
 
     // Try Nostr first (kind 38421)
     try {
-      // The queries are independent: run them concurrently so a cold
-      // bootstrap costs one relay round trip. Prefetch failures fall back
+      // Independent discovery queries run concurrently; the policy prefetch
+      // itself sequences mappings before whitelist validation. Prefetch failures fall back
       // to empty; a broken event store still surfaces via the 38421 query.
       const routstr21Prefetch = this.fetchRoutstr21Models(forceRefresh).catch(
         () => [] as string[]
       );
-      const mappingsPrefetch = this.fetchModelIdMappings(forceRefresh).catch(
-        () => this.getModelIdMappings()
+      const policyPrefetch = this.fetchModelPathWhitelist(forceRefresh).catch(
+        () => this.getModelPathWhitelist()
       );
       // Skip the review query when the adapter cannot store its result,
       // matching the wrapper's early return instead of waiting it out.
@@ -709,7 +744,7 @@ export class ModelManager {
         const filtered = this.filterBaseUrlsForTor(nostrProviders, torMode);
         this.adapter.setBaseUrlsList(filtered);
         this.adapter.setBaseUrlsLastUpdate(Date.now());
-        await Promise.all([routstr21Prefetch, mappingsPrefetch]);
+        await Promise.all([routstr21Prefetch, policyPrefetch]);
         this.applyReviewDisables(
           filtered,
           this.providerNodePubkeysByUrl,
@@ -972,7 +1007,7 @@ export class ModelManager {
         this.adapter.setBaseUrlsLastUpdate(Date.now());
         await Promise.all([
           this.fetchRoutstr21Models(forceRefresh),
-          this.fetchModelIdMappings(forceRefresh),
+          this.fetchModelPathWhitelist(forceRefresh),
           this.syncReviewedProvidersFromNostr(
             list,
             this.providerNodePubkeysByUrl,
@@ -1636,6 +1671,77 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  private whitelistMappingsKey: string | undefined;
+  private whitelistFetch: Promise<ModelPathWhitelist> | undefined;
+
+  getModelPathWhitelist(): ModelPathWhitelist {
+    return this.adapter.getModelPathWhitelist() ?? MODEL_PATH_BOOTSTRAP;
+  }
+
+  private isModelPathWhitelistEvidence(event: NostrEvent): boolean {
+    return event.kind === 38427 && event.pubkey === this.routstrModelsPubkey &&
+      getReplaceableIdentifier(event) === "model-path-whitelist" && this.isNostrEventTrustworthy(event);
+  }
+
+  private isModelPathWhitelistEvent(event: NostrEvent, mappings: ModelIdMappings): boolean {
+    if (!this.isModelPathWhitelistEvidence(event)) return false;
+    try { parseModelPathWhitelist(event.content, mappings); return true; }
+    catch { return false; }
+  }
+
+  /** Serialize passes so a slower refresh cannot overwrite a newer projection. */
+  async fetchModelPathWhitelist(forceRefresh = false): Promise<ModelPathWhitelist> {
+    if (this.whitelistFetch) {
+      if (!forceRefresh) return this.whitelistFetch;
+      await this.whitelistFetch;
+      return this.fetchModelPathWhitelist(true);
+    }
+    const pass = this.fetchModelPathWhitelistPass(forceRefresh);
+    this.whitelistFetch = pass;
+    try { return await pass; }
+    finally { this.whitelistFetch = undefined; }
+  }
+
+  private async fetchModelPathWhitelistPass(forceRefresh: boolean): Promise<ModelPathWhitelist> {
+    let mappings: ModelIdMappings;
+    try { mappings = await this.fetchModelIdMappings(forceRefresh); }
+    catch { mappings = this.getModelIdMappings(); }
+    // Snapshot once: validators must not read a concurrently changing adapter.
+    mappings = { ...mappings };
+    const mappingsKey = JSON.stringify(Object.entries(mappings).sort(([a], [b]) => a.localeCompare(b)));
+    const changed = mappingsKey !== this.whitelistMappingsKey;
+    const cached = this.adapter.getModelPathWhitelist();
+    const lastUpdate = this.adapter.getModelPathWhitelistLastUpdate?.();
+    if (!forceRefresh && !changed && cached !== null && lastUpdate != null &&
+        lastUpdate <= Date.now() && Date.now() - lastUpdate <= this.cacheTTL) return cached;
+    const saved = this.adapter.getModelPathWhitelistEvent();
+    if (saved && this.isModelPathWhitelistEvent(saved, mappings)) {
+      const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
+      this.storeDiscoveryEvent(store, saved);
+    }
+    const events = await this.getNostrEvents(
+      { kinds: [38427], "#d": ["model-path-whitelist"], authors: [this.routstrModelsPubkey] },
+      forceRefresh || changed, undefined, event => this.isModelPathWhitelistEvent(event, mappings)
+    );
+    this.whitelistMappingsKey = mappingsKey;
+    // Even when changed mappings invalidate saved content, its signed version
+    // remains the high-water mark. Never roll back to an older valid candidate.
+    const compare = (a: NostrEvent, b: NostrEvent) =>
+      b.created_at - a.created_at || a.id.localeCompare(b.id);
+    const candidates = (saved ? [...events, saved] : events)
+      .filter(event => this.isModelPathWhitelistEvent(event, mappings))
+      .filter(event => !saved || !this.isModelPathWhitelistEvidence(saved) || compare(event, saved) <= 0)
+      .sort(compare);
+    const event = candidates[0];
+    if (!event) return this.getModelPathWhitelist();
+    const policy = parseModelPathWhitelist(event.content, mappings);
+    this.adapter.setModelPathWhitelistEvent(event);
+    this.adapter.setModelPathWhitelist(policy);
+    this.adapter.setModelPathWhitelistLastUpdate?.(Date.now());
+    this.logger.debug("Accepted model-path whitelist", event.created_at, Object.keys(policy));
+    return policy;
   }
 
   /** Current per-adapter mapping snapshot; offline first runs use the bundled fallback. */
