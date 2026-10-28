@@ -146,7 +146,7 @@ export class CashuSpender {
     try {
       const metadata = getTokenMetadata(token);
       const unit = (metadata.unit as "sat" | "msat") || "sat";
-      return { amount: metadata.amount.toNumber(), unit };
+      return { amount: metadata.amount, unit };
     } catch {
       return { amount: 0, unit: "sat" };
     }
