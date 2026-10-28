@@ -874,9 +874,9 @@ describe("security regressions", () => {
           bearer: "sk-x",
           options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex] },
         });
-        // Released: the node's refusal is the answer, never a second session.
-        if (released) expect((await call).status).toBe(409);
-        else await expect(call).rejects.toThrow(/offer expired/);
+        // Released: never a second session, and no refusal Response to fail
+        // over on (the provider may have the request).
+        await expect(call).rejects.toThrow(/offer expired/);
         expect(runs).toBe(released ? 1 : 2);
         run.mockRestore();
       }
