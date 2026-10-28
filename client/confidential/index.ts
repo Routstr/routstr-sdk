@@ -179,4 +179,5 @@ export {
   aggregateChatCompletionSse,
   type ConfidentialFetchParams,
   type ConfidentialRequestOptions,
+  type ConfidentialSettlement,
 } from "./transport";

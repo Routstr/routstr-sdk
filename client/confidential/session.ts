@@ -170,6 +170,11 @@ export interface ConfidentialSessionResult {
    * The charge was fixed at setup; these are reported, not thrown.
    */
   imageWarnings?: string[];
+  /**
+   * Chat: what is odd about an accepted, already settled answer (the
+   * provider reports a model other than the pinned one).
+   */
+  warnings?: string[];
 }
 
 export interface ConfidentialSessionOptions {
@@ -460,6 +465,10 @@ export class ConfidentialSession {
   private handshaken = false;
   /** Set just before release_head: from then on nothing may be retried. */
   private released = false;
+  /** close() was called: the session never opens or arms again. */
+  private closed = false;
+  /** The setup carrying the node credential was sent. */
+  private authSent = false;
   private failure?: Error;
   private tArmed = 0;
   private finished = false;
@@ -573,6 +582,14 @@ export class ConfidentialSession {
   }
 
   /**
+   * True once the setup carrying the node credential went out: from then on
+   * the node may hold a deposit on it.
+   */
+  get credentialSent(): boolean {
+    return this.authSent;
+  }
+
+  /**
    * The abandon fee (msats) of the offer this session accepted at setup: what
    * the node charges if this session ends without being used.
    */
@@ -629,6 +646,8 @@ export class ConfidentialSession {
 
   /** Open the control/relay websocket. Resolves when it is open. */
   async open(): Promise<void> {
+    // A closed session must not start one: setup would reserve (and charge).
+    if (this.closed) throw new SessionRejectedError("session closed");
     if (this.ws) return this.wsReady;
     const ws = new WebSocket(this.controlUrl());
     this.ws = ws;
@@ -810,6 +829,7 @@ export class ConfidentialSession {
    */
   async arm(): Promise<void> {
     if (this.armStarted) throw new SessionProtocolError("arm() called twice");
+    if (this.closed) throw new SessionRejectedError("session closed");
     this.armStarted = true;
     // Before setup: the node reserves funds (and may charge an abandon fee)
     // as soon as it accepts one, so a missing local binary must fail first.
@@ -845,6 +865,7 @@ export class ConfidentialSession {
     if (fee > 0) setup.session_fee_msat = fee;
     if (abandonFee > 0) setup.abandon_fee_msat = abandonFee;
     setup.auth = this.auth;
+    this.authSent = true;
     this.sendText(setup);
 
     this.ready = await this.waitT("ready", this.timeouts.ready);
@@ -1018,6 +1039,8 @@ export class ConfidentialSession {
   /** Phase 2, request-bound: credential record, body, proofs, settle. */
   async finish(body: Uint8Array, tClaim = Date.now()): Promise<ConfidentialSessionResult> {
     if (!this.prepared) throw new SessionProtocolError("finish before prepareProofs");
+    // Never release the credential record for a session the caller closed.
+    if (this.closed) throw new SessionRejectedError("session closed");
     if (body.length !== this.bodyLength) {
       throw new SessionProtocolError(
         `body length ${body.length} != declared setup len ${this.bodyLength}`,
@@ -1032,6 +1055,16 @@ export class ConfidentialSession {
       throw new SessionProtocolError("the relay did not name the image suffix it pins");
     }
 
+    // The pinned suffix goes in its own final record: the node holds that
+    // record until π_C2S verifies (the upstream cannot start without it), and a
+    // suffix split across two records could not be proven. Checked before the
+    // release: a mismatch then costs nothing and may still be retried.
+    const suffixBytes = new TextEncoder().encode(this.suffix);
+    const tail = body.subarray(body.length - suffixBytes.length);
+    if (body.length < suffixBytes.length || !tail.every((b, i) => b === suffixBytes[i])) {
+      throw new SessionProtocolError("request body does not end with the pinned suffix");
+    }
+
     this.released = true;
     // The node writes epoch 0 (credential record + KeyUpdate under K_0); we
     // are already keyed for epoch 1 (c_ap_1, seq 0).
@@ -1043,14 +1076,6 @@ export class ConfidentialSession {
 
     this.tBodyWrite = Date.now();
     this.bodyEpoch = true;
-    // The pinned suffix goes in its own final record: the node holds that
-    // record until π_C2S verifies (the upstream cannot start without it), and a
-    // suffix split across two records could not be proven.
-    const suffixBytes = new TextEncoder().encode(this.suffix);
-    const tail = body.subarray(body.length - suffixBytes.length);
-    if (!tail.every((b, i) => b === suffixBytes[i])) {
-      throw new SessionProtocolError("request body does not end with the pinned suffix");
-    }
     await this.tls.write(body.subarray(0, body.length - suffixBytes.length));
     await this.tls.write(suffixBytes);
     this.event({ ev: "body_sent", len: body.length });
@@ -1210,6 +1235,7 @@ export class ConfidentialSession {
         sig: sigHex,
         pubkey: this.ready.pubkey,
         ownUsage,
+        pinnedModel: this.model,
         priceEntry: this.offer.price_list[this.model],
         sessionFeeMsat: offerSessionFeeMsat(this.offer),
         abandonFeeMsat: offerAbandonFeeMsat(this.offer),
@@ -1230,6 +1256,7 @@ export class ConfidentialSession {
     let image: ConfidentialSessionResult["image"];
     let imageWarnings: string[] | undefined;
     let effectiveModel: string | undefined;
+    let warnings: string[] | undefined;
     if (this.kind === "images") {
       // Accepted already (refusing would only cost the reservation): any
       // shortfall is reported, never thrown.
@@ -1245,8 +1272,13 @@ export class ConfidentialSession {
     } else {
       effectiveModel = effectiveModelFromText(http.bodyText);
     }
+    // π_C2S proved which model the request named, and the node settled at
+    // that model's signed rates. A provider echoing another spelling (an
+    // alias, a canonical id, a redirect) is reported, not thrown: the answer
+    // is here and already paid for.
     if (effectiveModel !== undefined && effectiveModel !== this.model) {
-      throw new ResponseVerificationError(`effective model ${effectiveModel} != ${this.model}`);
+      warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${this.model}`];
+      this.event({ ev: "model_mismatch", pinned: this.model, reported: effectiveModel });
     }
 
     this.finished = true;
@@ -1290,6 +1322,7 @@ export class ConfidentialSession {
       protocol: this.protocol,
       image,
       imageWarnings,
+      warnings,
     };
     if (image) {
       // An image's text form is megabytes; build it only if someone reads it.
@@ -1399,6 +1432,7 @@ export class ConfidentialSession {
   }
 
   close(): void {
+    this.closed = true;
     this.twoPc?.close();
     this.zkChan?.close();
     try {

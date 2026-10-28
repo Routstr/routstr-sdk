@@ -839,9 +839,12 @@ export class RoutstrClient {
       // (usage proof + charge); balance accounting must read it afterwards.
       // A failed settlement check already errored the response stream; the
       // balance is still re-read, since the node may have charged.
-      await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
+      // A one-off bearer's change comes with the settlement (a stream's
+      // wrapper copied the headers before the transport could set it).
+      const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
         this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
-      });
+        return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
+      })) as { change?: unknown } | undefined;
       const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
       const usage = capturedUsage ?? prepared.capturedUsage;
       const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
@@ -857,6 +860,8 @@ export class RoutstrClient {
         fallbackSatsSpent: usage?.satsCost,
         response: accountingResponse,
         responseBody: jsonBody,
+        refundToken:
+          typeof settlement?.change === "string" ? settlement.change : undefined,
         modelId: prepared.modelId,
         usage,
         requestId,
@@ -1657,6 +1662,14 @@ export class RoutstrClient {
         endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
         failurePhase: "network", errorType: error?.name,
       });
+      // A failed confidential session hands back a one-off bearer's change.
+      if (
+        params.confidential &&
+        this.mode === "xcashu" &&
+        typeof error?.cashuChange === "string"
+      ) {
+        await this._receiveConfidentialChange(baseUrl, token, error.cashuChange);
+      }
       // Handle network errors with failover
       if (!headersReceived && !signal?.aborted && isNetworkErrorMessage(error?.message || "")) {
         const fetchUrl = `${baseUrl.replace(/\/$/, "")}${path}`;
@@ -3190,6 +3203,27 @@ export class RoutstrClient {
   /**
    * Handle post-response balance update for all modes
    */
+  /**
+   * Receive the change a failed confidential session withdrew for a one-off
+   * xcashu bearer; the bearer's stored copy is then spent.
+   */
+  private async _receiveConfidentialChange(
+    baseUrl: string,
+    token: string,
+    change: string
+  ): Promise<void> {
+    const receiveResult = await this.cashuSpender.receiveToken(change);
+    if (receiveResult.success) {
+      this.storageAdapter.removeXcashuToken(baseUrl, token);
+    } else {
+      this.cashuSpender.cacheReceiveToken(change);
+      this._log(
+        "ERROR",
+        `[xcashu] Failed to receive confidential change token: ${receiveResult.message}`
+      );
+    }
+  }
+
   private async _handlePostResponseBalanceUpdate(params: {
     token: string;
     baseUrl: string;
@@ -3200,6 +3234,8 @@ export class RoutstrClient {
     /** Body already read from `response` (non-SSE). Saves a second read and
      *  keeps accounting off a body the caller may already have consumed. */
     responseBody?: unknown;
+    /** The xcashu change, when it does not come as the response's header. */
+    refundToken?: string;
     modelId?: string;
     usage?: UsageTrackingData;
     requestId?: string;
@@ -3222,7 +3258,8 @@ export class RoutstrClient {
     let satsSpent: number = initialTokenBalance;
 
     if (this.mode === "xcashu" && response) {
-      const refundToken = response.headers.get("x-cashu") ?? undefined;
+      const refundToken =
+        params.refundToken ?? response.headers.get("x-cashu") ?? undefined;
       if (refundToken) {
         const receiveResult =
           await this.cashuSpender.receiveToken(refundToken);
