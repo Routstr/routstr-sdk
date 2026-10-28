@@ -23,6 +23,13 @@ export interface ReceiptVerificationInput {
   pubkey?: string;
   /** Our own usage event parsed from the π_C3 disclosure. */
   ownUsage: UpstreamUsageEvent;
+  /**
+   * The model the request pinned (π_C2S proves it). The node settles at this
+   * model's rates and names it in the receipt even when the provider's usage
+   * event spells the model differently (an alias, a canonical id, a case
+   * change); a receipt naming either is accepted.
+   */
+  pinnedModel?: string;
   /** The model's rates from the *signed* offer. */
   priceEntry?: { in: number; out: number; cached_in?: number; cache_write?: number };
   /** The signed offer's session fee (msats); 0 or absent when none. */
@@ -277,7 +284,7 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
     rUsage?.usage?.prompt_tokens === ownUsage.usage.prompt_tokens &&
     rUsage?.usage?.completion_tokens === ownUsage.usage.completion_tokens &&
     cachedTokens(rUsage?.usage as Record<string, unknown> | undefined) === cachedTokens(ownUsage.usage) &&
-    receipt.model === ownUsage.model;
+    (receipt.model === ownUsage.model || (input.pinnedModel !== undefined && receipt.model === input.pinnedModel));
 
   // The node may charge less than its signed terms (cached input), never more.
   // Without a signed rate for the model there is no bound to check against,

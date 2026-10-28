@@ -13,7 +13,7 @@ const model = {
   sats_pricing: { prompt: 1, completion: 1, max_cost: 100 },
 } as Model;
 
-function setup() {
+function setup(mode: "apikeys" | "xcashu" = "apikeys") {
   const logger: SdkLogger = {
     log: () => {},
     warn: () => {},
@@ -40,7 +40,7 @@ function setup() {
     storage,
     {} as DiscoveryAdapter,
     "max",
-    "apikeys",
+    mode,
     { providerManager: providerManager as any, logger }
   );
   vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
@@ -89,5 +89,35 @@ describe("streamed confidential response finalization", () => {
     settle();
     await done;
     expect(balanceUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("finalize() takes a one-off bearer's change from the settlement", async () => {
+    for (const outcome of ["settled", "failed"] as const) {
+      const { client, balanceUpdate } = setup("xcashu");
+      const upstream = new Response("data: [DONE]\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      });
+      // The stream's wrapper copied the headers before the change existed.
+      (upstream as any).confidentialSettled =
+        outcome === "settled"
+          ? Promise.resolve({ change: "cashuBchange" })
+          : Promise.reject(Object.assign(new Error("bad receipt"), { cashuChange: "cashuBchange" }));
+      vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstream);
+      const response = await client.routeRequest({
+        path: "/v1/chat/completions",
+        method: "POST",
+        body: { model: model.id, messages: [{ role: "user", content: "hi" }], stream: true },
+        baseUrl,
+        mintUrl,
+        modelId: model.id,
+        headers: {},
+      });
+      await response.text();
+      await (response as any).finalize();
+      expect(balanceUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ refundToken: "cashuBchange" })
+      );
+      vi.restoreAllMocks();
+    }
   });
 });

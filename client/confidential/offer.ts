@@ -490,11 +490,17 @@ export function verifyConfidentialOffer(
     );
   }
 
+  const pinsConfigured = Boolean(options.pinnedPubkey) || (options.pinnedPubkeys?.length ?? 0) > 0;
   if (!offer.sig) {
     if (!options.allowUnpinned) {
       throw new OfferUnpinnedError(
         "offer is unsigned and allowUnpinned is not set (self-consistency is not authenticity)",
       );
+    }
+    // A pin is a claim about who signed: an unsigned offer naming the pinned
+    // key proves nothing, whatever allowUnpinned says.
+    if (pinsConfigured) {
+      throw new OfferUnpinnedError("offer is unsigned but node keys are pinned; a pinned offer must be signed");
     }
   } else if (!verifySchnorrSignature(payload, offer.sig, offer.notary_pubkey)) {
     throw new OfferBadSignatureError();
