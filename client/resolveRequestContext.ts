@@ -6,6 +6,8 @@
  * and build a RoutstrClient without duplicating the pipeline.
  */
 
+import { normalizeProviderUrl } from "../utils/torUtils";
+import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor, type ModelPathWhitelist } from "../core/modelPathWhitelist";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -24,12 +26,9 @@ import {
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import {
-  DEEPSEEK_AUTO_MODEL_ID,
-  DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPathsForModel,
   MODEL_PATH_HEADER,
-  resolveDeepSeekModelPathSelectors,
-  sameNode,
+  resolveModelPathSelectors,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 
@@ -47,11 +46,8 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
  * first, asking for the mapped spelling silently disabled auto model-path
  * selection while still routing to the same model.
  */
-function isAutoModelPathModel(id: string, mappings?: ModelIdMappings): boolean {
-  return (
-    canonicalizeModelId(id.trim().toLowerCase(), mappings).toLowerCase() ===
-    DEEPSEEK_AUTO_MODEL_ID
-  );
+function isAutoModelPathModel(id: string, whitelist: ModelPathWhitelist, mappings?: ModelIdMappings): boolean {
+  return modelPathPolicyFor(id, whitelist, mappings) !== undefined;
 }
 
 export interface ResolveContextInput {
@@ -227,6 +223,9 @@ export async function resolveRequestContext(
   // ── Select provider + model ─────────────────────────────────────────
   let baseUrl: string;
   let selectedModel: Model;
+  const whitelist = discoveryAdapter.getModelPathWhitelist?.() ?? MODEL_PATH_BOOTSTRAP;
+  const mappings = discoveryAdapter.getModelIdMappings?.() ?? undefined;
+  const policy = typeof modelId === "string" ? modelPathPolicyFor(modelId, whitelist, mappings) : undefined;
   let modelPath: ResolvedContext["modelPath"];
   let pinnedProvider = false;
 
@@ -267,12 +266,11 @@ export async function resolveRequestContext(
       !hasModelPathHeader(inputHeaders) &&
       typeof modelId === "string" &&
       isAutoModelPathModel(
-        modelId,
-        discoveryAdapter.getModelIdMappings?.() ?? undefined
-      ) &&
-      DEEPSEEK_AUTO_NODE_URLS.some((nodeUrl) =>
-        sameNode(nodeUrl, normalizedProvider)
-      )
+        modelId, whitelist, mappings
+      ) && policy &&
+      (!policy.nodes?.length || policy.nodes.some(nodeUrl =>
+        normalizeProviderUrl(new URL(nodeUrl).href) ===
+        normalizeProviderUrl(new URL(normalizedProvider).href)))
     ) {
       const nodePaths = await getNodeModelPathsForModel(
         normalizedProvider,
@@ -286,13 +284,14 @@ export async function resolveRequestContext(
         }
       );
       const resolved = nodePaths
-        ? resolveDeepSeekModelPathSelectors(
+        ? resolveModelPathSelectors(
             nodePaths,
             canonicalizeModelId(
               modelId,
               discoveryAdapter.getModelIdMappings?.() ?? undefined
             ),
-            discoveryAdapter.getModelIdMappings?.() ?? undefined
+            policy.routes,
+            mappings
           )
         : null;
       const index = resolved?.selectors.findIndex(
@@ -311,8 +310,7 @@ export async function resolveRequestContext(
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
     isAutoModelPathModel(
-      modelId,
-      discoveryAdapter.getModelIdMappings?.() ?? undefined
+      modelId, whitelist, mappings
     )
   ) {
     // "Get baseUrl for model path": rank the whitelisted auto-selection

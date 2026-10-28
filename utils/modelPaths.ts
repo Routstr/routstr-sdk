@@ -16,6 +16,7 @@
  * parameter; it is tolerated when matching but never required or built.
  */
 
+import { MODEL_PATH_BOOTSTRAP, normalizeRoute, type ModelPathRoute } from "../core/modelPathWhitelist";
 import type { ModelSatsPricing } from "../core/types";
 import { modelIdVariants, type ModelIdMappings } from "../core/modelMappings";
 import { normalizeProviderUrl } from "./torUtils";
@@ -24,70 +25,12 @@ import { withProviderDeadline } from "../discovery/providerDeadline";
 /** The only request header the SDK forwards upstream on routed requests. */
 export const MODEL_PATH_HEADER = "x-routstr-model-path";
 
-/** One whitelisted DeepSeek upstream route, identified by its stable parts. */
-export interface DeepSeekModelRoute {
-  /** Upstream base URL, exactly as the node advertises it in the selector. */
-  url: string;
-  /**
-   * OpenRouter subprovider endpoint tag. Required on whitelisted OpenRouter
-   * routes: a bare OpenRouter selector would let OpenRouter pick any
-   * subprovider (deepinfra, together, ...), not necessarily a whitelisted one.
-   * Direct upstreams (the provider's own base URL, e.g. api.ppq.ai) carry no
-   * endpoint tag — the base URL already names the single provider.
-   */
-  endpoint?: string;
-}
-
-/**
- * The upstream routes DeepSeek requests may take, in preference order.
- *
- * Order is load-bearing: `available[0]` is the default pin and the node's
- * ranking metric (and the per-route max_cost the deposit gate reserves), so
- * entries are only ever appended. Inserting ahead of the first entry would
- * change the default pin, the node ranking and the deposit envelope.
- *
- * 1. OpenRouter's deepseek subprovider — default pin
- * 2. OpenRouter's fireworks subprovider — original failover headroom
- * 3. api.ppq.ai — direct PPQ
- * 4. OpenRouter's venice/fp8 subprovider
- * 5. OpenRouter's wafer subprovider
- * 6. api.venice.ai — direct Venice
- * 7. api.fireworks.ai — direct Fireworks
- *
- * The direct upstreams are reached through the variant spelling a node files
- * them under (see resolveDeepSeekModelPathSelectors): `deepseek-v4-1-flash`
- * for Venice, `accounts/fireworks/models/deepseek-v4p1-flash` for Fireworks.
- */
-export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly DeepSeekModelRoute[] = [
-  { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
-  { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
-  { url: "https://api.ppq.ai" },
-  { url: "https://openrouter.ai/api/v1", endpoint: "venice/fp8" },
-  { url: "https://openrouter.ai/api/v1", endpoint: "wafer" },
-  { url: "https://api.venice.ai/api/v1" },
-  { url: "https://api.fireworks.ai/inference/v1" },
-];
-
-/**
- * The model whose requests get automatic x-routstr-model-path selection.
- * Only this model is auto-pinned for now; everything else routes normally.
- */
+/** Legacy bootstrap-only exports. Runtime policy comes from the discovery adapter. */
+export type DeepSeekModelRoute = ModelPathRoute;
 export const DEEPSEEK_AUTO_MODEL_ID = "deepseek-v4.1-flash";
-
-/**
- * The nodes the automatic selection may pin, in preference order. A
- * selector is only guaranteed valid on the node that advertised it, so the
- * pinned node must be the node we asked for paths. Hardcoded for now; the
- * intent is to discover eligible nodes by their advertised routstr-core
- * version once model paths are widely deployed.
- */
-export const DEEPSEEK_AUTO_NODE_URLS: readonly string[] = [
-  "https://ai.redsh1ft.com",
-  "https://routstr.otrta.me",
-  "https://api.nonkycai.com",
-];
-
-/** The preferred automatic-selection node (first of DEEPSEEK_AUTO_NODE_URLS). */
+export const DEEPSEEK_MODEL_PATH_WHITELIST = MODEL_PATH_BOOTSTRAP[DEEPSEEK_AUTO_MODEL_ID].routes;
+// Preserve the public constants' historical no-trailing-slash spelling.
+export const DEEPSEEK_AUTO_NODE_URLS = MODEL_PATH_BOOTSTRAP[DEEPSEEK_AUTO_MODEL_ID].nodes!;
 export const DEEPSEEK_AUTO_NODE_URL = DEEPSEEK_AUTO_NODE_URLS[0];
 
 /**
@@ -363,27 +306,28 @@ export function modelPathCandidateKey(
  * malformed or routes through a non-whitelisted upstream. Only the stable
  * identity (url + endpoint tag) is matched.
  */
-export function whitelistedDeepSeekRoute(
-  selector: string
-): DeepSeekModelRoute | null {
+export function whitelistedModelPathRoute(
+  selector: string, routes: readonly ModelPathRoute[]
+): ModelPathRoute | null {
   const params = parseSelector(selector);
   if (!params) return null;
-  return (
-    DEEPSEEK_MODEL_PATH_WHITELIST.find(
-      (route) =>
-        route.url === params.url &&
-        (route.endpoint ?? null) === (params.endpoint ?? null)
-    ) ?? null
-  );
+  try {
+    const identity = normalizeRoute(params.url, params.endpoint);
+    return routes.find(route => normalizeRoute(route.url, route.endpoint) === identity) ?? null;
+  } catch { return null; }
 }
 
-/**
- * True when an x-routstr-model-path selector routes through one of the
- * whitelisted DeepSeek upstream identities. Only url and endpoint tag are
- * matched.
- */
+export function isWhitelistedModelPath(selector: string, routes: readonly ModelPathRoute[]): boolean {
+  return whitelistedModelPathRoute(selector, routes) !== null;
+}
+
+/** @deprecated Bootstrap-only compatibility wrapper. */
+export function whitelistedDeepSeekRoute(selector: string): DeepSeekModelRoute | null {
+  return whitelistedModelPathRoute(selector, DEEPSEEK_MODEL_PATH_WHITELIST);
+}
+/** @deprecated Bootstrap-only compatibility wrapper. */
 export function isWhitelistedDeepSeekModelPath(selector: string): boolean {
-  return whitelistedDeepSeekRoute(selector) !== null;
+  return isWhitelistedModelPath(selector, DEEPSEEK_MODEL_PATH_WHITELIST);
 }
 
 /** Whitelisted DeepSeek selectors resolved from one node's advertised paths. */
@@ -448,9 +392,10 @@ function modelSpellings(
  * the node's own alias_ids, or a spelling linked by MODEL_ID_MAPPINGS — is
  * still found. Returns null when the node lists the model under none of them.
  */
-export function resolveDeepSeekModelPathSelectors(
+export function resolveModelPathSelectors(
   nodePaths: NodeModelPaths,
   modelId: string,
+  routes: readonly ModelPathRoute[],
   mappings?: ModelIdMappings
 ): DeepSeekModelPathSelectors | null {
   const spellings = modelSpellings(nodePaths, modelId, mappings);
@@ -466,16 +411,16 @@ export function resolveDeepSeekModelPathSelectors(
     ...matching.filter((m) => m.id.toLowerCase() === requested),
     ...matching.filter((m) => m.id.toLowerCase() !== requested),
   ];
-  const selectors: Array<string | null> = DEEPSEEK_MODEL_PATH_WHITELIST.map(
+  const selectors: Array<string | null> = routes.map(
     () => null
   );
   const satsPricing: Array<NodeModelPathMetadata["sats_pricing"] | null> =
-    DEEPSEEK_MODEL_PATH_WHITELIST.map(() => null);
+    routes.map(() => null);
   for (const entry of ordered) {
     for (const { path, model } of entry.paths) {
-      const route = whitelistedDeepSeekRoute(path);
+      const route = whitelistedModelPathRoute(path, routes);
       if (!route) continue;
-      const index = DEEPSEEK_MODEL_PATH_WHITELIST.indexOf(route);
+      const index = routes.indexOf(route);
       if (index >= 0 && selectors[index] === null) {
         selectors[index] = path;
         satsPricing[index] = model?.sats_pricing ?? null;
@@ -485,6 +430,13 @@ export function resolveDeepSeekModelPathSelectors(
   return { selectors, satsPricing };
 }
 
+
+/** @deprecated Bootstrap-only compatibility wrapper. */
+export function resolveDeepSeekModelPathSelectors(
+  nodePaths: NodeModelPaths, modelId: string, mappings?: ModelIdMappings
+): DeepSeekModelPathSelectors | null {
+  return resolveModelPathSelectors(nodePaths, modelId, DEEPSEEK_MODEL_PATH_WHITELIST, mappings);
+}
 
 /**
  * Headers object for routeRequests({ headers }) pinning a DeepSeek model to a

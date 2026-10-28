@@ -4,6 +4,7 @@ import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { StorageAdapter } from "../wallet/interfaces";
 import type { ProviderInfo, Model } from "../core";
 import type { ModelIdMappings } from "../core/modelMappings";
+import type { ModelPathWhitelist } from "../core/modelPathWhitelist";
 import { SDK_STORAGE_KEYS } from "./keys";
 import type { StorageDriver, SdkStorageState } from "./types";
 
@@ -64,8 +65,11 @@ export interface SdkStorageStore extends SdkStorageState {
   ) => void;
   updateXcashuTokenTryCount: (token: string, tryCount: number) => void;
   setModelIdMappingsEvent: (value: import("applesauce-core/helpers").NostrEvent) => void;
+  setModelPathWhitelistEvent: (value: import("applesauce-core/helpers").NostrEvent | null) => void;
   setModelIdMappings: (value: ModelIdMappings | null) => void;
+  setModelPathWhitelist: (value: ModelPathWhitelist | null) => void;
   setModelIdMappingsLastUpdate: (value: number | null) => void;
+  setModelPathWhitelistLastUpdate: (value: number | null) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
   setCachedReceiveTokens: (
@@ -153,8 +157,11 @@ const createEmptyStore = (
     childKeys: [],
     xcashuTokens: {},
     modelIdMappingsEvent: null,
+    modelPathWhitelistEvent: null,
     modelIdMappings: null,
+    modelPathWhitelist: null,
     lastModelIdMappingsUpdate: null,
+    lastModelPathWhitelistUpdate: null,
     routstr21Models: [],
     lastRoutstr21ModelsUpdate: null,
     cachedReceiveTokens: [],
@@ -328,13 +335,25 @@ const createEmptyStore = (
       void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, value);
       set({ modelIdMappingsEvent: value });
     },
+    setModelPathWhitelistEvent: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.MODEL_PATH_WHITELIST_EVENT, value);
+      set({ modelPathWhitelistEvent: value });
+    },
     setModelIdMappings: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, value);
       set({ modelIdMappings: value });
     },
+    setModelPathWhitelist: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.MODEL_PATH_WHITELIST, value);
+      set({ modelPathWhitelist: value });
+    },
     setModelIdMappingsLastUpdate: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, value);
       set({ lastModelIdMappingsUpdate: value });
+    },
+    setModelPathWhitelistLastUpdate: (value) => {
+      void driver.setItem(SDK_STORAGE_KEYS.LAST_MODEL_PATH_WHITELIST_UPDATE, value);
+      set({ lastModelPathWhitelistUpdate: value });
     },
     setRoutstr21Models: (value) => {
       void driver.setItem(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, value);
@@ -480,8 +499,11 @@ const hydrateStoreFromDriver = async (
     rawChildKeys,
     rawXcashuTokens,
     rawModelIdMappingsEvent,
+    rawModelPathWhitelistEvent,
     rawModelIdMappings,
+    rawModelPathWhitelist,
     rawLastModelIdMappingsUpdate,
+    rawLastModelPathWhitelistUpdate,
     rawRoutstr21Models,
     rawLastRoutstr21ModelsUpdate,
     rawCachedReceiveTokens,
@@ -546,8 +568,11 @@ const hydrateStoreFromDriver = async (
       >
     >(SDK_STORAGE_KEYS.XCASHU_TOKENS, {}),
     driver.getItem<import("applesauce-core/helpers").NostrEvent | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS_EVENT, null),
+    driver.getItem<import("applesauce-core/helpers").NostrEvent | null>(SDK_STORAGE_KEYS.MODEL_PATH_WHITELIST_EVENT, null),
     driver.getItem<ModelIdMappings | null>(SDK_STORAGE_KEYS.MODEL_ID_MAPPINGS, null),
+    driver.getItem<ModelPathWhitelist | null>(SDK_STORAGE_KEYS.MODEL_PATH_WHITELIST, null),
     driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_MODEL_ID_MAPPINGS_UPDATE, null),
+    driver.getItem<number | null>(SDK_STORAGE_KEYS.LAST_MODEL_PATH_WHITELIST_UPDATE, null),
     driver.getItem<string[]>(SDK_STORAGE_KEYS.ROUTSTR21_MODELS, []),
     driver.getItem<number | null>(
       SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
@@ -719,8 +744,11 @@ const hydrateStoreFromDriver = async (
     childKeys,
     xcashuTokens,
     modelIdMappingsEvent: rawModelIdMappingsEvent,
+    modelPathWhitelistEvent: rawModelPathWhitelistEvent,
     modelIdMappings: rawModelIdMappings,
+    modelPathWhitelist: rawModelPathWhitelist,
     lastModelIdMappingsUpdate: rawLastModelIdMappingsUpdate,
+    lastModelPathWhitelistUpdate: rawLastModelPathWhitelistUpdate,
     routstr21Models,
     lastRoutstr21ModelsUpdate,
     cachedReceiveTokens: deduplicatedReceiveTokens,
@@ -829,12 +857,19 @@ export const createDiscoveryAdapterFromStore = (
   setBaseUrlsLastUpdate: (timestamp) =>
     store.getState().setBaseUrlsLastUpdate(timestamp),
   getModelIdMappingsEvent: () => store.getState().modelIdMappingsEvent,
+  getModelPathWhitelistEvent: () => store.getState().modelPathWhitelistEvent,
   setModelIdMappingsEvent: (event) => store.getState().setModelIdMappingsEvent(event),
+  setModelPathWhitelistEvent: (event) => store.getState().setModelPathWhitelistEvent(event),
   getModelIdMappings: () => store.getState().modelIdMappings,
+  getModelPathWhitelist: () => store.getState().modelPathWhitelist,
   setModelIdMappings: (mappings) => store.getState().setModelIdMappings(mappings),
+  setModelPathWhitelist: (mappings) => store.getState().setModelPathWhitelist(mappings),
   getModelIdMappingsLastUpdate: () => store.getState().lastModelIdMappingsUpdate,
+  getModelPathWhitelistLastUpdate: () => store.getState().lastModelPathWhitelistUpdate,
   setModelIdMappingsLastUpdate: (timestamp) =>
     store.getState().setModelIdMappingsLastUpdate(timestamp),
+  setModelPathWhitelistLastUpdate: (timestamp) =>
+    store.getState().setModelPathWhitelistLastUpdate(timestamp),
   getRoutstr21Models: () => store.getState().routstr21Models,
   setRoutstr21Models: (models) => store.getState().setRoutstr21Models(models),
   getRoutstr21ModelsLastUpdate: () =>
