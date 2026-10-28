@@ -15,7 +15,8 @@
  * instead of a clean end. A stream's final `data: [DONE]` line is held back
  * until those checks passed, so a consumer that stops reading at `[DONE]`
  * still sees the error (the rest of the stream is not delayed).
- * `confidentialSettled` carries the same outcome.
+ * `confidentialSettled` carries the same outcome, and the change of a
+ * one-off bearer (`returnChange`).
  *
  * `POST /v1/chat/completions` runs a chat session (usage disclosed and
  * proven). `POST /v1/images/generations` and `/v1/image/generate` run an image
@@ -518,10 +519,12 @@ async function fetchConfidentialImageOnce(
   freshOffer: boolean,
 ): Promise<Response> {
   const { baseUrl, options } = params;
+  throwIfAborted(params.signal);
   const request = (params.body ?? {}) as Record<string, unknown>;
   const model = typeof request.model === "string" ? request.model : "";
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer, "images");
   const plan = planImageRequest(request, offer.images!);
+  throwIfAborted(params.signal);
   const session = new ConfidentialSession({
     baseUrl,
     offer,
@@ -536,31 +539,32 @@ async function fetchConfidentialImageOnce(
     runsDir: options.runsDir,
     allowInsecureTransport: options.allowInsecureTransport,
   });
-  const onAbort = () => session.close();
-  if (params.signal?.aborted) onAbort();
-  params.signal?.addEventListener("abort", onAbort, { once: true });
+  const abort = callerAbort(params.signal, () => session);
   // Image sessions never use the pre-warm pool, but its chat arms would
   // compete with this session's own 2PC preparation: hold them meanwhile.
   const releaseArming = pool?.holdArming();
+  const runP = session.run(plan.body).finally(() => {
+    abort.done();
+    releaseArming?.();
+    session.close();
+  });
   let result: ConfidentialSessionResult;
   try {
-    result = await session.run(plan.body);
+    result = await Promise.race([runP, abort.aborted]);
   } catch (error) {
     if (error instanceof SessionRejectedError && isOfferExpired(error) && !session.bodyReleased) {
       offerCache.delete(baseUrl.replace(/\/$/, ""));
       throw new OfferExpired(error.message);
     }
-    if (error instanceof SessionRejectedError && error.status) {
-      return new Response(JSON.stringify({ detail: error.nodeDetail ?? error.message }), {
-        status: error.status,
-        headers: { "content-type": "application/json" },
-      });
+    // The caller left after the release: the session settles on its own.
+    if (abort.detached) throw error;
+    const change = await failureChange(params, session, runP);
+    // After release the provider has the request: a node error is not a
+    // refusal, and failing over would run (and pay for) it again.
+    if (error instanceof SessionRejectedError && error.status && !session.bodyReleased) {
+      return refusalResponse(error, change);
     }
-    throw error;
-  } finally {
-    releaseArming?.();
-    session.close();
-    params.signal?.removeEventListener("abort", onAbort);
+    throw withChange(error, change);
   }
   const headers = new Headers();
   headers.set("x-routstr-verify", "confidential");
@@ -582,11 +586,10 @@ async function fetchConfidentialImageOnce(
     }
     response = new Response(new Blob([result.http.body as BlobPart]), { status: result.http.status, headers });
   }
-  if (params.returnChange) {
-    const change = await withdrawBalance(baseUrl, params.bearer);
-    if (change) response.headers.set("x-cashu", change);
-  }
-  (response as unknown as { confidentialSettled: Promise<unknown> }).confidentialSettled = Promise.resolve();
+  const change = params.returnChange ? await withdrawBalance(baseUrl, params.bearer) : undefined;
+  if (change) response.headers.set("x-cashu", change);
+  (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
+    Promise.resolve({ change });
   return response;
 }
 
@@ -602,9 +605,11 @@ async function fetchConfidentialOnce(
   freshOffer: boolean,
 ): Promise<Response> {
   const { baseUrl, options } = params;
+  throwIfAborted(params.signal);
   const request = (params.body ?? {}) as Record<string, unknown>;
   const model = typeof request.model === "string" ? request.model : "";
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer);
+  throwIfAborted(params.signal);
   const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
   const body = buildPinnedBody(request, model, maxTokens, offer.chat);
   const wantStream = request.stream === true;
@@ -623,13 +628,15 @@ async function fetchConfidentialOnce(
       allowInsecureTransport: options.allowInsecureTransport,
     });
 
-  // Pre-warm: a stable credential only (a one-off Cashu bearer is
-  // spent per request), and a body that ends with the pinned suffix.
+  // Pre-warm: a stable credential only, and a body that ends with the
+  // pinned suffix. A Cashu bearer is never pooled: a one-off one is spent per
+  // request, and the bootstrap one of a new key is replaced by that key.
   const suffix = canonicalSuffix(offer.chat, model, maxTokens);
   const usePool =
     options.prewarm !== undefined &&
     options.prewarm.enabled !== false &&
     !params.returnChange &&
+    !params.bearer.startsWith("cashu") &&
     endsWith(body, new TextEncoder().encode(suffix));
   const ticket: RequestTicket<ConfidentialSession> | undefined = usePool
     ? prewarmPool(options.prewarm!).begin(
@@ -667,13 +674,7 @@ async function fetchConfidentialOnce(
       },
     );
   if (!lease) attach(session);
-  const onAbort = () => {
-    session?.close();
-    const reason = params.signal?.reason ?? new DOMException("aborted", "AbortError");
-    void writer.abort(reason).catch(() => {});
-  };
-  if (params.signal?.aborted) onAbort();
-  params.signal?.addEventListener("abort", onAbort, { once: true });
+  const abort = callerAbort(params.signal, () => session, (reason) => void writer.abort(reason).catch(() => {}));
 
   const runCold = (): Promise<ConfidentialSessionResult> => {
     ticket?.cold();
@@ -685,6 +686,7 @@ async function fetchConfidentialOnce(
       warm = await lease!.session;
     } catch (error) {
       // The arm we waited for failed: nothing was sent, go cold.
+      throwIfAborted(params.signal);
       ticket!.log(`claimed arm failed (${errorText(error)}); falling back to a cold session`);
       session = coldSession();
       attach(session);
@@ -719,8 +721,8 @@ async function fetchConfidentialOnce(
 
   // The whole session, including settlement and its checks.
   const runP = (lease ? runWarm() : runCold()).finally(() => {
+    abort.done();
     session?.close();
-    params.signal?.removeEventListener("abort", onAbort);
   });
   runP.then(
     (r) =>
@@ -745,9 +747,10 @@ async function fetchConfidentialOnce(
         statusText: r.http.statusText,
         headers: r.http.headers,
       })),
+      abort.aborted,
     ]);
   } catch (error) {
-    session?.close();
+    if (!abort.detached) session?.close();
     void writer.abort(error).catch(() => {});
     // Retried only while nothing can have reached the provider: the node
     // refuses an expired offer at setup, never after the body went out.
@@ -755,27 +758,37 @@ async function fetchConfidentialOnce(
       offerCache.delete(baseUrl.replace(/\/$/, ""));
       throw new OfferExpired(error.message);
     }
+    // The caller left after the release: the session settles on its own.
+    if (abort.detached) throw error;
+    const change = await failureChange(params, session, runP);
     // A node-side refusal (e.g. 402 insufficient balance) becomes the same
     // HTTP error a normal request would get, so the client's existing
-    // top-up / failover handling applies.
-    if (error instanceof SessionRejectedError && error.status) {
-      return new Response(JSON.stringify({ detail: error.nodeDetail ?? error.message }), {
-        status: error.status,
-        headers: { "content-type": "application/json" },
-      });
+    // top-up / failover handling applies. After release the provider has the
+    // request: a node error is not a refusal, and failing over would run (and
+    // pay for) it again.
+    if (error instanceof SessionRejectedError && error.status && !session?.bodyReleased) {
+      return refusalResponse(error, change);
     }
-    throw error;
+    throw withChange(error, change);
   }
 
   let response: Response | undefined;
   let change: string | undefined;
-  const settled = runP.then(async (result) => {
-    if (params.returnChange) {
-      change = await withdrawBalance(baseUrl, params.bearer);
-      if (change) response?.headers.set("x-cashu", change);
-    }
-    return result;
-  });
+  // A caller that left before it had a response cannot take change: the
+  // bearer's deposit then stays on the node for the wallet to refund.
+  const callerGone = () => abort.detached && !response;
+  const settled = runP.then(
+    async () => {
+      if (params.returnChange && !callerGone()) {
+        change = await withdrawBalance(baseUrl, params.bearer);
+        if (change) response?.headers.set("x-cashu", change);
+      }
+      return { change };
+    },
+    async (error: unknown) => {
+      throw callerGone() ? error : withChange(error, await failureChange(params, session, runP));
+    },
+  );
   // A stream ends only once settlement verified (and only then gets its
   // `[DONE]`); a failed check errors it.
   settled.then(
@@ -816,12 +829,109 @@ async function fetchConfidentialOnce(
       response = new Response(new Blob([body as BlobPart]), { status: head.status, headers });
     }
     if (change) response.headers.set("x-cashu", change);
+    const warnings = (await runP).warnings;
+    if (warnings?.length) response.headers.set("x-routstr-confidential-warnings", warnings.join("; "));
   }
-  const settledHandled = settled.then(() => undefined);
-  settledHandled.catch(() => {}); // observed by the stream and by finalize()
-  (response as unknown as { confidentialSettled: Promise<unknown> }).confidentialSettled =
-    settledHandled;
+  settled.catch(() => {}); // observed by the stream and by finalize()
+  (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled = settled;
   return response!;
+}
+
+/**
+ * What a response's `confidentialSettled` resolves to. `change` is the
+ * bearer's remaining balance withdrawn as a Cashu token (`returnChange`); a
+ * stream's wrapper copies the response headers before it is set, so this is
+ * where a caller reads it. A rejection carries it as `cashuChange`.
+ */
+export interface ConfidentialSettlement {
+  change?: string;
+}
+
+/**
+ * A caller's abort. Before the release nothing reached the provider: the
+ * session closes at once (the node releases the reservation). After it the
+ * provider has the request, and closing would charge the whole reservation:
+ * the caller is detached instead (`aborted` rejects, nothing more is
+ * delivered) and the session drains, bounded by its pinned cap, and settles
+ * at the usage it had. Once the session ended (`done()`) an abort changes
+ * nothing.
+ */
+function callerAbort(
+  signal: AbortSignal | undefined,
+  current: () => ConfidentialSession | undefined,
+  onReason?: (reason: unknown) => void,
+): { aborted: Promise<never>; readonly detached: boolean; done(): void } {
+  let detached = false;
+  let ended = false;
+  let reject!: (reason: unknown) => void;
+  const aborted = new Promise<never>((_, r) => (reject = r));
+  aborted.catch(() => {});
+  const onAbort = () => {
+    const reason = abortReason(signal);
+    onReason?.(reason);
+    if (ended) return;
+    const session = current();
+    if (session?.bodyReleased) detached = true;
+    else session?.close();
+    reject(reason);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return {
+    aborted,
+    get detached() {
+      return detached;
+    },
+    done() {
+      ended = true;
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+/** A node refusal as the HTTP error a normal request would get. */
+function refusalResponse(error: SessionRejectedError, change: string | undefined): Response {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (change) headers.set("x-cashu", change);
+  return new Response(JSON.stringify({ detail: error.nodeDetail ?? error.message }), {
+    status: error.status,
+    headers,
+  });
+}
+
+/**
+ * After a failed session, a one-off bearer's deposit is still on the node:
+ * withdraw it (`returnChange`) once the session ended and the node released
+ * or charged its reservation. Nothing to withdraw if the credential never
+ * went out.
+ */
+async function failureChange(
+  params: ConfidentialFetchParams,
+  session: ConfidentialSession | undefined,
+  runP: Promise<unknown>,
+): Promise<string | undefined> {
+  if (!params.returnChange || !session?.credentialSent) return undefined;
+  await Promise.race([runP.catch(() => {}), delay(10_000)]);
+  return withdrawBalance(params.baseUrl, params.bearer, 5);
+}
+
+/** A thrown error carrying the withdrawn change (`cashuChange`) to the caller. */
+function withChange(error: unknown, change: string | undefined): unknown {
+  if (!change) return error;
+  const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
+  (e as { cashuChange?: string }).cashuChange = change;
+  return e;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -895,19 +1005,27 @@ export class SseDoneHoldback {
   }
 }
 
-/** The existing node refund endpoint: return the bearer's remaining balance. */
-async function withdrawBalance(baseUrl: string, bearer: string): Promise<string | undefined> {
-  try {
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/wallet/refund`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${bearer}` },
-    });
-    if (!res.ok) return undefined;
-    const j = (await res.json()) as { token?: string };
-    return j.token;
-  } catch {
-    return undefined;
+/**
+ * The existing node refund endpoint: return the bearer's remaining balance.
+ * The node refuses while a reservation is still held, which a session that
+ * just failed may briefly be: `attempts` retries with a growing pause.
+ */
+async function withdrawBalance(baseUrl: string, bearer: string, attempts = 2): Promise<string | undefined> {
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await delay(500 * i);
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/wallet/refund`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${bearer}` },
+      });
+      if (!res.ok) continue;
+      const j = (await res.json()) as { token?: string };
+      return j.token;
+    } catch {
+      /* retry */
+    }
   }
+  return undefined;
 }
 
 function errorText(e: unknown): string {
