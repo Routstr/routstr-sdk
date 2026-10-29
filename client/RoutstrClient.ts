@@ -438,10 +438,10 @@ export class RoutstrClient {
       : undefined);
     const controller = new AbortController();
     const abort = () => controller.abort(params.signal?.reason);
-    params.signal?.addEventListener("abort", abort, { once: true });
+    if (lifecycle) params.signal?.addEventListener("abort", abort, { once: true });
     if (params.signal?.aborted) abort();
     const transportState: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string } = {};
-    const local = { ...params, lifecycle, signal: controller.signal, transportState };
+    const local = { ...params, lifecycle, signal: lifecycle ? controller.signal : params.signal, transportState };
     try {
       let response = await this._routeRequest(local) as RoutstrResponse;
       if (!lifecycle) { params.signal?.removeEventListener("abort", abort); return response; }
@@ -555,7 +555,7 @@ export class RoutstrClient {
       const usage = capturedUsage ?? prepared.capturedUsage;
       const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
       (prepared.response as any).upstreamResponseId = upstreamResponseId;
-      const requestId = params.lifecycle?.requestId;
+      const requestId = params.lifecycle?.requestId ?? upstreamResponseId;
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
@@ -570,7 +570,7 @@ export class RoutstrClient {
       });
       (prepared.response as any).satsSpent = satsSpent;
       (prepared.response as any).usage = usage;
-      (prepared.response as any).requestId = requestId;
+      (prepared.response as any).requestId = requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
       return satsSpent;
     };
 
@@ -2969,7 +2969,7 @@ export class RoutstrClient {
         }
       }
 
-      const finalRequestId = requestId || "unknown";
+      const finalRequestId = requestId || upstreamResponseId || "unknown";
 
       const store = this.sdkStore ?? (await getDefaultSdkStore());
       const state = store.getState();

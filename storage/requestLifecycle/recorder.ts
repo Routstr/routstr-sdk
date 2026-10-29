@@ -68,18 +68,26 @@ export async function beginRequestLifecycle(
   let pendingPreflightFailover = false;
   const providers = new Set<string>();
   const attempts = new Map<string, RequestLifecycleAttempt>();
+  const recordPersistenceError = () => {
+    const message = "Request lifecycle persistence failed";
+    if (errors.length < 100) errors.push(message);
+    try {
+      (options.logger ?? console).error(
+        `[request:${request.requestId}] ${message}`,
+      );
+    } catch {
+      /* logging is also fail-open */
+    }
+  };
+  const persist = async (operation: () => Promise<void>): Promise<void> => {
+    try {
+      await operation();
+    } catch {
+      recordPersistenceError();
+    }
+  };
   const enqueue = (operation: () => Promise<void>): Promise<void> => {
-    queue = queue.then(operation).catch(() => {
-      const message = "Request lifecycle persistence failed";
-      if (errors.length < 100) errors.push(message);
-      try {
-        (options.logger ?? console).error(
-          `[request:${request.requestId}] ${message}`,
-        );
-      } catch {
-        /* logging is also fail-open */
-      }
-    });
+    queue = queue.then(() => persist(operation));
     return queue;
   };
   const append = async (
@@ -216,13 +224,15 @@ export async function beginRequestLifecycle(
                   ? "aborted"
                   : "failed";
             a.endedAt = endedAt;
-            await driver.updateAttempt(a.attemptId, a);
+            await persist(() => driver.updateAttempt(a.attemptId, a));
           }
-        await driver.updateRequest(request.requestId, request);
-        await append("request_finished", {
+        // A failed child write must not suppress the request's terminal state
+        // or its terminal event. Each persistence operation remains fail-open.
+        await persist(() => driver.updateRequest(request.requestId, request));
+        await persist(() => append("request_finished", {
           outcome: input.outcome,
           httpStatus: input.httpStatus,
-        });
+        }));
       });
     },
   };
