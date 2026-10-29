@@ -1,3 +1,5 @@
+import { awaitWithAbort } from "./abortable";
+import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecycleContext, type RequestLifecycleDriver } from "../storage/requestLifecycle";
 /**
  * RoutstrClient - Main API client for Routstr
  *
@@ -168,7 +170,53 @@ export interface ModelPathPin {
   satsPricing?: ModelPathSatsPricing;
 }
 
+export interface RoutstrResponse extends Response {
+  requestId?: string;
+  nodeRequestId?: string;
+  upstreamResponseId?: string;
+  finalize?: () => Promise<number>;
+}
+
+/** Rebuild only Fetch state through the constructor and forward SDK metadata.
+ * Node 22 Response has enumerable internal symbols: Object.assign(target, source)
+ * copies those too, replacing target headers/body with the source's locked body.
+ * Never copy native Response properties or symbols across this boundary.
+ */
+function rewrapRoutstrResponse(
+  source: RoutstrResponse,
+  body: BodyInit | null,
+  headers: Headers
+): RoutstrResponse {
+  const target = new Response(body, {
+    status: source.status,
+    statusText: source.statusText,
+    headers,
+  }) as RoutstrResponse;
+  for (const key of [
+    "requestId", "nodeRequestId", "upstreamResponseId", "satsSpent", "usage",
+    "usageEntryId", "usagePromise", "baseUrl", "token", "selectedMintUrl",
+    "requestResponseLogId", "lifecycleAttemptId", "initialTokenBalanceInSats",
+    "initialTokenBalanceUnknown", "passthrough", "streamError",
+  ]) {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      enumerable: true,
+      get: () => (source as any)[key],
+      set: (value: unknown) => { (source as any)[key] = value; },
+    });
+  }
+  // finalize is deliberately independent: the client-facing wrapper adds a
+  // terminal-flush wait without replacing the inspector's accounting function.
+  if (source.finalize) target.finalize = source.finalize;
+  return target;
+}
+
 export interface RouteRequestParams {
+  lifecycle?: RequestLifecycleContext;
+  requestLifecycleDriver?: RequestLifecycleDriver;
+  trackLifecycle?: boolean;
+  /** @internal Request-local final transport correlation. */
+  transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
   path: string;
   method: string;
   body?: unknown;
@@ -200,6 +248,9 @@ export interface RouteRequestParams {
 }
 
 export interface RequestResponseLogRequestInput {
+  requestId?: string;
+  attemptId?: string;
+  ordinal?: number;
   method: string;
   url: string;
   path: string;
@@ -219,6 +270,7 @@ export interface RequestResponseLogSink {
 }
 
 export interface RoutstrClientConfig {
+  requestLifecycleDriver?: RequestLifecycleDriver;
   usageTrackingDriver?: UsageTrackingDriver;
   sdkStore?: SdkStore;
   /** Optional: shared ProviderManager instance for consistent failure tracking across requests */
@@ -250,6 +302,7 @@ export class RoutstrClient {
   private mode: RoutstrClientMode;
   private debugLevel: DebugLevel = "WARN";
   private usageTrackingDriver?: UsageTrackingDriver;
+  private requestLifecycleDriver?: RequestLifecycleDriver;
   private sdkStore?: SdkStore;
   private logger: SdkLogger;
   private requestResponseLogSink?: RequestResponseLogSink;
@@ -287,6 +340,7 @@ export class RoutstrClient {
     this.alertLevel = alertLevel;
     this.mode = mode;
     this.usageTrackingDriver = options.usageTrackingDriver;
+    this.requestLifecycleDriver = options.requestLifecycleDriver;
     this.sdkStore = options.sdkStore;
     this.requestResponseLogSink = options.requestResponseLogSink;
     this.userCacheSecret = options.userCacheSecret;
@@ -302,6 +356,11 @@ export class RoutstrClient {
    */
   getMode(): RoutstrClientMode {
     return this.mode;
+  }
+
+  /** The configured lifecycle driver, for wrappers creating an ingress context. */
+  getRequestLifecycleDriver(): RequestLifecycleDriver | undefined {
+    return this.requestLifecycleDriver;
   }
 
   getDebugLevel(): DebugLevel {
@@ -370,8 +429,110 @@ export class RoutstrClient {
    * Useful for daemon-style routing where you just need to forward
    * requests and get responses back.
    */
-  async routeRequest(params: RouteRequestParams): Promise<Response> {
-    const prepared = await this._prepareRoutedRequestWithMintFailover(params);
+  async routeRequest(params: RouteRequestParams): Promise<RoutstrResponse> {
+    const eligible = shouldTrackRequestLifecycle(params.method, params.path);
+    const lifecycle = params.lifecycle ?? (params.trackLifecycle !== false && eligible
+      ? await beginRequestLifecycle({ driver: params.requestLifecycleDriver ?? this.requestLifecycleDriver,
+          method: params.method, path: params.path, modelId: params.modelId,
+          stream: Boolean((params.body as any)?.stream), mode: this.mode, logger: this.logger })
+      : undefined);
+    const controller = new AbortController();
+    const abort = () => controller.abort(params.signal?.reason);
+    if (lifecycle) params.signal?.addEventListener("abort", abort, { once: true });
+    if (params.signal?.aborted) abort();
+    const transportState: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string } = {};
+    const local = { ...params, lifecycle, signal: lifecycle ? controller.signal : params.signal, transportState };
+    try {
+      let response = await this._routeRequest(local) as RoutstrResponse;
+      if (!lifecycle) { params.signal?.removeEventListener("abort", abort); return response; }
+      response.requestId = lifecycle.requestId;
+      response.nodeRequestId = response.headers.get("x-routstr-request-id") ?? undefined;
+      // Fetch response headers may be immutable. Rewrap while retaining SDK metadata.
+      const headers = new Headers(response.headers);
+      headers.set("x-routstr-sdk-request-id", lifecycle.requestId);
+      const original = response;
+      response = rewrapRoutstrResponse(original, original.body, headers);
+      const attemptId = ((original as any).lifecycleAttemptId ?? transportState.attemptId) as string | undefined;
+      let terminal: Promise<void> | undefined;
+      const finish = (outcome: "succeeded" | "failed" | "aborted", error?: unknown) => {
+        if (terminal) return terminal;
+        terminal = (async () => {
+          params.signal?.removeEventListener("abort", onAbort);
+          params.signal?.removeEventListener("abort", abort);
+          if (attemptId) await lifecycle.updateAttempt(attemptId, {
+            outcome: outcome === "failed" && original.ok ? "stream_error" : outcome,
+            endedAt: Date.now(), ...(outcome === "failed" && original.ok ? { failurePhase: "stream" as const } : {}),
+            upstreamResponseId: original.upstreamResponseId,
+          });
+          await lifecycle.event(original.headers.get("content-type")?.includes("text/event-stream")
+            ? outcome === "succeeded" ? "stream_completed" : outcome === "aborted" ? "stream_cancelled" : "stream_error"
+            : "response_completed");
+          await lifecycle.finish({ outcome, httpStatus: original.status,
+            ...(((original as any).baseUrl ?? transportState.baseUrl) ? { finalBaseUrl: (original as any).baseUrl ?? transportState.baseUrl } : {}),
+            ...(attemptId ? { finalAttemptId: attemptId } : {}),
+            upstreamResponseId: original.upstreamResponseId,
+            usageEntryId: (original as any).usageEntryId,
+            errorType: outcome === "failed" ? transportState.errorType ?? (error instanceof Error ? error.name : undefined) : undefined,
+            errorCode: outcome === "failed" ? transportState.errorCode : undefined });
+        })();
+        return terminal;
+      };
+      let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let streamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const onAbort = () => {
+        void finish("aborted").then(() => {
+          try { streamController?.error(new DOMException("Request aborted", "AbortError")); } catch { /* already closed */ }
+          void streamReader?.cancel().catch(() => {});
+        });
+      };
+      if (!original.ok || !original.headers.get("content-type")?.includes("text/event-stream") || !original.body) {
+        await finish(params.signal?.aborted ? "aborted" : original.ok ? "succeeded" : "failed");
+        return response;
+      }
+      const reader = response.body!.getReader();
+      streamReader = reader;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) { streamController = controller; },
+        async pull(controller) {
+          try {
+            const result = await reader.read();
+            if (result.done) {
+              await original.finalize?.();
+              await finish((original as any).streamError ? "failed" : "succeeded");
+              controller.close();
+            } else controller.enqueue(result.value);
+          } catch (error) {
+            await finish(params.signal?.aborted ? "aborted" : "failed", error);
+            controller.error(error);
+          }
+        },
+        async cancel(reason) { controller.abort(reason); await finish("aborted"); void reader.cancel(reason).catch(() => {}); },
+      }, { highWaterMark: 0 });
+      response = rewrapRoutstrResponse(original, stream, headers);
+      const accounting = original.finalize;
+      response.finalize = async () => { const value = await accounting?.() ?? 0; if (terminal) await terminal; return value; };
+      params.signal?.addEventListener("abort", onAbort, { once: true });
+      if (params.signal?.aborted) onAbort();
+      return response;
+    } catch (error) {
+      params.signal?.removeEventListener("abort", abort);
+      await lifecycle?.finish({ outcome: params.signal?.aborted || (error as any)?.name === "AbortError" ? "aborted" : "failed",
+        errorType: transportState.errorType ?? (error instanceof Error ? error.name : undefined),
+        errorCode: transportState.errorCode,
+        ...(transportState.baseUrl ? { finalBaseUrl: transportState.baseUrl } : {}),
+        ...(transportState.attemptId ? { finalAttemptId: transportState.attemptId } : {}) });
+      if (error && typeof error === "object" && lifecycle) {
+        // SDK error classes historically use requestId for the node correlation.
+        const e = error as any;
+        e.nodeRequestId = transportState.nodeRequestId ?? e.nodeRequestId ?? e.requestId;
+        e.requestId = lifecycle.requestId;
+      }
+      throw error;
+    }
+  }
+
+  private async _routeRequest(params: RouteRequestParams): Promise<Response> {
+    const prepared = await awaitWithAbort(this._prepareRoutedRequestWithMintFailover(params), params.signal);
     const contentType =
       prepared.response.headers.get("content-type") || "";
     const isSSE = contentType.includes("text/event-stream");
@@ -392,7 +553,9 @@ export class RoutstrClient {
     const runFinalize = async (): Promise<number> => {
       const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
       const usage = capturedUsage ?? prepared.capturedUsage;
-      const requestId = capturedResponseId ?? prepared.capturedResponseId;
+      const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
+      (prepared.response as any).upstreamResponseId = upstreamResponseId;
+      const requestId = params.lifecycle?.requestId ?? upstreamResponseId;
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
         baseUrl: prepared.baseUrlUsed,
@@ -407,7 +570,7 @@ export class RoutstrClient {
       });
       (prepared.response as any).satsSpent = satsSpent;
       (prepared.response as any).usage = usage;
-      (prepared.response as any).requestId = requestId;
+      (prepared.response as any).requestId = requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
       return satsSpent;
     };
 
@@ -439,13 +602,18 @@ export class RoutstrClient {
     params: RouteRequestParams
   ): Promise<Awaited<ReturnType<RoutstrClient["_prepareRoutedRequest"]>>> {
     let current = params;
+    let previousPreflightBaseUrl = params.baseUrl;
     const attempted = new Set<string>();
     const triedModelPaths = new Set<string>();
     for (;;) {
+      if (current.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
       try {
+        if (current !== params) await current.lifecycle?.event("preflight_provider_failover", { from: previousPreflightBaseUrl, to: current.baseUrl, reason: "preflight_funding" });
+        previousPreflightBaseUrl = current.baseUrl;
         return await this._prepareRoutedRequest(current);
       } catch (error) {
         if (!(error instanceof ProviderMintBalanceError)) throw error;
+        await current.lifecycle?.event("preflight_funding_failed", { reason: "provider_mint_balance" }, { baseUrl: current.baseUrl });
         const selector = this._findModelPathHeader(current.headers ?? {});
         if (current.pinnedProvider || (selector && !current.autoModelPath)) {
           throw error;
@@ -746,6 +914,8 @@ export class RoutstrClient {
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
+      lifecycle: params.lifecycle,
+      transportState: params.transportState,
       // The SDK auto-pin marker must reach _handleErrorResponse to
       // distinguish an SDK-pinned selector (may fail over) from a
       // caller-pinned one (never does). Retry call sites inside
@@ -802,6 +972,7 @@ export class RoutstrClient {
         headers: response.headers,
       });
 
+      (processedResponse as any).lifecycleAttemptId = (response as any).lifecycleAttemptId;
       (processedResponse as any).baseUrl = (response as any).baseUrl;
       (processedResponse as any).token = (response as any).token;
       (processedResponse as any).selectedMintUrl =
@@ -816,9 +987,10 @@ export class RoutstrClient {
         },
         (responseId) => {
           capturedResponseId = responseId;
-          (processedResponse as any).requestId = responseId;
+          (processedResponse as any).upstreamResponseId = responseId;
         },
         {
+          onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
           onRawChunk: (_chunk, sequence, text) => {
             void this.requestResponseLogSink?.logResponseChunk?.(
               requestResponseLogId,
@@ -923,6 +1095,9 @@ export class RoutstrClient {
     /** (node, canonical path) candidates already attempted in this request. */
     triedModelPaths?: string[];
     failures?: RequestFailures;
+    lifecycle?: RequestLifecycleContext;
+    transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
+    attemptKind?: "mint_retry";
   }): Promise<Response> {
     const { path, method, body, baseUrl, token, headers, tinfoilEnabled, signal } = params;
 
@@ -931,8 +1106,6 @@ export class RoutstrClient {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
 
-    try {
-      const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       // EHBP seals the body end to end, so the proxy cannot translate a
       // reasoning effort for us: map the caller's level onto the exact value
       // the target model accepts before the request is encrypted. Applied per
@@ -944,7 +1117,30 @@ export class RoutstrClient {
         attemptBody === undefined || method === "GET"
           ? undefined
           : JSON.stringify(attemptBody);
-      const requestLogId = await this.requestResponseLogSink?.logRequest?.({
+    const previousUrl = params.transportState?.baseUrl;
+    if (previousUrl) await params.lifecycle?.event(previousUrl !== baseUrl ? "provider_failover" : "retry_decision", {
+      from: previousUrl, to: baseUrl, reason: params.attemptKind ?? (previousUrl !== baseUrl ? "provider_error" : "same_provider_retry"),
+    });
+    else await params.lifecycle?.event("provider_selected", undefined, { baseUrl });
+    if (params.transportState) {
+      params.transportState.baseUrl = baseUrl;
+      params.transportState.nodeRequestId = undefined;
+      params.transportState.errorType = undefined;
+      params.transportState.errorCode = undefined;
+    }
+    const attempt = await params.lifecycle?.beginAttempt({ baseUrl,
+      modelId: params.selectedModel?.id, modelPath: this._findModelPathHeader(params.baseHeaders),
+      kind: params.attemptKind });
+    if (params.transportState) params.transportState.attemptId = attempt?.attemptId;
+    params = { ...params, attemptKind: undefined };
+    let headersReceived = false;
+    try {
+      const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      let requestLogId: string | undefined;
+      try { requestLogId = await this.requestResponseLogSink?.logRequest?.({
+        requestId: params.lifecycle?.requestId,
+        attemptId: attempt?.attemptId,
+        ordinal: attempt?.ordinal,
         method,
         url,
         path,
@@ -952,7 +1148,9 @@ export class RoutstrClient {
         headers,
         body: attemptBody,
         rawBody: requestBodyText,
-      });
+      }); } catch { this._log("ERROR", "Request response log sink failed"); }
+
+      if (attempt) await params.lifecycle?.updateAttempt(attempt.attemptId, { requestLogId });
 
       // Request headers contain bearer credentials / x-cashu tokens. The
       // request-response sink has its own header redaction; do not log raw headers.
@@ -978,6 +1176,17 @@ export class RoutstrClient {
             body: requestBodyText,
             signal,
           });
+      headersReceived = true;
+      if (params.transportState) params.transportState.nodeRequestId = response.headers.get("x-routstr-request-id") ?? undefined;
+      if (attempt) {
+        (response as any).lifecycleAttemptId = attempt.attemptId;
+        await params.lifecycle?.updateAttempt(attempt.attemptId, {
+          headersReceivedAt: Date.now(), httpStatus: response.status,
+          nodeRequestId: response.headers.get("x-routstr-request-id") ?? undefined,
+          ...(response.ok ? {} : { outcome: "failed" as const, endedAt: Date.now(), failurePhase: "response" as const }),
+        });
+        await params.lifecycle?.event("response_received", { httpStatus: response.status }, { attemptId: attempt.attemptId, baseUrl });
+      }
       if (this.mode === "xcashu") this._log("DEBUG", "response,", response);
 
       (response as any).baseUrl = baseUrl;
@@ -1005,6 +1214,14 @@ export class RoutstrClient {
           bodyText = undefined;
         }
 
+        const diagnostic = parseCoreError(bodyText, response.status, requestId);
+        if (params.transportState) {
+          params.transportState.errorType = diagnostic.type;
+          params.transportState.errorCode = diagnostic.code === undefined ? undefined : String(diagnostic.code);
+        }
+        if (attempt) await params.lifecycle?.updateAttempt(attempt.attemptId, {
+          errorType: diagnostic.type, errorCode: diagnostic.code === undefined ? undefined : String(diagnostic.code),
+        });
         this._log("ERROR", "[RoutstrClient] Upstream error response", {
           baseUrl,
           url,
@@ -1015,7 +1232,7 @@ export class RoutstrClient {
           body: bodyText ?? "<unable to read response body>",
         });
 
-        return await this._handleErrorResponse(
+        const handled = await this._handleErrorResponse(
           params,
           token,
           response.status,
@@ -1027,6 +1244,9 @@ export class RoutstrClient {
           params.retryCount ?? 0,
           upstream
         );
+        (handled as any).lifecycleAttemptId ??= attempt?.attemptId;
+        (handled as any).baseUrl ??= baseUrl;
+        return handled;
       }
 
       // Only a successful model invocation proves this exact scope recovered.
@@ -1057,8 +1277,12 @@ export class RoutstrClient {
 
       return response;
     } catch (error: any) {
+      if (attempt && !headersReceived) await params.lifecycle?.updateAttempt(attempt.attemptId, {
+        endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
+        failurePhase: "network", errorType: error?.name,
+      });
       // Handle network errors with failover
-      if (isNetworkErrorMessage(error?.message || "")) {
+      if (!headersReceived && !signal?.aborted && isNetworkErrorMessage(error?.message || "")) {
         const fetchUrl = `${baseUrl.replace(/\/$/, "")}${path}`;
         this._log("ERROR", "[RoutstrClient] Network error fetching from provider", {
           baseUrl,
@@ -1190,6 +1414,9 @@ export class RoutstrClient {
       /** (node, canonical path) candidates already attempted in this request. */
       triedModelPaths?: string[];
       failures?: RequestFailures;
+      lifecycle?: RequestLifecycleContext;
+      transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
+      attemptKind?: "mint_retry";
     },
     token: string,
     status: number,
@@ -1418,6 +1645,7 @@ export class RoutstrClient {
       if (spendResult) {
         const retryResponse = await this._makeRequest({
           ...params,
+          attemptKind: "mint_retry",
           token: spendResult.token,
           selectedMintUrl: spendResult.selectedMintUrl,
           excludeMints,
@@ -1570,6 +1798,7 @@ export class RoutstrClient {
         } else {
           // A proactive (pre-request) topup may already be in flight for
           // this key — join it instead of stacking a second deposit.
+          await params.lifecycle?.event("topup_started", undefined, { baseUrl });
           const topupResult = await this._topUpOnce(
             `${baseUrl}:${params.token}`,
             () =>
@@ -1585,6 +1814,7 @@ export class RoutstrClient {
             `[RoutstrClient] _handleErrorResponse: Topup result for ${baseUrl}: success=${topupResult.success}, message=${topupResult.message}`
           );
 
+          await params.lifecycle?.event(topupResult.success ? "topup_succeeded" : "topup_failed", undefined, { baseUrl });
           if (!topupResult.success) {
             const message = topupResult.message || "";
             if (topupResult.providerMintsShort) {
@@ -1803,12 +2033,14 @@ export class RoutstrClient {
           `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
         );
         recoveryAttempted = true;
+        await params.lifecycle?.event("refund_started", undefined, { baseUrl });
         const refundResult = await this.balanceManager.refundApiKey({
           mintUrl,
           baseUrl,
           apiKey: token,
           forceRefund: true,
         });
+        await params.lifecycle?.event(refundResult.success ? "refund_succeeded" : "refund_failed", undefined, { baseUrl });
         if (refundResult.success) recoverySucceeded = true;
         this._log(
           "DEBUG",
@@ -2317,6 +2549,7 @@ export class RoutstrClient {
             newModel.id
           ),
           retryCount: 0,
+          attemptKind: undefined,
         });
         (retryResponse as any).initialTokenBalanceInSats = getBalanceInSats(
           spendResult.tokenBalance,
@@ -2680,8 +2913,9 @@ export class RoutstrClient {
     try {
       let usage = providedUsage;
       let requestId = providedRequestId;
+      let upstreamResponseId = (response as RoutstrResponse).upstreamResponseId;
 
-      if (!usage || !requestId) {
+      if (!usage || !upstreamResponseId) {
         const contentType = response.headers.get("content-type") || "";
 
         if (contentType.includes("text/event-stream")) {
@@ -2702,11 +2936,8 @@ export class RoutstrClient {
             usage ??
             extractUsageFromResponseBody(responseBody, satsSpent) ??
             undefined;
-          requestId =
-            requestId ??
-            extractResponseId(responseBody) ??
-            response.headers.get("x-routstr-request-id") ??
-            undefined;
+          upstreamResponseId = upstreamResponseId ?? extractResponseId(responseBody);
+          (response as RoutstrResponse).upstreamResponseId = upstreamResponseId;
         }
       }
 
@@ -2738,7 +2969,7 @@ export class RoutstrClient {
         }
       }
 
-      const finalRequestId = requestId || "unknown";
+      const finalRequestId = requestId || upstreamResponseId || "unknown";
 
       const store = this.sdkStore ?? (await getDefaultSdkStore());
       const state = store.getState();
@@ -2763,6 +2994,8 @@ export class RoutstrClient {
         modelId,
         baseUrl,
         requestId: finalRequestId,
+        nodeRequestId: response.headers.get("x-routstr-request-id") ?? undefined,
+        upstreamResponseId,
         client: matchingClient?.clientId,
         ...usage,
         // Anthropic responses may omit the body provider; the node can
@@ -2779,6 +3012,7 @@ export class RoutstrClient {
       }
 
       await usageTracking.append(entry);
+      (response as any).usageEntryId = entry.id;
     } catch (error) {
       // Silently ignore tracking failures
     }

@@ -38,3 +38,5 @@ export const createNodeModelManager = (
   adapter: DiscoveryAdapter,
   config: ModelManagerConfig = {}
 ): NodeModelManager => new NodeModelManager(adapter, config);
+
+export { createSqliteRequestLifecycleDriver, type SqliteRequestLifecycleDriverOptions } from "./storage/requestLifecycle/sqlite";

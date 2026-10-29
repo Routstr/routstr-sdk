@@ -149,3 +149,19 @@ describe("inspectSSEWebStream", () => {
     expect(result.capturedUsage?.totalTokens).toBe(3);
   });
 });
+
+describe("native SSE lifecycle correlation", () => {
+  it("captures nested Responses and Anthropic IDs", async () => {
+    for (const payload of [{ type: "response.created", response: { id: "resp-native" } }, { type: "message_start", message: { id: "msg-native" } }]) {
+      const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`)); c.close(); } });
+      const result = await inspectSSEWebStream(stream, () => {});
+      expect(result.capturedResponseId).toBe((payload as any).response?.id ?? (payload as any).message?.id);
+    }
+  });
+  it("detects response.failed after IDs and usage have been captured", async () => {
+    let failed = false;
+    const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('data: {"id":"resp","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\ndata: {"type":"response.failed","response":{"id":"resp","error":{"message":"private"}}}\n\n')); c.close(); } });
+    await inspectSSEWebStream(stream, () => {}, undefined, { onErrorEnvelope: () => { failed = true; } });
+    expect(failed).toBe(true);
+  });
+});

@@ -1,3 +1,5 @@
+import { awaitWithAbort } from "./abortable";
+import { beginRequestLifecycle, type RequestLifecycleContext, type RequestLifecycleDriver } from "../storage/requestLifecycle";
 import type { Message, Model, StreamingResult, SdkLogger } from "../core/types";
 import type {
   StreamingCallbacks,
@@ -42,6 +44,9 @@ export type { ResolveContextInput, ResolvedContext } from "./resolveRequestConte
  *    resolves a mint, and builds a RoutstrClient internally.
  */
 export interface FetchOptions {
+  requestLifecycleDriver?: RequestLifecycleDriver;
+  lifecycle?: RequestLifecycleContext;
+  trackLifecycle?: boolean;
   /** Message history for the conversation */
   messageHistory: Message[];
 
@@ -104,6 +109,9 @@ export interface FetchOptions {
 
 interface FetchAIResponseClient {
   routeRequest(params: {
+    lifecycle?: RequestLifecycleContext;
+    requestLifecycleDriver?: RequestLifecycleDriver;
+    trackLifecycle?: boolean;
     path: string;
     method: string;
     body?: unknown;
@@ -119,6 +127,7 @@ interface FetchAIResponseClient {
     pinnedProvider?: boolean;
   }): Promise<Response>;
   getMode(): RoutstrClientMode;
+  getRequestLifecycleDriver?(): RequestLifecycleDriver | undefined;
 }
 
 export interface FetchAIResponseDeps {
@@ -157,7 +166,9 @@ export async function fetchAIResponse(
     headers,
   } = options;
 
+  const lifecycle = options.lifecycle ?? (options.trackLifecycle !== false ? await beginRequestLifecycle({ driver: options.requestLifecycleDriver ?? deps.client?.getRequestLifecycleDriver?.(), method: "POST", path: "/v1/chat/completions", modelId: options.modelId ?? options.selectedModel?.id, stream: true, mode: options.mode, logger: deps.logger }) : undefined);
   try {
+    await lifecycle?.updateRequest({ modelId: options.modelId ?? options.selectedModel?.id, stream: true });
     // ── Resolve selectedModel / baseUrl / mintUrl / client ────────────
     let selectedModel: Model;
     let baseUrl: string;
@@ -197,7 +208,7 @@ export async function fetchAIResponse(
         );
       }
 
-      const resolved = await resolveRequestContext({
+      const resolved = await awaitWithAbort(resolveRequestContext({
         modelId: options.modelId,
         forcedProvider: options.forcedProvider,
         // The caller's headers carry any x-routstr-model-path selector: it
@@ -219,7 +230,7 @@ export async function fetchAIResponse(
         providerManager: options.providerManager,
         usageTrackingDriver: options.usageTrackingDriver,
         sdkStore: options.sdkStore,
-      });
+      }), options.abortSignal);
 
       selectedModel = resolved.selectedModel;
       baseUrl = resolved.baseUrl;
@@ -267,6 +278,9 @@ export async function fetchAIResponse(
       : headers;
 
     const response = await client.routeRequest({
+      lifecycle,
+      requestLifecycleDriver: options.requestLifecycleDriver,
+      trackLifecycle: options.trackLifecycle,
       path: "/v1/chat/completions",
       method: "POST",
       body,
@@ -333,9 +347,8 @@ export async function fetchAIResponse(
     callbacks.onStreamingUpdate("");
     callbacks.onThinkingUpdate("");
 
-    // Await finalization so the SDK writes usage tracking to IndexedDB.
-    // This also sets response.requestId which we expose to the caller so
-    // they can look up the exact usage entry for this request.
+    // Preserve callback timing: await accounting after consuming the stream.
+    // The SDK UUID is available immediately, independently of upstream IDs.
     const sdkResponse = response as Response & {
       finalize?: () => Promise<number>;
       requestId?: string;
@@ -343,10 +356,9 @@ export async function fetchAIResponse(
     if (sdkResponse.finalize) {
       await sdkResponse.finalize();
     }
-    if (sdkResponse.requestId) {
-      callbacks.onRequestId?.(sdkResponse.requestId);
-    }
+
   } catch (error) {
+    await lifecycle?.finish({ outcome: options.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError") ? "aborted" : "failed", errorType: error instanceof Error ? error.name : "Error" });
     // User-initiated abort: surface as a clean cancellation, not an error.
     if (error instanceof DOMException && error.name === "AbortError") {
       callbacks.onStreamingUpdate("");
@@ -359,6 +371,7 @@ export async function fetchAIResponse(
     }
     handleError(error, callbacks, deps.alertLevel, deps.logger);
   } finally {
+    if (lifecycle) callbacks.onRequestId?.(lifecycle.requestId);
     callbacks.onPaymentProcessing?.(false);
   }
 }
