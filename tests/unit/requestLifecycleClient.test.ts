@@ -61,6 +61,49 @@ describe("client lifecycle terminal boundary", () => {
       "succeeded",
     ]);
   });
+  it("rewraps Fetch state without copying enumerable runtime symbols", async () => {
+    for (const streaming of [false, true]) {
+      const driver = createMemoryRequestLifecycleDriver();
+      const c = client();
+      c.requestLifecycleDriver = driver;
+      const runtimeState = Symbol("runtime-owned-response-state");
+      const original = new Response("payload", {
+        headers: {
+          "content-type": streaming ? "text/event-stream" : "application/json",
+          "x-routstr-request-id": "node-original",
+        },
+      });
+      // Node 22 exposes Fetch internal state as enumerable symbols. Model
+      // that boundary on every runtime, including ones with private slots.
+      Object.defineProperty(original, runtimeState, { enumerable: true, value: {} });
+      const accounting = vi.fn(async () => {
+        Object.assign(original, { upstreamResponseId: "gen-late", satsSpent: 7, usage: { totalTokens: 2 } });
+        return 7;
+      });
+      if (streaming) Object.assign(original, { finalize: accounting });
+      c._routeRequest = vi.fn(async () => original);
+      const response = await c.routeRequest(params);
+      expect(response.headers.get("x-routstr-sdk-request-id")).toBe(response.requestId);
+      expect(response.headers.get("x-routstr-request-id")).toBe("node-original");
+      expect(response.nodeRequestId).toBe("node-original");
+      expect(original.headers.has("x-routstr-sdk-request-id")).toBe(false);
+      expect(Object.hasOwn(response, runtimeState)).toBe(false);
+      expect(response.body.locked).toBe(false);
+      expect(response.bodyUsed).toBe(false);
+      if (streaming) {
+        expect(response.body).not.toBe(original.body);
+        await response.finalize();
+        expect(response.upstreamResponseId).toBe("gen-late");
+        expect(response.satsSpent).toBe(7);
+        expect(response.usage).toEqual({ totalTokens: 2 });
+        expect((await driver.getTrace(response.requestId))?.request.outcome).toBe("in_progress");
+      }
+      expect(await response.text()).toBe("payload");
+      await response.finalize?.();
+      expect((await driver.getTrace(response.requestId))?.request.outcome).toBe("succeeded");
+      if (streaming) expect(accounting).toHaveBeenCalled();
+    }
+  });
   it("finalizes passthrough errors without successful accounting or body mutation", async () => {
     const driver = createMemoryRequestLifecycleDriver();
     const c = client();

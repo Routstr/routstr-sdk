@@ -177,6 +177,40 @@ export interface RoutstrResponse extends Response {
   finalize?: () => Promise<number>;
 }
 
+/** Rebuild only Fetch state through the constructor and forward SDK metadata.
+ * Node 22 Response has enumerable internal symbols: Object.assign(target, source)
+ * copies those too, replacing target headers/body with the source's locked body.
+ * Never copy native Response properties or symbols across this boundary.
+ */
+function rewrapRoutstrResponse(
+  source: RoutstrResponse,
+  body: BodyInit | null,
+  headers: Headers
+): RoutstrResponse {
+  const target = new Response(body, {
+    status: source.status,
+    statusText: source.statusText,
+    headers,
+  }) as RoutstrResponse;
+  for (const key of [
+    "requestId", "nodeRequestId", "upstreamResponseId", "satsSpent", "usage",
+    "usageEntryId", "usagePromise", "baseUrl", "token", "selectedMintUrl",
+    "requestResponseLogId", "lifecycleAttemptId", "initialTokenBalanceInSats",
+    "initialTokenBalanceUnknown", "passthrough", "streamError",
+  ]) {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      enumerable: true,
+      get: () => (source as any)[key],
+      set: (value: unknown) => { (source as any)[key] = value; },
+    });
+  }
+  // finalize is deliberately independent: the client-facing wrapper adds a
+  // terminal-flush wait without replacing the inspector's accounting function.
+  if (source.finalize) target.finalize = source.finalize;
+  return target;
+}
+
 export interface RouteRequestParams {
   lifecycle?: RequestLifecycleContext;
   requestLifecycleDriver?: RequestLifecycleDriver;
@@ -417,8 +451,7 @@ export class RoutstrClient {
       const headers = new Headers(response.headers);
       headers.set("x-routstr-sdk-request-id", lifecycle.requestId);
       const original = response;
-      response = Object.assign(new Response(original.body, { status: original.status,
-        statusText: original.statusText, headers }), original) as RoutstrResponse;
+      response = rewrapRoutstrResponse(original, original.body, headers);
       const attemptId = ((original as any).lifecycleAttemptId ?? transportState.attemptId) as string | undefined;
       let terminal: Promise<void> | undefined;
       const finish = (outcome: "succeeded" | "failed" | "aborted", error?: unknown) => {
@@ -475,9 +508,7 @@ export class RoutstrClient {
         },
         async cancel(reason) { controller.abort(reason); await finish("aborted"); void reader.cancel(reason).catch(() => {}); },
       }, { highWaterMark: 0 });
-      response = Object.assign(new Response(stream, { status: original.status,
-        statusText: original.statusText, headers }), response) as RoutstrResponse;
-      Object.defineProperty(response, "upstreamResponseId", { configurable: true, enumerable: true, get: () => original.upstreamResponseId });
+      response = rewrapRoutstrResponse(original, stream, headers);
       const accounting = original.finalize;
       response.finalize = async () => { const value = await accounting?.() ?? 0; if (terminal) await terminal; return value; };
       params.signal?.addEventListener("abort", onAbort, { once: true });
