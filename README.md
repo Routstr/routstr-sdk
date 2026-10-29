@@ -178,3 +178,10 @@ projection and queries the newly configured author.
 `getModelIdMappingsEvent`, and `setModelIdMappingsEvent`. Persist the signed event
 and retain the parsed projection for synchronous routing. Missing methods produce
 an explicit initialization error rather than silently retaining static mappings.
+
+### Request lifecycle diagnostics
+
+Inference routing now exposes an SDK lifecycle UUID separately from node and
+upstream response IDs, with persistent request/attempt/event traces. See
+[request lifecycle tracking](./REQUEST_LIFECYCLE.md) for driver setup, daemon
+integration, retention, privacy, streaming finalization, and usage compatibility.

@@ -119,3 +119,5 @@ export const getDefaultDiscoveryAdapter = async (): Promise<DiscoveryAdapter> =>
 
 export const getDefaultStorageAdapter = async () =>
   createStorageAdapterFromStore(await getDefaultSdkStore());
+
+export * from "./requestLifecycle";

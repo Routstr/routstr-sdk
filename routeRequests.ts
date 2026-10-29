@@ -1,3 +1,5 @@
+import { awaitWithAbort } from "./client/abortable";
+import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecycleContext, type RequestLifecycleDriver } from "./storage/requestLifecycle";
 /**
  * routeRequests - SDK helper for routing OpenAI-compatible requests to the cheapest provider
  *
@@ -15,6 +17,7 @@ import { ModelManager } from "./discovery/ModelManager";
 import { ProviderManager } from "./client/ProviderManager";
 import {
   RoutstrClient,
+  type RoutstrResponse,
   type DebugLevel,
   type RequestResponseLogSink,
 } from "./client/RoutstrClient";
@@ -36,6 +39,10 @@ export type { ResolveContextInput, ResolvedContext };
  * Options for routeRequests function
  */
 export interface RouteRequestOptions {
+  requestLifecycleDriver?: RequestLifecycleDriver;
+  lifecycle?: RequestLifecycleContext;
+  signal?: AbortSignal;
+  trackLifecycle?: boolean;
   /** The model ID to route (e.g., "gpt-4o") */
   modelId: string;
   /** The request body to proxy to the provider */
@@ -221,21 +228,29 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
  */
 export async function routeRequests(
   options: RouteRequestOptions
-): Promise<Response> {
-  const {
-    client,
-    baseUrl,
-    mintUrl,
-    path,
-    headers,
-    modelId,
-    proxiedBody,
-    modelPath,
-    pinnedProvider,
-  } = await resolveRouteRequestContext(options);
-
+): Promise<RoutstrResponse> {
+  const lifecycle = options.lifecycle ?? (options.trackLifecycle !== false && shouldTrackRequestLifecycle("POST", options.path ?? "/v1/chat/completions")
+    ? await beginRequestLifecycle({ driver: options.requestLifecycleDriver ?? options.client?.getRequestLifecycleDriver(), method: "POST", path: options.path ?? "/v1/chat/completions", modelId: options.modelId, stream: extractStream(options.requestBody), mode: options.mode, logger: options.logger })
+    : undefined);
   try {
+    await lifecycle?.updateRequest({ modelId: options.modelId, stream: extractStream(options.requestBody) });
+    const {
+      client,
+      baseUrl,
+      mintUrl,
+      path,
+      headers,
+      modelId,
+      proxiedBody,
+      modelPath,
+      pinnedProvider,
+    } = await awaitWithAbort(resolveRouteRequestContext(options), options.signal);
+
     const response = await client.routeRequest({
+      lifecycle,
+      requestLifecycleDriver: options.requestLifecycleDriver,
+      trackLifecycle: options.trackLifecycle,
+      signal: options.signal,
       path,
       method: "POST",
       body: proxiedBody,
@@ -264,6 +279,8 @@ export async function routeRequests(
     // local 500 ("All providers failed").
     return response;
   } catch (error) {
+    await lifecycle?.finish({ outcome: options.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "aborted" : "failed", errorType: error instanceof Error ? error.name : "Error" });
+    if (error instanceof Error && lifecycle) Object.assign(error, { requestId: lifecycle.requestId });
     // Preserve typed SDK errors so callers (e.g. routstrd) can instanceof-check
     // them and map to the correct HTTP status (e.g. 402 for InsufficientBalanceError).
     if (error instanceof InsufficientBalanceError) {
@@ -275,7 +292,7 @@ export async function routeRequests(
     // in the body, since balance/error messages may contain digit sequences
     // like "4022.807" that would otherwise false-match "402".
     if (error instanceof Error && AUTH_STATUS_RE.test(error.message)) {
-      throw new Error(`Authentication failed: ${error.message}`);
+      throw Object.assign(new Error(`Authentication failed: ${error.message}`), { requestId: lifecycle?.requestId, nodeRequestId: (error as any).nodeRequestId });
     }
     throw error;
   }

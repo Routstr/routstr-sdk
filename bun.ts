@@ -61,3 +61,5 @@ export async function createDefaultBunSqliteDriver(
 ): Promise<StorageDriver> {
   return createBunSqliteDriverInternal(dbPath, options);
 }
+
+export { createBunSqliteRequestLifecycleDriver, type BunSqliteRequestLifecycleDriverOptions } from "./storage/requestLifecycle/bunSqlite";

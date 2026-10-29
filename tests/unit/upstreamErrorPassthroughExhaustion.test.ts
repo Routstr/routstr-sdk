@@ -1,3 +1,4 @@
+import { createMemoryRequestLifecycleDriver } from "../../storage/requestLifecycle";
 /**
  * L3: forward the last upstream envelope at failover exhaustion.
  *
@@ -134,6 +135,21 @@ function routeRequest(client: RoutstrClient) {
 }
 
 describe("L3 failover exhaustion forwards the last envelope", () => {
+  it("records real 400 failover recursion then 200 under a single SDK ID", async () => {
+    const { client, providerManager } = setup();
+    (providerManager as any).recordSuccess = vi.fn();
+    const driver = createMemoryRequestLifecycleDriver();
+    (client as any).requestLifecycleDriver = driver;
+    stubFetchByProvider({
+      [baseUrl]: { status: 400, statusText: "Bad Request", body: providerBody("A", "provider_error"), requestId: "node-A" },
+      [nextUrl]: { status: 200, statusText: "OK", body: "{}", requestId: "node-B" },
+    });
+    const response = await routeRequest(client);
+    const trace = await driver.getTrace(response.requestId!);
+    expect(trace?.request).toMatchObject({ outcome: "succeeded", attemptCount: 2, failoverCount: 1, retryCount: 0 });
+    expect(trace?.attempts.map(a => [a.httpStatus, a.nodeRequestId, a.kind])).toEqual([[400, "node-A", "initial"], [200, "node-B", "provider_failover"]]);
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
