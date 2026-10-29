@@ -111,7 +111,7 @@ SDK unit tests live in `sdk/__tests__` and are run with Vitest.
 
 - `sdk/__tests__/storageStore.test.ts` covers baseUrl normalization and token storage behaviors.
 - `sdk/__tests__/providerManagerPricing.test.ts` covers provider price ranking and model id normalization.
-- `sdk/__tests__/cashuSpender.test.ts` covers validation, token reuse, and insufficient balance handling.
+- `sdk/__tests__/cashuSpender.test.ts` covers validation and insufficient balance handling.
 - `sdk/__tests__/balanceManager.test.ts` covers refund/top-up validation and early returns.
 
 Run:

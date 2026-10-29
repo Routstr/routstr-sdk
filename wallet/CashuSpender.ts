@@ -36,9 +36,6 @@ export interface SpendOptions {
   /** The provider base URL (for token storage and provider mint checks) */
   baseUrl: string;
 
-  /** Whether to reuse an existing token if available */
-  reuseToken?: boolean;
-
   /** Optional P2PK public key */
   p2pkPubkey?: string;
 
@@ -239,7 +236,6 @@ export class CashuSpender {
       mintUrl,
       amount,
       baseUrl,
-      reuseToken = false,
       p2pkPubkey,
       excludeMints = [],
       retryCount = 0,
@@ -252,7 +248,6 @@ export class CashuSpender {
         mintUrl,
         amount,
         baseUrl,
-        reuseToken,
         p2pkPubkey,
         excludeMints,
         retryCount,
@@ -314,7 +309,6 @@ export class CashuSpender {
       mintUrl,
       amount,
       baseUrl,
-      reuseToken,
       p2pkPubkey,
       excludeMints,
       retryCount,
@@ -322,7 +316,7 @@ export class CashuSpender {
 
     this._log(
       "DEBUG",
-      `[CashuSpender] _spendInternal: amount=${amount}, mintUrl=${mintUrl}, baseUrl=${baseUrl}, reuseToken=${reuseToken}`
+      `[CashuSpender] _spendInternal: amount=${amount}, mintUrl=${mintUrl}, baseUrl=${baseUrl}`
     );
 
     // Validate amount
@@ -338,30 +332,6 @@ export class CashuSpender {
         balance: 0,
         error: "Please enter a valid amount",
       };
-    }
-
-    // Try to get existing token for reuse
-    if (reuseToken && baseUrl) {
-      this._log(
-        "DEBUG",
-        `[CashuSpender] _spendInternal: Attempting to reuse token for ${baseUrl}`
-      );
-      const existingResult = await this._tryReuseToken(
-        baseUrl,
-        adjustedAmount,
-        mintUrl
-      );
-      if (existingResult) {
-        this._log(
-          "DEBUG",
-          `[CashuSpender] _spendInternal: Successfully reused token, balance: ${existingResult.balance}`
-        );
-        return existingResult;
-      }
-      this._log(
-        "DEBUG",
-        `[CashuSpender] _spendInternal: Could not reuse token, will create new token`
-      );
     }
 
     // Get current balance state
@@ -485,72 +455,6 @@ export class CashuSpender {
         (selectedMintUrl ? units[selectedMintUrl] : units[mintUrl]) || "sat",
       selectedMintUrl: selectedMintUrl || mintUrl,
     };
-  }
-
-  /**
-   * Try to reuse an existing API key
-   */
-  private async _tryReuseToken(
-    baseUrl: string,
-    amount: number,
-    mintUrl: string
-  ): Promise<SpendResult | null> {
-    const apiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
-    if (!apiKeyEntry) return null;
-
-    // Get pending distribution to check balance
-    const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
-    const balanceForBaseUrl =
-      apiKeyDistribution.find((b) => b.baseUrl === baseUrl)?.amount || 0;
-
-    this._log("DEBUG", "Reusing API key", balanceForBaseUrl, amount);
-
-    if (balanceForBaseUrl > amount) {
-      const units = this.walletAdapter.getMintUnits();
-      const unit = units[mintUrl] || "sat";
-      return {
-        token: apiKeyEntry.key,
-        status: "success",
-        balance: balanceForBaseUrl,
-        unit,
-      };
-    }
-
-    // API key exists but insufficient balance - attempt topup
-    if (this.balanceManager) {
-      const topUpAmount = Math.ceil(amount * 1.2 - balanceForBaseUrl);
-      const topUpResult = await this.balanceManager.topUp({
-        mintUrl,
-        baseUrl,
-        amount: topUpAmount,
-        token: apiKeyEntry.key,
-      });
-      this._log("DEBUG", "TOPUP ", topUpResult);
-
-      if (topUpResult.success && topUpResult.toppedUpAmount) {
-        const newBalance = balanceForBaseUrl + topUpResult.toppedUpAmount;
-        const units = this.walletAdapter.getMintUnits();
-        const unit = units[mintUrl] || "sat";
-
-        return {
-          token: apiKeyEntry.key,
-          status: "success",
-          balance: newBalance,
-          unit,
-        };
-      }
-
-      const providerBalance = await this._getProviderTokenBalance(
-        baseUrl,
-        apiKeyEntry.key
-      );
-      this._log("DEBUG", providerBalance);
-      if (providerBalance <= 0) {
-        this.storageAdapter.removeApiKey(baseUrl);
-      }
-    }
-
-    return null;
   }
 
   /**
@@ -1004,26 +908,5 @@ export class CashuSpender {
         maxMintUrl,
       },
     };
-  }
-
-  private async _getProviderTokenBalance(
-    baseUrl: string,
-    token: string
-  ): Promise<number> {
-    try {
-      const response = await fetch(`${baseUrl}v1/wallet/info`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return getBalanceInSats(data.balance, "msat");
-      }
-    } catch {
-      return 0;
-    }
-    return 0;
   }
 }

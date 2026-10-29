@@ -86,36 +86,6 @@ describe("CashuSpender", () => {
     expect(result).toMatchObject({ success: false, amount: 7, unit: "msat" });
   });
 
-  it("reuses stored API key when pending balance is sufficient", async () => {
-    const spender = new CashuSpender(
-      createWallet({
-        getMintUnits: () => ({ "https://mint.example.com": "sat" }),
-      }),
-      createStorage({
-        getApiKey: () => ({
-          key: "stored-api-key",
-          baseUrl: "https://provider.example.com/",
-          balance: 42,
-          lastUsed: null,
-        }),
-        getApiKeyDistribution: () => [
-          { baseUrl: "https://provider.example.com", amount: 42 },
-        ],
-      })
-    );
-
-    const result = await spender.spend({
-      mintUrl: "https://mint.example.com",
-      amount: 10,
-      baseUrl: "https://provider.example.com",
-      reuseToken: true,
-    });
-
-    expect(result.status).toBe("success");
-    expect(result.token).toBe("stored-api-key");
-    expect(result.balance).toBe(42);
-  });
-
   it("returns insufficient balance error with available total", async () => {
     const spender = new CashuSpender(
       createWallet({
