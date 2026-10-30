@@ -235,6 +235,22 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(response.status).toBe(400);
   });
 
+  it.each([
+    [401, "upstream", false],
+    [429, "upstream", false],
+    [401, "node", true],
+  ])("on a %i scoped to the %s, refunding the key is %s", async (status, scope, refunds) => {
+    const { client, providerManager, refund } = setup();
+    const body = JSON.stringify({ error: { type: "upstream_error", message: `failed with ${status}` } });
+    const headers = scope === "upstream" ? { "x-routstr-error-scope": "upstream" } : undefined;
+    const fetchMock = stubFetch({ status, statusText: "Failed", body, headers }, okResponse());
+    const response = await routeRequest(client);
+    expect(refund).toHaveBeenCalledTimes(refunds ? 1 : 0);
+    expect(providerManager.markFailed).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(response.status).toBe(200);
+  });
+
   it.each([400, 422])("keeps the key and retries on upstream %i, returning success from the next node", async (status) => {
     const { client, providerManager, refund, spend } = setup();
     const fetchMock = stubFetch({ status, statusText: "Rejected", body: webSearchOptionsBody }, okResponse());
