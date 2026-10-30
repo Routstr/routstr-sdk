@@ -896,11 +896,11 @@ export class BalanceManager {
       let fundedOutsideBalance = 0;
       for (const url in balances) {
         const balanceInSats = getBalanceInSats(balances[url], units[url]);
-        if (balanceInSats > maxBalance) {
+        const accepted = !supportedMintsOnly || providerMints.includes(url);
+        if (accepted && !excludeMints.includes(url) && balanceInSats > maxBalance) {
           maxBalance = balanceInSats;
           maxMintUrl = url;
         }
-        const accepted = !supportedMintsOnly || providerMints.includes(url);
         if (accepted) {
           if (balanceInSats > acceptableMaxBalance) {
             acceptableMaxBalance = balanceInSats;
