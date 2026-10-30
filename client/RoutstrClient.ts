@@ -148,6 +148,24 @@ function forwardableErrorHeaders(headers: Headers): Record<string, string> {
   return captured;
 }
 
+function hasImageInput(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const { messages, input } = body as Record<string, unknown>;
+  const isImage = (part: unknown): boolean => {
+    if (!part || typeof part !== "object") return false;
+    const { type } = part as Record<string, unknown>;
+    return type === "image" || type === "image_url" || type === "input_image";
+  };
+  return [messages, input].some((items) =>
+    Array.isArray(items) && items.some((item: unknown) => {
+      if (isImage(item)) return true;
+      if (!item || typeof item !== "object") return false;
+      const { content } = item as Record<string, unknown>;
+      return Array.isArray(content) && content.some(isImage);
+    })
+  );
+}
+
 /** Floor for proactive topup amounts as a fraction of the request price,
  *  mirroring the 402 handler's heuristic. */
 const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
@@ -1462,7 +1480,13 @@ export class RoutstrClient {
       `[RoutstrClient] _handleErrorResponse: status=${status}, baseUrl=${baseUrl}, mode=${this.mode}, token=${REDACTED_CREDENTIAL}, requestId=${resolvedRequestId}, errorType=${parsedError.type ?? "unknown"}, errorCode=${parsedError.code ?? "unknown"}, errorMessage=${errorMessage}`
     );
 
-    const upstreamRequestError = isUpstreamRequestError(status, parsedError);
+    // Missing metadata also takes this protective fallback. This is a heuristic:
+    // unrelated 404s can match, while advertised image support keeps normal handling.
+    const upstreamRequestError =
+      isUpstreamRequestError(status, parsedError) ||
+      (status === 404 &&
+        hasImageInput(body) &&
+        !selectedModel?.architecture?.input_modalities?.includes("image"));
     const unknownPathError = isUnknownPathError(status, parsedError);
     const aggregateFailure = upstreamRequestError || status >= 500 ||
       status === 424 || status === 429 || status === -1;
