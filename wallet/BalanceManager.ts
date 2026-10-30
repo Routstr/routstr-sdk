@@ -113,6 +113,9 @@ export interface BalanceState {
  */
 const walletSendQueues = new WeakMap<WalletAdapter, Promise<unknown>>();
 
+const RATE_LIMITED_MINT_SKIP_MS = 60_000;
+const rateLimitedMints = new WeakMap<WalletAdapter, Map<string, number>>();
+
 function runWalletSend<T>(
   walletAdapter: WalletAdapter,
   send: () => Promise<T>
@@ -673,11 +676,16 @@ export class BalanceManager {
     let requestId: string | undefined;
 
     try {
+      const now = Date.now();
+      const rateLimited = [...(rateLimitedMints.get(this.walletAdapter) ?? [])]
+        .filter(([key, until]) => until > now && key.startsWith(`${baseUrl}|`))
+        .map(([key]) => key.slice(baseUrl.length + 1))
+        .filter((mint) => !excludeMints.includes(mint));
       const tokenResult = await this.createProviderToken({
         mintUrl,
         baseUrl,
         amount,
-        excludeMints,
+        excludeMints: [...excludeMints, ...rateLimited],
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -720,6 +728,16 @@ export class BalanceManager {
         }
         if (recoveredToken || !canRecover) {
           this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+        }
+
+        if (
+          tokenResult.selectedMintUrl &&
+          topUpResult.parsedError?.type === CoreErrorType.MINT_RATE_LIMITED
+        ) {
+          const skip = rateLimitedMints.get(this.walletAdapter) ?? new Map();
+          const skipMs = topUpResult.retryAfterSeconds ? topUpResult.retryAfterSeconds * 1000 : RATE_LIMITED_MINT_SKIP_MS;
+          skip.set(`${baseUrl}|${tokenResult.selectedMintUrl}`, Date.now() + skipMs);
+          rateLimitedMints.set(this.walletAdapter, skip);
         }
 
         // A foreign-mint swap failure / untrusted source mint can be retried
@@ -1161,6 +1179,7 @@ export class BalanceManager {
     requestId?: string;
     error?: string;
     parsedError?: ParsedCoreError;
+    retryAfterSeconds?: number;
   }> {
     if (!baseUrl) {
       return {
@@ -1223,6 +1242,7 @@ export class BalanceManager {
           requestId: resolvedRequestId,
           error: conciseDetail,
           parsedError,
+          retryAfterSeconds: Number(response.headers.get("retry-after")) || undefined,
         };
       }
 
