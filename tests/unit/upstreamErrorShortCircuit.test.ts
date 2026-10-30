@@ -35,7 +35,7 @@ const tokenAlreadySpentBody = JSON.stringify({
   },
 });
 
-function setup(mode: "apikeys" | "xcashu" = "apikeys") {
+function setup(mode: "apikeys" | "xcashu" = "apikeys", selectedModel: Model = model) {
   const paymentToken = mode === "xcashu" ? "cashu-original" : credential;
   const logger: SdkLogger = {
     log: () => {},
@@ -69,7 +69,7 @@ function setup(mode: "apikeys" | "xcashu" = "apikeys") {
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([baseUrl]),
     findNextBestProvider: vi.fn((_model, current, attempted) => current === baseUrl && !attempted?.has(nextUrl) ? nextUrl : null),
-    getModelForProvider: vi.fn(async () => model),
+    getModelForProvider: vi.fn(async () => selectedModel),
     getRequiredSatsForModel: vi.fn(() => 100),
   };
   const client = new RoutstrClient(
@@ -245,16 +245,71 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(response.status).toBe(200);
   });
 
-  it("keeps the key and the model on a 404 for an image sent to a text-only model", async () => {
-    const { client, providerManager, refund } = setup();
-    const fetchMock = stubFetch({ status: 404, statusText: "Not Found", body: JSON.stringify({ error: { type: "upstream_error", message: "No endpoints found that support image input" } }) }, okResponse());
+  const imageRejection = {
+    status: 404,
+    statusText: "Not Found",
+    body: JSON.stringify({ error: { type: "upstream_error", message: "No endpoints found that support image input" } }),
+  };
+  const withModalities = (input_modalities: string[]): Model => ({
+    ...model,
+    architecture: { modality: "text", input_modalities, output_modalities: ["text"], tokenizer: "test", instruct_type: null },
+  });
+  const imageRequests = [
+    { path: "/v1/messages", body: { messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] }] } },
+    { path: "/v1/chat/completions", body: { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }] }] } },
+    { path: "/v1/responses", body: { input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }] }] } },
+    { path: "/v1/responses", body: { input: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }] } },
+  ];
+
+  describe.each([
+    { metadata: "explicit text-only metadata", selectedModel: withModalities(["text"]) },
+    { metadata: "missing metadata", selectedModel: model },
+  ])("image 404 with $metadata", ({ selectedModel }) => {
+    it.each(imageRequests)("keeps the key and model available for $path ($body)", async ({ path, body }) => {
+      const { client, providerManager, refund } = setup("apikeys", selectedModel);
+      const fetchMock = stubFetch(imageRejection, okResponse());
+      const response = await client.routeRequest({
+        path, method: "POST", baseUrl, mintUrl, modelId: model.id, headers: {},
+        body: { model: model.id, ...body },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(refund).not.toHaveBeenCalled();
+      expect(providerManager.markFailed).not.toHaveBeenCalled();
+      expect(response.status).toBe(200);
+    });
+
+    it("preserves the upstream diagnostic when every node rejects the image", async () => {
+      const { client, providerManager, refund } = setup("apikeys", selectedModel);
+      const fetchMock = stubFetch(imageRejection);
+      const response = await client.routeRequest({
+        ...imageRequests[0], method: "POST", baseUrl, mintUrl, modelId: model.id,
+        body: { model: model.id, ...imageRequests[0].body },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(refund).not.toHaveBeenCalled();
+      expect(providerManager.markFailed).not.toHaveBeenCalled();
+      expect(response.status).toBe(404);
+      expect((await response.json()).error.errors).toEqual([{
+        status: 404, type: "upstream_error", message: "No endpoints found that support image input",
+        providers: [baseUrl, nextUrl],
+      }]);
+    });
+  });
+
+  it.each([
+    { scenario: "a plain-text request", selectedModel: withModalities(["text"]), body: { messages: [{ role: "user", content: "hi" }] } },
+    { scenario: "an image request with advertised image support", selectedModel: withModalities(["text", "image"]), body: imageRequests[0].body },
+  ])("still refunds and cools down on a 404 for $scenario", async ({ selectedModel, body }) => {
+    const { client, providerManager, refund } = setup("apikeys", selectedModel);
+    const fetchMock = stubFetch(imageRejection, okResponse());
     const response = await client.routeRequest({
-      path: "/v1/messages", method: "POST", baseUrl, mintUrl, modelId: model.id, headers: {},
-      body: { model: model.id, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] }] },
+      path: "/v1/messages", method: "POST", baseUrl, mintUrl, modelId: model.id,
+      body: { model: model.id, ...body },
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(refund).not.toHaveBeenCalled();
-    expect(providerManager.markFailed).not.toHaveBeenCalled();
+    expect(refund).toHaveBeenCalledTimes(1);
+    expect(providerManager.markFailed).toHaveBeenCalledTimes(1);
+    expect(providerManager.markFailed.mock.calls[0][0]).toBe(baseUrl);
     expect(response.status).toBe(200);
   });
 
