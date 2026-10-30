@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { BalanceManager } from "../../wallet/BalanceManager";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 
@@ -1113,5 +1113,118 @@ describe("BalanceManager empty-refund cleanup", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe("refundApiKey parks the refund token before receiving it", () => {
+  const MINT = "https://mint.example.com";
+  const NODE_A = "https://a.example.com/";
+  const NODE_B = "https://b.example.com/";
+  const originalFetch = globalThis.fetch;
+
+  type Cached = ReturnType<StorageAdapter["getCachedReceiveTokens"]>;
+
+  const setup = (
+    receiveToken: WalletAdapter["receiveToken"],
+    onRefund?: (url: string) => void
+  ) => {
+    let cached: Cached = [];
+    const storage: StorageAdapter = {
+      ...createStatefulStorage({
+        apiKeys: {
+          [NODE_A]: { key: "key-a", balance: 0, lastUsed: null },
+          [NODE_B]: { key: "key-b", balance: 0, lastUsed: null },
+        },
+      }),
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (tokens) => {
+        cached = tokens;
+      },
+    };
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      onRefund?.(url);
+      const token = url.startsWith(NODE_A) ? "refund-a" : "refund-b";
+      return new Response(JSON.stringify({ token }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    const manager = new BalanceManager(createWallet({ receiveToken }), storage);
+    const refund = (baseUrl: string, apiKey: string) =>
+      manager.refundApiKey({ mintUrl: MINT, baseUrl, apiKey, forceRefund: true });
+    return { storage, refund, parked: () => cached.map((entry) => entry.token) };
+  };
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it.each([
+    [
+      "a mint 429 returned as a failure",
+      async () => ({ success: false, amount: 0, unit: "sat" as const, message: "429 Too Many Requests" }),
+    ],
+    [
+      "an unreachable mint",
+      async () => {
+        throw new Error("Failed to fetch mint");
+      },
+    ],
+    [
+      "a token the mint reports already spent",
+      async () => {
+        throw new Error("Token already spent");
+      },
+    ],
+  ])("drops the spent key and parks the token after %s", async (_, receiveToken) => {
+    const { storage, refund, parked } = setup(receiveToken);
+
+    const result = await refund(NODE_A, "key-a");
+
+    expect(result.success).toBe(false);
+    expect(storage.getApiKey(NODE_A)).toBeNull();
+    expect(parked()).toEqual(["refund-a"]);
+  });
+
+  it("unparks the token once the receive succeeds", async () => {
+    const { storage, refund, parked } = setup(async () => ({
+      success: true,
+      amount: 100,
+      unit: "sat",
+    }));
+
+    const result = await refund(NODE_A, "key-a");
+
+    expect(result.success).toBe(true);
+    expect(storage.getApiKey(NODE_A)).toBeNull();
+    expect(parked()).toEqual([]);
+  });
+
+  it("keeps a key that replaced the refunded one while the refund was in flight", async () => {
+    let storage: StorageAdapter | undefined;
+    const ctx = setup(
+      async () => ({ success: false, amount: 0, unit: "sat", message: "429 Too Many Requests" }),
+      () => storage?.setApiKey(NODE_A, "key-a2")
+    );
+    storage = ctx.storage;
+
+    await ctx.refund(NODE_A, "key-a");
+
+    expect(ctx.storage.getApiKey(NODE_A)?.key).toBe("key-a2");
+    expect(ctx.parked()).toEqual(["refund-a"]);
+  });
+
+  it("keeps both tokens when two refunds fail to receive at the same time", async () => {
+    const { storage, refund, parked } = setup(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      throw new Error("Failed to fetch mint");
+    });
+
+    await Promise.all([refund(NODE_A, "key-a"), refund(NODE_B, "key-b")]);
+
+    expect(storage.getApiKey(NODE_A)).toBeNull();
+    expect(storage.getApiKey(NODE_B)).toBeNull();
+    expect(parked().sort()).toEqual(["refund-a", "refund-b"]);
   });
 });
