@@ -41,6 +41,7 @@ export type { ResolveContextInput, ResolvedContext };
 export interface RouteRequestOptions {
   requestLifecycleDriver?: RequestLifecycleDriver;
   lifecycle?: RequestLifecycleContext;
+  /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
   trackLifecycle?: boolean;
   /** The model ID to route (e.g., "gpt-4o") */
