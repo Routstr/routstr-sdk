@@ -845,7 +845,6 @@ export class BalanceManager {
       (sum, value) => sum + value,
       0
     );
-    const targetProviderBalance = balanceState.providerBalances[baseUrl] || 0;
     const refundableProviderBalance = Object.entries(
       balanceState.providerBalances
     )
@@ -853,9 +852,8 @@ export class BalanceManager {
       .reduce((sum, [, value]) => sum + value, 0);
 
     if (
-      totalMintBalance + targetProviderBalance < adjustedAmount &&
-      totalMintBalance + targetProviderBalance + refundableProviderBalance >=
-        adjustedAmount &&
+      totalMintBalance < adjustedAmount &&
+      totalMintBalance + refundableProviderBalance >= adjustedAmount &&
       retryCount < 3
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
@@ -865,10 +863,10 @@ export class BalanceManager {
       });
     }
 
-    if (totalMintBalance + targetProviderBalance < adjustedAmount) {
+    if (totalMintBalance < adjustedAmount) {
       const error = new InsufficientBalanceError(
         adjustedAmount,
-        totalMintBalance + targetProviderBalance,
+        totalMintBalance,
         totalMintBalance,
         Object.entries(balanceState.mintBalances).reduce(
           (max, [url, balance]) =>
@@ -876,7 +874,7 @@ export class BalanceManager {
           { url: "", balance: 0 }
         ).url
       );
-      this.logger.error(`createProviderToken: insufficient balance required=${adjustedAmount} available=${totalMintBalance + targetProviderBalance} totalMint=${totalMintBalance} targetProvider=${targetProviderBalance}`);
+      this.logger.error(`createProviderToken: insufficient balance required=${adjustedAmount} available=${totalMintBalance}`);
       return { success: false, error: error.message };
     }
 
