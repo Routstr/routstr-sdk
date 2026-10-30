@@ -3316,7 +3316,6 @@ export class RoutstrClient {
           mintUrl: mintUrl,
           amount: initialAmount,
           baseUrl,
-          reuseToken: false,
           excludeMints,
         });
 
@@ -3479,7 +3478,6 @@ export class RoutstrClient {
       mintUrl,
       amount,
       baseUrl,
-      reuseToken: false,
       excludeMints,
     });
 
