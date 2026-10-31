@@ -80,13 +80,18 @@ describe("streamed confidential response finalization", () => {
       headers: {},
     });
     expect((response as any).confidentialSettled).toBe(settled);
-    await response.text();
+    // The stream ends only after the accounting, so neither the body nor
+    // finalize() completes before the settlement.
+    let ended = false;
     let finalized = false;
+    const body = response.text().then(() => (ended = true));
     const done = (response as any).finalize().then(() => (finalized = true));
     await new Promise((r) => setTimeout(r, 20));
+    expect(ended).toBe(false);
     expect(finalized).toBe(false);
     expect(balanceUpdate).not.toHaveBeenCalled();
     settle();
+    await body;
     await done;
     expect(balanceUpdate).toHaveBeenCalledTimes(1);
   });
