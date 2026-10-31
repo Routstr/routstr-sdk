@@ -221,6 +221,8 @@ function rewrapRoutstrResponse(
     "usageEntryId", "usagePromise", "baseUrl", "token", "selectedMintUrl",
     "requestResponseLogId", "lifecycleAttemptId", "initialTokenBalanceInSats",
     "initialTokenBalanceUnknown", "passthrough", "streamError",
+    // A confidential session's settlement (receipt check and xcashu change).
+    "confidentialSettled",
   ]) {
     Object.defineProperty(target, key, {
       configurable: true,
