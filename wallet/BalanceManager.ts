@@ -445,8 +445,11 @@ export class BalanceManager {
         };
       }
 
+      const refundToken = fetchResult.token;
+      this.cashuSpender.cacheReceiveToken(refundToken);
       const receiveResult = await this.cashuSpender.receiveToken(
-        fetchResult.token
+        refundToken,
+        false
       );
       const totalAmountMsat =
         receiveResult.unit === "msat"
@@ -454,15 +457,20 @@ export class BalanceManager {
           : receiveResult.amount * 1000;
 
       if (receiveResult.success) {
-        // The refunded key is spent; a replacement stored while the request
-        // was in flight is not.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
-          this.storageAdapter.removeApiKey(baseUrl);
-        }
+        this.storageAdapter.setCachedReceiveTokens(
+          this.storageAdapter
+            .getCachedReceiveTokens()
+            .filter((entry) => entry.token !== refundToken)
+        );
       } else {
         this.logger.warn(
-          `refundApiKey: receive failed for ${baseUrl}; keeping API key. message=${receiveResult.message ?? "none"}`
+          `refundApiKey: receive failed for ${baseUrl}; refund token kept for recovery. message=${receiveResult.message ?? "none"}`
         );
+      }
+      // The refunded key is spent; a replacement stored while the request
+      // was in flight is not.
+      if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        this.storageAdapter.removeApiKey(baseUrl);
       }
 
       return {
