@@ -24,6 +24,7 @@ export {
   deepSeekModelPathHeaders,
   clearModelPathsCache,
   sameNode,
+  sameNodeUrl,
   isWhitelistedDeepSeekModelPath,
   whitelistedDeepSeekRoute,
   fetchModelPaths,

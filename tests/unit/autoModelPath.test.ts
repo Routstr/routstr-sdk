@@ -4,6 +4,7 @@ import {
   DEEPSEEK_AUTO_NODE_URLS,
   MODEL_PATH_HEADER,
   clearModelPathsCache,
+  sameNodeUrl,
 } from "../../utils/modelPaths";
 import { ProviderManager } from "../../client/ProviderManager";
 import { MODEL_PATH_BOOTSTRAP, type ModelPathWhitelist } from "../../core/modelPathWhitelist";
@@ -488,6 +489,24 @@ describe("runtime model-path policies", () => {
     expect((await manager.warmModelPathCaches()).filter(r => !r.reason).map(r => r.baseUrl)).toEqual([`${NODE_A}/`]);
     await expect(resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
       forcedProvider: NODE_B, autoModelPath: true, ...deps })).rejects.toThrow();
+  });
+
+  it("folds host case in the forced-node allowlist but keeps path case", async () => {
+    // Same node, spelled with an upper-cased host only: the policy entry still
+    // matches, so the request is pinned on the node's own advertised selector.
+    const hostCaseNode = `https://${new URL(NODE_A).host.toUpperCase()}`;
+    expect(hostCaseNode).not.toBe(NODE_A);
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({
+      [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [hostCaseNode] },
+    });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.modelPath?.selector).toBe(DEEPSEEK_SELECTOR);
+    expect(sameNodeUrl("HTTPS://AI.REDSH1FT.COM/", `${NODE_A}/`)).toBe(true);
+    expect(sameNodeUrl("https://x.example/Approved/", "https://x.example/approved/")).toBe(false);
+    expect(sameNodeUrl("not a url", null)).toBe(false);
   });
 
   it("forced allowlists preserve provider path and query case", async () => {

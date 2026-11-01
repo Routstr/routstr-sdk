@@ -75,7 +75,11 @@ export interface FetchOptions {
   maxTokens?: number;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
-  /** Opt into automatic DeepSeek V4.1 Flash model-path selection for auto-discovery. Defaults to false; explicit path headers still work. */
+  /**
+   * Opt into automatic model-path selection for auto-discovered providers.
+   * Defaults to false; explicit path headers still work. Applies to the models
+   * the active policy snapshot covers.
+   */
   autoModelPath?: boolean;
   /**
    * Optional secret scoping Tinfoil's prompt cache for this request. Prefer a

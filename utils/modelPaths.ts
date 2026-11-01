@@ -742,7 +742,7 @@ export function getNodeModelPathsForModel(
 }
 
 
-/** True when two base URLs point at the same node. */
+/** True when two base URLs point at the same node, ignoring URL case. */
 export function sameNode(
   a?: string | null,
   b?: string | null
@@ -751,4 +751,37 @@ export function sameNode(
   const right = normalizeProviderUrl(b);
   if (!left || !right) return false;
   return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * URL-canonical form of a node URL for identity comparisons: host case and
+ * default ports are folded by the URL parser, while path, query and fragment
+ * case are preserved (they are case-sensitive on the wire, so `/Approved/`
+ * and `/approved/` are different upstreams). Never throws: a relative or
+ * otherwise unparsable input falls back to plain provider normalization, and
+ * an unusable input yields null so callers compare false.
+ */
+export function canonicalNodeUrl(url?: string | null): string | null {
+  if (!url || typeof url !== "string" || !url.trim()) return null;
+  try {
+    return normalizeProviderUrl(new URL(url).href);
+  } catch {
+    return normalizeProviderUrl(url);
+  }
+}
+
+/**
+ * True when two node URLs name the same node, by canonicalNodeUrl identity.
+ * Unlike sameNode this keeps path/query case significant, which is what a
+ * policy's node allowlist has to compare on (`/Approved/` is not `/approved/`,
+ * but `https://AI.example/` is `https://ai.example/`).
+ */
+export function sameNodeUrl(
+  a?: string | null,
+  b?: string | null
+): boolean {
+  const left = canonicalNodeUrl(a);
+  const right = canonicalNodeUrl(b);
+  if (!left || !right) return false;
+  return left === right;
 }

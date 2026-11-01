@@ -6,8 +6,7 @@
  * and build a RoutstrClient without duplicating the pipeline.
  */
 
-import { normalizeProviderUrl } from "../utils/torUtils";
-import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor, type ModelPathWhitelist } from "../core/modelPathWhitelist";
+import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor } from "../core/modelPathWhitelist";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -17,7 +16,7 @@ import type {
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
 import { WARM_COST_BASKET } from "./costEstimate";
-import { canonicalizeModelId, findModelForId, type ModelIdMappings } from "../core/modelMappings";
+import { canonicalizeModelId, findModelForId } from "../core/modelMappings";
 import {
   RoutstrClient,
   type DebugLevel,
@@ -29,6 +28,7 @@ import {
   getNodeModelPathsForModel,
   MODEL_PATH_HEADER,
   resolveModelPathSelectors,
+  sameNodeUrl,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 
@@ -39,17 +39,6 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
   );
 }
 
-/**
- * True when a requested model id names the auto-selected model in any
- * spelling: the canonical id, a case variant of it, or a mapped variant such
- * as "deepseek-v4-1-flash" (see MODEL_ID_MAPPINGS). Without canonicalizing
- * first, asking for the mapped spelling silently disabled auto model-path
- * selection while still routing to the same model.
- */
-function isAutoModelPathModel(id: string, whitelist: ModelPathWhitelist, mappings?: ModelIdMappings): boolean {
-  return modelPathPolicyFor(id, whitelist, mappings) !== undefined;
-}
-
 export interface ResolveContextInput {
   /** The model ID to route (e.g., "gpt-4o"). Required for auto-discovery. */
   modelId: string;
@@ -58,7 +47,13 @@ export interface ResolveContextInput {
   /** Optional: caller-supplied request headers (an x-routstr-model-path
    * header here suppresses the SDK's automatic model-path pinning). */
   inputHeaders?: Record<string, string>;
-  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; caller-supplied path headers still work. */
+  /**
+   * Opt into automatic model-path selection. Defaults to false; caller-supplied
+   * `x-routstr-model-path` headers still work.
+   *
+   * The flag gates the feature; the active policy snapshot decides which models
+   * it covers. A model with no policy entry routes as before.
+   */
   autoModelPath?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
@@ -258,19 +253,18 @@ export async function resolveRequestContext(
     baseUrl = normalizedProvider;
     selectedModel = match;
 
-    // Forcing one of the auto-selection nodes still pins the model path on
-    // that node: the selector is resolved from that node's own advertised
-    // paths, so the node is guaranteed to accept it.
+    // Forcing a policy node still pins the model path on that node: the
+    // selector is resolved from that node's own advertised paths, so the node
+    // is guaranteed to accept it. An absent/empty node allowlist admits every
+    // node; a listed node is matched by canonical URL identity (sameNodeUrl),
+    // which folds host case but keeps path/query case significant.
     if (
       autoModelPath === true &&
       !hasModelPathHeader(inputHeaders) &&
       typeof modelId === "string" &&
-      isAutoModelPathModel(
-        modelId, whitelist, mappings
-      ) && policy &&
-      (!policy.nodes?.length || policy.nodes.some(nodeUrl =>
-        normalizeProviderUrl(new URL(nodeUrl).href) ===
-        normalizeProviderUrl(new URL(normalizedProvider).href)))
+      policy &&
+      (!policy.nodes?.length ||
+        policy.nodes.some((nodeUrl) => sameNodeUrl(nodeUrl, normalizedProvider)))
     ) {
       const nodePaths = await getNodeModelPathsForModel(
         normalizedProvider,
@@ -309,9 +303,7 @@ export async function resolveRequestContext(
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
-    isAutoModelPathModel(
-      modelId, whitelist, mappings
-    )
+    policy !== undefined
   ) {
     // "Get baseUrl for model path": rank the whitelisted auto-selection
     // nodes by their per-route price and pin the best candidate's selector.
