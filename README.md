@@ -190,11 +190,19 @@ is a complete replacement, for example:
 {"version":1,"models":{"canonical-model-id":{"routes":[{"url":"https://upstream.example/v1"}],"nodes":["https://node.example"]}}}
 ```
 
-Route order defines preference. Optional `nodes` restricts/prioritizes the enabled
-discovered set; omitted or empty means any eligible node advertising a matching route.
-Only the target node's verbatim advertised selector is sent. Forcing a provider keeps
-requests on that provider, whether auto-pinning succeeds or not. Metadata-less routes
-retain existing model-level pricing/deposit fallback behavior.
+This is a **routing preference, not an egress control**: when no listed node or route
+is usable, the request degrades to the ordinary price ranking and the node picks its own
+upstream. The policy shapes which routes the SDK prefers; it does not fence traffic.
+
+Ranking is **route-major**: each advertised whitelisted route is a candidate, ordered by
+its own warm-basket cost, so a cheaper route on another node outranks an expensive route
+on the cheapest node. Route order only breaks exact ties within a node. Optional `nodes`
+restricts/prioritizes the enabled discovered set and supplies the tiebreak between
+equal-cost routes; omitted or empty means any eligible node advertising a matching route
+and ties fall back to URL order. Only the target node's verbatim advertised selector is
+sent. Forcing a provider keeps requests on that provider, whether auto-pinning succeeds
+or not. Metadata-less routes retain existing model-level pricing/deposit fallback
+behavior.
 
 `{"models":{}}` is a persistent kill switch. No valid snapshot on a fresh offline install
 uses the bundled bootstrap policy; invalid events or relay outages retain the last good

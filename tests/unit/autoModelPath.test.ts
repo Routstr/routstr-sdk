@@ -533,7 +533,7 @@ describe("runtime model-path policies", () => {
     expect(ctx.modelPath?.selector).toBe(selector);
     expect(ctx.pinnedProvider).toBe(true);
     const manager = new ProviderManager(deps.discoveryAdapter);
-    expect((await manager.getModelPathProviderRanking("Canonical"))[0].selectors).toEqual([selector]);
+    expect((await manager.getModelPathProviderRanking("Canonical"))[0].selector).toBe(selector);
   });
 
   it("kill switch prevents ranking and warming HTTP, even with explicit modelIds", async () => {
@@ -570,9 +570,15 @@ describe("runtime model-path policies", () => {
       [`${NODE_A}/`, DEEPSEEK_AUTO_MODEL_ID, 1], [`${NODE_A}/`, "second-model", 1], [`${NODE_B}/`, "second-model", 1],
     ]);
     const ranking = await manager.getModelPathProviderRanking("second-model", { torMode: false });
+    // One candidate per (node, route): the empty `nodes` list fans out to both
+    // cached nodes, and each contributes the one route it advertises.
     expect(ranking).toHaveLength(2);
-    expect(ranking[0].selectors).toEqual([secondSelector]);
-    expect(ranking[0].satsPricing).toEqual([null]); // existing metadata-less fallback
+    expect(ranking.map((c) => `${c.baseUrl} ${c.selector}`)).toEqual([
+      `${NODE_A}/ ${secondSelector}`,
+      `${NODE_B}/ ${secondSelector}`,
+    ]);
+    // Existing metadata-less fallback: null pricing ranks on the model aggregate.
+    expect(ranking[0].satsPricing).toBeNull();
     whitelist = { "second-model": { routes: [{ url: "https://second-upstream.example/v1" }], nodes: [NODE_B] } };
     fetch.mockClear();
     expect((await manager.warmModelPathCaches({ torMode: false })).map(r => r.baseUrl)).toEqual([`${NODE_B}/`]);

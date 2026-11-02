@@ -306,7 +306,7 @@ describe("getModelPathProviderRanking latency budget", () => {
     await vi.advanceTimersByTimeAsync(MODEL_PATH_RANKING_BUDGET_MS + 10);
     const ranking = await rankingPromise;
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${FAST}/`]);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 });
 
@@ -364,7 +364,7 @@ describe("warmModelPathCaches", () => {
     // Equal-cost nodes preserve runtime policy priority, not URL lexical order.
     const expected = [A, B, C].map(node => `${node}/`);
     expect(ranking.map((r) => r.baseUrl)).toEqual(expected);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 
   it("reports a failed refresh without discarding the last-good ranking cache", async () => {
@@ -402,7 +402,7 @@ describe("warmModelPathCaches", () => {
     );
     expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`]);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 
   it("reports why a node contributed nothing, and does not fetch it", async () => {

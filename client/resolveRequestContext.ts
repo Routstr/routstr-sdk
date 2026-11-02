@@ -305,9 +305,11 @@ export async function resolveRequestContext(
     typeof modelId === "string" &&
     policy !== undefined
   ) {
-    // "Get baseUrl for model path": rank the whitelisted auto-selection
-    // nodes by their per-route price and pin the best candidate's selector.
-    // An empty ranking (nodes down, cooled, or not advertising the route)
+    // "Get baseUrl for model path": rank every whitelisted (node, route)
+    // pair by what that route costs and pin the cheapest one's selector —
+    // route-major, so a cheaper route on another node outranks an expensive
+    // route on the node that happened to win the node-level ordering. An
+    // empty ranking (nodes down, cooled, or not advertising any route)
     // degrades to the normal price ranking unpinned.
     const ranking = await providerManager.getModelPathProviderRanking(
       modelId,
@@ -318,8 +320,8 @@ export async function resolveRequestContext(
       baseUrl = best.baseUrl;
       selectedModel = best.model;
       modelPath = {
-        selector: best.selectors[0],
-        satsPricing: best.satsPricing[0] ?? undefined,
+        selector: best.selector,
+        satsPricing: best.satsPricing ?? undefined,
         autoPinned: true,
       };
     } else {

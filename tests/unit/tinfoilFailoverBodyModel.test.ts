@@ -228,8 +228,8 @@ describe("Tinfoil model id across provider failover", () => {
     ).mockResolvedValue([
       {
         baseUrl: NEXT_URL,
-        selectors: [NEXT_SELECTOR],
-        satsPricing: [null],
+        selector: NEXT_SELECTOR,
+        satsPricing: null,
         model: makeModel(),
       },
     ]);

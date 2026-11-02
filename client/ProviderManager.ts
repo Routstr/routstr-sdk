@@ -58,6 +58,30 @@ export const MODEL_PATH_RANKING_BUDGET_MS = 6_000;
  */
 export const MODEL_PATH_WARM_BUDGET_MS = MODEL_PATHS_FETCH_TIMEOUT_MS + 5_000;
 
+/**
+ * One ranked model-path failover candidate: a single (node, route) pair.
+ *
+ * Route-major: the list is ordered by `cost`, so the cheapest route comes
+ * first regardless of which node serves it. `selector` is the node's own
+ * advertised string and must be forwarded verbatim (the node rejects one it
+ * did not advertise).
+ */
+export interface ModelPathRouteCandidate {
+  baseUrl: string;
+  selector: string;
+  /** This route's advertised pricing, or null when the node published none. */
+  satsPricing: ModelPathSatsPricing | null;
+  model: Model;
+  /** Warm-basket cost this candidate was ranked on, in sats. */
+  cost: number;
+}
+
+/** A candidate plus the sort-only keys (whitelist route index). */
+interface RankedRoute {
+  candidate: ModelPathRouteCandidate;
+  routeIndex: number;
+}
+
 /** One (node, model) lookup of a warm pass. */
 export interface ModelPathWarmResult {
   baseUrl: string;
@@ -1470,19 +1494,30 @@ export class ProviderManager {
   }
 
   /**
-   * Ranked DeepSeek model-path candidates for automatic pinning
+   * Ranked model-path failover candidates for automatic pinning
    * ("get baseUrl for model path").
    *
-   * One entry per whitelisted node that (a) is enabled and not cooled down
-   * for the model, and (b) advertises at least one whitelisted route for it
-   * on GET /v1/models/paths. Entries are sorted by what the node's best
-   * available route costs for WARM_COST_BASKET — the same key
-   * getProviderPriceRankingForModel (and therefore the fallback ranking
-   * routing lands on) sorts on, so the pinned node and the unpinned pick
-   * agree. Ties break on baseUrl. Within an entry, `selectors` and
-   * `satsPricing` are in whitelist preference order with cooled-down routes
-   * (and `excludeModelPaths` candidates) removed — the failover chain is
-   * node-major: every route of the cheapest node before the next node.
+   * One entry per (whitelisted node, advertised whitelisted route) pair where
+   * the node is enabled, is not cooled down for the model, and advertises the
+   * route on GET /v1/models/paths. Entries are sorted by what that route costs
+   * for WARM_COST_BASKET, so the failover chain is route-major: the cheapest
+   * route wins regardless of which node serves it. (The previous shape grouped
+   * routes under their node and ranked the node by its first usable route,
+   * which sent a request to a route it had already priced as worse purely to
+   * keep the node's position fixed.)
+   *
+   * Ties break on the policy's node order (when the snapshot lists nodes), then
+   * baseUrl, then the route's whitelist index, then the selector itself — an
+   * equal-cost ranking must never depend on the order nodes were discovered in.
+   * Equal costs are common, not exotic: a route that publishes no pricing is
+   * ranked on the model aggregate, which is the same number on every node.
+   *
+   * `estimateCost(...).total` is the billed token classes only: the node's
+   * per-request fee sizes the deposit ceiling and is not part of what it
+   * charges, so it is not part of this key either. A route publishing rates
+   * that are not prices (NaN, ±inf, negative) cannot rank — a negative one wins
+   * every comparison and a NaN poisons the sort — matching
+   * getProviderPriceRankingForModel, which skips such nodes outright.
    */
   async getModelPathProviderRanking(
     modelId: string,
@@ -1498,14 +1533,7 @@ export class ProviderManager {
        */
       excludeModelPaths?: Iterable<string>;
     } = {}
-  ): Promise<
-    Array<{
-      baseUrl: string;
-      selectors: string[];
-      satsPricing: Array<ModelPathSatsPricing | null>;
-      model: Model;
-    }>
-  > {
+  ): Promise<ModelPathRouteCandidate[]> {
     const mappings = this.getModelIdMappings();
     modelId = canonicalizeModelId(modelId, mappings);
     const policy = modelPathPolicyFor(modelId, this.getModelPathWhitelist(), mappings);
@@ -1516,34 +1544,51 @@ export class ProviderManager {
       this.discoveryAdapter.getDisabledProviders()
     );
     const allModels = this.discoveryAdapter.getCachedModels();
+    // Policy node order only exists as a preference when the snapshot lists
+    // nodes; otherwise it is absent and the comparator falls through to URL
+    // identity, so discovery order never leaks into the ranking.
+    const nodes = this.modelPathNodes(policy);
+    const nodeOrder = policy.nodes?.length
+      ? new Map(
+          nodes.flatMap((nodeUrl, index) => {
+            const normalized = normalizeProviderUrl(nodeUrl);
+            return normalized ? [[normalized, index] as const] : [];
+          })
+        )
+      : undefined;
 
-    this.logger.debug("Model-path ranking candidates", this.modelPathNodes(policy).length);
-    const candidates = await Promise.all(
-      this.modelPathNodes(policy).map(async (nodeUrl) => {
+    // Nodes probed and routes ranked, keyed by model so a multi-model pass is
+    // readable. Candidate count is not fetch count: path lookups may be cached.
+    this.logger.debug(
+      "Model-path ranking candidates",
+      { modelId, nodes: nodes.length }
+    );
+    const ranked = await Promise.all(
+      nodes.map(async (nodeUrl) => {
         const baseUrl = normalizeProviderUrl(nodeUrl);
-        if (!baseUrl) return null;
+        if (!baseUrl) return [];
         if (options.excludeBaseUrl && baseUrl === options.excludeBaseUrl) {
-          return null;
+          return [];
         }
-        if (options.excludeBaseUrls?.has(baseUrl)) return null;
+        if (options.excludeBaseUrls?.has(baseUrl)) return [];
         if (
           options.acceptableMintUrls &&
           !this.providerAcceptsAnyMint(baseUrl, options.acceptableMintUrls)
-        ) return null;
-        if (disabledProviders.has(baseUrl)) return null;
+        ) return [];
+        if (disabledProviders.has(baseUrl)) return [];
         // Enforce the transport invariant both ways (same as
         // getProviderPriceRankingForModel): Tor mode is onion-only, clearnet
         // mode never touches onion nodes. The auto-selection nodes are
         // clearnet today, so Tor mode gets an empty ranking here and
         // degrades to the normal onion-only price ranking (unpinned).
-        if (torMode && !isOnionUrl(baseUrl)) return null;
-        if (!torMode && isOnionUrl(baseUrl)) return null;
-        if (this.isOnCooldown(baseUrl, modelId)) return null;
+        if (torMode && !isOnionUrl(baseUrl)) return [];
+        if (!torMode && isOnionUrl(baseUrl)) return [];
+        if (this.isOnCooldown(baseUrl, modelId)) return [];
 
         const model = findModelForId(
           allModels[baseUrl] || [], modelId, mappings
         );
-        if (!model) return null;
+        if (!model) return [];
 
         // Per-model lookup (kilobytes), cached with stale-while-revalidate,
         // in-flight dedupe and negative caching; raced against a ranking
@@ -1557,80 +1602,61 @@ export class ProviderManager {
           }),
           MODEL_PATH_RANKING_BUDGET_MS
         );
-        if (!nodePaths) return null;
+        if (!nodePaths) return [];
         const resolved = resolveModelPathSelectors(
           nodePaths,
           modelId,
           policy.routes,
           mappings
         );
-        if (!resolved) return null;
+        if (!resolved) return [];
 
-        // Whitelist order, dropping routes this node has on path-scoped
-        // cooldown (or does not advertise at all).
-        const available: Array<{
-          selector: string;
-          pricing: ModelPathSatsPricing | null;
-        }> = [];
+        // One candidate per advertised whitelisted route, in whitelist order
+        // (the index doubles as the within-node tiebreak). A route this
+        // request already tried is dropped here — there is no node anchor to
+        // preserve, so no attempted-route carve-out is needed.
+        const routes: RankedRoute[] = [];
         for (let i = 0; i < resolved.selectors.length; i++) {
           const selector = resolved.selectors[i];
           if (!selector) continue;
           const pathId = canonicalModelPath(selector);
-          // An attempted route may have just earned its first cooldown.
-          // Keep it for this request's node-ranking price anchor, but the
-          // request-local exclusion below still prevents selecting it again.
-          const alreadyAttempted = excludedModelPaths.has(modelPathCandidateKey(baseUrl, selector));
-          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId) && !alreadyAttempted) continue;
-          available.push({ selector, pricing: resolved.satsPricing[i] ?? null });
+          if (excludedModelPaths.has(modelPathCandidateKey(baseUrl, selector))) {
+            continue;
+          }
+          if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
+          const satsPricing = resolved.satsPricing[i] ?? null;
+          // Only the model aggregate may stand in for missing route pricing.
+          // Borrowing a sibling route's rates is what let a node be ranked on
+          // a price a request might never be billed at.
+          const pricing = satsPricing ?? model.sats_pricing;
+          const cost = hasUsableTokenRates(pricing)
+            ? estimateCost(pricing, WARM_COST_BASKET).total
+            : Number.POSITIVE_INFINITY;
+          routes.push({
+            candidate: { baseUrl, selector, satsPricing, model, cost },
+            routeIndex: i,
+          });
         }
-        if (available.length === 0) return null;
-
-        // Rank by what the node's best available route costs for the warm
-        // basket — the key getProviderPriceRankingForModel ranks on, so the
-        // auto-pinned node is the node the fallback ranking would have picked
-        // first — deliberately BEFORE the request-scoped excludeModelPaths
-        // filter. The failover chain is node-major (every route of the
-        // cheapest node before the next node), so a node's position must stay
-        // fixed as the request walks the chain and excludes candidates hop by
-        // hop; re-ranking on the cheapest remaining route would interleave the
-        // nodes (e.g. node1:deepseek -> node2:deepseek -> node1:fireworks
-        // whenever node2's first route undercuts node1's second).
-        //
-        // `estimateCost(...).total` is the billed token classes only: the
-        // node's per-request fee sizes the deposit ceiling and is not part of
-        // what it charges, so it is not part of this key either. A route
-        // publishing rates that are not prices (NaN, ±inf, negative) cannot
-        // rank — a negative one wins every comparison and a NaN poisons the
-        // sort — matching getProviderPriceRankingForModel, which skips such
-        // nodes outright.
-        const pricing =
-          available[0].pricing ??
-          available.find((a) => a.pricing != null)?.pricing ??
-          model.sats_pricing;
-        const cost = hasUsableTokenRates(pricing)
-          ? estimateCost(pricing, WARM_COST_BASKET).total
-          : Number.POSITIVE_INFINITY;
-
-        const remaining = available.filter(
-          (a) =>
-            !excludedModelPaths.has(modelPathCandidateKey(baseUrl, a.selector))
-        );
-        if (remaining.length === 0) return null;
-        const selectors = remaining.map((a) => a.selector);
-        const satsPricing = remaining.map((a) => a.pricing);
-        return { baseUrl, selectors, satsPricing, model, cost };
+        return routes;
       })
     );
 
+    const candidates = ranked.flat();
+    this.logger.debug(
+      "Model-path ranking routes",
+      { modelId, routes: candidates.length }
+    );
     return candidates
-      .filter(
-        (c): c is NonNullable<typeof c> => c !== null
+      .sort(
+        (a, b) =>
+          a.candidate.cost - b.candidate.cost ||
+          (nodeOrder?.get(a.candidate.baseUrl) ?? 0) -
+            (nodeOrder?.get(b.candidate.baseUrl) ?? 0) ||
+          a.candidate.baseUrl.localeCompare(b.candidate.baseUrl) ||
+          a.routeIndex - b.routeIndex ||
+          a.candidate.selector.localeCompare(b.candidate.selector)
       )
-      // Same tiebreak as getProviderPriceRankingForModel: equal costs must
-      // not depend on the order the nodes happened to be fetched in.
-      // Stable sort preserves policy node priority when costs tie.
-      .sort((a, b) => a.cost - b.cost)
-      .map(({ cost: _cost, ...candidate }) => candidate);
+      .map(({ candidate }) => candidate);
   }
 
   /**

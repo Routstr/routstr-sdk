@@ -1684,7 +1684,7 @@ describe("ProviderManager", () => {
       expect(fetch.mock.calls.length).toBe(callsAfterFirst);
     });
 
-    it("ranks whitelisted nodes by their cheapest warm-basket route cost", async () => {
+    it("ranks whitelisted routes by their own warm-basket cost", async () => {
       stubPathsFetch({
         [NODE_A]: pathsPayload([
           { path: DEEPSEEK_SELECTOR, completion: 0.0013 },
@@ -1698,19 +1698,22 @@ describe("ProviderManager", () => {
 
       const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
 
+      // Route-major: every advertised route is its own candidate, ordered by
+      // its own cost — node A's fireworks route beats its deepseek route.
+      expect(ranking.map((c) => c.selector)).toEqual([
+        DEEPSEEK_SELECTOR, // NODE_B, 0.0004
+        FIREWORKS_SELECTOR, // NODE_A, 0.0007
+        DEEPSEEK_SELECTOR, // NODE_A, 0.0013
+      ]);
       expect(ranking.map((c) => c.baseUrl)).toEqual([
         `${NODE_B}/`,
         `${NODE_A}/`,
+        `${NODE_A}/`,
       ]);
-      // Selectors stay in whitelist preference order within the node, even
-      // where the second route is cheaper than the first.
-      expect(ranking[1].selectors).toEqual([
-        DEEPSEEK_SELECTOR,
-        FIREWORKS_SELECTOR,
-      ]);
-      // Per-route pricing rides along with the selectors.
-      expect(ranking[1].satsPricing[0]?.completion).toBe(0.0013);
-      expect(ranking[1].satsPricing[1]?.completion).toBe(0.0007);
+      // Per-route pricing rides along with each candidate.
+      expect(ranking[0].satsPricing?.completion).toBe(0.0004);
+      expect(ranking[1].satsPricing?.completion).toBe(0.0007);
+      expect(ranking[2].satsPricing?.completion).toBe(0.0013);
     });
 
     it("ranks on the warm-basket cost of the best route, not its completion rate", async () => {
@@ -1750,15 +1753,13 @@ describe("ProviderManager", () => {
 
       const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
 
-      // NODE_B is completion-order second and warm-basket first.
-      expect(ranking.map((c) => c.baseUrl)).toEqual([
-        `${NODE_B}/`,
-        `${NODE_A}/`,
-      ]);
-      // Both nodes keep every route they advertise, in whitelist order.
-      expect(ranking.map((c) => c.selectors)).toEqual([
-        [DEEPSEEK_SELECTOR, FIREWORKS_SELECTOR],
-        [DEEPSEEK_SELECTOR, FIREWORKS_SELECTOR],
+      // NODE_B is completion-order second and warm-basket first; its two
+      // routes tie exactly, so whitelist order breaks the tie within the node.
+      expect(ranking.map((c) => `${c.baseUrl} ${c.selector}`)).toEqual([
+        `${NODE_B}/ ${DEEPSEEK_SELECTOR}`,
+        `${NODE_B}/ ${FIREWORKS_SELECTOR}`,
+        `${NODE_A}/ ${DEEPSEEK_SELECTOR}`,
+        `${NODE_A}/ ${FIREWORKS_SELECTOR}`,
       ]);
     });
 
@@ -1838,13 +1839,14 @@ describe("ProviderManager", () => {
       manager.markFailed(`${NODE_A}/`, undefined, MODEL_ID, DEEPSEEK_SELECTOR);
 
       let ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+      expect(ranking.map((c) => c.selector)).toEqual([
+        DEEPSEEK_SELECTOR, // NODE_B, 0.0004
+        FIREWORKS_SELECTOR, // NODE_A, 0.0007 — its deepseek route is cooled
+      ]);
       expect(ranking.map((c) => c.baseUrl)).toEqual([
         `${NODE_B}/`,
         `${NODE_A}/`,
       ]);
-      expect(
-        ranking.find((c) => c.baseUrl === `${NODE_A}/`)?.selectors
-      ).toEqual([FIREWORKS_SELECTOR]);
 
       // Model-scoped cooldown on B: B drops entirely
       vi.setSystemTime(now + 2_000);
@@ -1891,7 +1893,7 @@ describe("ProviderManager", () => {
       // Node A keeps its second route after its first route's exclusion;
       // node B has nothing left and drops out entirely.
       expect(ranking.map((c) => c.baseUrl)).toEqual([`${NODE_A}/`]);
-      expect(ranking[0].selectors).toEqual([FIREWORKS_SELECTOR]);
+      expect(ranking[0].selector).toBe(FIREWORKS_SELECTOR);
     });
 
     it("excludes clearnet nodes when torMode=true", async () => {
@@ -1937,6 +1939,110 @@ describe("ProviderManager", () => {
       await expect(
         manager.getModelPathProviderRanking(MODEL_ID)
       ).resolves.toEqual([]);
+    });
+
+    it("orders routes by their own cost, interleaving nodes", async () => {
+      // Route-major: node A's second route costs more than node B's first, so
+      // the chain is A:deepseek -> B:deepseek -> A:fireworks. The node-major
+      // shape would have walked A:fireworks before B:deepseek.
+      stubPathsFetch({
+        [NODE_A]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0007 },
+          { path: FIREWORKS_SELECTOR, completion: 0.0013 },
+        ]),
+        [NODE_B]: pathsPayload([
+          { path: DEEPSEEK_SELECTOR, completion: 0.0009 },
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      expect(ranking.map((c) => `${c.baseUrl} ${c.selector}`)).toEqual([
+        `${NODE_A}/ ${DEEPSEEK_SELECTOR}`,
+        `${NODE_B}/ ${DEEPSEEK_SELECTOR}`,
+        `${NODE_A}/ ${FIREWORKS_SELECTOR}`,
+      ]);
+    });
+
+    it("breaks equal-cost ties by baseUrl even when nodes are absent", async () => {
+      // Metadata-less routes fall back to the same model aggregate, so their
+      // costs are exactly equal. With no `nodes` list the tie must still be
+      // deterministic — a ranking that followed discovery order would pin a
+      // different route depending on which provider answered first.
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+      });
+      const registryWith = (order: string[]) =>
+        createRegistry({
+          getModelPathWhitelist: () => ({
+            [MODEL_ID]: {
+              routes: [
+                { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
+              ],
+            },
+          }),
+          getCachedModels: () =>
+            Object.fromEntries(
+              order.map((node) => [
+                `${node}/`,
+                [
+                  {
+                    id: MODEL_ID,
+                    sats_pricing: { prompt: 1, completion: 1 },
+                  } as any,
+                ],
+              ])
+            ),
+        });
+
+      const forward = await new ProviderManager(
+        registryWith([NODE_A, NODE_B])
+      ).getModelPathProviderRanking(MODEL_ID);
+      const reversed = await new ProviderManager(
+        registryWith([NODE_B, NODE_A])
+      ).getModelPathProviderRanking(MODEL_ID);
+
+      const expected = [`${NODE_A}/`, `${NODE_B}/`];
+      expect(forward.map((c) => c.baseUrl)).toEqual(expected);
+      expect(reversed.map((c) => c.baseUrl)).toEqual(expected);
+    });
+
+    it("uses the policy's node order to break equal-cost ties", async () => {
+      // When the snapshot does list nodes, that order is the publisher's
+      // stated priority for equal prices — discovery order must not override it.
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+      });
+      const manager = new ProviderManager(
+        createRegistry({
+          getModelPathWhitelist: () => ({
+            [MODEL_ID]: {
+              routes: [
+                { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
+              ],
+              nodes: [NODE_B, NODE_A],
+            },
+          }),
+          getCachedModels: () => ({
+            [`${NODE_A}/`]: [
+              { id: MODEL_ID, sats_pricing: { prompt: 1, completion: 1 } } as any,
+            ],
+            [`${NODE_B}/`]: [
+              { id: MODEL_ID, sats_pricing: { prompt: 1, completion: 1 } } as any,
+            ],
+          }),
+        })
+      );
+
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+
+      expect(ranking.map((c) => c.baseUrl)).toEqual([
+        `${NODE_B}/`,
+        `${NODE_A}/`,
+      ]);
     });
   });
 

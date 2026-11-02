@@ -122,8 +122,8 @@ function makeHarness() {
           {
             baseUrl: PROVIDER_B,
             model,
-            selectors: [SELECTOR],
-            satsPricing: [undefined],
+            selector: SELECTOR,
+            satsPricing: null,
           },
         ];
       }
