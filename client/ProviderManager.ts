@@ -31,6 +31,7 @@ import {
   resolveModelPathSelectors,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
+import { withProviderDeadline } from "../discovery/providerDeadline";
 import { isTinfoilModel } from "./TinfoilSecure";
 import {
   estimateCost,
@@ -165,6 +166,15 @@ const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
 /**
+ * Upper bound on a cold `/v1/info` probe. `/v1/info` is not billed, but
+ * `getModelForProvider` awaits it, so a node that accepts the connection and
+ * then never answers would stall provider resolution — and with it the request
+ * that is failing over — for the runtime default: about 300 s on Node, and no
+ * bound at all on Bun. Same ceiling as MintDiscovery's info fetch.
+ */
+const INFO_FETCH_TIMEOUT_MS = 10_000;
+
+/**
  * Fetch provider info from network if not cached, then cache it.
  * Replaces the old ProviderRegistry.getProviderInfo() method.
  */
@@ -177,11 +187,21 @@ const fetchProviderInfo = async (
   const cached = adapter.getCachedProviderInfo()[normalized];
   if (cached) return cached;
   try {
-    const response = await fetch(`${normalized}v1/info`);
-    if (!response.ok) {
-      throw new Error(`Failed ${response.status}`);
-    }
-    const info = (await response.json()) as ProviderInfo;
+    // The bound covers the body read too: a node can send headers and then
+    // stall. It settles by the deadline even when the runtime ignores the
+    // abort (withProviderDeadline), so the probe can never hold its caller
+    // past it.
+    const info = await withProviderDeadline(async (signal) => {
+      const response = await fetch(`${normalized}v1/info`, { signal });
+      if (!response.ok) {
+        throw new Error(`Failed ${response.status}`);
+      }
+      return (await response.json()) as ProviderInfo;
+    }, INFO_FETCH_TIMEOUT_MS);
+    // Publish outside the deadline. The wrapped operation must return data
+    // only: a response that lands after the deadline, or whose runtime ignored
+    // the abort, must never overwrite a fresher capability/mint snapshot with
+    // a stale one.
     adapter.setCachedProviderInfo({
       ...adapter.getCachedProviderInfo(),
       [normalized]: info,
@@ -201,7 +221,15 @@ const fetchProviderInfo = async (
     }
     return info;
   } catch (error) {
-    logger.warn(`Failed to fetch provider info from ${normalized}:`, error);
+    if ((error as Error | undefined)?.name === "TimeoutError") {
+      // Not an outage: the node answered slowly or not at all. The caller
+      // treats a missing probe like any other unknown info.
+      logger.warn(
+        `Provider info probe timed out after ${INFO_FETCH_TIMEOUT_MS}ms for ${normalized}`,
+      );
+    } else {
+      logger.warn(`Failed to fetch provider info from ${normalized}:`, error);
+    }
     return null;
   }
 };
