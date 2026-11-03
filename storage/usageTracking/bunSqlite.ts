@@ -15,6 +15,8 @@ const MIGRATION_MARKER_KEY = "usage_tracking_migration_v1";
 // missing (checked with PRAGMA table_info) so migration is idempotent.
 const ADDED_COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
   { name: "provider", type: "TEXT" },
+  { name: "node_request_id", type: "TEXT" },
+  { name: "upstream_response_id", type: "TEXT" },
   { name: "base_msats", type: "REAL" },
   { name: "input_msats", type: "REAL" },
   { name: "output_msats", type: "REAL" },
@@ -153,10 +155,10 @@ export const createBunSqliteUsageTrackingDriver = (
         client, session_id, tags,
         provider, base_msats, input_msats, output_msats, total_msats,
         total_usd, cache_read_input_tokens, cache_creation_input_tokens,
-        cache_read_msats, cache_creation_msats, remaining_balance_msats
+        cache_read_msats, cache_creation_msats, remaining_balance_msats, node_request_id, upstream_response_id
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `).run(
       entry.id,
@@ -182,7 +184,9 @@ export const createBunSqliteUsageTrackingDriver = (
       entry.cacheCreationInputTokens ?? null,
       entry.cacheReadMsats ?? null,
       entry.cacheCreationMsats ?? null,
-      entry.remainingBalanceMsats ?? null
+      entry.remainingBalanceMsats ?? null,
+      entry.nodeRequestId ?? null,
+      entry.upstreamResponseId ?? null
     );
   };
 
@@ -192,6 +196,8 @@ export const createBunSqliteUsageTrackingDriver = (
     modelId: row.model_id,
     baseUrl: row.base_url,
     requestId: row.request_id,
+    nodeRequestId: row.node_request_id ?? undefined,
+    upstreamResponseId: row.upstream_response_id ?? undefined,
     cost: row.cost,
     satsCost: row.sats_cost,
     promptTokens: row.prompt_tokens,

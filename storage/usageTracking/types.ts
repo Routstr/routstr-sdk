@@ -4,6 +4,8 @@ export interface UsageTrackingEntry {
   modelId: string;
   baseUrl: string;
   requestId: string;
+  nodeRequestId?: string;
+  upstreamResponseId?: string;
   cost: number;
   satsCost: number;
   promptTokens: number;

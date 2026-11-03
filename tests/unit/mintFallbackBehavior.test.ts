@@ -252,6 +252,16 @@ describe("BalanceManager request-scoped mint selection", () => {
       amount: 10,
       excludeMints: [MINT_A],
     });
+
+    createTokenSpy.mockResolvedValueOnce({ success: true, token: "token-b2", selectedMintUrl: MINT_B });
+    postSpy.mockResolvedValueOnce({ success: true });
+    await manager.topUp({ mintUrl: MINT_A, baseUrl: PROVIDER, amount: 10, token: "api-key" });
+    expect(createTokenSpy).toHaveBeenNthCalledWith(3, {
+      mintUrl: MINT_A,
+      baseUrl: PROVIDER,
+      amount: 10,
+      excludeMints: [MINT_A],
+    });
   });
 });
 

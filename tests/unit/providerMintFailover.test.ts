@@ -1,3 +1,4 @@
+import { createMemoryRequestLifecycleDriver } from "../../storage/requestLifecycle";
 /**
  * Unit tests: initial-deposit provider-mint failover.
  *
@@ -192,6 +193,8 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
 
   it("surfaces the honest provider-mint error when every provider is exhausted", async () => {
     const { client } = createClient(() => null);
+    const driver = createMemoryRequestLifecycleDriver();
+    (client as any).requestLifecycleDriver = driver;
     vi.spyOn(client as any, "_spendToken").mockImplementation(async () => {
       throw new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A], 0, "");
     });
@@ -203,6 +206,10 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
         providerBaseUrl: BASE_URL,
       }
     );
+    const [row] = await driver.list();
+    const trace = await driver.getTrace(row.requestId);
+    expect(row).toMatchObject({ outcome: "failed", attemptCount: 0 });
+    expect(trace?.events.some(event => event.type === "preflight_funding_failed")).toBe(true);
   });
 
   it.each([

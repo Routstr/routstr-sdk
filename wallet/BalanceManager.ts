@@ -113,6 +113,9 @@ export interface BalanceState {
  */
 const walletSendQueues = new WeakMap<WalletAdapter, Promise<unknown>>();
 
+const RATE_LIMITED_MINT_SKIP_MS = 60_000;
+const rateLimitedMints = new WeakMap<WalletAdapter, Map<string, number>>();
+
 function runWalletSend<T>(
   walletAdapter: WalletAdapter,
   send: () => Promise<T>
@@ -136,16 +139,31 @@ interface QueuedTopUp {
  */
 const queuedTopUps = new WeakMap<WalletAdapter, Map<string, QueuedTopUp>>();
 
+type ProviderWalletOperation = {
+  type: "topup" | "refund";
+  startTime: number;
+  endTime?: number;
+};
+
+/** Per-provider wallet mutations (topup / refund) of each wallet */
+const providerWalletOperations = new WeakMap<
+  WalletAdapter,
+  Map<string, ProviderWalletOperation>
+>();
+
 /**
  * BalanceManager handles token refunds and topups from providers
  */
 export class BalanceManager {
   private cashuSpender: CashuSpender;
-  /** In-memory guard for per-provider wallet mutations (topup / refund) */
-  private providerWalletOps: Map<
-    string,
-    { type: "topup" | "refund"; startTime: number; endTime?: number }
-  > = new Map();
+  private get providerWalletOps(): Map<string, ProviderWalletOperation> {
+    let operations = providerWalletOperations.get(this.walletAdapter);
+    if (!operations) {
+      operations = new Map();
+      providerWalletOperations.set(this.walletAdapter, operations);
+    }
+    return operations;
+  }
   /** Cooldown (ms) between opposite operations on the same provider */
   private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
   /** Providers that have timed out during the current refund cascade. */
@@ -427,8 +445,11 @@ export class BalanceManager {
         };
       }
 
+      const refundToken = fetchResult.token;
+      this.cashuSpender.cacheReceiveToken(refundToken);
       const receiveResult = await this.cashuSpender.receiveToken(
-        fetchResult.token
+        refundToken,
+        false
       );
       const totalAmountMsat =
         receiveResult.unit === "msat"
@@ -436,15 +457,20 @@ export class BalanceManager {
           : receiveResult.amount * 1000;
 
       if (receiveResult.success) {
-        // The refunded key is spent; a replacement stored while the request
-        // was in flight is not.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
-          this.storageAdapter.removeApiKey(baseUrl);
-        }
+        this.storageAdapter.setCachedReceiveTokens(
+          this.storageAdapter
+            .getCachedReceiveTokens()
+            .filter((entry) => entry.token !== refundToken)
+        );
       } else {
         this.logger.warn(
-          `refundApiKey: receive failed for ${baseUrl}; keeping API key. message=${receiveResult.message ?? "none"}`
+          `refundApiKey: receive failed for ${baseUrl}; refund token kept for recovery. message=${receiveResult.message ?? "none"}`
         );
+      }
+      // The refunded key is spent; a replacement stored while the request
+      // was in flight is not.
+      if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        this.storageAdapter.removeApiKey(baseUrl);
       }
 
       return {
@@ -673,11 +699,16 @@ export class BalanceManager {
     let requestId: string | undefined;
 
     try {
+      const now = Date.now();
+      const rateLimited = [...(rateLimitedMints.get(this.walletAdapter) ?? [])]
+        .filter(([key, until]) => until > now && key.startsWith(`${baseUrl}|`))
+        .map(([key]) => key.slice(baseUrl.length + 1))
+        .filter((mint) => !excludeMints.includes(mint));
       const tokenResult = await this.createProviderToken({
         mintUrl,
         baseUrl,
         amount,
-        excludeMints,
+        excludeMints: [...excludeMints, ...rateLimited],
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -720,6 +751,16 @@ export class BalanceManager {
         }
         if (recoveredToken || !canRecover) {
           this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
+        }
+
+        if (
+          tokenResult.selectedMintUrl &&
+          topUpResult.parsedError?.type === CoreErrorType.MINT_RATE_LIMITED
+        ) {
+          const skip = rateLimitedMints.get(this.walletAdapter) ?? new Map();
+          const skipMs = topUpResult.retryAfterSeconds ? topUpResult.retryAfterSeconds * 1000 : RATE_LIMITED_MINT_SKIP_MS;
+          skip.set(`${baseUrl}|${tokenResult.selectedMintUrl}`, Date.now() + skipMs);
+          rateLimitedMints.set(this.walletAdapter, skip);
         }
 
         // A foreign-mint swap failure / untrusted source mint can be retried
@@ -812,7 +853,6 @@ export class BalanceManager {
       (sum, value) => sum + value,
       0
     );
-    const targetProviderBalance = balanceState.providerBalances[baseUrl] || 0;
     const refundableProviderBalance = Object.entries(
       balanceState.providerBalances
     )
@@ -820,9 +860,8 @@ export class BalanceManager {
       .reduce((sum, [, value]) => sum + value, 0);
 
     if (
-      totalMintBalance + targetProviderBalance < adjustedAmount &&
-      totalMintBalance + targetProviderBalance + refundableProviderBalance >=
-        adjustedAmount &&
+      totalMintBalance < adjustedAmount &&
+      totalMintBalance + refundableProviderBalance >= adjustedAmount &&
       retryCount < 3
     ) {
       await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
@@ -832,10 +871,10 @@ export class BalanceManager {
       });
     }
 
-    if (totalMintBalance + targetProviderBalance < adjustedAmount) {
+    if (totalMintBalance < adjustedAmount) {
       const error = new InsufficientBalanceError(
         adjustedAmount,
-        totalMintBalance + targetProviderBalance,
+        totalMintBalance,
         totalMintBalance,
         Object.entries(balanceState.mintBalances).reduce(
           (max, [url, balance]) =>
@@ -843,7 +882,7 @@ export class BalanceManager {
           { url: "", balance: 0 }
         ).url
       );
-      this.logger.error(`createProviderToken: insufficient balance required=${adjustedAmount} available=${totalMintBalance + targetProviderBalance} totalMint=${totalMintBalance} targetProvider=${targetProviderBalance}`);
+      this.logger.error(`createProviderToken: insufficient balance required=${adjustedAmount} available=${totalMintBalance}`);
       return { success: false, error: error.message };
     }
 
@@ -878,11 +917,11 @@ export class BalanceManager {
       let fundedOutsideBalance = 0;
       for (const url in balances) {
         const balanceInSats = getBalanceInSats(balances[url], units[url]);
-        if (balanceInSats > maxBalance) {
+        const accepted = !supportedMintsOnly || providerMints.includes(url);
+        if (accepted && !excludeMints.includes(url) && balanceInSats > maxBalance) {
           maxBalance = balanceInSats;
           maxMintUrl = url;
         }
-        const accepted = !supportedMintsOnly || providerMints.includes(url);
         if (accepted) {
           if (balanceInSats > acceptableMaxBalance) {
             acceptableMaxBalance = balanceInSats;
@@ -1161,6 +1200,7 @@ export class BalanceManager {
     requestId?: string;
     error?: string;
     parsedError?: ParsedCoreError;
+    retryAfterSeconds?: number;
   }> {
     if (!baseUrl) {
       return {
@@ -1223,6 +1263,7 @@ export class BalanceManager {
           requestId: resolvedRequestId,
           error: conciseDetail,
           parsedError,
+          retryAfterSeconds: Number(response.headers.get("retry-after")) || undefined,
         };
       }
 

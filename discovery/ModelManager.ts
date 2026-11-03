@@ -915,7 +915,7 @@ export class ModelManager {
         for (const p of providers) {
           const endpoints = this.getProviderEndpoints(p, torMode);
           for (const endpoint of endpoints) {
-            addBase(endpoint, p?.pubkey || event.pubkey);
+            addBase(endpoint, event.pubkey);
           }
         }
       } catch {
@@ -925,7 +925,7 @@ export class ModelManager {
             for (const p of providers) {
               const endpoints = this.getProviderEndpoints(p, torMode);
               for (const endpoint of endpoints) {
-                addBase(endpoint, p?.pubkey || event.pubkey);
+                addBase(endpoint, event.pubkey);
               }
             }
           }
@@ -1254,7 +1254,7 @@ export class ModelManager {
             ...this.getProviderEndpoints(p, true),
           ];
           for (const endpoint of endpoints) {
-            addNode(endpoint, p?.pubkey || event.pubkey);
+            addNode(endpoint, event.pubkey);
           }
         }
       } catch {

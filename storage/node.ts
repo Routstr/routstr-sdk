@@ -7,3 +7,5 @@ export {
   createSqliteUsageTrackingDriver,
   type SqliteUsageTrackingDriverOptions,
 } from "./usageTracking/sqlite";
+
+export { createSqliteRequestLifecycleDriver, type SqliteRequestLifecycleDriverOptions } from "./requestLifecycle/sqlite";

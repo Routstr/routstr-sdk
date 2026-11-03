@@ -111,7 +111,7 @@ SDK unit tests live in `sdk/__tests__` and are run with Vitest.
 
 - `sdk/__tests__/storageStore.test.ts` covers baseUrl normalization and token storage behaviors.
 - `sdk/__tests__/providerManagerPricing.test.ts` covers provider price ranking and model id normalization.
-- `sdk/__tests__/cashuSpender.test.ts` covers validation, token reuse, and insufficient balance handling.
+- `sdk/__tests__/cashuSpender.test.ts` covers validation and insufficient balance handling.
 - `sdk/__tests__/balanceManager.test.ts` covers refund/top-up validation and early returns.
 
 Run:
@@ -179,7 +179,6 @@ projection and queries the newly configured author.
 and retain the parsed projection for synchronous routing. Missing methods produce
 an explicit initialization error rather than silently retaining static mappings.
 
-
 ### Nostr model-path policy snapshots
 
 With `autoModelPath: true`, routing uses signed kind `38427` events, `d` tag
@@ -221,3 +220,10 @@ and signed event (including an empty policy), not just a timestamp. Optionally i
 Missing required methods cause an explicit `ModelManager` initialization error. Both
 built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
 resolver wrappers remain explicit-selector compatibility APIs, not runtime policy accessors.
+
+### Request lifecycle diagnostics
+
+Inference routing now exposes an SDK lifecycle UUID separately from node and
+upstream response IDs, with persistent request/attempt/event traces. See
+[request lifecycle tracking](./REQUEST_LIFECYCLE.md) for driver setup, daemon
+integration, retention, privacy, streaming finalization, and usage compatibility.

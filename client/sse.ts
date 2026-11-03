@@ -108,6 +108,8 @@ export async function inspectSSEWebStream(
   onUsage: (usage: UsageTrackingData) => void,
   onResponseId?: (responseId: string) => void,
   options?: {
+    /** Safe notification only; never exposes/stores the raw upstream error. */
+    onErrorEnvelope?: () => void;
     /** Called with each raw chunk read from the tee'd inspection branch. */
     onRawChunk?: (chunk: Uint8Array, sequence: number, text: string) => void | Promise<void>;
   }
@@ -134,13 +136,14 @@ export async function inspectSSEWebStream(
 
     try {
       const data = JSON.parse(trimmed) as any;
+      if (data?.error || data?.type === "error" || data?.type === "response.failed" || data?.response?.error) options?.onErrorEnvelope?.();
 
       if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
         return;
       }
 
       if (!responseIdCaptured) {
-        const responseId = data?.id;
+        const responseId = data?.response?.id ?? data?.message?.id ?? data?.id;
         if (typeof responseId === "string" && responseId.trim().length > 0) {
           capturedResponseId = responseId.trim();
           onResponseId?.(capturedResponseId);
@@ -265,7 +268,7 @@ export function createSSEParserTransform(
       }
 
       if (!responseIdCaptured) {
-        const responseId = data?.id;
+        const responseId = data?.response?.id ?? data?.message?.id ?? data?.id;
         if (typeof responseId === "string" && responseId.trim().length > 0) {
           onResponseId?.(responseId.trim());
           responseIdCaptured = true;
