@@ -15,6 +15,7 @@ import type {
   StorageAdapter,
 } from "./interfaces";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
+import { withProviderDeadline } from "../discovery/providerDeadline";
 import type { RefundResult, TopUpResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError, ProviderMintBalanceError } from "../core/errors";
@@ -1377,14 +1378,21 @@ export class BalanceManager {
     balanceUnknown?: boolean;
   }> {
     try {
-      const response = await fetch(`${baseUrl}v1/wallet/info`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
+      const { response, responseBody } = await withProviderDeadline(
+        async (signal) => {
+          const response = await fetch(`${baseUrl}v1/wallet/info`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+            signal,
+          });
+          return { response, responseBody: await response.text() };
         },
-      });
+        10_000,
+      );
 
       if (response.ok) {
-        const data = await response.json();
+        const data = JSON.parse(responseBody);
         return {
           amount: data.balance,
           reserved: data.reserved ?? 0,
@@ -1393,7 +1401,6 @@ export class BalanceManager {
         };
       } else {
         this.logger.warn(`getTokenBalance: status=${response.status}`);
-        const responseBody = await response.text().catch(() => undefined);
         const parsedError = parseCoreError(responseBody, response.status);
         if (parsedError.json) {
           this.logger.warn(`getTokenBalance: FAILED status=${response.status} detail=${parsedError.message ?? "none"}`);
