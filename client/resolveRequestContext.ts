@@ -15,7 +15,7 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
-import { WARM_COST_BASKET } from "./costEstimate";
+import { estimateCost, hasUsableTokenRates, WARM_COST_BASKET } from "./costEstimate";
 import { canonicalizeModelId, findModelForId } from "../core/modelMappings";
 import {
   RoutstrClient,
@@ -289,7 +289,12 @@ export async function resolveRequestContext(
           )
         : null;
       const index = resolved?.selectors.findIndex(
-        (s): s is string => s !== null
+        (selector, i) => {
+          const pricing = resolved?.satsPricing[i];
+          if (!selector || !pricing || !hasUsableTokenRates(pricing)) return false;
+          const cost = estimateCost(pricing, WARM_COST_BASKET).total;
+          return Number.isFinite(cost) && cost >= 0;
+        }
       ) ?? -1;
       if (resolved && index >= 0) {
         modelPath = {

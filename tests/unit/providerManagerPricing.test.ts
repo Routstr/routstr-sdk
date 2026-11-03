@@ -1765,8 +1765,7 @@ describe("ProviderManager", () => {
 
     it("does not let a route whose rates are not prices win the ranking", async () => {
       // A negative rate yields a negative cost and would beat every real
-      // route; it is not a price, so it cannot rank. Such a node stays
-      // rankable (it is still a failover candidate) but sorts last.
+      // route; it is not a price, so it cannot rank or be selected on failover.
       stubPathsFetch({
         [NODE_A]: pricedPathsPayload([
           [DEEPSEEK_SELECTOR, { prompt: 1, completion: -5 }],
@@ -1781,14 +1780,41 @@ describe("ProviderManager", () => {
 
       expect(ranking.map((c) => c.baseUrl)).toEqual([
         `${NODE_B}/`,
-        `${NODE_A}/`,
       ]);
     });
 
-    it("ranks a route that publishes no pricing on the catalog model's rates", async () => {
-      // A route with no sats_pricing of its own is priced by the node's
-      // /v1/models entry, not treated as unrankable: dropping it to +inf
-      // would demote a node that really does have a published rate.
+    it.each([
+      null,
+      { prompt: 1 },
+      { prompt: -1, completion: 1 },
+      { prompt: NaN, completion: 1 },
+      { prompt: Infinity, completion: 1 },
+      { prompt: Number.MAX_VALUE, completion: Number.MAX_VALUE },
+    ])("excludes unusable route pricing even with valid catalog rates: %j", async (pricing) => {
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, pricing]]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+      expect(await manager.getModelPathProviderRanking(MODEL_ID)).toEqual([]);
+    });
+
+    it("keeps zero-priced routes and never retries an invalid candidate after valid exhaustion", async () => {
+      stubPathsFetch({
+        [NODE_A]: pricedPathsPayload([
+          [DEEPSEEK_SELECTOR, { prompt: 0, completion: 0 }],
+          [FIREWORKS_SELECTOR, { prompt: 1, completion: -1 }],
+        ]),
+      });
+      const manager = new ProviderManager(pathRegistry());
+      const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
+      expect(ranking).toHaveLength(1);
+      expect(ranking[0].cost).toBe(0);
+      expect(await manager.getModelPathProviderRanking(MODEL_ID, {
+        excludeModelPaths: [modelPathCandidateKey(`${NODE_A}/`, DEEPSEEK_SELECTOR)],
+      })).toEqual([]);
+    });
+
+    it("skips missing route pricing even when catalog pricing is cheaper", async () => {
       stubPathsFetch({
         [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
         [NODE_B]: pricedPathsPayload([
@@ -1814,7 +1840,6 @@ describe("ProviderManager", () => {
       const ranking = await manager.getModelPathProviderRanking(MODEL_ID);
 
       expect(ranking.map((c) => c.baseUrl)).toEqual([
-        `${NODE_A}/`,
         `${NODE_B}/`,
       ]);
     });
@@ -1862,8 +1887,8 @@ describe("ProviderManager", () => {
 
     it("excludes the failed node when excludeBaseUrl is given", async () => {
       stubPathsFetch({
-        [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
-        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
+        [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]),
+        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]),
       });
       const manager = new ProviderManager(pathRegistry());
 
@@ -1921,7 +1946,7 @@ describe("ProviderManager", () => {
           // The official DeepSeek API route is not whitelisted.
           { path: "url=https%3A%2F%2Fapi.deepseek.com&model-id=deepseek-v4.1-flash" },
         ]),
-        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
+        [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]),
       });
       const manager = new ProviderManager(pathRegistry());
 
@@ -1966,13 +1991,12 @@ describe("ProviderManager", () => {
     });
 
     it("breaks equal-cost ties by baseUrl even when nodes are absent", async () => {
-      // Metadata-less routes fall back to the same model aggregate, so their
-      // costs are exactly equal. With no `nodes` list the tie must still be
+      // Routes advertise identical prices, so their costs are exactly equal. With no `nodes` list the tie must still be
       // deterministic — a ranking that followed discovery order would pin a
       // different route depending on which provider answered first.
       stubPathsFetch({
-        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
-        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, { prompt: 1, completion: 1 }]]),
+        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, { prompt: 1, completion: 1 }]]),
       });
       const registryWith = (order: string[]) =>
         createRegistry({
@@ -2013,8 +2037,8 @@ describe("ProviderManager", () => {
       // When the snapshot does list nodes, that order is the publisher's
       // stated priority for equal prices — discovery order must not override it.
       stubPathsFetch({
-        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
-        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, null]]),
+        [NODE_A]: pricedPathsPayload([[DEEPSEEK_SELECTOR, { prompt: 1, completion: 1 }]]),
+        [NODE_B]: pricedPathsPayload([[DEEPSEEK_SELECTOR, { prompt: 1, completion: 1 }]]),
       });
       const manager = new ProviderManager(
         createRegistry({

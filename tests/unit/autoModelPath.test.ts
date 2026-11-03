@@ -466,7 +466,7 @@ describe("runtime model-path policies", () => {
   it.each([undefined, [], [NODE_A], [NODE_B]])("forced provider honors optional nodes %j", async nodes => {
     const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
     deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes } });
-    const fetch = stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    const fetch = stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
     const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
       forcedProvider: NODE_A, autoModelPath: true, ...deps });
     expect(ctx.pinnedProvider).toBe(true);
@@ -475,11 +475,41 @@ describe("runtime model-path policies", () => {
     expect(fetch.mock.calls.length > 0).toBe(nodes?.[0] !== NODE_B);
   });
 
+  it.each([undefined, -1, Infinity])("leaves a forced provider unpinned when route pricing is unusable: %s", async (completion) => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.pinnedProvider).toBe(true);
+    expect(ctx.modelPath).toBeUndefined();
+  });
+
+  it("skips an unpriced forced-provider route and pins the next priced route", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([
+      { path: DEEPSEEK_SELECTOR },
+      { path: FIREWORKS_SELECTOR, completion: 0 },
+    ]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.modelPath?.selector).toBe(FIREWORKS_SELECTOR);
+  });
+
+  it("falls back unpinned when all advertised routes lack pricing", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true, ...deps });
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toBeUndefined();
+  });
+
   it("preserves policy node priority for equal-cost ranking and excludes disabled nodes", async () => {
     const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()], [`${NODE_B}/`]: [makeModel()] });
     deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [NODE_B, NODE_A] } });
-    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]),
-      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]),
+      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
     const manager = new ProviderManager(deps.discoveryAdapter);
     expect((await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).map(r => r.baseUrl))
       .toEqual([`${NODE_B}/`, `${NODE_A}/`]);
@@ -500,7 +530,7 @@ describe("runtime model-path policies", () => {
     deps.discoveryAdapter.getModelPathWhitelist = () => ({
       [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [hostCaseNode] },
     });
-    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
     const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
       forcedProvider: NODE_A, autoModelPath: true, ...deps });
     expect(ctx.modelPath?.selector).toBe(DEEPSEEK_SELECTOR);
@@ -527,7 +557,7 @@ describe("runtime model-path policies", () => {
     deps.discoveryAdapter.getModelIdMappings = () => ({ variant: "Canonical" });
     deps.discoveryAdapter.getModelPathWhitelist = () => ({ variant: { routes: [{ url: "https://case.example/v1" }] } });
     const selector = "url=https%3A%2F%2Fcase.example%2Fv1&model-id=variant";
-    stubPathsFetch({ [NODE_A]: { data: [{ id: "variant", paths: [{ path: selector }] }] } });
+    stubPathsFetch({ [NODE_A]: { data: [{ id: "variant", paths: [{ path: selector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] }] } });
     const ctx = await resolveRequestContext({ modelId: "Canonical", forcedProvider: NODE_A,
       autoModelPath: true, ...deps });
     expect(ctx.modelPath?.selector).toBe(selector);
@@ -561,9 +591,9 @@ describe("runtime model-path policies", () => {
     };
     deps.discoveryAdapter.getModelPathWhitelist = () => whitelist;
     const fetch = stubPathsFetch({ [NODE_A]: { data: [
-      ...pathsPayload([{ path: DEEPSEEK_SELECTOR }]).data,
-      { id: "second-model", paths: [{ path: secondSelector }] },
-    ] }, [NODE_B]: { data: [{ id: "second-model", paths: [{ path: secondSelector }] }] } });
+      ...pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]).data,
+      { id: "second-model", paths: [{ path: secondSelector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] },
+    ] }, [NODE_B]: { data: [{ id: "second-model", paths: [{ path: secondSelector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] }] } });
     const manager = new ProviderManager(deps.discoveryAdapter);
     const warm = await manager.warmModelPathCaches({ torMode: false });
     expect(warm.map(r => [r.baseUrl, r.modelId, r.whitelisted])).toEqual([
@@ -577,8 +607,7 @@ describe("runtime model-path policies", () => {
       `${NODE_A}/ ${secondSelector}`,
       `${NODE_B}/ ${secondSelector}`,
     ]);
-    // Existing metadata-less fallback: null pricing ranks on the model aggregate.
-    expect(ranking[0].satsPricing).toBeNull();
+    expect(ranking[0].satsPricing).toEqual({ prompt: 1, completion: 1 });
     whitelist = { "second-model": { routes: [{ url: "https://second-upstream.example/v1" }], nodes: [NODE_B] } };
     fetch.mockClear();
     expect((await manager.warmModelPathCaches({ torMode: false })).map(r => r.baseUrl)).toEqual([`${NODE_B}/`]);

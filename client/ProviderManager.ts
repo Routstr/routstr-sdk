@@ -69,8 +69,8 @@ export const MODEL_PATH_WARM_BUDGET_MS = MODEL_PATHS_FETCH_TIMEOUT_MS + 5_000;
 export interface ModelPathRouteCandidate {
   baseUrl: string;
   selector: string;
-  /** This route's advertised pricing, or null when the node published none. */
-  satsPricing: ModelPathSatsPricing | null;
+  /** This route's advertised pricing (required for automatic selection). */
+  satsPricing: ModelPathSatsPricing;
   model: Model;
   /** Warm-basket cost this candidate was ranked on, in sats. */
   cost: number;
@@ -1509,8 +1509,8 @@ export class ProviderManager {
    * Ties break on the policy's node order (when the snapshot lists nodes), then
    * baseUrl, then the route's whitelist index, then the selector itself — an
    * equal-cost ranking must never depend on the order nodes were discovered in.
-   * Equal costs are common, not exotic: a route that publishes no pricing is
-   * ranked on the model aggregate, which is the same number on every node.
+   * Equal prices still use these deterministic tiebreaks. Routes without usable
+   * route-specific pricing are skipped; model-level prices are never substituted.
    *
    * `estimateCost(...).total` is the billed token classes only: the node's
    * per-request fee sizes the deposit ceiling and is not part of what it
@@ -1624,14 +1624,12 @@ export class ProviderManager {
             continue;
           }
           if (pathId && this.isOnCooldown(baseUrl, modelId, pathId)) continue;
-          const satsPricing = resolved.satsPricing[i] ?? null;
-          // Only the model aggregate may stand in for missing route pricing.
-          // Borrowing a sibling route's rates is what let a node be ranked on
-          // a price a request might never be billed at.
-          const pricing = satsPricing ?? model.sats_pricing;
-          const cost = hasUsableTokenRates(pricing)
-            ? estimateCost(pricing, WARM_COST_BASKET).total
-            : Number.POSITIVE_INFINITY;
+          const satsPricing = resolved.satsPricing[i];
+          // Automatic pins require the route's own usable rates, never model
+          // or sibling-route pricing. Zero rates are valid advertised prices.
+          if (!satsPricing || !hasUsableTokenRates(satsPricing)) continue;
+          const cost = estimateCost(satsPricing, WARM_COST_BASKET).total;
+          if (!Number.isFinite(cost) || cost < 0) continue;
           routes.push({
             candidate: { baseUrl, selector, satsPricing, model, cost },
             routeIndex: i,

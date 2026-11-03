@@ -164,13 +164,13 @@ follows the pinned route's `max_cost`.
    lookup. The earlier full-catalog probe artifact is evidence of capability, not a
    measurement of current per-request round-trips; recheck the per-model endpoint before
    widening eligibility.
-2. **A decision on metadata-less nodes.** `llm.satsandsports.cash` advertises the
-   whitelisted routes with `sats_pricing: null`, so it enters the ranking on the
-   `model.sats_pricing?.completion` fallback and the deposit gate falls back to the model
-   aggregate instead of a route envelope — the route-vs-aggregate mixing
-   `ProviderManager.getRequiredSatsForModel` warns about. **Implementation decision:
-   accept this existing pre-metadata fallback**, rather than changing pricing eligibility
-   in this feature. Probe reports must make missing metadata visible before widening.
+2. **Route-specific pricing is required.** Routes with absent, incomplete, invalid,
+   or overflowing token pricing are skipped for automatic pinning, even if the node
+   publishes usable model-level pricing. Zero rates qualify. Never borrow model-level
+   or sibling-route rates. This also applies when automatically pinning a forced
+   provider; if no priced route remains it stays on that provider unpinned. Ordinary
+   automatic selection falls back to the unpinned provider ranking when none remain.
+   Explicit caller-supplied pins are unchanged. Probe reports should expose missing metadata.
 
 The field therefore stays in the snapshot as an *override*, not a requirement: publish it
 to restrict/prioritise, omit it to let the probe decide. Whichever shape becomes the
@@ -375,8 +375,8 @@ Keep `...DeepSeek...` aliases delegating to the generic functions for one minor 
 
 1. Read the policy: `const policy = modelPathPolicyFor(modelId, this.getModelPathWhitelist(), this.getModelIdMappings())`; **return `[]` when undefined** (model not auto-pinned → caller degrades to unpinned ranking, same as an empty ranking today when all nodes are down).
 2. Candidate nodes: `policy.nodes?.length ? policy.nodes : Object.keys(this.discoveryAdapter.getCachedModels())` (§2.1). Keys from the store are already normalized while snapshot entries are normalized at parse time (§4), so both branches compare consistently. Every existing guard stays: `excludeBaseUrl(s)`, mint acceptance, disabled set, Tor/clearnet invariant, cooldown, `findModelForId`, `getNodeModelPathsForModel` (with mappings and the catalog model's native/alias spellings), `resolveModelPathSelectors(nodePaths, modelId, policy.routes, mappings)`. Keep the existing `withBudget(..., MODEL_PATH_RANKING_BUDGET_MS)` wrapper: a slow node is skipped for this ranking while its fetch can fill the cache for later requests. Never substitute the full-catalog fetch.
-3. **Route-major output.** Emit one candidate per advertised whitelisted route, each ranked on *its own* `sats_pricing` (falling back only to the model aggregate, never to a sibling route's rates). The request-local `excludeModelPaths` filter drops candidates directly, so there is no node price anchor to preserve. Failover therefore interleaves nodes by price: a cheap second route on another node outranks an expensive route on the cheapest node. Return `Array<{ baseUrl, selector, satsPricing, model, cost }>`. This replaced the earlier node-major shape, which grouped routes under a node and ranked the node by its first usable route; the tradeoff is documented in the PR review comment "Design decision: route-major failover".
-4. The sort must be **total and order-independent**, because equal costs are common (every metadata-less route falls back to the same model aggregate): `cost`, then the policy's `nodes` index when the snapshot lists nodes, then `baseUrl`, then the route's whitelist index, then the selector. A plain stable sort would otherwise let discovery order decide the pin.
+3. **Route-major output.** Emit one candidate per advertised whitelisted route, each ranked on *its own* `sats_pricing` (skipping routes without usable route-specific pricing; never borrowing model-level or sibling-route rates). The request-local `excludeModelPaths` filter drops candidates directly, so there is no node price anchor to preserve. Failover therefore interleaves nodes by price: a cheap second route on another node outranks an expensive route on the cheapest node. Return `Array<{ baseUrl, selector, satsPricing, model, cost }>`. This replaced the earlier node-major shape, which grouped routes under a node and ranked the node by its first usable route; the tradeoff is documented in the PR review comment "Design decision: route-major failover".
+4. The sort must be **total and order-independent**, including when multiple routes advertise equal prices: `cost`, then the policy's `nodes` index when the snapshot lists nodes, then `baseUrl`, then the route's whitelist index, then the selector. A plain stable sort would otherwise let discovery order decide the pin.
 5. When `nodes` is absent/empty, the candidate fan-out is the whole enabled set. Preserve and test the existing per-model negative caching/backoff, empty-result caching, in-flight dedupe, stale-while-revalidate, and ranking budget (§2.1). Log candidate/probed node counts at debug so widening is observable; candidate count is not necessarily HTTP fetch count because lookups may be cached or deduplicated.
 
 Add a small `getModelPathWhitelist()` helper on `ProviderManager` mirroring
@@ -498,8 +498,8 @@ routing (ProviderManager / resolveRequestContext level)
     concurrent rankings dedupe in-flight fetches, and stale entries refresh in background
   - cold/hung widened candidates respect MODEL_PATH_RANKING_BUDGET_MS; timed-out ranking
     candidates can fill the cache for subsequent calls without stalling this ranking
-  - a metadata-less node (route advertised, sats_pricing null) is ranked on the model-level
-    fallback and the deposit gate receives no route envelope (§2.1)
+  - routes with missing/invalid pricing are skipped, even with valid model-level prices;
+    zero prices remain eligible and all-invalid rankings return [] (§2.1)
   - getModelPathProviderRanking returns [] for a model with an empty/absent policy
     → resolveRequestContext falls back to the unpinned price ranking
 
@@ -597,7 +597,7 @@ per-request fetch, by design (§3).
 | A stale relay rolling back the policy | Relays can re-serve older replaceable versions | Saved signed event merged into candidates + `created_at`/`id` ordering + persisted projection (the 38426 rollback test generalizes directly) |
 | Extra latency | Widened candidates increase cold per-model lookups and background refresh work. Current ranking already caches failures/empty results, deduplicates in-flight fetches, serves bounded stale entries, and budgets waiting per candidate | Preserve `getNodeModelPathsForModel` and ranking budgets, test widened candidates, make warming runtime-policy-driven, and log candidate/probed counts (§2.1, §5.5) |
 | Widening eligibility moves the pin | With `nodes` absent, a newly path-capable node (`llm.satsandsports.cash` in the 2026-10-09 probe) enters the ranking and can take the default pin, changing the deposit envelope with it | Expected, but validate a widened snapshot with the probe (§7 step 2) before publishing it; keep `nodes` as the override when a pin must stay fixed |
-| Metadata-less node prices the reserve off the model aggregate | `getRequiredSatsForModel` falls back to `model.sats_pricing` when the resolved route carries no metadata — the mixing its own comment warns about | Decide explicitly (§2.1); reject or accept candidates without per-route pricing |
+| Missing route pricing | A model-level price need not describe the selected route | Skip automatic candidates without usable route-specific pricing (§2.1) |
 | Second model auto-pinned without intent | Generalizing to N models means a typo'd key silently enables pinning for another model | Validate key collisions, log accepted model keys, ship with exactly one key |
 
 ---

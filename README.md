@@ -201,8 +201,9 @@ restricts/prioritizes the enabled discovered set and supplies the tiebreak betwe
 equal-cost routes; omitted or empty means any eligible node advertising a matching route
 and ties fall back to URL order. Only the target node's verbatim advertised selector is
 sent. Forcing a provider keeps requests on that provider, whether auto-pinning succeeds
-or not. Metadata-less routes retain existing model-level pricing/deposit fallback
-behavior.
+or not. Automatic pins require usable route-specific prompt and completion prices
+(zero is valid). Routes with missing or invalid pricing are skipped; model-level
+pricing is never substituted. If none remain, selection falls back unpinned.
 
 `{"models":{}}` is a persistent kill switch. No valid snapshot on a fresh offline install
 uses the bundled bootstrap policy; invalid events or relay outages retain the last good
