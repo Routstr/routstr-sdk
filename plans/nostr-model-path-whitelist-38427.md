@@ -1,3 +1,7 @@
+> Updated decision: there is no built-in route policy. A null/absent stored policy
+> and an accepted empty policy both mean no automatic route preferences. Legacy
+> DeepSeek helpers remain only for explicit callers, never automatic selection.
+
 # Plan: move the model-path whitelist out of the SDK and onto Nostr (kind 38427)
 
 ## Goal
@@ -13,7 +17,7 @@ Move that policy onto Nostr as an authoritative signed snapshot, exactly the way
 `MODEL_ID_MAPPINGS` already works: **kind 38427, `d` tag `model-path-whitelist`,
 authored by `routstrModelsPubkey`** (falling back to `routstrPubkey`), fetched through
 the existing relay/trust/persistence pipeline, with the constants demoted to an
-offline bootstrap fallback.
+no automatic preferences until a signed policy is accepted.
 
 After this change:
 
@@ -190,17 +194,15 @@ Mirror `fetchModelIdMappings` / `applyModelIdMappingEvents` exactly:
 | --- | --- |
 | Snapshot with ≥1 model | replaces the whole policy: those models auto-pin, everything else does not |
 | Snapshot with zero models (`{"models":{}}`) | **feature off**: no model auto-pins; requests degrade to the normal unpinned price ranking |
-| Absent / malformed / invalid / forge-rejected event | last good snapshot retained; genuinely nothing ever accepted → bundled fallback |
+| Absent / malformed / invalid / forge-rejected event | last good snapshot retained; genuinely nothing ever accepted → empty policy |
 | Two valid events, different versions | newest `created_at` wins; ties broken by lowest `id` (ascending lexicographic, as in 38426 / Nostr replaceable-event ordering) |
-| Fresh install, relays unreachable | bundled bootstrap snapshot (= today's hardcoded values, so first-run behaviour is unchanged) |
+| Fresh install, relays unreachable | empty policy (ordinary unpinned routing) |
 | Configured author changes | the stored projection is discarded and rebuilt only from events for the new author |
 
-The empty-snapshot rule is the one deliberate semantic difference from 38426: 38426's
-empty snapshot clears mappings and falls back to the bundled table only on a *fresh*
-install; here the bundled table is a bootstrap value and a published empty snapshot is an
-explicit, immediate kill switch that survives restarts. That is the whole point of moving
-this to Nostr — being able to stop pinning without a release — so it must not silently
-fall back to the constants.
+For route policy, both a null/absent projection and an accepted empty snapshot mean
+no automatic pinning. The signed empty event still persists as a high-water mark,
+so older policy events cannot reactivate it. Model-ID mapping fallback is separate
+and unchanged.
 
 **Resolution of a requested model id.** `models` keys are expected to be canonical model
 ids (`MODEL_ID_MAPPINGS` values / routstr21 spellings), but lookup goes through
@@ -295,8 +297,6 @@ export interface ModelPathPolicy {
 /** undefined when the model is not auto-pinned in this snapshot. */
 export type ModelPathWhitelist = Record<string, ModelPathPolicy>;
 
-/** Bundled fallback: exactly today's constants. Used only before a snapshot is accepted. */
-export const MODEL_PATH_BOOTSTRAP: ModelPathWhitelist = { ... };
 
 export function parseModelPathWhitelist(content: string,
   mappings: ModelIdMappings): ModelPathWhitelist;                             // throws on invalid
@@ -310,14 +310,9 @@ own-property lookups. Persist normalized variant keys rather than canonical keys
 under the mappings active at first acceptance; canonical-first lookup uses the current
 mapping snapshot. This avoids `Map` serialization and prototype hazards.
 
-Backward-compatible re-exports in `utils/modelPaths.ts`: `DEEPSEEK_MODEL_PATH_WHITELIST`
-becomes `MODEL_PATH_BOOTSTRAP[<canonical id>].routes`, `DEEPSEEK_AUTO_MODEL_ID` becomes the
-first bootstrap key, `DEEPSEEK_AUTO_NODE_URLS` becomes its `nodes`, `DEEPSEEK_AUTO_NODE_URL`
-stays `DEEPSEEK_AUTO_NODE_URLS[0]`. They remain exported (public API, used by `routstrd`,
-scripts and the `model-paths` skill) but are documented as "bundled fallback only; the
-runtime policy comes from the adapter snapshot". They currently live in `utils/modelPaths.ts`;
-moving the source of truth to `core/` and re-deriving them keeps `utils/index.ts` exports
-stable.
+Legacy `DEEPSEEK_*` constants and explicit-selector wrappers remain exported in
+`utils/modelPaths.ts` for existing callers, but are not a runtime default policy.
+No production `MODEL_PATH_BOOTSTRAP` object exists. Tests install explicit policies.
 
 ### 5.2 Discovery adapter + storage
 
@@ -347,7 +342,7 @@ const MODEL_PATH_WHITELIST_D_TAG = "model-path-whitelist";
 
 New private/public members, structurally identical to the mappings ones:
 
-- `getModelPathWhitelist()` — synchronous, `adapter.getModelPathWhitelist() ?? MODEL_PATH_BOOTSTRAP`. This is the **only** thing the request path reads; it never fetches.
+- `getModelPathWhitelist()` — synchronous, `adapter.getModelPathWhitelist() ?? {}`. This is the **only** thing the request path reads; it never fetches.
 - `parseModelPathWhitelist(event, mappings)` / `isModelPathWhitelistEvent(event, mappings)` — kind, author, `d` tag, trust gate, then the §4 parser using the explicit mappings argument.
 - `applyModelPathWhitelistEvents(events, mappings)` — merge the adapter's *saved signed event* with fetched candidates, filter, sort by descending `created_at` then ascending `id` (`b.created_at - a.created_at || a.id.localeCompare(b.id)`), take the first, persist event + projection + `lastUpdate`, return the projection. Use the same captured mappings for every candidate. If none is valid under those mappings, retain the last-good projection and signed event; do not clear them or restore bootstrap merely because mappings changed.
 - `fetchModelPathWhitelist(forceRefresh)` — **first await `fetchModelIdMappings(forceRefresh)`**, then capture its returned snapshot for all whitelist validation and application in this call. After that dependency completes, use the mappings-style cache-TTL short-circuit, hydrate the saved event into the event store, query `getNostrEvents({kinds:[38427], "#d":[MODEL_PATH_WHITELIST_D_TAG], authors:[routstrModelsPubkey]}, forceRefresh, undefined, e => this.isModelPathWhitelistEvent(e, mappings))`, then apply with those same mappings. A changed mapping snapshot must bypass the whitelist TTL shortcut so collision validation runs even when the whitelist event has not changed. If the mapping fetch fails, use the last-good mappings (or their bundled fallback); never race validation against an unfinished fetch.
@@ -363,7 +358,7 @@ New private/public members, structurally identical to the mappings ones:
 | `whitelistedDeepSeekRoute(selector)` | → `whitelistedModelPathRoute(selector, routes: readonly ModelPathRoute[])`; match on normalized `(url, endpoint)` (§4) |
 | `isWhitelistedDeepSeekModelPath(selector)` | → `isWhitelistedModelPath(selector, routes)` |
 | `resolveDeepSeekModelPathSelectors(nodePaths, modelId, mappings?)` | → `resolveModelPathSelectors(nodePaths, modelId, routes, mappings?)`; the `selectors`/`satsPricing` arrays become `routes.length` long |
-| `deepSeekModelPath(modelId, route?)` | default route param dropped or kept pointing at `MODEL_PATH_BOOTSTRAP[0].routes[0]`; the builder is otherwise generic |
+| `deepSeekModelPath(modelId, route?)` | default route param dropped or kept pointing at the legacy explicit-selector route constant; the builder is otherwise generic |
 | `canonicalModelPath`, `modelPathCandidateKey`, `sameNode`, `fetchModelPaths`, `parseModelPathsPayload`, `getNodeModelPaths`, `getNodeModelPathsForModel`, `MODEL_PATH_HEADER`, caches | **unchanged**; retain per-model alias lookup, negative caching/backoff, in-flight dedupe, and stale-while-revalidate |
 
 Keep `...DeepSeek...` aliases delegating to the generic functions for one minor release
@@ -380,7 +375,7 @@ Keep `...DeepSeek...` aliases delegating to the generic functions for one minor 
 5. When `nodes` is absent/empty, the candidate fan-out is the whole enabled set. Preserve and test the existing per-model negative caching/backoff, empty-result caching, in-flight dedupe, stale-while-revalidate, and ranking budget (§2.1). Log candidate/probed node counts at debug so widening is observable; candidate count is not necessarily HTTP fetch count because lookups may be cached or deduplicated.
 
 Add a small `getModelPathWhitelist()` helper on `ProviderManager` mirroring
-`getModelIdMappings()` (`this.discoveryAdapter.getModelPathWhitelist?.() ?? MODEL_PATH_BOOTSTRAP`).
+`getModelIdMappings()` (`this.discoveryAdapter.getModelPathWhitelist?.() ?? {}`).
 Also update `warmModelPathCaches(options)`; leaving it hardcoded would warm removed
 policies and miss newly enabled models/nodes:
 
@@ -436,7 +431,7 @@ helpers, same `createMemoryDriver` / `createDiscoveryAdapterFromStore` /
 ```
 fetch
   - queries exactly { kinds:[38427], "#d":["model-path-whitelist"], authors:[pubkey] }
-  - accepts only the configured author and d tag; replaces the bootstrap fallback
+  - accepts only the configured author and d tag; replaces the empty effective policy
   - forged signature → ignored; created_at beyond the future-drift window → ignored
   - valid newer event replaces; equal created_at chooses the lexicographically lowest id
     regardless of arrival order; assert the exact winner after restart and pruning too
@@ -459,7 +454,7 @@ validation (each case leaves the previous good snapshot in place and the saved e
 
 semantics
   - {"models":{}} → getModelPathWhitelist() is empty AND survives a restart (kill switch)
-  - offline on a fresh install → MODEL_PATH_BOOTSTRAP
+  - offline on a fresh install → {}
   - offline after a successful fetch → last good snapshot (not the fallback)
   - author change discards the stored projection
   - bootstrap (warm cache, Nostr, and HTTP), refresh, and direct whitelist fetch all await
@@ -515,7 +510,7 @@ warming (ProviderManager.warmModelPathCaches)
 ```
 
 Updates to existing suites: `modelPaths.test.ts` (constructor params, normalized matching,
-bootstrap-derived constants), `modelPathAliasResolution.test.ts`,
+explicit-selector compatibility constants), `modelPathAliasResolution.test.ts`,
 `autoModelPath.test.ts`, `fetchAIResponseModelPath.test.ts`, `pinnedModelPathFailover.test.ts`,
 `providerManagerPricing.test.ts` (all currently import `DEEPSEEK_AUTO_NODE_URLS` /
 `DEEPSEEK_MODEL_PATH_WHITELIST` — they can keep importing the aliases, or inject a snapshot
@@ -550,10 +545,8 @@ agree and drift is detectable.
    `ai.redsh1ft.com` is unchanged, i.e. still the OpenRouter `deepseek` subprovider.
 5. **Then** the policy becomes remotely mutable: append routes, add a second model, add or
    drop nodes, and publish `{"models":{}}` as the off switch — each verified the same way.
-6. **Follow-up decision** (separate change, not this plan): after one or two releases,
-   shrink `MODEL_PATH_BOOTSTRAP` to empty so a fresh install with no relay access does *not*
-   auto-pin. Keeping the fallback forever means a relay outage silently reinstates a policy
-   the publisher may have deliberately turned off.
+6. **No built-in route fallback.** Fresh installs and author/trust resets use ordinary
+   unpinned selection until a valid signed policy is available.
 7. **Independent follow-up**: publish a snapshot with `nodes` omitted/`[]` (probe-driven
    candidates) after verifying the existing per-model cache/backoff, dedupe, stale refresh,
    ranking budget, and runtime-driven warming with the widened set (§6), and resolving the
@@ -604,11 +597,9 @@ per-request fetch, by design (§3).
 
 ## 10. Open questions
 
-1. **`nodes` required or optional?** *Resolved:* optional. Present = allowlist + priority/tiebreak; absent or `[]` = "any enabled node that advertises the route", which is exactly the probe-driven behaviour and matches the existing comment on `DEEPSEEK_AUTO_NODE_URLS`. The wider probe fan-out must retain the existing per-model cache/backoff and budget protections (§2.1); publishing the first snapshot with `nodes` present keeps today's behaviour byte-for-byte, so the field can be dropped later as its own validated step. Metadata-less candidates retain the existing fallback (§2.1).
-2. **Empty snapshot: kill switch (recommended) or fall back to bootstrap?** The
-   recommendation is the whole point of the feature, but it is a deliberate divergence from
-   38426's "empty clears mappings" plus fallback-on-fresh-install, so it should be an
-   explicit sign-off.
+1. **`nodes` required or optional?** *Resolved:* optional. Present = allowlist + priority/tiebreak; absent or `[]` = "any enabled node that advertises the route", which is exactly the probe-driven behaviour and matches the existing comment on `DEEPSEEK_AUTO_NODE_URLS`. The wider probe fan-out must retain the existing per-model cache/backoff and budget protections (§2.1); publishing the first snapshot with `nodes` present keeps today's behaviour byte-for-byte, so the field can be dropped later as its own validated step. Metadata-less candidates are skipped (§2.1).
+2. **Empty or absent snapshot:** resolved — no automatic route preferences in either
+   case; no hardcoded fallback. Accepted empty evidence remains persisted.
 3. **Snapshot-in-one-event vs per-model `#d` events** — §2 recommends one; the trade is
    independent per-model refresh vs one fetch/cache/persist path.
 4. **Snapshot key spelling** — accept any mapped variant key and resolve via
@@ -631,7 +622,7 @@ per-request fetch, by design (§3).
   release waiting period. The comment on `utils/modelPaths.ts`'s `DEEPSEEK_AUTO_NODE_URLS`
   already describes capability discovery as the intent; retain the optional allowlist
   as an override when explicit restriction/priority is needed.
-- Shrink `MODEL_PATH_BOOTSTRAP` to empty (§7 step 6).
+- Built-in route-policy fallback removed; no later bootstrap retirement is needed.
 - Remove the `DeepSeek`-named aliases in the next major.
 - File the RIP for kind 38427 alongside whatever documents 38423/38425/38426.
 

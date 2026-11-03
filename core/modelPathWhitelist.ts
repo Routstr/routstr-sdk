@@ -11,26 +11,6 @@ export interface ModelPathPolicy {
 /** JSON-safe policy projection. Empty is an explicit kill switch, not a cache miss. */
 export type ModelPathWhitelist = Record<string, ModelPathPolicy>;
 
-/** Offline bootstrap only, never substituted for an accepted empty snapshot. */
-export const MODEL_PATH_BOOTSTRAP: ModelPathWhitelist = {
-  "deepseek-v4.1-flash": {
-    routes: [
-      { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
-      { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
-      { url: "https://api.ppq.ai" },
-      { url: "https://openrouter.ai/api/v1", endpoint: "venice/fp8" },
-      { url: "https://openrouter.ai/api/v1", endpoint: "wafer" },
-      { url: "https://api.venice.ai/api/v1" },
-      { url: "https://api.fireworks.ai/inference/v1" },
-    ],
-    nodes: [
-      "https://ai.redsh1ft.com",
-      "https://routstr.otrta.me",
-      "https://api.nonkycai.com",
-    ],
-  },
-};
-
 /** Matching identity only. Headers always use the node's verbatim selector. */
 export function normalizeRoute(url: string, endpoint?: string): string {
   if (typeof url !== "string" || !/^https?:\/\//i.test(url.trim())) {

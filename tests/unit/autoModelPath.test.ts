@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEEPSEEK_AUTO_MODEL_ID,
@@ -7,7 +8,7 @@ import {
   sameNodeUrl,
 } from "../../utils/modelPaths";
 import { ProviderManager } from "../../client/ProviderManager";
-import { MODEL_PATH_BOOTSTRAP, type ModelPathWhitelist } from "../../core/modelPathWhitelist";
+import { type ModelPathWhitelist } from "../../core/modelPathWhitelist";
 import { resolveRequestContext } from "../../client/resolveRequestContext";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
@@ -74,6 +75,7 @@ const makeModel = (completion = 1): Model =>
 
 function makeDeps(modelsByNode: Record<string, Model[]>) {
   const discoveryAdapter = {
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getModelIdMappings: () => null,
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
@@ -124,6 +126,24 @@ afterEach(() => {
 });
 
 describe("resolveRequestContext model-path selection", () => {
+  it.each([null, {}])("does not bootstrap automatic routes for absent/empty policy: %j", async (policy) => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => policy;
+    const fetch = stubPathsFetch({});
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    expect(manager.getModelPathWhitelist()).toEqual({});
+    expect(await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).toEqual([]);
+    expect(await manager.warmModelPathCaches()).toEqual([]);
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true, ...deps });
+    expect(ctx.modelPath).toBeUndefined();
+    const forced = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(forced.modelPath).toBeUndefined();
+    expect(forced.pinnedProvider).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([undefined, false])("defaults to normal provider ranking when opt-in is %s", async (autoModelPath) => {
     const fetchMock = stubPathsFetch({});
     const deps = makeDeps({
@@ -462,7 +482,7 @@ describe("routeRequests model-path passthrough", () => {
 
 
 describe("runtime model-path policies", () => {
-  const routes = MODEL_PATH_BOOTSTRAP[DEEPSEEK_AUTO_MODEL_ID].routes;
+  const routes = TEST_MODEL_PATH_POLICY[DEEPSEEK_AUTO_MODEL_ID].routes;
   it.each([undefined, [], [NODE_A], [NODE_B]])("forced provider honors optional nodes %j", async nodes => {
     const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
     deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes } });

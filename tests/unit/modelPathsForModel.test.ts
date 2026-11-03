@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * Per-model path lookups (GET /v1/models/paths/model?model_id=<id>).
  *
@@ -293,6 +294,7 @@ describe("getModelPathProviderRanking latency budget", () => {
       sats_pricing: { prompt: 1, completion: 1 },
     } as any;
     const manager = new ProviderManager({
+      getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
       getCachedModels: () => ({ [`${FAST}/`]: [model], [`${HUNG}/`]: [model] }),
       getCachedMints: () => ({}),
       getCachedProviderInfo: () => ({}),
@@ -322,6 +324,7 @@ describe("warmModelPathCaches", () => {
     disabled: string[] = []
   ) =>
     new ProviderManager({
+      getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
       getCachedModels: () => models,
       getCachedMints: () => ({}),
       getCachedProviderInfo: () => ({}),

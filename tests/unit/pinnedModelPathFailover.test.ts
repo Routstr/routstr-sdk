@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * A pinned x-routstr-model-path selector is only guaranteed valid on the node
  * that advertised it, so failing a pinned request over to a different
@@ -98,6 +99,7 @@ const createDiscovery = (
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
     setModelIdMappingsEvent: () => {},
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getCachedModels: () => ({}),
     setCachedModels: () => {},
     getCachedMints: () => ({}),

@@ -3,7 +3,6 @@ import { EventStore } from "applesauce-core";
 import { finalizeEvent, getPublicKey, verifiedSymbol } from "applesauce-core/helpers";
 import type { NostrEvent } from "applesauce-core/helpers";
 import { of, throwError } from "rxjs";
-import { MODEL_PATH_BOOTSTRAP } from "../../core/modelPathWhitelist";
 import { ModelManager } from "../../discovery/ModelManager";
 import {
   createMemoryDriver,
@@ -56,10 +55,10 @@ const snapshot = { test: policy() };
 describe("kind 38427 model path policy", () => {
   afterEach(() => { relay.events = []; relay.filters = []; relay.offline = false; vi.restoreAllMocks(); });
 
-  it("queries mappings before the exact whitelist filter and preserves bootstrap offline", async () => {
+  it("queries mappings before the exact whitelist filter and has no policy offline", async () => {
     const { manager } = await open();
     relay.offline = true;
-    expect(await manager.fetchModelPathWhitelist()).toEqual(MODEL_PATH_BOOTSTRAP);
+    expect(await manager.fetchModelPathWhitelist()).toEqual({});
     relay.offline = false;
     relay.filters = [];
     relay.events = [event(snapshot)];
@@ -147,7 +146,7 @@ describe("kind 38427 model path policy", () => {
     // Adapter differs deliberately: validation must use the returned dependency.
     adapter.setModelIdMappings({});
     release({ a: "b" });
-    expect(await fetch).toEqual(MODEL_PATH_BOOTSTRAP);
+    expect(await fetch).toEqual({});
     expect(adapter.getModelPathWhitelistEvent()).toBeNull();
   });
 
@@ -169,7 +168,7 @@ describe("kind 38427 model path policy", () => {
     const { manager, adapter } = await open(); relay.events = [event(snapshot)];
     await manager.fetchModelPathWhitelist(true);
     const changed = new ModelManager(adapter, { routstrModelsPubkey: getPublicKey(other), logger: quiet });
-    expect(changed.getModelPathWhitelist()).toEqual(MODEL_PATH_BOOTSTRAP);
+    expect(changed.getModelPathWhitelist()).toEqual({});
     expect(adapter.getModelPathWhitelistEvent()).toBeNull();
     delete (adapter as any).setModelPathWhitelist;
     expect(() => new ModelManager(adapter)).toThrow("DiscoveryAdapter must implement setModelPathWhitelist");

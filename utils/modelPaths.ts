@@ -16,7 +16,7 @@
  * parameter; it is tolerated when matching but never required or built.
  */
 
-import { MODEL_PATH_BOOTSTRAP, normalizeRoute, type ModelPathRoute } from "../core/modelPathWhitelist";
+import { normalizeRoute, type ModelPathRoute } from "../core/modelPathWhitelist";
 import type { ModelSatsPricing } from "../core/types";
 import { modelIdVariants, type ModelIdMappings } from "../core/modelMappings";
 import { normalizeProviderUrl } from "./torUtils";
@@ -25,12 +25,24 @@ import { withProviderDeadline } from "../discovery/providerDeadline";
 /** The only request header the SDK forwards upstream on routed requests. */
 export const MODEL_PATH_HEADER = "x-routstr-model-path";
 
-/** Legacy bootstrap-only exports. Runtime policy comes from the discovery adapter. */
+/** Legacy explicit-selector helpers only; never used as an automatic policy. */
 export type DeepSeekModelRoute = ModelPathRoute;
 export const DEEPSEEK_AUTO_MODEL_ID = "deepseek-v4.1-flash";
-export const DEEPSEEK_MODEL_PATH_WHITELIST = MODEL_PATH_BOOTSTRAP[DEEPSEEK_AUTO_MODEL_ID].routes;
+export const DEEPSEEK_MODEL_PATH_WHITELIST: readonly ModelPathRoute[] = [
+  { url: "https://openrouter.ai/api/v1", endpoint: "deepseek" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "fireworks" },
+  { url: "https://api.ppq.ai" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "venice/fp8" },
+  { url: "https://openrouter.ai/api/v1", endpoint: "wafer" },
+  { url: "https://api.venice.ai/api/v1" },
+  { url: "https://api.fireworks.ai/inference/v1" },
+];
 // Preserve the public constants' historical no-trailing-slash spelling.
-export const DEEPSEEK_AUTO_NODE_URLS = MODEL_PATH_BOOTSTRAP[DEEPSEEK_AUTO_MODEL_ID].nodes!;
+export const DEEPSEEK_AUTO_NODE_URLS = [
+  "https://ai.redsh1ft.com",
+  "https://routstr.otrta.me",
+  "https://api.nonkycai.com",
+] as const;
 export const DEEPSEEK_AUTO_NODE_URL = DEEPSEEK_AUTO_NODE_URLS[0];
 
 /**

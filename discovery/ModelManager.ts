@@ -7,7 +7,7 @@
 import type { Model, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { canonicalIdForModel, MODEL_ID_MAPPINGS, type ModelIdMappings } from "../core/modelMappings";
-import { MODEL_PATH_BOOTSTRAP, parseModelPathWhitelist, type ModelPathWhitelist } from "../core/modelPathWhitelist";
+import { parseModelPathWhitelist, type ModelPathWhitelist } from "../core/modelPathWhitelist";
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
 import { withProviderDeadline } from "./providerDeadline";
 import {
@@ -1677,7 +1677,7 @@ export class ModelManager {
   private whitelistFetch: Promise<ModelPathWhitelist> | undefined;
 
   getModelPathWhitelist(): ModelPathWhitelist {
-    return this.adapter.getModelPathWhitelist() ?? MODEL_PATH_BOOTSTRAP;
+    return this.adapter.getModelPathWhitelist() ?? {};
   }
 
   private isModelPathWhitelistEvidence(event: NostrEvent): boolean {

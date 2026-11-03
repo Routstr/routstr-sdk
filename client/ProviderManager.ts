@@ -10,7 +10,7 @@
  * Extracted from utils/apiUtils.ts findNextBestProvider and related logic
  */
 
-import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor, type ModelPathWhitelist, type ModelPathPolicy } from "../core/modelPathWhitelist";
+import { modelPathPolicyFor, type ModelPathWhitelist, type ModelPathPolicy } from "../core/modelPathWhitelist";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type { Model, ProviderInfo, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
@@ -943,9 +943,9 @@ export class ProviderManager {
     }
   }
 
-  /** Active signed snapshot; null/missing getter alone enables bootstrap fallback. */
+  /** Active signed snapshot; absent policy means no automatic route preferences. */
   getModelPathWhitelist(): ModelPathWhitelist {
-    return this.discoveryAdapter.getModelPathWhitelist?.() ?? MODEL_PATH_BOOTSTRAP;
+    return this.discoveryAdapter.getModelPathWhitelist?.() ?? {};
   }
 
   private modelPathNodes(policy: ModelPathPolicy): readonly string[] {

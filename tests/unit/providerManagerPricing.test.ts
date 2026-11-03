@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ProviderManager,
@@ -25,6 +26,7 @@ const makeModel = (overrides?: Partial<Model>): Model => ({
 
 const createRegistry = (overrides?: Partial<DiscoveryAdapter>) => {
   const registry: DiscoveryAdapter = {
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getModelIdMappings: () => null,
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,

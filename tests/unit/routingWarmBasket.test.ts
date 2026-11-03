@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * Provider selection prices a warm session.
  *
@@ -45,6 +46,7 @@ const CACHED_MODELS: Record<string, Model[]> = {
 
 const createRegistry = (): DiscoveryAdapter =>
   ({
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getCachedModels: () => CACHED_MODELS,
     setCachedModels: () => {},
     getCachedMints: () => ({}),

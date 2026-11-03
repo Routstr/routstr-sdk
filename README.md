@@ -205,8 +205,9 @@ or not. Automatic pins require usable route-specific prompt and completion price
 (zero is valid). Routes with missing or invalid pricing are skipped; model-level
 pricing is never substituted. If none remain, selection falls back unpinned.
 
-`{"models":{}}` is a persistent kill switch. No valid snapshot on a fresh offline install
-uses the bundled bootstrap policy; invalid events or relay outages retain the last good
+`{"models":{}}` is a persistent kill switch. A missing/null policy also means no
+automatic route preferences: there is no built-in policy, including on fresh offline
+installs or after an author/trust reset. Invalid events or relay outages retain the last good
 policy. Accepted signed evidence prevents older relay events rolling policy back.
 Mappings are hydrated before whitelist validation; mapping-induced collisions retain
 the last accepted projection and signed high-water mark, including across restarts.
@@ -219,4 +220,4 @@ and signed event (including an empty policy), not just a timestamp. Optionally i
 `getModelPathWhitelistLastUpdate` / `setModelPathWhitelistLastUpdate` for cache TTLs.
 Missing required methods cause an explicit `ModelManager` initialization error. Both
 built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
-resolver wrappers remain bootstrap-only compatibility APIs, not runtime policy accessors.
+resolver wrappers remain explicit-selector compatibility APIs, not runtime policy accessors.

@@ -6,7 +6,7 @@
  * and build a RoutstrClient without duplicating the pipeline.
  */
 
-import { MODEL_PATH_BOOTSTRAP, modelPathPolicyFor } from "../core/modelPathWhitelist";
+import { modelPathPolicyFor } from "../core/modelPathWhitelist";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -218,7 +218,7 @@ export async function resolveRequestContext(
   // ── Select provider + model ─────────────────────────────────────────
   let baseUrl: string;
   let selectedModel: Model;
-  const whitelist = discoveryAdapter.getModelPathWhitelist?.() ?? MODEL_PATH_BOOTSTRAP;
+  const whitelist = discoveryAdapter.getModelPathWhitelist?.() ?? {};
   const mappings = discoveryAdapter.getModelIdMappings?.() ?? undefined;
   const policy = typeof modelId === "string" ? modelPathPolicyFor(modelId, whitelist, mappings) : undefined;
   let modelPath: ResolvedContext["modelPath"];
