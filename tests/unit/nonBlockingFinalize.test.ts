@@ -148,3 +148,48 @@ describe("non-streaming accounting is not on the response path", () => {
     await response.finalize?.();
   });
 });
+
+describe("out-of-order accounting", () => {
+  it("keeps the older read's cost without overwriting the newer snapshot", async () => {
+    const { client, rows, storage } = makeClient();
+    const olderRead = deferred<any>();
+    const newerRead = deferred<any>();
+    client.balanceManager.getTokenBalance
+      .mockImplementationOnce(() => olderRead.promise)
+      .mockImplementationOnce(() => newerRead.promise);
+    // Use distinct provider IDs so both usage entries can be checked.
+    const prepare = client._prepareRoutedRequestWithMintFailover;
+    const makePrepared = prepare.getMockImplementation()!;
+    prepare.mockImplementationOnce(async () => {
+      const prepared = await makePrepared();
+      prepared.response = new Response(answerBody.replace("gen-1", "gen-older"), {
+        headers: JSON_HEADERS,
+      });
+      return prepared;
+    });
+
+    const older = await client.routeRequest(params);
+    const newer = await client.routeRequest(params);
+    newerRead.resolve({ amount: 150_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 2 });
+    expect(await newer.finalize()).toBe(50);
+    olderRead.resolve({ amount: 170_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 1 });
+    expect(await older.finalize()).toBe(30);
+    expect(older.satsSpent).toBe(30);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.id === "gen-older")).toMatchObject({ satsCost: 30 });
+    expect(storage.updateApiKeyBalance).toHaveBeenCalledTimes(1);
+    expect(storage.updateApiKeyBalance).toHaveBeenCalledWith(baseUrl, 150, 0);
+  });
+
+  it.each([
+    { amount: 170_000, reserved: 0, balanceUnknown: true },
+    { amount: -1, reserved: 0 },
+    { amount: 170_000, reserved: -1 },
+  ])("does not calculate a delta from an unusable read: %j", async (readResult) => {
+    const { client, storage, read } = makeClient();
+    const response = await client.routeRequest(params);
+    read.resolve({ ...readResult, unit: "msat", apiKey: KEY, readSeq: 1 });
+    expect(await response.finalize()).toBe(0);
+    expect(storage.updateApiKeyBalance).not.toHaveBeenCalled();
+  });
+});

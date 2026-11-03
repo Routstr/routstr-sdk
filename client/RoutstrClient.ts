@@ -2905,7 +2905,15 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey ?? token,
           latestBalanceInfo
         );
-        const latestTokenBalance = latestBalance?.balance;
+        // Persistence can reject an otherwise valid read when a newer snapshot
+        // has already settled (or the stored key rotated). That must not erase
+        // this request's balance delta: accounting uses its own provider read.
+        const latestTokenBalance =
+          !latestBalanceInfo.balanceUnknown &&
+          latestBalanceInfo.amount >= 0 &&
+          latestBalanceInfo.reserved >= 0
+            ? Math.floor(getBalanceInSats(latestBalanceInfo.amount, latestBalanceInfo.unit))
+            : undefined;
         if (latestBalance) {
           this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
