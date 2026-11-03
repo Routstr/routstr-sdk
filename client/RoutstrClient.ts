@@ -192,6 +192,9 @@ export interface RoutstrResponse extends Response {
   requestId?: string;
   nodeRequestId?: string;
   upstreamResponseId?: string;
+  /** Settles accounting for this reply (provider balance read, usage row) and
+   *  returns the sats spent. Started when the response is handed out, so it
+   *  never delays the body; await it before reading `satsSpent`/`usage`. */
   finalize?: () => Promise<number>;
 }
 
@@ -446,6 +449,8 @@ export class RoutstrClient {
    * the request upstream without the streaming callback machinery.
    * Useful for daemon-style routing where you just need to forward
    * requests and get responses back.
+   *
+   * Accounting runs behind the response (`finalize()`), never in front of it.
    */
   async routeRequest(params: RouteRequestParams): Promise<RoutstrResponse> {
     const eligible = shouldTrackRequestLifecycle(params.method, params.path);
@@ -561,18 +566,55 @@ export class RoutstrClient {
       return prepared.response;
     }
 
-    // For SSE, defer accounting until the inspector (tee'd branch) has seen
-    // usage — which only happens as the client consumes the stream. We expose
-    // the finalization as `(response).finalize` so callers that want to block
-    // on accounting (e.g. a proxy after it finished piping) can `await` it.
-    // Non-SSE responses can be finalized inline since the body is fully
-    // available (the clone-and-read path inside `_trackResponseUsage` handles
-    // JSON bodies without consuming the client-facing copy).
+    // Accounting never runs in front of the answer. A balance read or a usage
+    // write is bookkeeping for a reply the caller has already paid for, so it
+    // settles behind `finalize()` instead of holding the response: a node that
+    // answers the request and then stalls on `/v1/wallet/info` would otherwise
+    // delay (or, with an abort, discard) a completed answer.
+    //
+    // For SSE the body is only readable as the client consumes it, so usage
+    // arrives through the inspector. A non-SSE body is read from its own copy
+    // before the response is handed out: the caller may start reading the
+    // moment this returns (`clone()` throws after that), and the reply's own
+    // provider ID is published as `requestId`, which callers read straight
+    // away. Accounting reuses the parsed body, so nothing is parsed twice.
+    let jsonBody: unknown;
+    if (!isSSE) {
+      try {
+        jsonBody = await prepared.response.clone().json();
+        const bodyResponseId = extractResponseId(jsonBody);
+        if (bodyResponseId) {
+          (prepared.response as RoutstrResponse).upstreamResponseId =
+            bodyResponseId;
+        }
+      } catch {
+        // Encrypted (EHBP/Tinfoil) or non-JSON body: usage then comes from the
+        // response headers, exactly as when accounting read the body itself.
+        jsonBody = undefined;
+      }
+    }
+    const accountingResponse = isSSE
+      ? prepared.response
+      : prepared.response.clone();
+
+    // `requestId` is documented as immediately available, so publish it before
+    // the response leaves: the SDK UUID when the request is tracked, otherwise
+    // the provider ID already read from a non-SSE body. SSE supplies it later,
+    // when the inspector sees one.
+    const immediateRequestId =
+      params.lifecycle?.requestId ??
+      (prepared.response as RoutstrResponse).upstreamResponseId;
+    if (immediateRequestId !== undefined) {
+      (prepared.response as RoutstrResponse).requestId = immediateRequestId;
+    }
+
     const runFinalize = async (): Promise<number> => {
       const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
       const usage = capturedUsage ?? prepared.capturedUsage;
       const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
-      (prepared.response as any).upstreamResponseId = upstreamResponseId;
+      if (upstreamResponseId !== undefined) {
+        (prepared.response as any).upstreamResponseId = upstreamResponseId;
+      }
       const requestId = params.lifecycle?.requestId ?? upstreamResponseId;
       const satsSpent = await this._handlePostResponseBalanceUpdate({
         token: prepared.tokenUsed,
@@ -580,7 +622,8 @@ export class RoutstrClient {
         initialTokenBalance: prepared.tokenBalanceInSats,
         initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
         fallbackSatsSpent: usage?.satsCost,
-        response: prepared.response,
+        response: accountingResponse,
+        responseBody: jsonBody,
         modelId: prepared.modelId,
         usage,
         requestId,
@@ -588,23 +631,19 @@ export class RoutstrClient {
       });
       (prepared.response as any).satsSpent = satsSpent;
       (prepared.response as any).usage = usage;
-      (prepared.response as any).requestId = requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
+      (prepared.response as any).requestId =
+        requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
       return satsSpent;
     };
 
-    if (isSSE) {
-      // Expose a finalize() that the caller can await after it's done piping
-      // the stream to its client. Also fire-and-forget so accounting still
-      // happens even if the caller ignores it.
-      const finalizePromise = runFinalize().catch((error) => {
-        this._log("ERROR", "[RoutstrClient] SSE finalize failed:", error);
-        return 0;
-      });
-      (prepared.response as any).finalize = () => finalizePromise;
-      return prepared.response;
-    }
-
-    await runFinalize();
+    // Exposed as `finalize()` so a proxy can await accounting once it has
+    // forwarded the body, and started now so accounting still happens when the
+    // caller ignores it. `satsSpent` and `usage` are filled in when it settles.
+    const finalizePromise = runFinalize().catch((error) => {
+      this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
+      return 0;
+    });
+    (prepared.response as any).finalize = () => finalizePromise;
     return prepared.response;
   }
 
@@ -2797,6 +2836,9 @@ export class RoutstrClient {
     initialTokenBalanceUnknown?: boolean;
     fallbackSatsSpent?: number;
     response?: Response;
+    /** Body already read from `response` (non-SSE). Saves a second read and
+     *  keeps accounting off a body the caller may already have consumed. */
+    responseBody?: unknown;
     modelId?: string;
     usage?: UsageTrackingData;
     requestId?: string;
@@ -2809,6 +2851,7 @@ export class RoutstrClient {
       initialTokenBalanceUnknown,
       fallbackSatsSpent,
       response,
+      responseBody,
       modelId,
       usage,
       requestId,
@@ -2881,6 +2924,7 @@ export class RoutstrClient {
       token,
       baseUrl,
       response,
+      responseBody,
       modelId,
       satsSpent,
       usage,
@@ -2920,6 +2964,8 @@ export class RoutstrClient {
     token: string;
     baseUrl: string;
     response?: Response;
+    /** Body already read from `response`; only non-SSE callers set it. */
+    responseBody?: unknown;
     modelId?: string;
     satsSpent: number;
     usage?: UsageTrackingData;
@@ -2930,6 +2976,7 @@ export class RoutstrClient {
       token,
       baseUrl,
       response,
+      responseBody,
       modelId,
       satsSpent,
       usage: providedUsage,
@@ -2961,13 +3008,17 @@ export class RoutstrClient {
             return;
           }
         } else {
-          const cloned = response.clone();
-          const responseBody = await cloned.json();
+          // Reuse the body the router already read when it has one: the caller
+          // may have consumed `response` by now, and a second read would throw.
+          let body = responseBody;
+          if (body === undefined) {
+            body = await response.clone().json();
+          }
           usage =
             usage ??
-            extractUsageFromResponseBody(responseBody, satsSpent) ??
+            extractUsageFromResponseBody(body, satsSpent) ??
             undefined;
-          upstreamResponseId = upstreamResponseId ?? extractResponseId(responseBody);
+          upstreamResponseId = upstreamResponseId ?? extractResponseId(body);
           (response as RoutstrResponse).upstreamResponseId = upstreamResponseId;
         }
       }

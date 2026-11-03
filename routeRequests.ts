@@ -233,7 +233,12 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 }
 
 /**
- * Route an OpenAI-compatible request to the cheapest provider
+ * Route an OpenAI-compatible request to the cheapest provider.
+ *
+ * The returned response carries `finalize()`, which settles accounting: the
+ * provider balance read and the usage row. It is already running and never
+ * holds the response, so a proxy should forward the body first and then
+ * `await response.finalize()` instead of waiting on it up front.
  */
 export async function routeRequests(
   options: RouteRequestOptions

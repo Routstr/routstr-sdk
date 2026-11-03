@@ -41,7 +41,10 @@ it.each([false, true])("opted-out JSON preserves upstream IDs (pre-inspected: %s
   });
   c._handlePostResponseBalanceUpdate = async (p: any) => { await c._trackResponseUsage({ ...p, satsSpent: 0 }); return 0; };
   const response = await c.routeRequest(params);
+  // The provider ID is published before the response leaves.
   expect(response.requestId).toBe("gen-123");
+  // The usage row is written by accounting, which runs behind the response.
+  await response.finalize?.();
   expect(rows[0]).toMatchObject({ id: "gen-123", requestId: "gen-123", upstreamResponseId: "gen-123" });
 });
 
