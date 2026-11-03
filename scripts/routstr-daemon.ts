@@ -24,6 +24,19 @@ const MOCK_ERROR_CODES: Record<string, number> = {
   // 'https://api.provider.com': 429,
 };
 
+/**
+ * Settle a proxied reply's accounting (provider balance read, usage row). The
+ * SDK starts it when it hands the response over and never waits for it, so a
+ * proxy has to await it once the body is on the wire — otherwise the usage row
+ * for this request is written after the handler returns, or not at all.
+ */
+async function finalizeProxiedResponse(response: Response): Promise<void> {
+  const finalize = (response as Response & {
+    finalize?: () => Promise<number>;
+  }).finalize;
+  await finalize?.();
+}
+
 // Hardcoded list of disabled providers
 const DISABLED_PROVIDERS = [
   "https://llm.satsandsports.cash",
@@ -454,6 +467,7 @@ async function main(): Promise<void> {
 
         if (!response.body) {
           res.end();
+          await finalizeProxiedResponse(response);
           return;
         }
 
@@ -478,6 +492,13 @@ async function main(): Promise<void> {
 
           nodeReadable.pipe(res);
         });
+
+        // Accounting (provider balance read, usage row) runs behind the
+        // response, so the answer is not held while it settles. Await it here,
+        // after the body is on the wire, so a proxy still writes one usage row
+        // per request and a failure is reported against this request rather
+        // than as an unhandled rejection.
+        await finalizeProxiedResponse(response);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[daemon] Error: ${message}`);

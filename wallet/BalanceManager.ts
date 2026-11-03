@@ -29,6 +29,7 @@ import {
   type ParsedCoreError,
 } from "../core/errorTypes";
 import { CashuSpender } from "./CashuSpender";
+import { stampBalanceRead } from "./apiKeyBalance";
 import {
   getBalanceInSats,
   isNetworkErrorMessage,
@@ -1362,6 +1363,11 @@ export class BalanceManager {
    * check compares against. `reserved` is informational (diagnostics and
    * stored snapshots); callers must not subtract it from `amount` again — use
    * `getAvailableBalanceInSats` for the spendable figure.
+   *
+   * `readSeq` is the order this read was issued in, not when it returned. A
+   * read that was issued earlier can land later (the accounting behind a paid
+   * reply is not awaited), so the stored snapshot needs it to refuse a write
+   * that would move the balance backwards. See `persistApiKeyBalance`.
    */
   async getTokenBalance(
     token: string,
@@ -1376,7 +1382,12 @@ export class BalanceManager {
      *  response, etc.).  Callers MUST NOT use `amount` in arithmetic when
      *  this flag is set — it is 0, not a real balance. */
     balanceUnknown?: boolean;
+    /** Order this read was issued in. */
+    readSeq: number;
   }> {
+    // Taken before the request goes out, so a read issued later always wins
+    // even when it settles first.
+    const readSeq = stampBalanceRead();
     try {
       const { response, responseBody } = await withProviderDeadline(
         async (signal) => {
@@ -1398,6 +1409,7 @@ export class BalanceManager {
           reserved: data.reserved ?? 0,
           unit: "msat",
           apiKey: data.api_key,
+          readSeq,
         };
       } else {
         this.logger.warn(`getTokenBalance: status=${response.status}`);
@@ -1430,6 +1442,7 @@ export class BalanceManager {
           apiKey: data.api_key,
           isInvalidApiKey,
           balanceUnknown: true,
+          readSeq,
         };
       }
     } catch (error) {
@@ -1442,6 +1455,7 @@ export class BalanceManager {
       unit: "sat",
       apiKey: "",
       balanceUnknown: true,
+      readSeq,
     };
   }
 
