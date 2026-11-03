@@ -179,6 +179,48 @@ projection and queries the newly configured author.
 and retain the parsed projection for synchronous routing. Missing methods produce
 an explicit initialization error rather than silently retaining static mappings.
 
+### Nostr model-path policy snapshots
+
+With `autoModelPath: true`, routing uses signed kind `38427` events, `d` tag
+`model-path-whitelist`, authored by `routstrModelsPubkey` (or `routstrPubkey`). Content
+is a complete replacement, for example:
+
+```json
+{"version":1,"models":{"canonical-model-id":{"routes":[{"url":"https://upstream.example/v1"}],"nodes":["https://node.example"]}}}
+```
+
+This is a **routing preference, not an egress control**: when no listed node or route
+is usable, the request degrades to the ordinary price ranking and the node picks its own
+upstream. The policy shapes which routes the SDK prefers; it does not fence traffic.
+
+Ranking is **route-major**: each advertised whitelisted route is a candidate, ordered by
+its own warm-basket cost, so a cheaper route on another node outranks an expensive route
+on the cheapest node. Route order only breaks exact ties within a node. Optional `nodes`
+restricts/prioritizes the enabled discovered set and supplies the tiebreak between
+equal-cost routes; omitted or empty means any eligible node advertising a matching route
+and ties fall back to URL order. Only the target node's verbatim advertised selector is
+sent. Forcing a provider keeps requests on that provider, whether auto-pinning succeeds
+or not. Automatic pins require usable route-specific prompt and completion prices
+(zero is valid). Routes with missing or invalid pricing are skipped; model-level
+pricing is never substituted. If none remain, selection falls back unpinned.
+
+`{"models":{}}` is a persistent kill switch. A missing/null policy also means no
+automatic route preferences: there is no built-in policy, including on fresh offline
+installs or after an author/trust reset. Invalid events or relay outages retain the last good
+policy. Accepted signed evidence prevents older relay events rolling policy back.
+Mappings are hydrated before whitelist validation; mapping-induced collisions retain
+the last accepted projection and signed high-water mark, including across restarts.
+Routing reads the snapshot synchronously; only bootstrap/refresh accesses relays.
+
+**Breaking custom adapter migration:** implement `getModelPathWhitelist`,
+`setModelPathWhitelist`, `getModelPathWhitelistEvent`, and `setModelPathWhitelistEvent`.
+Both setters accept `null` for author/trust purges. Persist the JSON-safe policy record
+and signed event (including an empty policy), not just a timestamp. Optionally implement
+`getModelPathWhitelistLastUpdate` / `setModelPathWhitelistLastUpdate` for cache TTLs.
+Missing required methods cause an explicit `ModelManager` initialization error. Both
+built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
+resolver wrappers remain explicit-selector compatibility APIs, not runtime policy accessors.
+
 ### Request lifecycle diagnostics
 
 Inference routing now exposes an SDK lifecycle UUID separately from node and

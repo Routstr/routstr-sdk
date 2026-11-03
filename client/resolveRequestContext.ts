@@ -6,6 +6,7 @@
  * and build a RoutstrClient without duplicating the pipeline.
  */
 
+import { modelPathPolicyFor } from "../core/modelPathWhitelist";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -14,8 +15,8 @@ import type {
 } from "../wallet/interfaces";
 import { ModelManager } from "../discovery/ModelManager";
 import { ProviderManager } from "./ProviderManager";
-import { WARM_COST_BASKET } from "./costEstimate";
-import { canonicalizeModelId, findModelForId, type ModelIdMappings } from "../core/modelMappings";
+import { estimateCost, hasUsableTokenRates, WARM_COST_BASKET } from "./costEstimate";
+import { canonicalizeModelId, findModelForId } from "../core/modelMappings";
 import {
   RoutstrClient,
   type DebugLevel,
@@ -24,12 +25,10 @@ import {
 import type { UsageTrackingDriver } from "../storage/usageTracking";
 import type { SdkStore } from "../storage/store";
 import {
-  DEEPSEEK_AUTO_MODEL_ID,
-  DEEPSEEK_AUTO_NODE_URLS,
   getNodeModelPathsForModel,
   MODEL_PATH_HEADER,
-  resolveDeepSeekModelPathSelectors,
-  sameNode,
+  resolveModelPathSelectors,
+  sameNodeUrl,
   type ModelPathSatsPricing,
 } from "../utils/modelPaths";
 
@@ -37,20 +36,6 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
   return (
     !!headers &&
     Object.keys(headers).some((name) => name.toLowerCase() === MODEL_PATH_HEADER)
-  );
-}
-
-/**
- * True when a requested model id names the auto-selected model in any
- * spelling: the canonical id, a case variant of it, or a mapped variant such
- * as "deepseek-v4-1-flash" (see MODEL_ID_MAPPINGS). Without canonicalizing
- * first, asking for the mapped spelling silently disabled auto model-path
- * selection while still routing to the same model.
- */
-function isAutoModelPathModel(id: string, mappings?: ModelIdMappings): boolean {
-  return (
-    canonicalizeModelId(id.trim().toLowerCase(), mappings).toLowerCase() ===
-    DEEPSEEK_AUTO_MODEL_ID
   );
 }
 
@@ -62,7 +47,13 @@ export interface ResolveContextInput {
   /** Optional: caller-supplied request headers (an x-routstr-model-path
    * header here suppresses the SDK's automatic model-path pinning). */
   inputHeaders?: Record<string, string>;
-  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; caller-supplied path headers still work. */
+  /**
+   * Opt into automatic model-path selection. Defaults to false; caller-supplied
+   * `x-routstr-model-path` headers still work.
+   *
+   * The flag gates the feature; the active policy snapshot decides which models
+   * it covers. A model with no policy entry routes as before.
+   */
   autoModelPath?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
@@ -227,6 +218,9 @@ export async function resolveRequestContext(
   // ── Select provider + model ─────────────────────────────────────────
   let baseUrl: string;
   let selectedModel: Model;
+  const whitelist = discoveryAdapter.getModelPathWhitelist?.() ?? {};
+  const mappings = discoveryAdapter.getModelIdMappings?.() ?? undefined;
+  const policy = typeof modelId === "string" ? modelPathPolicyFor(modelId, whitelist, mappings) : undefined;
   let modelPath: ResolvedContext["modelPath"];
   let pinnedProvider = false;
 
@@ -259,20 +253,18 @@ export async function resolveRequestContext(
     baseUrl = normalizedProvider;
     selectedModel = match;
 
-    // Forcing one of the auto-selection nodes still pins the model path on
-    // that node: the selector is resolved from that node's own advertised
-    // paths, so the node is guaranteed to accept it.
+    // Forcing a policy node still pins the model path on that node: the
+    // selector is resolved from that node's own advertised paths, so the node
+    // is guaranteed to accept it. An absent/empty node allowlist admits every
+    // node; a listed node is matched by canonical URL identity (sameNodeUrl),
+    // which folds host case but keeps path/query case significant.
     if (
       autoModelPath === true &&
       !hasModelPathHeader(inputHeaders) &&
       typeof modelId === "string" &&
-      isAutoModelPathModel(
-        modelId,
-        discoveryAdapter.getModelIdMappings?.() ?? undefined
-      ) &&
-      DEEPSEEK_AUTO_NODE_URLS.some((nodeUrl) =>
-        sameNode(nodeUrl, normalizedProvider)
-      )
+      policy &&
+      (!policy.nodes?.length ||
+        policy.nodes.some((nodeUrl) => sameNodeUrl(nodeUrl, normalizedProvider)))
     ) {
       const nodePaths = await getNodeModelPathsForModel(
         normalizedProvider,
@@ -286,17 +278,23 @@ export async function resolveRequestContext(
         }
       );
       const resolved = nodePaths
-        ? resolveDeepSeekModelPathSelectors(
+        ? resolveModelPathSelectors(
             nodePaths,
             canonicalizeModelId(
               modelId,
               discoveryAdapter.getModelIdMappings?.() ?? undefined
             ),
-            discoveryAdapter.getModelIdMappings?.() ?? undefined
+            policy.routes,
+            mappings
           )
         : null;
       const index = resolved?.selectors.findIndex(
-        (s): s is string => s !== null
+        (selector, i) => {
+          const pricing = resolved?.satsPricing[i];
+          if (!selector || !pricing || !hasUsableTokenRates(pricing)) return false;
+          const cost = estimateCost(pricing, WARM_COST_BASKET).total;
+          return Number.isFinite(cost) && cost >= 0;
+        }
       ) ?? -1;
       if (resolved && index >= 0) {
         modelPath = {
@@ -310,14 +308,13 @@ export async function resolveRequestContext(
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
-    isAutoModelPathModel(
-      modelId,
-      discoveryAdapter.getModelIdMappings?.() ?? undefined
-    )
+    policy !== undefined
   ) {
-    // "Get baseUrl for model path": rank the whitelisted auto-selection
-    // nodes by their per-route price and pin the best candidate's selector.
-    // An empty ranking (nodes down, cooled, or not advertising the route)
+    // "Get baseUrl for model path": rank every whitelisted (node, route)
+    // pair by what that route costs and pin the cheapest one's selector —
+    // route-major, so a cheaper route on another node outranks an expensive
+    // route on the node that happened to win the node-level ordering. An
+    // empty ranking (nodes down, cooled, or not advertising any route)
     // degrades to the normal price ranking unpinned.
     const ranking = await providerManager.getModelPathProviderRanking(
       modelId,
@@ -328,8 +325,8 @@ export async function resolveRequestContext(
       baseUrl = best.baseUrl;
       selectedModel = best.model;
       modelPath = {
-        selector: best.selectors[0],
-        satsPricing: best.satsPricing[0] ?? undefined,
+        selector: best.selector,
+        satsPricing: best.satsPricing ?? undefined,
         autoPinned: true,
       };
     } else {

@@ -43,8 +43,11 @@ export interface SdkStorageState {
     tryCount: number;
   }>>;
   modelIdMappingsEvent: import("applesauce-core/helpers").NostrEvent | null;
+  modelPathWhitelistEvent: import("applesauce-core/helpers").NostrEvent | null;
   modelIdMappings: import("../core/modelMappings").ModelIdMappings | null;
+  modelPathWhitelist: import("../core/modelPathWhitelist").ModelPathWhitelist | null;
   lastModelIdMappingsUpdate: number | null;
+  lastModelPathWhitelistUpdate: number | null;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
   cachedReceiveTokens: Array<{

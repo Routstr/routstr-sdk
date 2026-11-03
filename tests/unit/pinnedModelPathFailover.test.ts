@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * A pinned x-routstr-model-path selector is only guaranteed valid on the node
  * that advertised it, so failing a pinned request over to a different
@@ -98,6 +99,7 @@ const createDiscovery = (
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
     setModelIdMappingsEvent: () => {},
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getCachedModels: () => ({}),
     setCachedModels: () => {},
     getCachedMints: () => ({}),
@@ -232,8 +234,8 @@ describe("RoutstrClient pinned model-path failover", () => {
       .mockResolvedValue([
         {
           baseUrl: "https://routstr.otrta.me/",
-          selectors: [NEXT_SELECTOR],
-          satsPricing: [null],
+          selector: NEXT_SELECTOR,
+          satsPricing: null,
           model: makeModel(),
         },
       ]);
@@ -304,8 +306,8 @@ describe("RoutstrClient pinned model-path failover", () => {
     ).mockResolvedValue([
       {
         baseUrl: "https://ai.redsh1ft.com/",
-        selectors: [NEXT_SELECTOR],
-        satsPricing: [null],
+        selector: NEXT_SELECTOR,
+        satsPricing: null,
         model: makeModel(),
       },
     ]);
@@ -481,8 +483,8 @@ describe("RoutstrClient pinned model-path failover", () => {
       .mockResolvedValue([
         {
           baseUrl: NEXT_BASE_URL,
-          selectors: [NEXT_SELECTOR],
-          satsPricing: [null],
+          selector: NEXT_SELECTOR,
+          satsPricing: null,
           model: makeModel(),
         },
       ]);
@@ -678,13 +680,13 @@ describe("RoutstrClient pinned model-path failover", () => {
     ]);
   });
 
-  it("keeps the node-major chain order when route prices differ across nodes", async () => {
-    // Regression: the ranking used to re-sort nodes by their cheapest
-    // REMAINING route at each hop, so once the cheaper node's first route
-    // failed, the chain interleaved (A:deepseek -> B:deepseek -> A:fireworks)
-    // whenever B's first route undercut A's second. Node positions must stay
-    // fixed as the request walks the chain. Only the payment/accounting
-    // boundaries, discovery cache and transport are stubbed.
+  it("interleaves nodes when route prices cross, following route cost", async () => {
+    // Route-major: every (node, route) pair is ranked on its own price, so the
+    // chain interleaves the nodes — A:deepseek, B:deepseek, A:fireworks,
+    // B:fireworks — whenever B's first route undercuts A's second. (The old
+    // node-major shape kept every route of the cheaper node first, sending the
+    // request to a route it had already priced as worse.) Only the
+    // payment/accounting boundaries, discovery cache and transport are stubbed.
     const [NODE_A, NODE_B] = DEEPSEEK_AUTO_NODE_URLS;
     clearModelPathsCache();
     const client = makeClient(
@@ -769,12 +771,12 @@ describe("RoutstrClient pinned model-path failover", () => {
     });
 
     expect(response.status).toBe(200);
-    // Node-major: every route of the cheaper node before the next node,
-    // even though B's first route (0.000747) undercuts A's second (0.000790).
+    // Route cost order: A:deepseek 0.000718 < B:deepseek 0.000747 <
+    // A:fireworks 0.000790 < B:fireworks 0.000822.
     expect(attempts).toEqual([
       { url: `${NODE_A}/v1/chat/completions`, selector: DEEPSEEK_SEL },
-      { url: `${NODE_A}/v1/chat/completions`, selector: FIREWORKS_SEL },
       { url: `${NODE_B}/v1/chat/completions`, selector: DEEPSEEK_SEL },
+      { url: `${NODE_A}/v1/chat/completions`, selector: FIREWORKS_SEL },
       { url: `${NODE_B}/v1/chat/completions`, selector: FIREWORKS_SEL },
     ]);
   });

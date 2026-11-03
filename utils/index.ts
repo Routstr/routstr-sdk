@@ -24,6 +24,7 @@ export {
   deepSeekModelPathHeaders,
   clearModelPathsCache,
   sameNode,
+  sameNodeUrl,
   isWhitelistedDeepSeekModelPath,
   whitelistedDeepSeekRoute,
   fetchModelPaths,
@@ -40,3 +41,5 @@ export {
   type NodeModelPathEntry,
   type NodeModelPathMetadata,
 } from "./modelPaths";
+
+export { whitelistedModelPathRoute, isWhitelistedModelPath, resolveModelPathSelectors } from "./modelPaths";

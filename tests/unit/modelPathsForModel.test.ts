@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * Per-model path lookups (GET /v1/models/paths/model?model_id=<id>).
  *
@@ -293,6 +294,7 @@ describe("getModelPathProviderRanking latency budget", () => {
       sats_pricing: { prompt: 1, completion: 1 },
     } as any;
     const manager = new ProviderManager({
+      getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
       getCachedModels: () => ({ [`${FAST}/`]: [model], [`${HUNG}/`]: [model] }),
       getCachedMints: () => ({}),
       getCachedProviderInfo: () => ({}),
@@ -306,7 +308,7 @@ describe("getModelPathProviderRanking latency budget", () => {
     await vi.advanceTimersByTimeAsync(MODEL_PATH_RANKING_BUDGET_MS + 10);
     const ranking = await rankingPromise;
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${FAST}/`]);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 });
 
@@ -322,6 +324,7 @@ describe("warmModelPathCaches", () => {
     disabled: string[] = []
   ) =>
     new ProviderManager({
+      getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
       getCachedModels: () => models,
       getCachedMints: () => ({}),
       getCachedProviderInfo: () => ({}),
@@ -361,15 +364,10 @@ describe("warmModelPathCaches", () => {
       { torMode: false }
     );
     expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
-    // Every node advertises the same route at the same rates here, so the
-    // basket costs tie and the ranking falls back to its baseUrl tiebreak
-    // (the same one getProviderPriceRankingForModel uses) rather than the
-    // whitelist order.
-    const expected = [A, B, C]
-      .map((node) => `${node}/`)
-      .sort((a, b) => a.localeCompare(b));
+    // Equal-cost nodes preserve runtime policy priority, not URL lexical order.
+    const expected = [A, B, C].map(node => `${node}/`);
     expect(ranking.map((r) => r.baseUrl)).toEqual(expected);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 
   it("reports a failed refresh without discarding the last-good ranking cache", async () => {
@@ -407,7 +405,7 @@ describe("warmModelPathCaches", () => {
     );
     expect(fetchMock.mock.calls.length).toBe(callsAfterWarm);
     expect(ranking.map((r) => r.baseUrl)).toEqual([`${A}/`]);
-    expect(ranking[0].selectors).toEqual([PPQ]);
+    expect(ranking[0].selector).toBe(PPQ);
   });
 
   it("reports why a node contributed nothing, and does not fetch it", async () => {

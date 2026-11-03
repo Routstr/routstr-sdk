@@ -1,10 +1,14 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEEPSEEK_AUTO_MODEL_ID,
   DEEPSEEK_AUTO_NODE_URLS,
   MODEL_PATH_HEADER,
   clearModelPathsCache,
+  sameNodeUrl,
 } from "../../utils/modelPaths";
+import { ProviderManager } from "../../client/ProviderManager";
+import { type ModelPathWhitelist } from "../../core/modelPathWhitelist";
 import { resolveRequestContext } from "../../client/resolveRequestContext";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
@@ -71,6 +75,7 @@ const makeModel = (completion = 1): Model =>
 
 function makeDeps(modelsByNode: Record<string, Model[]>) {
   const discoveryAdapter = {
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getModelIdMappings: () => null,
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
@@ -121,6 +126,24 @@ afterEach(() => {
 });
 
 describe("resolveRequestContext model-path selection", () => {
+  it.each([null, {}])("does not bootstrap automatic routes for absent/empty policy: %j", async (policy) => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => policy;
+    const fetch = stubPathsFetch({});
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    expect(manager.getModelPathWhitelist()).toEqual({});
+    expect(await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).toEqual([]);
+    expect(await manager.warmModelPathCaches()).toEqual([]);
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true, ...deps });
+    expect(ctx.modelPath).toBeUndefined();
+    const forced = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(forced.modelPath).toBeUndefined();
+    expect(forced.pinnedProvider).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([undefined, false])("defaults to normal provider ranking when opt-in is %s", async (autoModelPath) => {
     const fetchMock = stubPathsFetch({});
     const deps = makeDeps({
@@ -454,5 +477,161 @@ describe("routeRequests model-path passthrough", () => {
     const call = client.routeRequest.mock.calls[0][0];
     expect(call.headers[MODEL_PATH_HEADER]).toBe(PPQ_SELECTOR);
     expect(call.autoModelPath).toBeUndefined();
+  });
+});
+
+
+describe("runtime model-path policies", () => {
+  const routes = TEST_MODEL_PATH_POLICY[DEEPSEEK_AUTO_MODEL_ID].routes;
+  it.each([undefined, [], [NODE_A], [NODE_B]])("forced provider honors optional nodes %j", async nodes => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes } });
+    const fetch = stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.pinnedProvider).toBe(true);
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath?.selector).toBe(nodes?.[0] === NODE_B ? undefined : DEEPSEEK_SELECTOR);
+    expect(fetch.mock.calls.length > 0).toBe(nodes?.[0] !== NODE_B);
+  });
+
+  it.each([undefined, -1, Infinity])("leaves a forced provider unpinned when route pricing is unusable: %s", async (completion) => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.pinnedProvider).toBe(true);
+    expect(ctx.modelPath).toBeUndefined();
+  });
+
+  it("skips an unpriced forced-provider route and pins the next priced route", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([
+      { path: DEEPSEEK_SELECTOR },
+      { path: FIREWORKS_SELECTOR, completion: 0 },
+    ]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.modelPath?.selector).toBe(FIREWORKS_SELECTOR);
+  });
+
+  it("falls back unpinned when all advertised routes lack pricing", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      autoModelPath: true, ...deps });
+    expect(ctx.baseUrl).toBe(`${NODE_A}/`);
+    expect(ctx.modelPath).toBeUndefined();
+  });
+
+  it("preserves policy node priority for equal-cost ranking and excludes disabled nodes", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()], [`${NODE_B}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [NODE_B, NODE_A] } });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]),
+      [NODE_B]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    expect((await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).map(r => r.baseUrl))
+      .toEqual([`${NODE_B}/`, `${NODE_A}/`]);
+    deps.discoveryAdapter.getDisabledProviders = () => [`${NODE_B}/`];
+    expect((await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).map(r => r.baseUrl))
+      .toEqual([`${NODE_A}/`]);
+    expect((await manager.warmModelPathCaches()).filter(r => !r.reason).map(r => r.baseUrl)).toEqual([`${NODE_A}/`]);
+    await expect(resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_B, autoModelPath: true, ...deps })).rejects.toThrow();
+  });
+
+  it("folds host case in the forced-node allowlist but keeps path case", async () => {
+    // Same node, spelled with an upper-cased host only: the policy entry still
+    // matches, so the request is pinned on the node's own advertised selector.
+    const hostCaseNode = `https://${new URL(NODE_A).host.toUpperCase()}`;
+    expect(hostCaseNode).not.toBe(NODE_A);
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({
+      [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [hostCaseNode] },
+    });
+    stubPathsFetch({ [NODE_A]: pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]) });
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.modelPath?.selector).toBe(DEEPSEEK_SELECTOR);
+    expect(sameNodeUrl("HTTPS://AI.REDSH1FT.COM/", `${NODE_A}/`)).toBe(true);
+    expect(sameNodeUrl("https://x.example/Approved/", "https://x.example/approved/")).toBe(false);
+    expect(sameNodeUrl("not a url", null)).toBe(false);
+  });
+
+  it("forced allowlists preserve provider path and query case", async () => {
+    const allowed = "https://gateway.example/Approved/?Key=Value/";
+    const denied = "https://gateway.example/approved/?Key=value/";
+    const deps = makeDeps({ [denied]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({ [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [allowed] } });
+    const fetch = stubPathsFetch({});
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: denied, autoModelPath: true, ...deps });
+    expect(ctx.pinnedProvider).toBe(true);
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("routes a case-sensitive mapped canonical ID through a variant-keyed policy", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [{ ...makeModel(), id: "variant" }] });
+    deps.discoveryAdapter.getModelIdMappings = () => ({ variant: "Canonical" });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({ variant: { routes: [{ url: "https://case.example/v1" }] } });
+    const selector = "url=https%3A%2F%2Fcase.example%2Fv1&model-id=variant";
+    stubPathsFetch({ [NODE_A]: { data: [{ id: "variant", paths: [{ path: selector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] }] } });
+    const ctx = await resolveRequestContext({ modelId: "Canonical", forcedProvider: NODE_A,
+      autoModelPath: true, ...deps });
+    expect(ctx.modelPath?.selector).toBe(selector);
+    expect(ctx.pinnedProvider).toBe(true);
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    expect((await manager.getModelPathProviderRanking("Canonical"))[0].selector).toBe(selector);
+  });
+
+  it("kill switch prevents ranking and warming HTTP, even with explicit modelIds", async () => {
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel()] });
+    deps.discoveryAdapter.getModelPathWhitelist = () => ({});
+    const fetch = stubPathsFetch({});
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    expect(await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).toEqual([]);
+    expect(await manager.warmModelPathCaches()).toEqual([]);
+    expect(await manager.warmModelPathCaches({ modelIds: [DEEPSEEK_AUTO_MODEL_ID] })).toEqual([]);
+    const ctx = await resolveRequestContext({ modelId: DEEPSEEK_AUTO_MODEL_ID,
+      forcedProvider: NODE_A, autoModelPath: true, ...deps });
+    expect(ctx.pinnedProvider).toBe(true);
+    expect(ctx.modelPath).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("warms and ranks multiple models using current policy routes, optional nodes, and removal", async () => {
+    const other = { ...makeModel(), id: "second-model" };
+    const deps = makeDeps({ [`${NODE_A}/`]: [makeModel(), other], [`${NODE_B}/`]: [makeModel(), other] });
+    const secondSelector = "url=https%3A%2F%2Fsecond-upstream.example%2Fv1&model-id=second-model";
+    let whitelist: ModelPathWhitelist = {
+      [DEEPSEEK_AUTO_MODEL_ID]: { routes, nodes: [NODE_A] },
+      "second-model": { routes: [{ url: "https://second-upstream.example/v1" }], nodes: [] },
+    };
+    deps.discoveryAdapter.getModelPathWhitelist = () => whitelist;
+    const fetch = stubPathsFetch({ [NODE_A]: { data: [
+      ...pathsPayload([{ path: DEEPSEEK_SELECTOR, completion: 0.001 }]).data,
+      { id: "second-model", paths: [{ path: secondSelector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] },
+    ] }, [NODE_B]: { data: [{ id: "second-model", paths: [{ path: secondSelector, model: { sats_pricing: { prompt: 1, completion: 1 } } }] }] } });
+    const manager = new ProviderManager(deps.discoveryAdapter);
+    const warm = await manager.warmModelPathCaches({ torMode: false });
+    expect(warm.map(r => [r.baseUrl, r.modelId, r.whitelisted])).toEqual([
+      [`${NODE_A}/`, DEEPSEEK_AUTO_MODEL_ID, 1], [`${NODE_A}/`, "second-model", 1], [`${NODE_B}/`, "second-model", 1],
+    ]);
+    const ranking = await manager.getModelPathProviderRanking("second-model", { torMode: false });
+    // One candidate per (node, route): the empty `nodes` list fans out to both
+    // cached nodes, and each contributes the one route it advertises.
+    expect(ranking).toHaveLength(2);
+    expect(ranking.map((c) => `${c.baseUrl} ${c.selector}`)).toEqual([
+      `${NODE_A}/ ${secondSelector}`,
+      `${NODE_B}/ ${secondSelector}`,
+    ]);
+    expect(ranking[0].satsPricing).toEqual({ prompt: 1, completion: 1 });
+    whitelist = { "second-model": { routes: [{ url: "https://second-upstream.example/v1" }], nodes: [NODE_B] } };
+    fetch.mockClear();
+    expect((await manager.warmModelPathCaches({ torMode: false })).map(r => r.baseUrl)).toEqual([`${NODE_B}/`]);
+    expect(fetch.mock.calls.every(([url]) => String(url).startsWith(NODE_B))).toBe(true);
+    expect(await manager.getModelPathProviderRanking(DEEPSEEK_AUTO_MODEL_ID)).toEqual([]);
   });
 });

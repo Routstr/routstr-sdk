@@ -474,8 +474,8 @@ describe("RoutstrClient 402 top-up validation", () => {
     const next = "https://next.example/";
     const last = "https://last.example/";
     providerManager.getModelPathProviderRanking = vi.fn()
-      .mockResolvedValueOnce([{baseUrl: next, selectors: ["next-path"], satsPricing: [null], model}])
-      .mockResolvedValueOnce([{baseUrl: last, selectors: ["last-path"], satsPricing: [{prompt: 2, completion: 3}], model}]);
+      .mockResolvedValueOnce([{baseUrl: next, selector: "next-path", satsPricing: null, model}])
+      .mockResolvedValueOnce([{baseUrl: last, selector: "last-path", satsPricing: {prompt: 2, completion: 3}, model}]);
     vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
       amount: 20_000, reserved: 0, unit: "msat", apiKey: API_KEY,
     });

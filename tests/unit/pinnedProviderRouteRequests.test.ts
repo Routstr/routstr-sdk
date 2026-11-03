@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * Routing-level regression for the forced-provider pin.
  *
@@ -93,6 +94,7 @@ function makeHarness() {
   } as unknown as StorageAdapter;
 
   const discovery = {
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getDisabledProviders: () => [],
     getCachedMints: () => ({ [PROVIDER_A]: [MINT_URL] }),
     getModelIdMappings: () => null,
@@ -122,8 +124,8 @@ function makeHarness() {
           {
             baseUrl: PROVIDER_B,
             model,
-            selectors: [SELECTOR],
-            satsPricing: [undefined],
+            selector: SELECTOR,
+            satsPricing: null,
           },
         ];
       }

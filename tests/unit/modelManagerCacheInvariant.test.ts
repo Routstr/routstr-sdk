@@ -44,6 +44,10 @@ function makeAdapter(): DiscoveryAdapter {
   let mappings: import("../../core/modelMappings").ModelIdMappings | null = null;
   let mappingEvent: NostrEvent | null = null;
   return {
+    getModelPathWhitelist: () => null,
+    setModelPathWhitelist: () => {},
+    getModelPathWhitelistEvent: () => null,
+    setModelPathWhitelistEvent: () => {},
     getModelIdMappings: () => mappings,
     setModelIdMappings: value => { mappings = value; },
     getModelIdMappingsEvent: () => mappingEvent,

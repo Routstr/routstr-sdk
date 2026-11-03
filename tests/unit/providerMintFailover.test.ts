@@ -231,7 +231,7 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
     const { client, providerManager } = createClient(() => NEXT_URL);
     const pricing = { prompt: 7, completion: 8 };
     providerManager.getModelPathProviderRanking = vi.fn(async () => [{
-      baseUrl: NEXT_URL, model, selectors: ["next-selector"], satsPricing: [pricing],
+      baseUrl: NEXT_URL, model, selector: "next-selector", satsPricing: pricing,
     }]);
     vi.spyOn(client as any, "_spendToken").mockImplementation(async ({baseUrl}: any) => {
       if (baseUrl === BASE_URL) throw new ProviderMintBalanceError(100, 500, BASE_URL, [MINT_A]);

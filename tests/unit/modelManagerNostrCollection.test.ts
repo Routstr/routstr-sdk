@@ -74,6 +74,10 @@ function makeAdapter(): DiscoveryAdapter {
   let mappings: import("../../core/modelMappings").ModelIdMappings | null = null;
   let mappingEvent: NostrEvent | null = null;
   return {
+    getModelPathWhitelist: () => null,
+    setModelPathWhitelist: () => {},
+    getModelPathWhitelistEvent: () => null,
+    setModelPathWhitelistEvent: () => {},
     getModelIdMappings: () => mappings,
     setModelIdMappings: value => { mappings = value; },
     getModelIdMappingsEvent: () => mappingEvent,
@@ -115,7 +119,7 @@ describe("ModelManager Nostr collection", () => {
     relayStream.current = null;
   });
 
-  it("starts all refresh queries before completion and applies policy only afterwards", async () => {
+  it("starts whitelist after mappings and applies review policy only after all queries", async () => {
     vi.useFakeTimers();
     const streams = new Map<number, Subject<NostrEvent>>();
     relayStream.current = (filter: unknown) => {
@@ -138,6 +142,10 @@ describe("ModelManager Nostr collection", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(policy).not.toHaveBeenCalled();
     streams.get(38426)!.complete();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(streams.has(38427)).toBe(true);
+    expect(policy).not.toHaveBeenCalled();
+    streams.get(38427)!.complete();
     await refresh;
     expect(prune).toHaveBeenCalledOnce();
     expect(policy).toHaveBeenCalledOnce();
@@ -171,11 +179,11 @@ describe("ModelManager Nostr collection", () => {
 
     const manager = new ModelManager(makeAdapter(), { logger: silentLogger });
     const promise = manager.bootstrapProviders(false, true);
-    // All four queries run concurrently, so one timeout window covers them.
-    await vi.advanceTimersByTimeAsync(5000);
+    // Mappings precede whitelist, so two timeout windows cover the dependency chain.
+    await vi.advanceTimersByTimeAsync(10000);
     const bases = await promise;
     expect(bases).toEqual([NORMALIZED_A]);
-    expect(teardowns).toBe(4);
+    expect(teardowns).toBe(5);
   });
 
   it("does not announce onion providers the clearnet result drops", async () => {

@@ -1,3 +1,4 @@
+import { TEST_MODEL_PATH_POLICY } from "./modelPathPolicyFixture";
 /**
  * fetchAIResponse shares resolveRequestContext with routeRequests, so an
  * SDK auto-pinned model path must be threaded through both ways: the
@@ -92,6 +93,7 @@ function makeDeps(modelsByNode: Record<string, Model[]>) {
     setModelIdMappings: () => {},
     getModelIdMappingsEvent: () => null,
     setModelIdMappingsEvent: () => {},
+    getModelPathWhitelist: () => TEST_MODEL_PATH_POLICY,
     getCachedModels: () => modelsByNode,
     setCachedModels: () => {},
     getCachedMints: () => ({}),

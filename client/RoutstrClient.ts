@@ -657,7 +657,7 @@ export class RoutstrClient {
               acceptableMintUrls: fundedMints,
             }
           );
-          const nextSelector = next?.selectors[0];
+          const nextSelector = next?.selector;
           const headers = Object.fromEntries(
             Object.entries(current.headers ?? {}).filter(
               ([name]) => name.toLowerCase() !== MODEL_PATH_HEADER
@@ -691,7 +691,7 @@ export class RoutstrClient {
             headers: { ...headers, [MODEL_PATH_HEADER]: nextSelector },
             autoModelPath: {
               selector: nextSelector,
-              satsPricing: next.satsPricing[0] ?? undefined,
+              satsPricing: next.satsPricing ?? undefined,
             },
           };
           continue;
@@ -2230,10 +2230,11 @@ export class RoutstrClient {
     // the node that advertised it. A caller-pinned request must never fail
     // over to a different node: the selector may be rejected there (404
     // invalid_model_path) and the caller explicitly asked for that one
-    // upstream. An SDK auto-pinned request walks the node-major model-path
-    // chain (node1:deepseek -> node1:fireworks -> node2:deepseek -> ...),
-    // swapping in a fresh selector resolved from the next candidate's own
-    // node.
+    // upstream. An SDK auto-pinned request walks the route-major model-path
+    // chain: candidates are ranked by each route's own cost, so the walk can
+    // interleave nodes (node1:deepseek -> node2:deepseek -> node1:fireworks
+    // when node2's route is cheaper than node1's second route). Each hop takes
+    // a fresh selector from the next candidate's own node.
     // Failover is keyed by the requested (canonical) model id, never by the
     // failed provider's native id.
     const failoverModelId = this._canonicalRequestModelId(
@@ -2286,8 +2287,10 @@ export class RoutstrClient {
         nextTriedModelPaths = [...triedModelPaths];
         // A provider-wide failure (network error / mint unreachable — the
         // empty cooldown scope) rules out the node's remaining routes too:
-        // they share the host. A route-scoped failure keeps them in play,
-        // so the chain walks every route of the cheaper node first.
+        // they share the host, so the ranking is asked to skip the whole
+        // baseUrl. A route-scoped failure only removes that one candidate
+        // (they are per-route now), leaving the node's other routes ranked
+        // where their own cost puts them.
         const providerWideFailure = cooldownScope.modelId === undefined;
         const ranking =
           await this.providerManager.getModelPathProviderRanking(
@@ -2301,8 +2304,8 @@ export class RoutstrClient {
           );
         const next = ranking[0];
         nextProvider = next?.baseUrl ?? null;
-        nextModelPathSelector = next?.selectors[0];
-        nextModelPathPricing = next?.satsPricing[0] ?? undefined;
+        nextModelPathSelector = next?.selector;
+        nextModelPathPricing = next?.satsPricing ?? undefined;
         if (nextProvider) {
           this._log(
             "DEBUG",
@@ -2450,8 +2453,8 @@ export class RoutstrClient {
                 }
               );
               nextProvider = next?.baseUrl ?? null;
-              nextModelPathSelector = next?.selectors[0];
-              nextModelPathPricing = next?.satsPricing[0] ?? undefined;
+              nextModelPathSelector = next?.selector;
+              nextModelPathPricing = next?.satsPricing ?? undefined;
               nextTriedModelPaths = [...tried];
               if (!nextProvider) {
                 // Same degradation as above: no fundable model-path route

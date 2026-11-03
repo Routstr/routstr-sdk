@@ -52,7 +52,15 @@ export interface RouteRequestOptions {
   path?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
-  /** Opt into automatic DeepSeek V4.1 Flash model-path selection. Defaults to false; explicit path headers still work. */
+  /**
+   * Opt into automatic model-path selection. Defaults to false; explicit
+   * `x-routstr-model-path` headers still work.
+   *
+   * When enabled, any model the active policy snapshot covers (kind 38427)
+   * auto-pins the cheapest whitelisted node/route; models the policy does not
+   * cover route exactly as before. The policy decides *which* models this
+   * applies to, not this flag.
+   */
   autoModelPath?: boolean;
   /**
    * Optional per-request secret scoping Tinfoil's prompt cache. Prefer a
