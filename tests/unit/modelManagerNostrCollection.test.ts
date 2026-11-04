@@ -227,6 +227,63 @@ describe("ModelManager Nostr collection", () => {
     expect(bases).toEqual([]);
   });
 
+  it("drops announced localhost and private-network URLs unless included", async () => {
+    const local = [
+      "http://localhost:8000",
+      "http://127.0.0.1:8000",
+      "http://0x7f.1:8000",
+      "http://[::1]:8000",
+      "http://[::ffff:127.0.0.1]:8000",
+      "http://192.168.1.20:8000",
+      "http://10.0.0.5",
+      "http://172.20.0.2:8000",
+      "http://169.254.169.254",
+      "http://100.100.1.1",
+      "http://[fd12::1]",
+      "http://[fe80::1]",
+      "http://node.local:8000",
+      "http://api.localhost",
+      "http://umbrel:8000",
+      "http://host.docker.internal:8000",
+      "http://router.lan",
+      "http://nas.home.arpa",
+    ];
+    const announced = makeProviderEvent("evt-local", "pk-a", [
+      PROVIDER_A_URL,
+      ...local,
+      "https://172.32.0.1",
+    ]);
+    relayStream.current = () => of(announced);
+
+    const discovered: string[] = [];
+    const manager = new ModelManager(makeAdapter(), {
+      logger: silentLogger,
+      includeProviderUrls: ["http://127.0.0.1:8000"],
+    });
+    const bases = await manager.bootstrapProviders(false, true, {
+      onProvider: (baseUrl) => discovered.push(baseUrl),
+    });
+
+    // 127.0.0.1:8000 stays only because the caller included it
+    const kept = [NORMALIZED_A, "http://127.0.0.1:8000/", "https://172.32.0.1/"];
+    expect(discovered).toEqual(kept);
+    expect(bases.sort()).toEqual([...kept].sort());
+  });
+
+  it("discovers again instead of serving a saved list that holds a local URL", async () => {
+    relayStream.current = () =>
+      of(makeProviderEvent("evt-b", "pk-b", [PROVIDER_B_URL]));
+    const adapter = makeAdapter();
+    adapter.setBaseUrlsList([NORMALIZED_A, "http://127.0.0.1:8000/"]);
+    adapter.getBaseUrlsLastUpdate = () => Date.now();
+
+    const manager = new ModelManager(adapter, { logger: silentLogger });
+    const bases = await manager.bootstrapProviders(false, false);
+
+    expect(bases).toEqual([NORMALIZED_B]);
+    expect(adapter.getBaseUrlsList()).toEqual([NORMALIZED_B]);
+  });
+
   it("skips the review query when the adapter cannot store its result", async () => {
     vi.useFakeTimers();
     relayStream.current = (filter) => {

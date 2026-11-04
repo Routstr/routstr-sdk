@@ -20,6 +20,7 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
+import { isLocalNetworkUrl } from "../utils/torUtils";
 import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
@@ -153,7 +154,7 @@ export interface ModelManagerConfig {
   eventStore?: EventStore;
   /** URL to fetch provider directory from */
   providerDirectoryUrl?: string;
-  /** Additional provider base URLs to include */
+  /** Additional provider base URLs to include (the only way a localhost or private-network provider is used) */
   includeProviderUrls?: string[];
   /** Provider base URLs to exclude */
   excludeProviderUrls?: string[];
@@ -701,7 +702,7 @@ export class ModelManager {
         const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
         const cacheValid =
           lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
-        if (cacheValid) {
+        if (cacheValid && cachedUrls.every((url) => this.reachable(url))) {
           const filteredCachedUrls = this.filterBaseUrlsForTor(
             cachedUrls,
             torMode
@@ -869,6 +870,7 @@ export class ModelManager {
     let eventsFound = 0;
 
     const addBase = (url: string, pubkey?: string) => {
+      if (!this.reachable(url)) return;
       const isNew = !bases.has(url);
       bases.add(url);
       this.addProviderNode(this.providerNodePubkeysByUrl, url, pubkey);
@@ -984,6 +986,7 @@ export class ModelManager {
       for (const p of providers) {
         const endpoints = this.getProviderEndpoints(p, torMode);
         for (const endpoint of endpoints) {
+          if (!this.reachable(endpoint)) continue;
           bases.add(endpoint);
           this.addProviderNode(this.providerNodePubkeysByUrl, endpoint, p?.pubkey);
         }
@@ -1671,6 +1674,14 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  /** A localhost or private-network URL is used only when the app includes it. */
+  private reachable(url: string): boolean {
+    return (
+      !isLocalNetworkUrl(url) ||
+      this.includeProviderUrls.some((include) => this.normalizeUrl(include) === url)
+    );
   }
 
   private whitelistMappingsKey: string | undefined;

@@ -28,6 +28,50 @@ export const isOnionUrl = (url: string): boolean => {
   }
 };
 
+const isLocalIpv4 = (host: string): boolean => {
+  const m = host.match(/^(\d+)\.(\d+)\.\d+\.\d+$/);
+  if (!m) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+};
+
+/**
+ * True when the URL's host is this device or a private network: localhost,
+ * names without a dot or under .local, .internal, .lan or .home.arpa, and
+ * loopback, private, link-local or shared IPv4/IPv6 addresses. Only the
+ * announcer can reach such a provider, and a browser on a public site asks
+ * the user for local network access when one is fetched.
+ */
+export const isLocalNetworkUrl = (url: string): boolean => {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || /\.(localhost|local|internal|lan|home\.arpa)$/.test(host)) {
+    return true;
+  }
+  if (!host.startsWith("[")) return !host.includes(".") || isLocalIpv4(host);
+  const v6 = host.slice(1, -1);
+  // The URL parser writes an IPv4-mapped address in hex: ::ffff:7f00:1
+  const mapped = v6.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mapped) {
+    const hi = parseInt(mapped[1], 16);
+    const lo = parseInt(mapped[2], 16);
+    return isLocalIpv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  return v6 === "::" || v6 === "::1" || /^f[cd][0-9a-f]{2}:/.test(v6) || /^fe[89ab][0-9a-f]:/.test(v6);
+};
+
 const shouldAllowHttp = (url: string, torMode: boolean): boolean => {
   if (!url.startsWith("http://")) return true;
   if (url.includes("localhost") || url.includes("127.0.0.1")) return true;
