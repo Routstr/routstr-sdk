@@ -65,7 +65,10 @@ import {
 import {
   getAvailableBalanceInSats,
   getBalanceInSats,
+  isNetworkErrorCode,
   isNetworkErrorMessage,
+  isTransientSocketErrorCode,
+  isTransientSocketErrorMessage,
 } from "../wallet/tokenUtils";
 import { persistApiKeyBalance } from "../wallet/apiKeyBalance";
 import { getDefaultSdkStore, getDefaultUsageTrackingDriver } from "../storage";
@@ -93,6 +96,19 @@ export type RoutstrClientMode = "xcashu" | "apikeys";
 export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.4;
+
+/**
+ * Same-provider attempts allowed after a transient socket failure (reset /
+ * closed socket) before the request is failed over to the next provider.
+ *
+ * One is enough for the failure mode this covers: a provider that closed an
+ * idle keep-alive connection at the same moment we wrote to it answers the
+ * re-sent request immediately when it arrives on a fresh connection. More than
+ * one retry only lengthens the client-visible stall, so the budget is per
+ * provider, not per request: after a failover the new provider starts with a
+ * fresh budget (see `networkRetryCount` reset in `_handleErrorResponse`).
+ */
+const MAX_NETWORK_RETRIES_PER_PROVIDER = 1;
 
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";
@@ -1130,6 +1146,11 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
+    /**
+     * Same-provider retries already spent for `baseUrl` after transient socket
+     * failures. Reset to 0 whenever the request moves to another provider.
+     */
+    networkRetryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
     /** Secret scoping Tinfoil's prompt cache for this request. */
@@ -1338,22 +1359,64 @@ export class RoutstrClient {
         endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
         failurePhase: "network", errorType: error?.name,
       });
-      // Handle network errors with failover
-      if (!headersReceived && !signal?.aborted && isNetworkErrorMessage(error?.message || "")) {
+      // Handle network errors with failover. Classified by message *and* by
+      // the system error code the runtime attaches (Bun: `error.code`, undici:
+      // `error.cause.code`) so a reworded runtime message cannot silently send
+      // a transport failure back to the caller as-is.
+      const transportMessage = error?.message || String(error);
+      const transportCode =
+        (error as { code?: unknown })?.code ??
+        (error as { cause?: { code?: unknown } })?.cause?.code;
+      if (
+        !headersReceived &&
+        !signal?.aborted &&
+        (isNetworkErrorMessage(transportMessage) || isNetworkErrorCode(transportCode))
+      ) {
         const fetchUrl = `${baseUrl.replace(/\/$/, "")}${path}`;
         this._log("ERROR", "[RoutstrClient] Network error fetching from provider", {
           baseUrl,
           url: fetchUrl,
           path,
-          error: error?.message || String(error),
+          code: transportCode,
+          error: transportMessage,
         });
+
+        // A socket that died after it was established (keep-alive reuse race,
+        // provider restart, mesh hiccup) is usually gone on the next
+        // connection. Re-send the identical request to the same provider once
+        // before paying for a failover: a cross-provider hop re-prices, mints a
+        // new token and may land on a more expensive node, all to recover a
+        // failure that clears in milliseconds. Credentials are unchanged (same
+        // token, same key), so the retry reuses `params.headers` as-is.
+        const networkRetryCount = params.networkRetryCount ?? 0;
+        if (
+          networkRetryCount < MAX_NETWORK_RETRIES_PER_PROVIDER &&
+          (isTransientSocketErrorMessage(transportMessage) ||
+            isTransientSocketErrorCode(transportCode))
+        ) {
+          this._log("WARN", "[RoutstrClient] Retrying same provider after transient socket failure", {
+            baseUrl,
+            url: fetchUrl,
+            path,
+            code: transportCode,
+            attempt: networkRetryCount + 1,
+            maxAttempts: MAX_NETWORK_RETRIES_PER_PROVIDER,
+            error: transportMessage,
+          });
+          return await this._makeRequest({
+            ...params,
+            networkRetryCount: networkRetryCount + 1,
+            attemptKind: undefined,
+          });
+        }
+
         return await this._handleErrorResponse(
           params,
           token,
           -1, // just for Network Error to skip all statuses
           undefined,
           undefined,
-          error?.message || String(error),
+          transportMessage,
           params.retryCount ?? 0
         );
         // return await this._handleNetworkError(error, params);
@@ -1462,6 +1525,8 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
+      /** Same-provider transient-socket retries spent for this provider. */
+      networkRetryCount?: number;
       /** SDK-pinned model path for this request, if any. */
       autoModelPath?: ModelPathPin;
       /** Caller forced a provider: never fail over to another node. */
@@ -2619,6 +2684,9 @@ export class RoutstrClient {
             newModel.id
           ),
           retryCount: 0,
+          // Each provider gets its own transient-socket retry budget; the
+          // failed node's must not be charged to the node we just moved to.
+          networkRetryCount: 0,
           attemptKind: undefined,
         });
         (retryResponse as any).initialTokenBalanceInSats = getBalanceInSats(
