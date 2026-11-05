@@ -1,0 +1,1043 @@
+/**
+ * Confidential-upstream as a request transport.
+ *
+ * `RoutstrClient` calls this instead of `fetch()` for a request that opted
+ * into confidential mode. Credential acquisition, top-ups, failover, usage
+ * tracking and balance accounting stay the client's normal code: this only
+ * turns (node, request body, bearer) into an ordinary `Response`.
+ *
+ * The node reserves the request's maximum cost on the bearer (a full-context
+ * prompt plus the pinned completion cap, at the signed offer's rates) and
+ * settles the π_C3-verified usage on it. The response body streams as records
+ * decrypt (each record is authenticated by TLS). Settlement checks (proofs,
+ * receipt signature and binding, usage, cost) finish after the body: a
+ * non-streaming call fails if they fail, and a stream ends with an error
+ * instead of a clean end. A stream's final `data: [DONE]` line is held back
+ * until those checks passed, so a consumer that stops reading at `[DONE]`
+ * still sees the error (the rest of the stream is not delayed).
+ * `confidentialSettled` carries the same outcome, and the change of a
+ * one-off bearer (`returnChange`).
+ *
+ * `POST /v1/chat/completions` runs a chat session (usage disclosed and
+ * proven). `POST /v1/images/generations` and `/v1/image/generate` run an image
+ * session when the node's signed offer has the `images` capability: the price
+ * is fixed at setup from the pinned model, variant and count, so nothing is
+ * disclosed on success. Image sessions are never pre-warmed.
+ */
+
+import { ConfidentialError, SessionRejectedError } from "./errors";
+import {
+  fetchConfidentialOffer,
+  offerAbandonFeeMsat,
+  imageCountKey,
+  offerSupportsImages,
+  renderImageSuffix,
+  verifyConfidentialOffer,
+  type ConfidentialImageVariant,
+  type ConfidentialImagesOffer,
+  type VerifiedOffer,
+} from "./offer";
+import { CuProverBackend } from "./prover";
+import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
+import {
+  CHAT_PROTOCOL_KEYS,
+  type ChatSuffixSpec,
+  canonicalSuffix,
+  exposedProviderHeader,
+  samePinValue,
+} from "./suffix";
+import { encryptedNodeTransport } from "./hosts";
+import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
+import {
+  endsWith,
+  padPinnedBody,
+  PREWARM_DEFAULTS,
+  PrewarmPool,
+  type ArmHandle,
+  type PoolKeyInfo,
+  type PrewarmOptions,
+  type RequestTicket,
+} from "./prewarm";
+
+export interface ConfidentialRequestOptions {
+  /** Upstream TLS hostnames the client trusts (exact or wildcard). */
+  trustedHosts: readonly string[];
+  /** Node signing keys (hex or npub) whose offers are accepted. */
+  nodePubkeys?: readonly string[];
+  /**
+   * Used only when `nodePubkeys` is not set: the keys that announced this node
+   * URL (e.g. its Nostr provider announcement). Applied only to `https:` and
+   * onion URLs, where the transport authenticates the server that serves the
+   * offer; a plain-http URL with no configured pin is refused.
+   */
+  nodePubkeysFor?: (baseUrl: string) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
+  /** Dev only: accept an offer signed by a key that is not pinned. */
+  allowUnpinned?: boolean;
+  /**
+   * Dev only: run sessions with a plain-http node that is neither loopback
+   * nor an onion service. The node credential (setup `auth`) then travels
+   * over an unencrypted websocket.
+   */
+  allowInsecureTransport?: boolean;
+  /** `cu-prover` binary (else CU_PROVER_BIN / CU_PROVER / PATH). */
+  proverPath?: string;
+  /**
+   * `cu-2pc` binary (else CU_2PC_BIN / CU_2PC, then
+   * next to cu-prover, then PATH).
+   */
+  twoPcPath?: string;
+  /**
+   * Evidence directory for per-session artifacts (development only). It
+   * receives the decrypted response in plaintext (`<sid>.response.txt`), so
+   * leave it unset for real traffic.
+   */
+  runsDir?: string;
+  /**
+   * Hand confidential requests and responses to the client's raw
+   * request/response log sink. Off by default: that sink writes the prompt
+   * and the decrypted response in plaintext.
+   */
+  logPlaintext?: boolean;
+  /**
+   * Traffic-driven pre-warming of sessions (see `prewarm.ts`).
+   * Off unless set; `{}` enables it with the defaults. Not used for one-off
+   * Cashu bearers (`returnChange`).
+   */
+  prewarm?: PrewarmOptions;
+}
+
+/** The process-wide pre-warm pool (created on first use). */
+let pool: PrewarmPool<ConfidentialSession, ConfidentialRequestOptions> | undefined;
+
+function prewarmPool(options: PrewarmOptions): PrewarmPool<ConfidentialSession, ConfidentialRequestOptions> {
+  if (!pool) {
+    pool = new PrewarmPool<ConfidentialSession, ConfidentialRequestOptions>(options, {
+      arm: armPooledSession,
+      availableMsats: availableBalance,
+    });
+  } else pool.configure(options);
+  return pool;
+}
+
+/** Close every pre-warmed session (the node releases their reservations). */
+export function closeConfidentialPrewarm(): void {
+  pool?.close();
+  pool = undefined;
+}
+
+/** Pool state, for status pages and tests. */
+export function confidentialPrewarmSnapshot(): ReturnType<PrewarmPool<ConfidentialSession>["snapshot"]> {
+  return pool?.snapshot() ?? [];
+}
+
+function armPooledSession(
+  info: PoolKeyInfo,
+  options: ConfidentialRequestOptions,
+  bodyLength: number,
+): ArmHandle<ConfidentialSession> {
+  let session: ConfidentialSession | undefined;
+  let cancelled = false;
+  const ready = (async () => {
+    const offer = await verifiedOffer(info.baseUrl, options);
+    if (!Object.hasOwn(offer.price_list, info.model)) {
+      throw new ConfidentialError("offer_malformed", `node no longer serves ${info.model} confidentially`);
+    }
+    // An armed session that is never used costs the node's abandon fee.
+    const fee = offerAbandonFeeMsat(offer);
+    const maxFee = options.prewarm?.maxSessionFeeMsat ?? PREWARM_DEFAULTS.maxSessionFeeMsat;
+    if (fee > maxFee) {
+      throw new ConfidentialError(
+        "session_rejected",
+        `node abandon fee ${fee} msats exceeds prewarm.maxSessionFeeMsat ${maxFee}; not pre-warming`,
+      );
+    }
+    if (cancelled) throw new ConfidentialError("session_rejected", "pre-warm cancelled");
+    session = new ConfidentialSession({
+      baseUrl: info.baseUrl,
+      offer,
+      auth: info.bearer,
+      model: info.model,
+      maxTokens: info.maxTokens,
+      bodyLength,
+      prover: new CuProverBackend({ binaryPath: options.proverPath }),
+      twoPcPath: options.twoPcPath,
+      runsDir: options.runsDir,
+      allowInsecureTransport: options.allowInsecureTransport,
+      // The sidecar allows 180 s of preprocessing; a pooled arm is not
+      // waited on by a request, so give it the full window.
+      timeouts: { twoPcKeyShare: 175_000 },
+    });
+    await session.open();
+    await session.arm();
+    return session;
+  })();
+  ready.catch(() => session?.close());
+  return {
+    ready,
+    cancel: () => {
+      cancelled = true;
+      session?.close();
+    },
+  };
+}
+
+/** The credential's spendable balance on the node (msats), via the normal balance endpoint. */
+async function availableBalance(info: PoolKeyInfo): Promise<number | undefined> {
+  try {
+    const res = await fetch(`${info.baseUrl.replace(/\/$/, "")}/v1/balance/info`, {
+      headers: { Authorization: `Bearer ${info.bearer}` },
+    });
+    if (!res.ok) return undefined;
+    const j = (await res.json()) as { balance?: unknown };
+    return typeof j.balance === "number" ? j.balance : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Signed offers by node; every use re-verifies it under the caller's policy. */
+const offerCache = new Map<string, { offer: VerifiedOffer; at: number }>();
+
+/** The announced keys for `baseUrl`, when its scheme authenticates the server. */
+async function discoveredPins(
+  baseUrl: string,
+  options: ConfidentialRequestOptions,
+): Promise<readonly string[] | undefined> {
+  if (!options.nodePubkeysFor) return undefined;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return undefined;
+  }
+  const authenticated = url.protocol === "https:" || url.hostname.endsWith(".onion");
+  if (!authenticated) return undefined;
+  const keys = await options.nodePubkeysFor(baseUrl);
+  return keys && keys.length > 0 ? keys : undefined;
+}
+
+async function verifiedOffer(
+  baseUrl: string,
+  options: ConfidentialRequestOptions,
+  fresh = false,
+): Promise<VerifiedOffer> {
+  const key = baseUrl.replace(/\/$/, "");
+  const policy = {
+    pinnedPubkeys: options.nodePubkeys ?? (await discoveredPins(baseUrl, options)),
+    allowUnpinned: options.allowUnpinned,
+    trustedHosts: options.trustedHosts,
+  };
+  const hit = offerCache.get(key);
+  let offer: VerifiedOffer;
+  if (!fresh && hit && Date.now() - hit.at < 30_000) {
+    // Signature, pin, version and trusted host are checked again for *this*
+    // call: a cached offer accepted under a looser policy must not leak.
+    offer = verifyConfidentialOffer(hit.offer, policy);
+  } else {
+    offer = await fetchConfidentialOffer(key, policy);
+    offerCache.set(key, { offer, at: Date.now() });
+  }
+  // Pinned keys authenticate the offer, not the connection: the session
+  // carries the node credential, which plain http would expose on the wire.
+  if (!options.allowInsecureTransport && !encryptedNodeTransport(baseUrl)) {
+    throw new ConfidentialError(
+      "not_configured",
+      `refusing a confidential session with ${key}: plain http would send the node credential unencrypted ` +
+        "(use an https or onion URL; allowInsecureTransport is for development)",
+    );
+  }
+  return offer;
+}
+
+
+/** The node's verified offer, which must price `model` for this kind of request. */
+async function qualifiedOffer(
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions,
+  fresh = false,
+  kind: "chat" | "images" = "chat",
+): Promise<VerifiedOffer> {
+  const offer = await verifiedOffer(baseUrl, options, fresh);
+  if (kind === "images") {
+    if (!offerSupportsImages(offer)) {
+      throw new ConfidentialError("offer_no_images", `node ${baseUrl} serves no confidential image generation`);
+    }
+    if (!Object.hasOwn(offer.images!.price_list, model)) {
+      throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not generate ${model} images confidentially`);
+    }
+    return offer;
+  }
+  if (!Object.hasOwn(offer.price_list, model)) {
+    throw new ConfidentialError("offer_malformed", `node ${baseUrl} does not serve ${model} confidentially`);
+  }
+  return offer;
+}
+
+/**
+ * Check, with no credential, that `baseUrl` would run a confidential session
+ * for `model`: its signed offer verifies under the caller's policy, the node
+ * is reachable over an encrypted transport and its price list names the
+ * model. Throws the error the session itself would raise; returns the
+ * verified offer. The client calls this before it spends a token on a node,
+ * and sizes the deposit from the offer.
+ */
+export async function qualifyConfidentialNode(
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions,
+  kind: "chat" | "images" = "chat",
+): Promise<VerifiedOffer> {
+  return qualifiedOffer(baseUrl, model, options, false, kind);
+}
+
+/** The chat endpoint the confidential transport implements. */
+export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
+  return (
+    (method ?? "POST").toUpperCase() === "POST" &&
+    /^(\/v1)?\/chat\/completions\/?$/.test((path ?? "/v1/chat/completions").split("?")[0]!)
+  );
+}
+
+/** The image endpoints the confidential transport implements. */
+export function isConfidentialImageEndpoint(method: string | undefined, path: string | undefined): boolean {
+  return (
+    (method ?? "POST").toUpperCase() === "POST" &&
+    /^(\/v1)?\/(images\/generations|image\/generate)\/?$/.test((path ?? "").split("?")[0]!)
+  );
+}
+
+/**
+ * An image request split into what the node may see (model, variant, count:
+ * they set the price and are pinned in the suffix) and the private part
+ * (prompt and every option that does not change the price). The choice is
+ * `chooseImageVariant`'s, which refuses rather than substitutes.
+ */
+export function planImageRequest(
+  request: Record<string, unknown>,
+  images: ConfidentialImagesOffer,
+): { model: string; variant: ConfidentialImageVariant; count: number; body: Uint8Array; suffix: string } {
+  const { model, variant, count, countKey } = chooseImageVariant(request, images);
+  const priv: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(request)) {
+    if (IMAGE_SELECTOR_KEYS.has(k) || k === countKey) continue;
+    priv[k] = v;
+  }
+  const suffix = renderImageSuffix(model, count, countKey, images.fixed_pins, variant.pins);
+  const prefix = JSON.stringify(priv).slice(0, -1);
+  // The suffix is its own final record and begins with a comma: a body with
+  // no private keys could not end with it (the prompt is required anyway).
+  if (prefix === "{") throw new ConfidentialError("unsupported_endpoint", "an image request needs a prompt");
+  return { model, variant, count, body: new TextEncoder().encode(prefix + suffix), suffix };
+}
+
+/**
+ * The request body as the provider sees it: private part + pinned suffix.
+ * The protocol's own keys (model, caps, n, stream) never come from the
+ * caller. Another key the offer pins is dropped when the caller asked for the
+ * pinned value, and refused when it asked for another: the suffix would
+ * silently override it.
+ */
+export function buildPinnedBody(
+  request: Record<string, unknown>,
+  model: string,
+  maxTokens: number,
+  chat: ChatSuffixSpec,
+): Uint8Array {
+  const pinned = new Map(chat.fixed_pins);
+  const priv: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(request)) {
+    if (CHAT_PROTOCOL_KEYS.has(k)) continue;
+    if (pinned.has(k)) {
+      if (samePinValue(v, pinned.get(k))) continue;
+      throw new ConfidentialError(
+        "pinned_parameter",
+        `the node's offer pins ${k} to ${JSON.stringify(pinned.get(k))}; this request sets it to ${JSON.stringify(v)}`,
+      );
+    }
+    priv[k] = v;
+  }
+  const json = JSON.stringify(priv);
+  // Drop the closing brace: the suffix closes the object and wins last.
+  const suffix = canonicalSuffix(chat, model, maxTokens);
+  const prefix = json.slice(0, -1);
+  // The pinned suffix begins with a comma and must end the body exactly: a
+  // request with no private keys (no messages) cannot be pinned.
+  if (prefix === "{") throw new ConfidentialError("unsupported_endpoint", "a chat request needs messages");
+  return new TextEncoder().encode(prefix + suffix);
+}
+
+/**
+ * The token cap the session pins: the smallest the caller set (`max_tokens`,
+ * `max_completion_tokens`, `max_output_tokens`), at most the node's cap.
+ * `clampedFrom` is the caller's value when the node's cap lowered it, so the
+ * response can say the answer may be cut short.
+ */
+export function maxTokensFor(
+  request: Record<string, unknown>,
+  cap: number,
+): { maxTokens: number; clampedFrom?: number } {
+  let asked: number | undefined;
+  for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
+    const v = request[k];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      asked = Math.min(asked ?? Infinity, Math.trunc(v));
+    }
+  }
+  if (asked === undefined) return { maxTokens: cap };
+  const maxTokens = Math.max(1, Math.min(asked, cap));
+  return maxTokens < asked ? { maxTokens, clampedFrom: asked } : { maxTokens };
+}
+
+/**
+ * Fold the streamed SSE into one `chat.completion` for a caller that did not
+ * ask for a stream (the pinned suffix always streams: the billed usage event
+ * only exists there).
+ */
+export function aggregateChatCompletionSse(sseText: string): Record<string, unknown> {
+  let id: unknown;
+  let created: unknown;
+  let model: unknown;
+  let usage: unknown;
+  const choices = new Map<
+    number,
+    {
+      role: string;
+      content: string;
+      reasoning: string;
+      finish_reason: unknown;
+      tool_calls: Map<number, { id?: unknown; type?: unknown; function: { name: string; arguments: string } }>;
+    }
+  >();
+  for (const line of sseText.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let ev: Record<string, any>;
+    try {
+      ev = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    id ??= ev.id;
+    created ??= ev.created;
+    model ??= ev.model;
+    if (ev.usage) usage = ev.usage;
+    for (const c of Array.isArray(ev.choices) ? ev.choices : []) {
+      const idx = typeof c.index === "number" ? c.index : 0;
+      let acc = choices.get(idx);
+      if (!acc) {
+        acc = { role: "assistant", content: "", reasoning: "", finish_reason: null, tool_calls: new Map() };
+        choices.set(idx, acc);
+      }
+      const d = c.delta ?? {};
+      if (typeof d.role === "string") acc.role = d.role;
+      if (typeof d.content === "string") acc.content += d.content;
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === "string") acc.reasoning += r;
+      for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+        const ti = typeof tc.index === "number" ? tc.index : 0;
+        let t = acc.tool_calls.get(ti);
+        if (!t) {
+          t = { function: { name: "", arguments: "" } };
+          acc.tool_calls.set(ti, t);
+        }
+        if (tc.id !== undefined) t.id = tc.id;
+        if (tc.type !== undefined) t.type = tc.type;
+        if (typeof tc.function?.name === "string") t.function.name += tc.function.name;
+        if (typeof tc.function?.arguments === "string") t.function.arguments += tc.function.arguments;
+      }
+      if (c.finish_reason != null) acc.finish_reason = c.finish_reason;
+    }
+  }
+  const out: Record<string, unknown> = {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [...choices.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([index, acc]) => {
+        const message: Record<string, unknown> = { role: acc.role, content: acc.content };
+        if (acc.reasoning) message.reasoning_content = acc.reasoning;
+        if (acc.tool_calls.size > 0) {
+          message.tool_calls = [...acc.tool_calls.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, t]) => ({ id: t.id, type: t.type ?? "function", function: t.function }));
+        }
+        return { index, message, finish_reason: acc.finish_reason };
+      }),
+  };
+  if (usage !== undefined) out.usage = usage;
+  return out;
+}
+
+export interface ConfidentialFetchParams {
+  baseUrl: string;
+  /** The JSON request body the client would have POSTed. */
+  body: unknown;
+  /** The bearer the client already obtained for this node. */
+  bearer: string;
+  options: ConfidentialRequestOptions;
+  /** The caller's method and path; anything but POST chat/completions is refused. */
+  method?: string;
+  path?: string;
+  /**
+   * Return the key's remaining balance as an `x-cashu` header after
+   * settlement (xcashu mode: the bearer was a one-off Cashu token).
+   */
+  returnChange?: boolean;
+  signal?: AbortSignal;
+}
+
+/** Run one confidential session and present it as a `Response`. */
+export async function fetchConfidential(params: ConfidentialFetchParams): Promise<Response> {
+  const image = isConfidentialImageEndpoint(params.method, params.path);
+  if (!image && !isConfidentialEndpoint(params.method, params.path)) {
+    throw new ConfidentialError(
+      "unsupported_endpoint",
+      `confidential mode supports only POST /v1/chat/completions and /v1/images/generations, not ${params.method ?? ""} ${params.path ?? ""}`,
+    );
+  }
+  const once = image ? fetchConfidentialImageOnce : fetchConfidentialOnce;
+  try {
+    return await once(params, false);
+  } catch (error) {
+    // The node settles at the rates of the offer we verified; once it no
+    // longer holds that offer it refuses the setup. Refetch and retry once.
+    if (error instanceof OfferExpired) return once(params, true);
+    throw error;
+  }
+}
+
+/**
+ * One confidential image request: always a cold session (image sessions are
+ * never armed ahead of a request), presented as an OpenAI images response.
+ */
+async function fetchConfidentialImageOnce(
+  params: ConfidentialFetchParams,
+  freshOffer: boolean,
+): Promise<Response> {
+  const { baseUrl, options } = params;
+  throwIfAborted(params.signal);
+  const request = (params.body ?? {}) as Record<string, unknown>;
+  const model = typeof request.model === "string" ? request.model : "";
+  const offer = await qualifiedOffer(baseUrl, model, options, freshOffer, "images");
+  const plan = planImageRequest(request, offer.images!);
+  throwIfAborted(params.signal);
+  const session = new ConfidentialSession({
+    baseUrl,
+    offer,
+    auth: params.bearer,
+    model: plan.model,
+    maxTokens: 0,
+    kind: "images",
+    image: { variant: plan.variant.id, count: plan.count },
+    bodyLength: plan.body.length,
+    prover: new CuProverBackend({ binaryPath: options.proverPath }),
+    twoPcPath: options.twoPcPath,
+    runsDir: options.runsDir,
+    allowInsecureTransport: options.allowInsecureTransport,
+  });
+  const abort = callerAbort(params.signal, () => session);
+  // Image sessions never use the pre-warm pool, but its chat arms would
+  // compete with this session's own 2PC preparation: hold them meanwhile.
+  const releaseArming = pool?.holdArming();
+  const runP = session.run(plan.body).finally(() => {
+    abort.done();
+    releaseArming?.();
+    session.close();
+  });
+  let result: ConfidentialSessionResult;
+  try {
+    result = await Promise.race([runP, abort.aborted]);
+  } catch (error) {
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !session.bodyReleased) {
+      offerCache.delete(baseUrl.replace(/\/$/, ""));
+      throw new OfferExpired(error.message);
+    }
+    // The caller left after the release: the session settles on its own.
+    if (abort.detached) throw error;
+    const change = await failureChange(params, session, runP);
+    // After release the provider has the request: a node error is not a
+    // refusal, and failing over would run (and pay for) it again.
+    if (error instanceof SessionRejectedError && error.status && !session.bodyReleased) {
+      return refusalResponse(error, change);
+    }
+    throw withChange(error, change);
+  }
+  const headers = new Headers();
+  headers.set("x-routstr-verify", "confidential");
+  headers.set("x-routstr-confidential-sid", session.sid);
+  headers.set("x-routstr-confidential-variant", plan.variant.id);
+  if (typeof result.receipt.cost_msats === "number") {
+    headers.set("x-routstr-cost-msats", String(result.receipt.cost_msats));
+  }
+  let response: Response;
+  if (result.image) {
+    headers.set("content-type", "application/json");
+    // What fell short in an accepted response (it was paid at the flat price).
+    if (result.imageWarnings?.length) headers.set("x-routstr-confidential-warnings", result.imageWarnings.join("; "));
+    response = new Response(JSON.stringify(result.image), { status: result.http.status, headers });
+  } else {
+    // An upstream error: its body as the provider sent it.
+    for (const [k, v] of Object.entries(result.http.headers)) {
+      if (exposedProviderHeader(k) && !headers.has(k)) headers.set(k, v);
+    }
+    response = new Response(new Blob([result.http.body as BlobPart]), { status: result.http.status, headers });
+  }
+  const change = params.returnChange ? await withdrawBalance(baseUrl, params.bearer) : undefined;
+  if (change) response.headers.set("x-cashu", change);
+  (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
+    Promise.resolve({ change });
+  return response;
+}
+
+class OfferExpired extends Error {}
+
+function isOfferExpired(error: SessionRejectedError): boolean {
+  const detail = error.nodeDetail as { error?: { type?: string } } | undefined;
+  return error.status === 409 && detail?.error?.type === "offer_expired";
+}
+
+async function fetchConfidentialOnce(
+  params: ConfidentialFetchParams,
+  freshOffer: boolean,
+): Promise<Response> {
+  const { baseUrl, options } = params;
+  throwIfAborted(params.signal);
+  const request = (params.body ?? {}) as Record<string, unknown>;
+  const model = typeof request.model === "string" ? request.model : "";
+  const offer = await qualifiedOffer(baseUrl, model, options, freshOffer);
+  throwIfAborted(params.signal);
+  const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
+  const body = buildPinnedBody(request, model, maxTokens, offer.chat);
+  const wantStream = request.stream === true;
+
+  const coldSession = () =>
+    new ConfidentialSession({
+      baseUrl,
+      offer,
+      auth: params.bearer,
+      model,
+      maxTokens,
+      bodyLength: body.length,
+      prover: new CuProverBackend({ binaryPath: options.proverPath }),
+      twoPcPath: options.twoPcPath,
+      runsDir: options.runsDir,
+      allowInsecureTransport: options.allowInsecureTransport,
+    });
+
+  // Pre-warm: a stable credential only, and a body that ends with the
+  // pinned suffix. A Cashu bearer is never pooled: a one-off one is spent per
+  // request, and the bootstrap one of a new key is replaced by that key.
+  const suffix = canonicalSuffix(offer.chat, model, maxTokens);
+  const usePool =
+    options.prewarm !== undefined &&
+    options.prewarm.enabled !== false &&
+    !params.returnChange &&
+    !params.bearer.startsWith("cashu") &&
+    endsWith(body, new TextEncoder().encode(suffix));
+  const ticket: RequestTicket<ConfidentialSession> | undefined = usePool
+    ? prewarmPool(options.prewarm!).begin(
+        { baseUrl: baseUrl.replace(/\/$/, ""), model, maxTokens, bearer: params.bearer },
+        options,
+        body.length,
+      )
+    : undefined;
+  // The request's start: a warm request may first wait for an arm still in
+  // progress, and that wait belongs in its timings.
+  const tRequest = Date.now();
+  const lease = ticket?.take();
+  let session: ConfidentialSession = lease ? (undefined as never) : coldSession();
+  let prewarmed = false;
+
+  const stream = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = stream.writable.getWriter();
+  type Head = { status: number; statusText: string; headers: Record<string, string> };
+  let resolveHead!: (h: Head) => void;
+  const headP = new Promise<Head>((r) => (resolveHead = r));
+  const chunks: Uint8Array[] = [];
+  const doneHold = new SseDoneHoldback();
+  const attach = (s: ConfidentialSession) =>
+    s.setResponseHandlers(
+      (h) => {
+        ticket?.head();
+        resolveHead(h);
+      },
+      (chunk) => {
+        if (wantStream && chunk.length) {
+          const now = doneHold.push(chunk);
+          if (now.length) void writer.write(now).catch(() => {});
+        }
+        else if (chunk.length) chunks.push(chunk);
+      },
+    );
+  if (!lease) attach(session);
+  const abort = callerAbort(params.signal, () => session, (reason) => void writer.abort(reason).catch(() => {}));
+
+  const runCold = (): Promise<ConfidentialSessionResult> => {
+    ticket?.cold();
+    return session.run(body);
+  };
+  const runWarm = async (): Promise<ConfidentialSessionResult> => {
+    let warm: ConfidentialSession;
+    try {
+      warm = await lease!.session;
+    } catch (error) {
+      // The arm we waited for failed: nothing was sent, go cold.
+      throwIfAborted(params.signal);
+      ticket!.log(`claimed arm failed (${errorText(error)}); falling back to a cold session`);
+      session = coldSession();
+      attach(session);
+      return runCold();
+    }
+    if (params.signal?.aborted) {
+      warm.close();
+      throw params.signal.reason ?? new DOMException("aborted", "AbortError");
+    }
+    session = warm;
+    attach(session);
+    // Pre-warmed only if the session was already armed when the request came.
+    prewarmed = lease!.ready;
+    ticket!.warm();
+    try {
+      return await warm.claim(padPinnedBody(body, warm.bodyLength, suffix), tRequest);
+    } catch (error) {
+      // Before the credential record is released nothing reached the
+      // provider: retry once on a fresh cold session. Never after.
+      if (warm.bodyReleased || params.signal?.aborted) throw error;
+      ticket!.log(
+        `pre-warmed sid=${warm.sid.slice(0, 8)} failed before release (${errorText(error)}); falling back to a cold session`,
+      );
+      ticket!.armedFailed(errorText(error));
+      warm.close();
+      prewarmed = false;
+      session = coldSession();
+      attach(session);
+      return runCold();
+    }
+  };
+
+  // The whole session, including settlement and its checks.
+  const runP = (lease ? runWarm() : runCold()).finally(() => {
+    abort.done();
+    session?.close();
+  });
+  runP.then(
+    (r) =>
+      ticket?.end(
+        typeof r.receipt.reserved_msats === "number" ? r.receipt.reserved_msats : undefined,
+        // What an unused armed session for this key would cost.
+        Math.max(
+          typeof r.receipt.abandon_fee_msat === "number" ? r.receipt.abandon_fee_msat : 0,
+          typeof r.receipt.session_fee_msat === "number" ? r.receipt.session_fee_msat : 0,
+        ),
+      ),
+    () => ticket?.end(),
+  );
+  let head: Head;
+  try {
+    head = await Promise.race([
+      // A stream starts at the response head; anything else waits for the
+      // settled session, so a failed check fails the call.
+      wantStream ? headP : runP.then(() => headP),
+      runP.then((r: ConfidentialSessionResult) => ({
+        status: r.http.status,
+        statusText: r.http.statusText,
+        headers: r.http.headers,
+      })),
+      abort.aborted,
+    ]);
+  } catch (error) {
+    if (!abort.detached) session?.close();
+    void writer.abort(error).catch(() => {});
+    // Retried only while nothing can have reached the provider: the node
+    // refuses an expired offer at setup, never after the body went out.
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !session?.bodyReleased) {
+      offerCache.delete(baseUrl.replace(/\/$/, ""));
+      throw new OfferExpired(error.message);
+    }
+    // The caller left after the release: the session settles on its own.
+    if (abort.detached) throw error;
+    const change = await failureChange(params, session, runP);
+    // A node-side refusal (e.g. 402 insufficient balance) becomes the same
+    // HTTP error a normal request would get, so the client's existing
+    // top-up / failover handling applies. After release the provider has the
+    // request: a node error is not a refusal, and failing over would run (and
+    // pay for) it again.
+    if (error instanceof SessionRejectedError && error.status && !session?.bodyReleased) {
+      return refusalResponse(error, change);
+    }
+    throw withChange(error, change);
+  }
+
+  let response: Response | undefined;
+  let change: string | undefined;
+  // A caller that left before it had a response cannot take change: the
+  // bearer's deposit then stays on the node for the wallet to refund.
+  const callerGone = () => abort.detached && !response;
+  const settled = runP.then(
+    async () => {
+      if (params.returnChange && !callerGone()) {
+        change = await withdrawBalance(baseUrl, params.bearer);
+        if (change) response?.headers.set("x-cashu", change);
+      }
+      return { change };
+    },
+    async (error: unknown) => {
+      throw callerGone() ? error : withChange(error, await failureChange(params, session, runP));
+    },
+  );
+  // A stream ends only once settlement verified (and only then gets its
+  // `[DONE]`); a failed check errors it.
+  settled.then(
+    () => {
+      const rest = doneHold.release();
+      if (rest.length) void writer.write(rest).catch(() => {});
+      void writer.close().catch(() => {});
+    },
+    (error) => void writer.abort(error).catch(() => {}),
+  );
+
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(head.headers)) {
+    if (exposedProviderHeader(k)) headers.set(k, v);
+  }
+  headers.set("x-routstr-verify", "confidential");
+  headers.set("x-routstr-confidential-sid", session.sid);
+  // The node's cap lowered the caller's token limit: say so, since the answer
+  // may end early (finish_reason "length") for that reason alone.
+  if (clampedFrom !== undefined) {
+    headers.set("x-routstr-confidential-max-tokens", `${maxTokens}; requested=${clampedFrom}`);
+  }
+  if (usePool) headers.set("x-routstr-confidential-prewarmed", prewarmed ? "1" : "0");
+  const ok = head.status < 400 && /event-stream/i.test(head.headers["content-type"] ?? "");
+  if (wantStream) {
+    response = new Response(stream.readable, { status: head.status, headers });
+  } else {
+    await settled; // throws on a failed proof, receipt or usage check
+    const body = concat(chunks);
+    if (ok) {
+      headers.set("content-type", "application/json");
+      const text = new TextDecoder().decode(body);
+      response = new Response(JSON.stringify(aggregateChatCompletionSse(text)), {
+        status: head.status,
+        headers,
+      });
+    } else {
+      response = new Response(new Blob([body as BlobPart]), { status: head.status, headers });
+    }
+    if (change) response.headers.set("x-cashu", change);
+    const warnings = (await runP).warnings;
+    if (warnings?.length) response.headers.set("x-routstr-confidential-warnings", warnings.join("; "));
+  }
+  settled.catch(() => {}); // observed by the stream and by finalize()
+  (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled = settled;
+  return response!;
+}
+
+/**
+ * What a response's `confidentialSettled` resolves to. `change` is the
+ * bearer's remaining balance withdrawn as a Cashu token (`returnChange`); a
+ * stream's wrapper copies the response headers before it is set, so this is
+ * where a caller reads it. A rejection carries it as `cashuChange`.
+ */
+export interface ConfidentialSettlement {
+  change?: string;
+}
+
+/**
+ * A caller's abort. Before the release nothing reached the provider: the
+ * session closes at once (the node releases the reservation). After it the
+ * provider has the request, and closing would charge the whole reservation:
+ * the caller is detached instead (`aborted` rejects, nothing more is
+ * delivered) and the session drains, bounded by its pinned cap, and settles
+ * at the usage it had. Once the session ended (`done()`) an abort changes
+ * nothing.
+ */
+function callerAbort(
+  signal: AbortSignal | undefined,
+  current: () => ConfidentialSession | undefined,
+  onReason?: (reason: unknown) => void,
+): { aborted: Promise<never>; readonly detached: boolean; done(): void } {
+  let detached = false;
+  let ended = false;
+  let reject!: (reason: unknown) => void;
+  const aborted = new Promise<never>((_, r) => (reject = r));
+  aborted.catch(() => {});
+  const onAbort = () => {
+    const reason = abortReason(signal);
+    onReason?.(reason);
+    if (ended) return;
+    const session = current();
+    if (session?.bodyReleased) detached = true;
+    else session?.close();
+    reject(reason);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return {
+    aborted,
+    get detached() {
+      return detached;
+    },
+    done() {
+      ended = true;
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+/** A node refusal as the HTTP error a normal request would get. */
+function refusalResponse(error: SessionRejectedError, change: string | undefined): Response {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (change) headers.set("x-cashu", change);
+  return new Response(JSON.stringify({ detail: error.nodeDetail ?? error.message }), {
+    status: error.status,
+    headers,
+  });
+}
+
+/**
+ * After a failed session, a one-off bearer's deposit is still on the node:
+ * withdraw it (`returnChange`) once the session ended and the node released
+ * or charged its reservation. Nothing to withdraw if the credential never
+ * went out.
+ */
+async function failureChange(
+  params: ConfidentialFetchParams,
+  session: ConfidentialSession | undefined,
+  runP: Promise<unknown>,
+): Promise<string | undefined> {
+  if (!params.returnChange || !session?.credentialSent) return undefined;
+  await Promise.race([runP.catch(() => {}), delay(10_000)]);
+  return withdrawBalance(params.baseUrl, params.bearer, 5);
+}
+
+/** A thrown error carrying the withdrawn change (`cashuChange`) to the caller. */
+function withChange(error: unknown, change: string | undefined): unknown {
+  if (!change) return error;
+  const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
+  (e as { cashuChange?: string }).cashuChange = change;
+  return e;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Holds back an SSE stream from its `data: [DONE]` line on. Bytes before it
+ * pass through at once; only a tail that could still become that line (at
+ * most a few bytes) waits for the next chunk.
+ */
+export class SseDoneHoldback {
+  private static readonly MARKERS = ["data: [DONE]", "data:[DONE]"].map((m) => new TextEncoder().encode(m));
+  /** Bytes not yet emitted (a possible marker prefix, or everything from the marker on). */
+  private pending: Uint8Array = new Uint8Array(0);
+  private holding = false;
+  /** The byte before `pending` (a marker counts only at a line start). */
+  private prev = 10;
+
+  /** Add decrypted bytes; returns what may be delivered now. */
+  push(chunk: Uint8Array): Uint8Array {
+    const buf = concat([this.pending, chunk]);
+    if (this.holding) {
+      this.pending = buf;
+      return new Uint8Array(0);
+    }
+    const at = this.findMarker(buf);
+    if (at >= 0) {
+      this.holding = true;
+      this.pending = buf.subarray(at);
+      return this.emit(buf.subarray(0, at));
+    }
+    const keep = this.partialMarkerTail(buf);
+    this.pending = buf.slice(buf.length - keep);
+    return this.emit(buf.subarray(0, buf.length - keep));
+  }
+
+  /** Everything still held, once the stream may end. */
+  release(): Uint8Array {
+    const out = this.pending;
+    this.pending = new Uint8Array(0);
+    this.holding = false;
+    return out;
+  }
+
+  private emit(out: Uint8Array): Uint8Array {
+    if (out.length) this.prev = out[out.length - 1]!;
+    return out;
+  }
+
+  private atLineStart(buf: Uint8Array, i: number): boolean {
+    const b = i === 0 ? this.prev : buf[i - 1]!;
+    return b === 10 || b === 13;
+  }
+
+  private findMarker(buf: Uint8Array): number {
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 0x64 /* d */ || !this.atLineStart(buf, i)) continue;
+      for (const m of SseDoneHoldback.MARKERS) {
+        if (i + m.length <= buf.length && m.every((b, j) => buf[i + j] === b)) return i;
+      }
+    }
+    return -1;
+  }
+
+  /** Length of the longest tail of `buf` that starts a marker at a line start. */
+  private partialMarkerTail(buf: Uint8Array): number {
+    const longest = Math.max(...SseDoneHoldback.MARKERS.map((m) => m.length)) - 1;
+    for (let n = Math.min(longest, buf.length); n > 0; n--) {
+      const i = buf.length - n;
+      if (!this.atLineStart(buf, i)) continue;
+      if (SseDoneHoldback.MARKERS.some((m) => m.subarray(0, n).every((b, j) => buf[i + j] === b))) return n;
+    }
+    return 0;
+  }
+}
+
+/**
+ * The existing node refund endpoint: return the bearer's remaining balance.
+ * The node refuses while a reservation is still held, which a session that
+ * just failed may briefly be: `attempts` retries with a growing pause.
+ */
+async function withdrawBalance(baseUrl: string, bearer: string, attempts = 2): Promise<string | undefined> {
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await delay(500 * i);
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/wallet/refund`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${bearer}` },
+      });
+      if (!res.ok) continue;
+      const j = (await res.json()) as { token?: string };
+      return j.token;
+    } catch {
+      /* retry */
+    }
+  }
+  return undefined;
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
