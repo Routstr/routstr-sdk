@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BalanceManager } from "../../wallet/BalanceManager";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 
@@ -857,6 +857,7 @@ describe("BalanceManager non-JSON error responses", () => {
       },
     });
     const manager = new BalanceManager(createWallet(), storage);
+    const saveToken = vi.spyOn(storage, "setCachedReceiveTokens");
     const originalFetch = globalThis.fetch;
     const keyNotFoundBody = JSON.stringify({
       detail:
@@ -880,6 +881,9 @@ describe("BalanceManager non-JSON error responses", () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe("Key not found, removed dead API key");
       expect(storage.getApiKey(Provider)).toBeNull();
+      expect(saveToken).toHaveBeenCalledWith([
+        expect.objectContaining({ token: "cashu_dead_bootstrap_key" }),
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -923,6 +927,7 @@ describe("BalanceManager non-JSON error responses", () => {
       },
     });
     const manager = new BalanceManager(createWallet(), storage);
+    const saveToken = vi.spyOn(storage, "setCachedReceiveTokens");
     const originalFetch = globalThis.fetch;
     globalThis.fetch = mockFetchResponse(
       401,
@@ -950,6 +955,7 @@ describe("BalanceManager non-JSON error responses", () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe("Key not found, removed dead API key");
       expect(storage.getApiKey(Provider)).toBeNull();
+      expect(saveToken).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = originalFetch;
     }

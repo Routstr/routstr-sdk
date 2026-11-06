@@ -384,6 +384,7 @@ export class BalanceManager {
         this.logger.warn(
           `refundApiKey: key not found for ${baseUrl}; removing dead API key`
         );
+        if (apiKey.startsWith("cashu")) this.cashuSpender.cacheReceiveToken(apiKey);
         if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
