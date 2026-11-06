@@ -367,6 +367,69 @@ describe("RoutstrClient 402 top-up validation", () => {
     ).rejects.toBeInstanceOf(InsufficientBalanceError);
   });
 
+  function keyHeldByOtherRequests(client: RoutstrClient) {
+    const balanceManager = client.getBalanceManager();
+    vi.spyOn(balanceManager, "topUp").mockResolvedValue({
+      success: false,
+      message: "Insufficient balance: need 112 sats, have 30 sats available.",
+    });
+    return vi.spyOn(balanceManager, "getTokenBalance").mockResolvedValue({
+      amount: 20_000, reserved: 450_000, unit: "msat", apiKey: API_KEY,
+    });
+  }
+
+  it("waits for our in-flight request on the key to settle, then retries the same node", async () => {
+    // routeRequests builds a client per call.
+    const routedClient = () => {
+      const { client, providerManager } = createClient();
+      providerManager.getRequiredSatsForModel = vi.fn(() => 100);
+      providerManager.recordSuccess = vi.fn();
+      keyHeldByOtherRequests(client);
+      vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
+      vi.spyOn(client as any, "_topUpIfNeeded").mockResolvedValue(undefined);
+      vi.spyOn(client as any, "_spendToken").mockResolvedValue({ token: API_KEY, tokenBalance: 20, tokenBalanceUnit: "sat" });
+      vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
+      return client;
+    };
+    const encoder = new TextEncoder();
+    let endFirst!: () => void;
+    const firstBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[]}\n\n'));
+        endFirst = () => {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        };
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(firstBody, { headers: { "content-type": "text/event-stream" } }))
+      .mockResolvedValueOnce(new Response(localInsufficientBalanceBody, { status: 402 }))
+      .mockResolvedValueOnce(new Response("{}", { headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await routedClient().routeRequest({ ...params, modelId: model.id });
+    const second = routedClient().routeRequest({ ...params, modelId: model.id });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    endFirst();
+    await first.text();
+    expect((await second).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(String(fetchMock.mock.calls[2][0])).toContain("provider.example.com");
+  });
+
+  it("fails at once when the holds belong to another client", async () => {
+    const { client } = createClient();
+    keyHeldByOtherRequests(client);
+
+    await expect(
+      handle402(client, localInsufficientBalanceBody)
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+  });
+
   it("fails over when the top-up cannot fund any mint the provider accepts", async () => {
     const NEXT_URL = "https://next.example.com/";
     const { client, providerManager } = createClient(NEXT_URL);

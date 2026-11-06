@@ -194,6 +194,34 @@ const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
  */
 const MIN_DEPOSIT_SATS = 7;
 
+// Module-level: `routeRequests` builds a new client per call.
+const inFlightRequests = new Map<string, Set<Promise<void>>>();
+
+function trackInFlight(key: string): () => void {
+  let release!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const requests = inFlightRequests.get(key) ?? new Set();
+  inFlightRequests.set(key, requests);
+  requests.add(settled);
+  void settled.then(() => {
+    requests.delete(settled);
+    if (requests.size === 0) inFlightRequests.delete(key);
+  });
+  return release;
+}
+
+async function waitForInFlightRequest(
+  key: string,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const requests = inFlightRequests.get(key);
+  if (!requests?.size) return false;
+  await awaitWithAbort(Promise.race(requests), signal);
+  return true;
+}
+
 /**
  * An SDK-pinned x-routstr-model-path selector and the per-route pricing the
  * node advertised for it. Marks the request as auto-pinned (failover may
@@ -656,10 +684,12 @@ export class RoutstrClient {
     // Exposed as `finalize()` so a proxy can await accounting once it has
     // forwarded the body, and started now so accounting still happens when the
     // caller ignores it. `satsSpent` and `usage` are filled in when it settles.
-    const finalizePromise = runFinalize().catch((error) => {
-      this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
-      return 0;
-    });
+    const finalizePromise = runFinalize()
+      .catch((error) => {
+        this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
+        return 0;
+      })
+      .finally(() => prepared.releaseHold?.());
     (prepared.response as any).finalize = () => finalizePromise;
     return prepared.response;
   }
@@ -782,6 +812,7 @@ export class RoutstrClient {
       capturedUsage?: UsageTrackingData;
       capturedResponseId?: string;
     }>;
+    releaseHold?: () => void;
   }> {
     const {
       path: requestPath,
@@ -1099,6 +1130,7 @@ export class RoutstrClient {
       capturedResponseId,
       clientApiKey,
       usagePromise,
+      releaseHold: (response as any).releaseHold,
     };
   }
 
@@ -1217,6 +1249,7 @@ export class RoutstrClient {
     if (params.transportState) params.transportState.attemptId = attempt?.attemptId;
     params = { ...params, attemptKind: undefined };
     let headersReceived = false;
+    const releaseHold = trackInFlight(`${baseUrl}:${token}`);
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       let requestLogId: string | undefined;
@@ -1260,6 +1293,7 @@ export class RoutstrClient {
             signal,
           });
       headersReceived = true;
+      if (!response.ok) releaseHold();
       if (params.transportState) params.transportState.nodeRequestId = response.headers.get("x-routstr-request-id") ?? undefined;
       if (attempt) {
         (response as any).lifecycleAttemptId = attempt.attemptId;
@@ -1358,8 +1392,10 @@ export class RoutstrClient {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
       }
 
+      (response as any).releaseHold = releaseHold;
       return response;
     } catch (error: any) {
+      releaseHold();
       if (attempt && !headersReceived) await params.lifecycle?.updateAttempt(attempt.attemptId, {
         endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
         failurePhase: "network", errorType: error?.name,
@@ -1867,6 +1903,8 @@ export class RoutstrClient {
       } else {
         let balanceValidated = false;
         let balanceSufficient = false;
+        let availableBalance = 0;
+        let reservedBalance = 0;
 
         try {
           const currentBalanceInfo = await this.balanceManager.getTokenBalance(
@@ -1884,11 +1922,11 @@ export class RoutstrClient {
             // compares the request price against. Do not subtract `reserved`
             // again: that understates available funds by the held amount and
             // inflates the resulting topup by the same margin.
-            const availableBalance = getAvailableBalanceInSats(
+            availableBalance = getAvailableBalanceInSats(
               currentBalanceInfo.amount,
               currentBalanceInfo.unit
             );
-            const reservedBalance = getBalanceInSats(
+            reservedBalance = getBalanceInSats(
               currentBalanceInfo.reserved ?? 0,
               currentBalanceInfo.unit
             );
@@ -1966,6 +2004,20 @@ export class RoutstrClient {
                 topupResult.maxMintUrl ?? ""
               );
               tryNextProvider = true;
+            } else if (
+              retryCount < MAX_RETRIES_PER_PROVIDER &&
+              message.includes("Insufficient balance") &&
+              reservedBalance > 0 &&
+              availableBalance + reservedBalance >= params.requiredSats &&
+              (await waitForInFlightRequest(
+                `${baseUrl}:${params.token}`,
+                params.signal
+              ))
+            ) {
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _handleErrorResponse: an in-flight request on ${baseUrl} settled; retrying instead of failing over`
+              );
             } else if (message.includes("Insufficient balance")) {
               // Parse decimals and the largest-mint hint so the final 402
               // JSON reports the real shortfall instead of 0/"".
