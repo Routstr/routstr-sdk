@@ -618,6 +618,73 @@ describe("BalanceManager force-refund escalation", () => {
     }
   });
 
+  it("keeps force-refunding when only the target's own key would cover the top-up", async () => {
+    let walletBalance = 50;
+    const ProviderC = "https://provider-c.example.com";
+    let currentRefundProvider = "";
+
+    const wallet = createWallet({
+      getBalances: async () => ({ [Mint]: walletBalance }),
+      getMintUnits: () => ({ [Mint]: "sat" }),
+      sendToken: async (_mintUrl: string, amount: number) => {
+        if (walletBalance >= amount) {
+          walletBalance -= amount;
+          return "token-for-provider-b";
+        }
+        throw new Error("Insufficient balance");
+      },
+      receiveToken: async () => {
+        const amounts: Record<string, number> = { [ProviderA]: 100, [ProviderC]: 400 };
+        const amt = amounts[currentRefundProvider.replace(/\/$/, "")] ?? 0;
+        walletBalance += amt;
+        return { success: true, amount: amt, unit: "sat" as const };
+      },
+    });
+
+    const storage = createStatefulStorage({
+      apiKeys: {
+        [ProviderA]: { key: "key-a", balance: 100, lastUsed: Date.now() - 120_000 },
+        [ProviderB]: { key: "key-b", balance: 300, lastUsed: Date.now() - 30_000 },
+        [ProviderC]: { key: "key-c", balance: 400, lastUsed: Date.now() - 60_000 },
+      },
+    });
+
+    const manager = new BalanceManager(wallet, storage);
+    const originalRefund = manager.refundApiKey.bind(manager);
+    manager.refundApiKey = async (opts) => {
+      currentRefundProvider = opts.baseUrl;
+      return originalRefund(opts);
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("v1/wallet/refund")) {
+        return new Response(JSON.stringify({ token: "refunded-cashu-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    try {
+      // The top-up for B's key must be paid from the wallet: B's own 300 sats
+      // cannot pay for it, so refunding A (wallet 150) is not enough.
+      const result = await manager.createProviderToken({
+        mintUrl: Mint,
+        baseUrl: norm(ProviderB),
+        amount: 308,
+      });
+
+      expect(result.success).toBe(true);
+      expect(storage.getApiKey(ProviderA)).toBeNull();
+      expect(storage.getApiKey(ProviderC)).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("does not force-refund if soft refund from a naturally-expired provider frees enough balance", async () => {
     let walletBalance = 500;
     let refundCalls = 0;

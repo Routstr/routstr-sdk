@@ -906,12 +906,39 @@ export class BalanceManager {
       .filter(([providerBaseUrl]) => providerBaseUrl !== baseUrl)
       .reduce((sum, [, value]) => sum + value, 0);
 
+    const providerMints =
+      baseUrl && this.discoveryAdapter
+        ? this.discoveryAdapter.getCachedMints()[
+            baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`
+          ] || []
+        : [];
+    const supportedMintsOnly = providerMints.length > 0;
+
     if (
       totalMintBalance < adjustedAmount &&
       totalMintBalance + refundableProviderBalance >= adjustedAmount &&
       retryCount < 3
     ) {
-      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount, options.signal);
+      const canFund = async () => {
+        throwIfFundingAborted(options.signal);
+        return (
+          this._selectCandidateMints({
+            balances: await this.walletAdapter.getBalances(),
+            units: this.walletAdapter.getMintUnits(),
+            amount: adjustedAmount,
+            preferredMintUrl: mintUrl,
+            excludeMints,
+            allowedMints: supportedMintsOnly ? providerMints : undefined,
+          }).length > 0
+        );
+      };
+      await this._refundOtherProvidersForTopUp(
+        baseUrl,
+        mintUrl,
+        retryCount,
+        canFund,
+        options.signal
+      );
       return this._createProviderToken({
         ...options,
         retryCount: retryCount + 1,
@@ -933,15 +960,7 @@ export class BalanceManager {
       return { success: false, error: error.message };
     }
 
-    const providerMints =
-      baseUrl && this.discoveryAdapter
-        ? this.discoveryAdapter.getCachedMints()[
-            baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`
-          ] || []
-        : [];
-
     let requiredAmount = adjustedAmount;
-    const supportedMintsOnly = providerMints.length > 0;
 
     let candidates = this._selectCandidateMints({
       balances,
@@ -1151,7 +1170,7 @@ export class BalanceManager {
     baseUrl: string,
     mintUrl: string,
     retryCount: number,
-    requiredAmount: number,
+    canFund: () => Promise<boolean>,
     signal?: AbortSignal
   ): Promise<void> {
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
@@ -1200,15 +1219,12 @@ export class BalanceManager {
           this._refundTimedOutProviders.add(candidate.baseUrl);
         }
 
-        // Check if we've freed enough balance for the target provider
-        const newState = await this.getBalanceState();
-        const newAvailable =
-          (newState.mintBalances[mintUrl] || 0) +
-          (newState.providerBalances[baseUrl] || 0);
-
-        if (newAvailable >= requiredAmount) {
+        // Check whether the top-up can be paid now, from any mint this
+        // provider accepts — not just the preferred one, and never counting
+        // the target key's own sats, which cannot pay for its own top-up.
+        if (await canFund()) {
           this.logger.log(
-            `_refundOtherProvidersForTopUp: freed enough balance (${newAvailable} >= ${requiredAmount}), stopping early`
+            "_refundOtherProvidersForTopUp: the top-up can be paid now, stopping early"
           );
           return;
         }
