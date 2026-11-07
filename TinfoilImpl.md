@@ -137,8 +137,9 @@ and that the enclave enforces **in place of** any body cap, larger or smaller.
 > call; it is not an aggregate budget for multiple requests or agent/tool loops.
 >
 > Discounting requires a verified deployment: core must advertise
-> `features.ehbp_single_choice_output_token_reservation === true` plus an
-> authoritative route list containing `chat/completions`. This is a capability
+> `features.ehbp_single_choice_output_token_reservation === true` plus
+> `features.ehbp_single_choice_output_token_reservation_routes` containing
+> `chat/completions`. This is a capability
 > statement, not an operator toggle. **Reservation remains OFF:** core leaves
 > this capability disabled/unadvertised pending a request-total cost guarantee.
 > PR #532 is already deployed at `inference.tinfoil.sh`: hidden `n=3` with
@@ -201,10 +202,13 @@ The SDK also requires these `/v1/info` capabilities:
 | Key | Meaning |
 |---|---|
 | `features.ehbp_single_choice_output_token_reservation` | exactly `true`: node supports the verified single-choice cap/count contract |
-| `features.ehbp_output_token_reservation_routes` | authoritative nonempty canonical route list, including `chat/completions` |
+| `features.ehbp_single_choice_output_token_reservation_routes` | authoritative nonempty canonical route list, including `chat/completions` |
 
 The old `ehbp_output_token_reservation` and
-`ehbp_output_token_reservation_total_cap` booleans do **not** enable this quote.
+`ehbp_output_token_reservation_total_cap` booleans and legacy
+`ehbp_output_token_reservation_routes` list do **not** enable this quote.
+The dedicated and legacy route sets are separate protocols: they are never
+unioned, even when both flags are true.
 Responses ignores completion-count, so it always keeps the full sealed reserve,
 even if advertised in the route list. Count headers supplied by callers are
 forwarded verbatim, never replaced or duplicated; malformed, repeated, or

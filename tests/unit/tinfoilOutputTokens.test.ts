@@ -1076,6 +1076,17 @@ describe("reservation capability compatibility", () => {
     expect(spend.mock.calls[0][0].amount).toBe(20);
   });
 
+  it("new flag with only the legacy route list still reserves the full envelope", async () => {
+    const { client, spend } = setupRealPricing({
+      ehbp_output_token_reservation: true,
+      ehbp_output_token_reservation_total_cap: true,
+      ehbp_output_token_reservation_routes: ["chat/completions"],
+      ehbp_single_choice_output_token_reservation: true,
+    });
+    await request(client);
+    expect(spend.mock.calls[0][0].amount).toBe(20);
+  });
+
   it("reserves the full envelope when no feature is advertised", async () => {
     const { client, spend } = setupRealPricing({});
 
@@ -1090,7 +1101,7 @@ describe("reservation capability compatibility", () => {
     const { client, spend } = setupRealPricing({
       ehbp_output_token_reservation: true,
       ehbp_single_choice_output_token_reservation: true,
-      ehbp_output_token_reservation_routes: ["chat/completions"],
+      ehbp_single_choice_output_token_reservation_routes: ["chat/completions"],
     });
 
     await request(client);
@@ -1112,7 +1123,7 @@ describe("node capability advertisement", () => {
       await features({
         ehbp_output_token_reservation: true,
         ehbp_single_choice_output_token_reservation: true,
-        ehbp_output_token_reservation_routes: ["chat/completions"],
+        ehbp_single_choice_output_token_reservation_routes: ["chat/completions"],
       }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(true);
     expect(
@@ -1149,14 +1160,14 @@ describe("node capability advertisement", () => {
       await features({
         ehbp_output_token_reservation: true,
         ehbp_single_choice_output_token_reservation: true,
-        ehbp_output_token_reservation_routes: ["responses"],
+        ehbp_single_choice_output_token_reservation_routes: ["responses"],
       }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
     expect(
       await features({
         ehbp_output_token_reservation: true,
         ehbp_single_choice_output_token_reservation: true,
-        ehbp_output_token_reservation_routes: ["responses"],
+        ehbp_single_choice_output_token_reservation_routes: ["responses"],
       }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
     ).toBe(false);
 
@@ -1166,10 +1177,40 @@ describe("node capability advertisement", () => {
         await features({
           ehbp_output_token_reservation: true,
           ehbp_single_choice_output_token_reservation: true,
-          ehbp_output_token_reservation_routes: routes,
+          ehbp_single_choice_output_token_reservation_routes: routes,
         }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
       ).toBe(false);
     }
+  });
+
+  it.each([undefined, [], ["responses"]])(
+    "never unions legacy routes into dedicated routes %j when both protocols are enabled",
+    async (routes) => {
+      expect(await features({
+        ehbp_output_token_reservation: true,
+        ehbp_output_token_reservation_total_cap: true,
+        ehbp_output_token_reservation_routes: ["chat/completions", "responses"],
+        ehbp_single_choice_output_token_reservation: true,
+        ehbp_single_choice_output_token_reservation_routes: routes,
+      }).supportsSealedOutputTokenReservation(FIRST, chat)).toBe(false);
+    }
+  );
+
+  it("dedicated routes enable chat independently of misleading legacy routes", async () => {
+    const manager = features({
+      ehbp_output_token_reservation: true,
+      ehbp_output_token_reservation_total_cap: true,
+      ehbp_output_token_reservation_routes: ["responses"],
+      ehbp_single_choice_output_token_reservation: true,
+      ehbp_single_choice_output_token_reservation_routes: ["chat/completions"],
+    });
+    expect(await manager.supportsSealedOutputTokenReservation(FIRST, chat)).toBe(true);
+    expect(await manager.supportsSealedOutputTokenReservation(FIRST, "/v1/responses")).toBe(false);
+    expect(await features({
+      ehbp_output_token_reservation: true,
+      ehbp_output_token_reservation_total_cap: true,
+      ehbp_single_choice_output_token_reservation_routes: ["chat/completions"],
+    }).supportsSealedOutputTokenReservation(FIRST, chat)).toBe(false);
   });
 
   it("bounds a cold /v1/info probe and fails closed on a stall or cancel", async () => {
@@ -1410,7 +1451,7 @@ describe("cancellation, cache integrity, and suppression through the transport",
             features: {
               ehbp_output_token_reservation: true,
               ehbp_single_choice_output_token_reservation: true,
-              ehbp_output_token_reservation_routes: ["chat/completions"],
+              ehbp_single_choice_output_token_reservation_routes: ["chat/completions"],
             },
           }),
           { status: 200, headers: { "content-type": "application/json" } }

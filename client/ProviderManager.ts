@@ -638,7 +638,7 @@ const INFO_PROBE_TIMEOUT_MS = 10_000;
 
 /**
  * The canonical route name routstr-core publishes in
- * `ehbp_output_token_reservation_routes` (`chat/completions`, `responses`, ...).
+ * `ehbp_single_choice_output_token_reservation_routes` (`chat/completions`).
  * The SDK path may be `/v1/chat/completions?x=y`; this collapses it to the
  * exact string core compares against.
  */
@@ -657,7 +657,8 @@ function canonicalReservationRoute(path: string | undefined): string | null {
  * core currently leaves the capability disabled/unadvertised.
  */
 const EHBP_SINGLE_CHOICE_FEATURE = "ehbp_single_choice_output_token_reservation";
-const EHBP_RESERVATION_ROUTES_FEATURE = "ehbp_output_token_reservation_routes";
+const EHBP_SINGLE_CHOICE_ROUTES_FEATURE =
+  "ehbp_single_choice_output_token_reservation_routes";
 
 /**
  * Sum the length of every string in a value tree, keys included.
@@ -2015,7 +2016,7 @@ export class ProviderManager {
    * Whether this node reserves against the visible Tinfoil output cap *safely*.
    *
    * Requires the single-choice contract and an authoritative chat route list.
-   * Legacy total-cap flags do not establish this contract. Responses does not
+   * Legacy total-cap flags and legacy route lists do not establish this contract. Responses does not
    * honor the completion-count header and cannot use this quote.
    */
   async supportsSealedOutputTokenReservation(
@@ -2068,7 +2069,7 @@ export class ProviderManager {
       // the SDK would under-fund a request the node prices at max_cost (402).
       // Missing/malformed/empty list is a capability we cannot trust: fail
       // closed rather than assume "all routes".
-      const routes = features?.[EHBP_RESERVATION_ROUTES_FEATURE];
+      const routes = features?.[EHBP_SINGLE_CHOICE_ROUTES_FEATURE];
       const route = canonicalReservationRoute(requestPath);
       const usableRoutes =
         Array.isArray(routes) &&
