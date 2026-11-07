@@ -380,11 +380,15 @@ describe("RoutstrClient 402 top-up validation", () => {
 
   it("waits for our in-flight request on the key to settle, then retries the same node", async () => {
     // routeRequests builds a client per call.
+    let settled = false;
     const routedClient = () => {
       const { client, providerManager } = createClient();
       providerManager.getRequiredSatsForModel = vi.fn(() => 100);
       providerManager.recordSuccess = vi.fn();
-      keyHeldByOtherRequests(client);
+      keyHeldByOtherRequests(client).mockImplementation(async () => ({
+        amount: settled ? 150_000 : 20_000, reserved: settled ? 0 : 450_000,
+        unit: "msat", apiKey: API_KEY,
+      }));
       vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
       vi.spyOn(client as any, "_topUpIfNeeded").mockResolvedValue(undefined);
       vi.spyOn(client as any, "_spendToken").mockResolvedValue({ token: API_KEY, tokenBalance: 20, tokenBalanceUnit: "sat" });
@@ -414,11 +418,69 @@ describe("RoutstrClient 402 top-up validation", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
+    settled = true;
     endFirst();
     await first.text();
     expect((await second).status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(String(fetchMock.mock.calls[2][0])).toContain("provider.example.com");
+  });
+
+  it.each(["locked-stream", "clone-failure", "accounting-failure"])(
+    "releases the hold after %s so future unfunded calls do not wait",
+    async (failure) => {
+      const { client, providerManager } = createClient();
+      providerManager.recordSuccess = vi.fn();
+      const balance = keyHeldByOtherRequests(client);
+      vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
+      vi.spyOn(client as any, "_topUpIfNeeded").mockResolvedValue(undefined);
+      vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+        token: API_KEY, tokenBalance: 20, tokenBalanceUnit: "sat",
+      });
+      vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockRejectedValue(new Error("accounting failed"));
+      let unlock: (() => void) | undefined;
+      let response = Response.json({});
+      if (failure === "locked-stream") {
+        response = new Response(new ReadableStream({ start(controller) { controller.close(); } }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+        const reader = response.body!.getReader();
+        unlock = () => reader.releaseLock();
+      } else if (failure === "clone-failure") {
+        vi.spyOn(response, "clone").mockImplementation(() => { throw new Error("clone failed"); });
+      }
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+      try {
+        const routed = client.routeRequest({ ...params, modelId: model.id, trackLifecycle: false });
+        if (failure === "accounting-failure") await (await routed).finalize!();
+        else await expect(routed).rejects.toThrow();
+        balance.mockClear();
+        await expect(handle402(client, localInsufficientBalanceBody)).rejects.toBeInstanceOf(InsufficientBalanceError);
+        // One validation read + ensureBalance's read; no reservation-loop read.
+        expect(balance).toHaveBeenCalledTimes(2);
+      } finally { unlock?.(); }
+    }
+  );
+
+  it("releases an aborted transport hold even when fetch ignores cancellation", async () => {
+    const { client } = createClient();
+    const balance = keyHeldByOtherRequests(client);
+    vi.spyOn(client as any, "_checkBalance").mockResolvedValue(undefined);
+    vi.spyOn(client as any, "_topUpIfNeeded").mockResolvedValue(undefined);
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: API_KEY, tokenBalance: 20, tokenBalanceUnit: "sat",
+    });
+    const fetchMock = vi.fn(() => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const routed = client.routeRequest({ ...params, modelId: model.id, signal: controller.signal, trackLifecycle: false });
+    const rejected = expect(routed).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    controller.abort();
+    await rejected;
+    balance.mockClear();
+    await expect(handle402(client, localInsufficientBalanceBody)).rejects.toBeInstanceOf(InsufficientBalanceError);
+    expect(balance).toHaveBeenCalledTimes(2);
   });
 
   it("fails at once when the holds belong to another client", async () => {
