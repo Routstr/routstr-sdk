@@ -172,11 +172,8 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       amount: 120,
       token: API_KEY,
     });
-    // After a successful topup the new total is persisted from toppedUpAmount
-    // (snapshot 20 + added 120) so the stored snapshot isn't stale-low.
-    await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 140, 0)
-    );
+    // No optimistic stale snapshot write: only provider reads establish balance.
+    expect(updateApiKeyBalance).not.toHaveBeenCalled();
   });
 
   it("treats the snapshot as available balance instead of deducting reserved twice", async () => {
@@ -205,13 +202,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       amount: 21,
       token: API_KEY,
     });
-    // The stored snapshot stays on the same (available) scale as the deposit:
-    // 120 + 21, with the 30 sat hold carried only as a diagnostic. Writing
-    // `120 - 30 + 21` would put the snapshot on a different scale from the
-    // figure the topup trigger reads back, and re-open the double subtraction.
-    await vi.waitFor(() =>
-      expect(updateApiKeyBalance).toHaveBeenCalledWith(BASE_URL, 141, 30)
-    );
+    expect(updateApiKeyBalance).not.toHaveBeenCalled();
   });
 
   it("applies the 0.21-floor when the shortfall is tiny", async () => {
@@ -246,6 +237,9 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(client.getBalanceManager(), "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 3500, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
     // target = 3 * 1.4 = 4.2; shortfall = 0.7. A 1-sat token is worth no
     // more than its own redemption fee at a 100 ppk mint.
     topUpIfNeeded(client, { requiredSats: 3, tokenBalance: 3.5 });
@@ -260,35 +254,16 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     });
   });
 
-  it("tops up from the snapshot without re-fetching the balance first", async () => {
+  it("ignores a stale low snapshot when the fresh balance covers the target", async () => {
     const { client } = createClient();
-    const balanceManager = client.getBalanceManager();
-    // A fresh call would say the key is plenty (150-10=140 sat), but the
-    // proactive path trusts the snapshot and does not consult the provider
-    // before topping up.
-    const getTokenBalance = vi
-      .spyOn(balanceManager, "getTokenBalance")
-      .mockResolvedValue({
-        amount: 150_000,
-        reserved: 10_000,
-        unit: "msat",
-        apiKey: API_KEY,
-      });
-    const topUp = vi
-      .spyOn(balanceManager, "topUp")
-      .mockResolvedValue({ success: true, toppedUpAmount: 120, message: "ok" });
-
-    topUpIfNeeded(client); // snapshot: 20 sat available < target 140
-
-    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    expect(topUp).toHaveBeenCalledWith({
-      signal: expect.any(AbortSignal),
-      mintUrl: MINT_URL,
-      baseUrl: BASE_URL,
-      amount: 120, // shortfall vs target from the snapshot (140 - 20)
-      token: API_KEY,
+    const manager = client.getBalanceManager();
+    const read = vi.spyOn(manager, "getTokenBalance").mockResolvedValue({
+      amount: 150_000, reserved: 10_000, unit: "msat", apiKey: API_KEY,
     });
-    expect(getTokenBalance).not.toHaveBeenCalled();
+    const deposit = vi.spyOn(manager, "topUp");
+    await topUpIfNeeded(client);
+    expect(read).toHaveBeenCalledOnce();
+    expect(deposit).not.toHaveBeenCalled();
   });
 
   it("does not spin off when the snapshot balance is already sufficient", async () => {
@@ -354,11 +329,9 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .spyOn(balanceManager, "topUp")
       .mockResolvedValue({ success: true, message: "ok" });
 
-    topUpIfNeeded(client);
-    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
-    // Wait until the in-flight entry is fully cleared (the post-topup
-    // persist is the last step) before firing the next snapshot.
-    await vi.waitFor(() => expect(updateApiKeyBalance).toHaveBeenCalledOnce());
+    await topUpIfNeeded(client);
+    expect(topUp).toHaveBeenCalledOnce();
+    expect(updateApiKeyBalance).not.toHaveBeenCalled();
 
     // The first attempt settled, so a new low-balance snapshot may start
     // another one immediately — the in-flight guard is the only
@@ -436,7 +409,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
       .mockResolvedValue(new Response("ok", { status: 200 }));
 
     await topUpIfNeeded(client, { tokenBalance: 120 }); // margin zone
-    expect(topUp).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
 
     const handled = (client as any)._handleErrorResponse(
       {

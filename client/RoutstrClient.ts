@@ -1865,7 +1865,6 @@ export class RoutstrClient {
         );
         tryNextProvider = true;
       } else {
-        let topupAmount = params.requiredSats;
         let balanceValidated = false;
         let balanceSufficient = false;
 
@@ -1906,11 +1905,6 @@ export class RoutstrClient {
               balanceSufficient = true;
             } else {
               balanceValidated = true;
-              topupAmount =
-                shortfall > 0.21 * params.requiredSats
-                  ? shortfall
-                  : 0.21 * params.requiredSats;
-
               this._log(
                 "DEBUG",
                 `The shortfall is: ${shortfall}. requiredSats: ${params.requiredSats}. Reserved Balance: ${reservedBalance}. Available Balance: ${availableBalance}`
@@ -1937,12 +1931,13 @@ export class RoutstrClient {
           const topupResult = await this._topUpOnce(
             `${baseUrl}:${params.token}`,
             (signal) =>
-              this.balanceManager.topUp({
-                signal,
-                mintUrl,
-                baseUrl,
-                amount: Math.max(topupAmount * TOPUP_MARGIN, MIN_DEPOSIT_SATS),
-                token: params.token,
+              this.balanceManager.ensureBalance({
+                signal, mintUrl, baseUrl, token: params.token,
+                requiredSats: params.requiredSats,
+                targetSats: params.requiredSats,
+                shortfallMultiplier: TOPUP_MARGIN,
+                minimumFraction: 0.21 * TOPUP_MARGIN,
+                minimumDeposit: MIN_DEPOSIT_SATS,
               }),
             params.signal
           );
@@ -3281,12 +3276,10 @@ export class RoutstrClient {
   }
 
   /**
-   * Top up the key based on the balance snapshot captured by _spendToken. The
-   * trigger already confirmed available < required x TOPUP_MARGIN, so we
-   * deposit exactly the shortfall to land at the margin. No extra balance
-   * round-trip: the post-topup total is persisted from topUp's
-   * toppedUpAmount so future snapshots aren't stale. Only pre-send cancellation
-   * throws; other failures remain TopUpResult values.
+   * The snapshot only triggers automatic funding. The wallet-scoped coordinator
+   * checks fresh available balance after earlier funding settles; no stale snapshot
+   * arithmetic or optimistic snapshot write can authorize another deposit.
+   * Only pre-send cancellation throws; financial failures remain result values.
    */
   private async _runProactiveTopup(snapshot: {
     token: string;
@@ -3300,64 +3293,16 @@ export class RoutstrClient {
   }): Promise<TopUpResult> {
     throwIfFundingAborted(snapshot.signal);
     try {
-      // Provider-reported available sats (`total_balance`); `reserved` is
-      // carried only to keep the stored snapshot's diagnostics intact.
-      const availableSats = getAvailableBalanceInSats(
-        snapshot.tokenBalance,
-        snapshot.tokenBalanceUnit
-      );
-      const reservedSats = getBalanceInSats(
-        snapshot.tokenReserved ?? 0,
-        snapshot.tokenBalanceUnit
-      );
-      // The trigger already guaranteed available < target, so the shortfall
-      // is exactly the amount needed to land the key at the margin.
-      const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
-      const shortfall = Math.max(0, targetSats - availableSats);
-
-      if (shortfall <= 0) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _runProactiveTopup: snapshot for ${snapshot.baseUrl} is sufficient (available=${availableSats} sat >= target=${targetSats} sat); no topup needed`
-        );
-        return {
-          success: true,
-          message: "proactive topup skipped: balance sufficient on snapshot",
-        };
-      }
-
-      const topupAmount = Math.max(
-        shortfall,
-        PROACTIVE_TOPUP_MIN_FRACTION * snapshot.requiredSats,
-        MIN_DEPOSIT_SATS
-      );
-      const result = await this.balanceManager.topUp({
+      return await this.balanceManager.ensureBalance({
         signal: snapshot.signal,
         mintUrl: snapshot.mintUrl,
         baseUrl: snapshot.baseUrl,
-        // The target already includes TOPUP_MARGIN — deposit the shortfall.
-        amount: topupAmount,
         token: snapshot.token,
+        requiredSats: snapshot.requiredSats,
+        targetSats: snapshot.requiredSats * TOPUP_MARGIN,
+        minimumFraction: PROACTIVE_TOPUP_MIN_FRACTION,
+        minimumDeposit: MIN_DEPOSIT_SATS,
       });
-      this._log(
-        "DEBUG",
-        `[RoutstrClient] _runProactiveTopup: result for ${snapshot.baseUrl}: success=${result.success}, amount=${topupAmount}, message=${result.message}`
-      );
-
-      // Persist the new snapshot so it does not stay stale-low and re-trigger
-      // a topup on every future request. topUp reports how much it added;
-      // combine it with the snapshot instead of fetching the balance again.
-      // The snapshot is an available figure, so adding the deposit keeps the
-      // same meaning (a held amount lowers available, not the deposit size).
-      if (result.success) {
-        const added = result.toppedUpAmount ?? topupAmount;
-        this.storageAdapter.updateApiKeyBalance(
-          snapshot.baseUrl,
-          Math.floor(availableSats + added),
-          Math.floor(reservedSats)
-        );
-      }
-      return result;
     } catch (e) {
       // Preserve explicit pre-send cancellation for _topUpOnce's live-newcomer
       // retry. Financial work that started reports its settlement result instead.

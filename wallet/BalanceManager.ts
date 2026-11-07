@@ -33,6 +33,7 @@ import { CashuSpender } from "./CashuSpender";
 import { stampBalanceRead } from "./apiKeyBalance";
 import {
   getBalanceInSats,
+  getAvailableBalanceInSats,
   isNetworkErrorMessage,
   selectMintWithBalance,
 } from "./tokenUtils";
@@ -70,6 +71,19 @@ export interface TopUpOptions {
 
   /** Optional specific API key to top up (if not provided, uses stored token) */
   token?: string;
+}
+
+/** Automatic funding expresses a balance requirement, never an additive deposit. */
+export interface EnsureBalanceOptions {
+  mintUrl: string;
+  baseUrl: string;
+  token: string;
+  requiredSats: number;
+  targetSats: number;
+  minimumDeposit: number;
+  minimumFraction: number;
+  shortfallMultiplier?: number;
+  signal?: AbortSignal;
 }
 
 export interface CreateProviderTokenOptions {
@@ -146,6 +160,11 @@ interface QueuedTopUp {
  * wallet for the same provider and resolved API key that arrive meanwhile.
  */
 const queuedTopUps = new WeakMap<WalletAdapter, Map<string, QueuedTopUp>>();
+
+// Automatic callers must not sum stale shortfalls. Each waits for prior financial
+// settlement, then makes its own fresh admission decision. Different keys/wallets
+// have independent queues; only actual sends use the existing wallet-wide queue.
+const balanceEnsures = new WeakMap<WalletAdapter, Map<string, Promise<unknown>>>();
 
 type ProviderWalletOperation = {
   type: "topup" | "refund";
@@ -629,6 +648,53 @@ export class BalanceManager {
         error: "Unknown error occurred during API key refund request",
       };
     }
+  }
+
+  /** Ensure available balance for automatic inference funding. Manual topUp stays additive. */
+  async ensureBalance(options: EnsureBalanceOptions): Promise<TopUpResult> {
+    throwIfFundingAborted(options.signal);
+    if (![options.requiredSats, options.targetSats, options.minimumDeposit,
+      options.minimumFraction, options.shortfallMultiplier ?? 1].every(Number.isFinite) ||
+      options.requiredSats <= 0 || options.targetSats < options.requiredSats ||
+      options.minimumDeposit < 0 || options.minimumFraction < 0 ||
+      (options.shortfallMultiplier ?? 1) <= 0) {
+      return { success: false, message: "Invalid balance requirement" };
+    }
+    let queues = balanceEnsures.get(this.walletAdapter);
+    if (!queues) {
+      queues = new Map();
+      balanceEnsures.set(this.walletAdapter, queues);
+    }
+    const key = JSON.stringify([options.baseUrl.replace(/\/+$/, ""), options.token]);
+    const previous = queues.get(key) ?? Promise.resolve();
+    const current = previous.then(async () => {
+      // Wait for earlier wallet sends before reading, not while holding that queue
+      // (topUp itself enqueues a send). Cancellation never interrupts settlement.
+      await walletSendQueues.get(this.walletAdapter);
+      throwIfFundingAborted(options.signal);
+      const balance = await this.getTokenBalance(options.token, options.baseUrl);
+      throwIfFundingAborted(options.signal);
+      const available = getAvailableBalanceInSats(balance.amount, balance.unit);
+      if (balance.balanceUnknown || balance.isInvalidApiKey || !Number.isFinite(available)) {
+        return { success: false, message: "Cannot ensure unknown API-key balance" };
+      }
+      if (available >= options.targetSats) {
+        return { success: true, toppedUpAmount: 0, message: "Fresh balance sufficient" };
+      }
+      const amount = Math.max(
+        (options.targetSats - available) * (options.shortfallMultiplier ?? 1),
+        options.minimumFraction * options.requiredSats,
+        options.minimumDeposit,
+      );
+      return this.topUp({ mintUrl: options.mintUrl, baseUrl: options.baseUrl,
+        token: options.token, amount, signal: options.signal });
+    });
+    // Keep the non-rejecting tail through posting, persistence and recovery. A
+    // cancelled waiter cannot replace work that may already have moved funds.
+    const tail = current.catch(() => {});
+    queues.set(key, tail);
+    void tail.then(() => { if (queues.get(key) === tail) queues.delete(key); });
+    return current;
   }
 
   /**
