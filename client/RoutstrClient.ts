@@ -3216,7 +3216,8 @@ export class RoutstrClient {
    * trigger already confirmed available < required x TOPUP_MARGIN, so we
    * deposit exactly the shortfall to land at the margin. No extra balance
    * round-trip: the post-topup total is persisted from topUp's
-   * toppedUpAmount so future snapshots aren't stale. Never throws.
+   * toppedUpAmount so future snapshots aren't stale. Only pre-send cancellation
+   * throws; other failures remain TopUpResult values.
    */
   private async _runProactiveTopup(snapshot: {
     token: string;
@@ -3289,6 +3290,9 @@ export class RoutstrClient {
       }
       return result;
     } catch (e) {
+      // Preserve explicit pre-send cancellation for _topUpOnce's live-newcomer
+      // retry. Financial work that started reports its settlement result instead.
+      if ((e as Error)?.name === "AbortError") throw e;
       this._log(
         "WARN",
         `[RoutstrClient] _runProactiveTopup: failed for ${snapshot.baseUrl}`,
