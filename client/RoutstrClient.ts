@@ -98,8 +98,8 @@ export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 const TOPUP_MARGIN = 1.4;
 
 /**
- * Same-provider attempts allowed after a transient socket failure (reset /
- * closed socket) before the request is failed over to the next provider.
+ * Same-provider attempts allowed for safe HTTP methods after a transient
+ * socket failure, before failing over to the next provider.
  *
  * One is enough for the failure mode this covers: a provider that closed an
  * idle keep-alive connection at the same moment we wrote to it answers the
@@ -1381,15 +1381,16 @@ export class RoutstrClient {
           error: transportMessage,
         });
 
-        // A socket that died after it was established (keep-alive reuse race,
-        // provider restart, mesh hiccup) is usually gone on the next
-        // connection. Re-send the identical request to the same provider once
-        // before paying for a failover: a cross-provider hop re-prices, mints a
-        // new token and may land on a more expensive node, all to recover a
-        // failure that clears in milliseconds. Credentials are unchanged (same
-        // token, same key), so the retry reuses `params.headers` as-is.
+        // A reset before response headers does not prove the provider has
+        // not processed and charged the request. Reusing credentials/body is
+        // not idempotency, so do not automatically replay inference POSTs.
+        // Unsafe methods retain the existing error/failover handling below.
+        const canReplayAutomatically = ["GET", "HEAD", "OPTIONS"].includes(
+          method.toUpperCase()
+        );
         const networkRetryCount = params.networkRetryCount ?? 0;
         if (
+          canReplayAutomatically &&
           networkRetryCount < MAX_NETWORK_RETRIES_PER_PROVIDER &&
           (isTransientSocketErrorMessage(transportMessage) ||
             isTransientSocketErrorCode(transportCode))

@@ -1,21 +1,8 @@
 /**
- * Same-provider retry after a transient socket failure.
- *
- * Bug: `_makeRequest` classified a network error and immediately walked to
- * `_handleErrorResponse`, which cools the provider down and fails over to the
- * next one. For a socket that dies *after* it was established — a provider
- * closing an idle keep-alive connection exactly as we reuse it, a provider
- * restart, a mesh/VPN hiccup — the identical request sent over a fresh
- * connection typically succeeds within milliseconds. Paying a cross-provider
- * failover (re-price, new cashu token / API key reservation, possibly a more
- * expensive node, maybe "all providers failed") for that class of failure is
- * what these tests pin down:
- *
- *   1. transient socket error       -> retry the same provider once
- *   2. retry also fails             -> then fail over (unchanged behavior)
- *   3. "could not connect at all"   -> fail over immediately, no retry
- *   4. caller-forced provider       -> still retries the same provider, but
- *                                      never fails over (pin is absolute)
+ * Safe-method socket retries must not introduce automatic inference replays.
+ * GET/HEAD/OPTIONS get one same-provider retry; POST and other unsafe methods
+ * go directly to existing error handling. A reset before headers does not
+ * establish that the provider has not already processed and charged a POST.
  */
 
 import { createServer } from "node:http";
@@ -106,8 +93,8 @@ const makeModel = (): Model =>
 
 const requestParams = (overrides?: Record<string, unknown>) => ({
   path: "/v1/chat/completions",
-  method: "POST",
-  body: { model: "deepseek-v4.1-flash", messages: [] },
+  method: "GET",
+  body: undefined,
   selectedModel: makeModel(),
   baseUrl: BASE_URL,
   mintUrl: MINT_URL,
@@ -130,7 +117,7 @@ function makeClient() {
 }
 
 const okResponse = () =>
-  new Response(JSON.stringify({ choices: [] }), {
+  new Response(null, {
     status: 200,
     headers: { "content-type": "application/json" },
   });
@@ -141,7 +128,7 @@ afterEach(() => {
 });
 
 describe("RoutstrClient transient socket retry", () => {
-  it("retries the same provider once and returns the successful retry", async () => {
+  it.each(["GET", "HEAD", "OPTIONS", "get"])("retries a safe %s request once", async (method) => {
     const client = makeClient();
     const fetchMock = vi
       .fn()
@@ -154,7 +141,7 @@ describe("RoutstrClient transient socket retry", () => {
       "findNextBestProvider"
     );
 
-    const response = await (client as any)._makeRequest(requestParams());
+    const response = await (client as any)._makeRequest(requestParams({ method }));
 
     expect(response).toBeInstanceOf(Response);
     expect(response.status).toBe(200);
@@ -194,6 +181,28 @@ describe("RoutstrClient transient socket retry", () => {
     expect(status).toBe(-1);
     expect(body).toBe(BUN_SOCKET_RESET);
   });
+
+  it.each(["POST", "PATCH", "PUT", "DELETE"])(
+    "routes %s socket failures directly to existing error handling",
+    async (method) => {
+      const client = makeClient();
+      const fetchMock = vi.fn().mockRejectedValue(new TypeError(BUN_SOCKET_RESET));
+      vi.stubGlobal("fetch", fetchMock);
+      const handled = okResponse();
+      const handleError = vi.spyOn(client as any, "_handleErrorResponse")
+        .mockResolvedValue(handled);
+
+      const response = await (client as any)._makeRequest(requestParams({
+        method,
+        body: { model: "deepseek-v4.1-flash", messages: [] },
+      }));
+
+      expect(response).toBe(handled);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(handleError).toHaveBeenCalledTimes(1);
+      expect(handleError.mock.calls[0][2]).toBe(-1);
+    }
+  );
 
   it("does not retry a provider that could not be connected to at all", async () => {
     const client = makeClient();
@@ -312,6 +321,55 @@ describe("RoutstrClient transient socket retry over real networking", () => {
 
       expect(response.status).toBe(200);
       expect(connections).toBe(2);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("does not replay a pinned POST consumed before the socket reset", async () => {
+    let invocations = 0;
+    const receivedBodies: string[] = [];
+    const server = createServer((req, res) => {
+      invocations++;
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        receivedBodies.push(body);
+        if (invocations === 1) {
+          // Simulate processing/charging before losing the response.
+          req.socket.destroy();
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ choices: [] }));
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const body = { model: "deepseek-v4.1-flash", messages: [] };
+    const token = "sk-existing-api-key";
+
+    try {
+      const client = makeClient();
+      const findNext = vi.spyOn((client as any).providerManager, "findNextBestProvider");
+      const response = await (client as any)._makeRequest(requestParams({
+        baseUrl: `http://127.0.0.1:${port}/`,
+        method: "POST",
+        body,
+        token,
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        baseHeaders: {},
+        pinnedProvider: true,
+      }));
+
+      expect(response.status).toBe(502);
+      expect((await response.json()).error.type).toBe("all_providers_failed");
+
+      expect(invocations).toBe(1);
+      expect(receivedBodies).toEqual([JSON.stringify(body)]);
+      expect(findNext).not.toHaveBeenCalled();
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
