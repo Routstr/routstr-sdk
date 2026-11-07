@@ -77,6 +77,15 @@ export function safeUrl(value: string): string {
     return "[invalid-url]";
   }
 }
+// Route IDs may contain slash-separated provider/model names. Keep this
+// separate from diagnostic codes: no URLs, query text, whitespace or credentials.
+const SAFE_ROUTE_IDENTIFIER = /^[a-zA-Z0-9_.:-]+(?:\/[a-zA-Z0-9_.:-]+)*$/;
+function safeRouteIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    value.length <= 120 && SAFE_ROUTE_IDENTIFIER.test(value)
+    ? value
+    : undefined;
+}
 export function safeModelPath(value: string): string {
   if (value.includes("=")) {
     const input = new URLSearchParams(value);
@@ -84,7 +93,7 @@ export function safeModelPath(value: string): string {
     const url = input.get("url");
     if (url) output.set("url", safeUrl(url));
     for (const key of ["model-id", "endpoint"]) {
-      const code = safeCode(input.get(key));
+      const code = safeRouteIdentifier(input.get(key));
       if (code) output.set(key, code);
     }
     return output.toString().slice(0, 512);

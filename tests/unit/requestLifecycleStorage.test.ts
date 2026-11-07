@@ -189,6 +189,35 @@ for (const [name, factory] of factories)
       expect(raw).toContain("cashu_mint_unreachable");
       expect(raw).toContain("same_provider_retry");
     });
+    it("persists slash-qualified route identifiers without leaking URL secrets", async () => {
+      const driver = factory();
+      const c = await beginRequestLifecycle({
+        driver,
+        method: "POST",
+        path: "/v1/chat/completions",
+      });
+      const path = new URLSearchParams({
+        url: "https://user:SECRET@openrouter.ai/api/v1?key=SECRET#SECRET",
+        "model-id": "deepseek/deepseek-v4.1-flash",
+        endpoint: "venice/fp8",
+        unknown: "SECRET",
+      }).toString();
+      const expected =
+        "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek%2Fdeepseek-v4.1-flash&endpoint=venice%2Ffp8";
+      const a = await c.beginAttempt({
+        baseUrl: "https://provider.test",
+        modelPath: path,
+      });
+      expect((await driver.getTrace(c.requestId))!.attempts[0].modelPath)
+        .toBe(expected);
+      await c.updateAttempt(a.attemptId, { modelPath: path });
+      await c.event("response_received", { modelPath: path });
+      const trace = (await driver.getTrace(c.requestId))!;
+      expect(trace.attempts[0].modelPath).toBe(expected);
+      expect(trace.events.find((event) => event.type === "response_received")?.data?.modelPath)
+        .toBe(expected);
+      expect(JSON.stringify(trace)).not.toContain("SECRET");
+    });
     it("does not persist payloads, secrets, raw errors, or URL credentials", async () => {
       const driver = factory();
       const c = await beginRequestLifecycle({
