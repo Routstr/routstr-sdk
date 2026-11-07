@@ -1594,14 +1594,15 @@ export class RoutstrClient {
   private async _waitForReservedBalance(params: {
     baseUrl: string; token: string; requiredSats: number; signal?: AbortSignal;
     reservedBalanceWaitMs?: number; reservationWait?: ReservationWaitState;
-  }): Promise<"settled" | "sufficient" | false> {
+  }, priorRequests: Promise<void>[] = []): Promise<"settled" | "sufficient" | false> {
     const budget = params.reservedBalanceWaitMs ?? DEFAULT_RESERVED_BALANCE_WAIT_MS;
     if (!Number.isFinite(budget) || budget <= 0) return false;
     const key = providerKey(params.baseUrl, params.token);
-    if (!inFlightRequests.get(key)?.size) return false;
+    if (!priorRequests.length && !inFlightRequests.get(key)?.size) return false;
     const state = params.reservationWait ??= {};
     const deadline = state.deadline ??= Date.now() + budget;
-    let settled = false;
+    // A request may finish while the failed funding attempt is settling.
+    let settled = priorRequests.some(request => !inFlightRequests.get(key)?.has(request));
     try {
       while (Date.now() < deadline) {
         throwIfFundingAborted(params.signal);
@@ -2051,6 +2052,7 @@ export class RoutstrClient {
         } else {
           // A proactive (pre-request) topup may already be in flight for
           // this key — join it instead of stacking a second deposit.
+          const pendingReservations = [...(inFlightRequests.get(providerKey(baseUrl, params.token)) ?? [])];
           await params.lifecycle?.event("topup_started", undefined, { baseUrl });
           const topupResult = await this._topUpOnce(
             providerKey(baseUrl, params.token),
@@ -2094,7 +2096,7 @@ export class RoutstrClient {
               message.includes("Insufficient balance") &&
               reservedBalance > 0 &&
               availableBalance + reservedBalance >= params.requiredSats &&
-              (reservationWaitResult = await this._waitForReservedBalance(params))
+              (reservationWaitResult = await this._waitForReservedBalance(params, pendingReservations))
             ) {
               // Only observed settlement earns a retry outside the ordinary cap.
               reservationRetry = reservationWaitResult === "settled";
