@@ -652,24 +652,11 @@ function canonicalReservationRoute(path: string | undefined): string | null {
   return normalized === "" ? null : normalized;
 }
 
-/**
- * `/v1/info` capability keys for the visible Tinfoil output cap.
- *
- * `RESERVATION` says the node reads `X-Tinfoil-Max-Output-Tokens` and trims its
- * sealed-body reservation with it. `RESERVATION_TOTAL_CAP` says the enclave's
- * cap bounds the *whole request* rather than each of `n` choices — the
- * precondition that makes the first one sound, because a sealed body hides `n`
- * from the node.
- *
- * No node advertises `RESERVATION_TOTAL_CAP` today (the live enclave caps per
- * choice), so no cap is quoted and the SDK reserves the full envelope
- * everywhere. Do not relax this on the strength of the client-side `n` guard:
- * that guard only protects our own callers, while core's hold has to survive a
- * direct adversarial EHBP client.
+/** Only deployments with a verified request-total cost guarantee may advertise
+ * this contract. Count=1 bounds a single call, not hidden tool-loop calls;
+ * core currently leaves the capability disabled/unadvertised.
  */
-const EHBP_RESERVATION_FEATURE = "ehbp_output_token_reservation";
-const EHBP_RESERVATION_TOTAL_CAP_FEATURE =
-  "ehbp_output_token_reservation_total_cap";
+const EHBP_SINGLE_CHOICE_FEATURE = "ehbp_single_choice_output_token_reservation";
 const EHBP_RESERVATION_ROUTES_FEATURE = "ehbp_output_token_reservation_routes";
 
 /**
@@ -2027,36 +2014,9 @@ export class ProviderManager {
   /**
    * Whether this node reserves against the visible Tinfoil output cap *safely*.
    *
-   * Two additive capability keys are required, and both are advisory only — a
-   * client cannot verify either, so they are a compatibility signal, not a
-   * security boundary:
-   *
-   * - `features.ehbp_output_token_reservation` — the node reads
-   *   `X-Tinfoil-Max-Output-Tokens` and trims its sealed-body reservation with
-   *   it (`calculate_discounted_max_cost`, tinfoil path). Older nodes ignore
-   *   both the header and the feature and hold the whole `max_cost` envelope,
-   *   so reserving against a cap there would under-fund the request and turn it
-   *   into a 402 top-up loop.
-   * - `features.ehbp_output_token_reservation_total_cap` — the enclave's cap
-   *   bounds the **whole request**, not each of `n` choices. Live probe
-   *   (`tinfoil/probe-n-multi-choice.mjs`, router-0.tinfoil.sh): header `8`
-   *   with `n=3` billed 24 completion tokens, so today the cap is per choice.
-   *   A sealed body hides `n` from the node, which means the node's cap-based
-   *   hold bounds nothing: a direct adversarial EHBP client can ask for `n`
-   *   choices and be billed up to `n * cap` against a hold sized for one. Until
-   *   the enclave either divides the cap across choices, rejects `n > 1` with
-   *   the header, or exposes `n` in a way it can validate, no cap-based hold is
-   *   sound — so no cap is quoted.
-   *
-   * Requiring the second key means the SDK keeps the full-envelope reserve by
-   * default and starts discounting only once the node advertises that the
-   * precondition actually holds. On an old node both keys are absent; on a node
-   * that discounts without the precondition the second is. Either way the SDK
-   * holds the full envelope, which is the safe failure.
-   *
-   * `/v1/info` is already fetched lazily (and cached) on this path for mint and
-   * model discovery, so this is normally a cache read. A node we cannot reach
-   * is also "unsupported": choosing the larger reservation is the safe failure.
+   * Requires the single-choice contract and an authoritative chat route list.
+   * Legacy total-cap flags do not establish this contract. Responses does not
+   * honor the completion-count header and cannot use this quote.
    */
   async supportsSealedOutputTokenReservation(
     baseUrl: string,
@@ -2100,19 +2060,11 @@ export class ProviderManager {
       if (!info) return false;
 
       const features = (info as any)?.features;
-      const reservation = features?.[EHBP_RESERVATION_FEATURE] === true;
-      const totalCap = features?.[EHBP_RESERVATION_TOTAL_CAP_FEATURE] === true;
-      if (!reservation || !totalCap) {
-        if (reservation && !totalCap) {
-          this.logger.debug(
-            `[ProviderManager] ${baseUrl} advertises ${EHBP_RESERVATION_FEATURE} without ${EHBP_RESERVATION_TOTAL_CAP_FEATURE}; sealed output-cap discount stays disabled (full reserve)`
-          );
-        }
-        return false;
-      }
+      if (features?.[EHBP_SINGLE_CHOICE_FEATURE] !== true) return false;
+      if (canonicalReservationRoute(requestPath) !== "chat/completions") return false;
 
       // The node publishes the authoritative route set for its quote. A route
-      // outside it gets the full envelope even when both booleans are true, or
+      // outside it gets the full envelope even when the capability is true, or
       // the SDK would under-fund a request the node prices at max_cost (402).
       // Missing/malformed/empty list is a capability we cannot trust: fail
       // closed rather than assume "all routes".

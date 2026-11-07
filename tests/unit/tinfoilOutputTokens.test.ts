@@ -46,6 +46,7 @@ vi.mock("../../client/TinfoilSecure", async (importOriginal) => {
   };
 });
 
+const COUNT = "X-Tinfoil-Completion-Count";
 const HEADER = "X-Tinfoil-Max-Output-Tokens";
 const FIRST = "https://first.example/";
 const NEXT = "https://next.example/";
@@ -65,10 +66,10 @@ const logger: SdkLogger = {
 };
 
 /** Every value the request carries for the cap header (0, 1 or many). */
-function headerValues(headers: unknown): string[] {
+function headerValues(headers: unknown, header = HEADER): string[] {
   const entries = Object.entries(
     (headers ?? {}) as Record<string, unknown>
-  ).filter(([name]) => name.toLowerCase() === HEADER.toLowerCase());
+  ).filter(([name]) => name.toLowerCase() === header.toLowerCase());
   return entries.map(([, value]) => String(value));
 }
 
@@ -285,6 +286,8 @@ describe("tinfoil output cap resolution", () => {
     // The hop that honors `Connection` removes the field before the enclave
     // sees it, so a quote computed from it is not a bound.
     for (const conn of [
+      COUNT,
+      COUNT.toLowerCase(),
       HEADER,
       HEADER.toLowerCase(),
       `keep-alive, ${HEADER}`,
@@ -317,7 +320,7 @@ describe("tinfoil output cap resolution", () => {
   });
 
   it("never adds a second value when the header is already present", () => {
-    const headers = { [HEADER]: "8" };
+    const headers = { [HEADER]: "8", [COUNT]: "1" };
     const resolution = resolveTinfoilOutputCap({
       path: "/v1/chat/completions",
       body: { max_tokens: 500 },
@@ -325,7 +328,7 @@ describe("tinfoil output cap resolution", () => {
     });
     expect(withTinfoilOutputCapHeader(headers, resolution)).toBe(headers);
 
-    const lowered = { "x-tinfoil-max-output-tokens": "8" };
+    const lowered = { "x-tinfoil-max-output-tokens": "8", "x-tinfoil-completion-count": "1" };
     const loweredResolution = resolveTinfoilOutputCap({
       path: "/v1/chat/completions",
       body: { max_tokens: 500 },
@@ -1001,7 +1004,7 @@ describe("X-Tinfoil-Max-Output-Tokens across retries and failover", () => {
   });
 });
 
-describe("reservation stays disabled until the cap is a request-total bound", () => {
+describe("reservation capability compatibility", () => {
   /** A client wired to a REAL ProviderManager, so pricing is the real thing. */
   function setupRealPricing(featureFlags: Record<string, unknown>) {
     const registry = createRegistry(
@@ -1063,6 +1066,16 @@ describe("reservation stays disabled until the cap is a request-total bound", ()
     expect(spend.mock.calls[0][0].amount).toBe(20);
   });
 
+  it("legacy total-cap flags still reserve the full envelope", async () => {
+    const { client, spend } = setupRealPricing({
+      ehbp_output_token_reservation: true,
+      ehbp_output_token_reservation_total_cap: true,
+      ehbp_output_token_reservation_routes: ["chat/completions"],
+    });
+    await request(client);
+    expect(spend.mock.calls[0][0].amount).toBe(20);
+  });
+
   it("reserves the full envelope when no feature is advertised", async () => {
     const { client, spend } = setupRealPricing({});
 
@@ -1071,12 +1084,12 @@ describe("reservation stays disabled until the cap is a request-total bound", ()
     expect(spend.mock.calls[0][0].amount).toBe(20);
   });
 
-  it("quotes the cap only once the total-cap guarantee is advertised too", async () => {
-    // Locks in the wiring for the day the enclave bounds the whole request:
-    // the same request then reserves the capped hold instead of the envelope.
+  it("quotes the cap only with the single-choice guarantee", async () => {
+    // Synthetic future capability only: current core does not advertise it
+    // because hidden tool loops still lack a request-total cost guarantee.
     const { client, spend } = setupRealPricing({
       ehbp_output_token_reservation: true,
-      ehbp_output_token_reservation_total_cap: true,
+      ehbp_single_choice_output_token_reservation: true,
       ehbp_output_token_reservation_routes: ["chat/completions"],
     });
 
@@ -1092,14 +1105,13 @@ describe("node capability advertisement", () => {
 
   const chat = "/v1/chat/completions";
 
-  it("requires the cap to bound the whole request, not each choice", async () => {
-    // Discounting is only sound once the enclave's cap is a request-total
-    // bound. The probe showed it is per choice today, so the first key alone
-    // must not be enough.
+  it("requires the single-choice contract, not legacy total-cap flags", async () => {
+    // Only the new contract enables quotes. Legacy flags cannot establish
+    // single-choice enforcement or request-total safety.
     expect(
       await features({
         ehbp_output_token_reservation: true,
-        ehbp_output_token_reservation_total_cap: true,
+        ehbp_single_choice_output_token_reservation: true,
         ehbp_output_token_reservation_routes: ["chat/completions"],
       }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(true);
@@ -1110,7 +1122,14 @@ describe("node capability advertisement", () => {
     ).toBe(false);
     expect(
       await features({
+        ehbp_single_choice_output_token_reservation: true,
+      }).supportsSealedOutputTokenReservation(FIRST, chat)
+    ).toBe(false);
+    expect(
+      await features({
+        ehbp_output_token_reservation: true,
         ehbp_output_token_reservation_total_cap: true,
+        ehbp_output_token_reservation_routes: ["chat/completions"],
       }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
     expect(
@@ -1129,24 +1148,24 @@ describe("node capability advertisement", () => {
     expect(
       await features({
         ehbp_output_token_reservation: true,
-        ehbp_output_token_reservation_total_cap: true,
+        ehbp_single_choice_output_token_reservation: true,
         ehbp_output_token_reservation_routes: ["responses"],
       }).supportsSealedOutputTokenReservation(FIRST, chat)
     ).toBe(false);
     expect(
       await features({
         ehbp_output_token_reservation: true,
-        ehbp_output_token_reservation_total_cap: true,
+        ehbp_single_choice_output_token_reservation: true,
         ehbp_output_token_reservation_routes: ["responses"],
       }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
-    ).toBe(true);
+    ).toBe(false);
 
     // Missing / malformed / empty list: no quotable route.
     for (const routes of [undefined, [], ["response"], [42], [""]]) {
       expect(
         await features({
           ehbp_output_token_reservation: true,
-          ehbp_output_token_reservation_total_cap: true,
+          ehbp_single_choice_output_token_reservation: true,
           ehbp_output_token_reservation_routes: routes,
         }).supportsSealedOutputTokenReservation(FIRST, "/v1/responses")
       ).toBe(false);
@@ -1390,7 +1409,7 @@ describe("cancellation, cache integrity, and suppression through the transport",
             mints: ["https://mint.stale.example/"],
             features: {
               ehbp_output_token_reservation: true,
-              ehbp_output_token_reservation_total_cap: true,
+              ehbp_single_choice_output_token_reservation: true,
               ehbp_output_token_reservation_routes: ["chat/completions"],
             },
           }),
@@ -1441,7 +1460,7 @@ describe("cancellation, cache integrity, and suppression through the transport",
 });
 
 describe("Connection suppression survives a routed failover", () => {
-  it("quotes nothing and sends no cap header on either hop (429 failover)", async () => {
+  it.each([HEADER, COUNT])("quotes nothing when Connection nominates %s (429 failover)", async (nominated) => {
     // Node advertises the full capability set, so a re-derived cap WOULD be
     // quoted here — that is exactly the regression: the prepared decision is
     // suppressed (Connection nomination), and both pricing and the transport
@@ -1469,18 +1488,97 @@ describe("Connection suppression survives a routed failover", () => {
         messages: [],
         max_completion_tokens: 64,
       },
-      headers: { Connection: HEADER },
+      headers: { Connection: nominated },
     });
 
     // Both hops happened, and neither carried the suppressed header.
     expect(fetchTinfoilMock.mock.calls.length).toBe(2);
     expect(headerValues(sealedInit(0).headers)).toEqual([]);
     expect(headerValues(sealedInit(1).headers)).toEqual([]);
+    expect(headerValues(sealedInit(0).headers, COUNT)).toEqual([]);
+    expect(headerValues(sealedInit(1).headers, COUNT)).toEqual([]);
 
     // Neither hop was priced against the cap: no discounted reserve for a
     // request whose cap header was nominated for stripping.
     for (const call of providerManager.getRequiredSatsForModel.mock.calls) {
       expect(call[5]).toBeUndefined();
     }
+  });
+});
+
+
+describe("paired single-choice output reservation", () => {
+  it("never quotes a prepared cap without a visible single-choice count", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    const quote = await (client as any)._sealedOutputCapForReserve(
+      true, FIRST, "/v1/chat/completions",
+      { endpoint: "chat", cap: 64, source: "body", callerHeaderInvalid: false }
+    );
+    expect(quote).toBeUndefined();
+    expect(providerManager.supportsSealedOutputTokenReservation).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 1])("derives count 1 for capped chat n=%s", async (n) => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    await routeRequest(client, { body: { max_tokens: 64, n } });
+    expect(headerValues(sealedInit().headers, COUNT)).toEqual(["1"]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBe(64);
+  });
+
+  it.each(["2", "bad", "1, 1", "", "+1", "01"])("forwards count %s verbatim but never quotes it", async (count) => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    await routeRequest(client, { body: { max_tokens: 64 }, headers: { [COUNT]: count } });
+    expect(headerValues(sealedInit().headers, COUNT)).toEqual([count]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("preserves duplicate caller counts and declines to quote", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    await routeRequest(client, {
+      body: { max_tokens: 64 },
+      headers: { [COUNT]: "1", "x-tinfoil-completion-count": "1" },
+    });
+    expect(headerValues(sealedInit().headers, COUNT)).toEqual(["1", "1"]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it.each([{ n: 3 }, { best_of: 2 }])("does not derive paired headers or quote multiple choices %j", async (counts) => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    await routeRequest(client, { body: { max_tokens: 64, ...counts } });
+    expect(headerValues(sealedInit().headers)).toEqual([]);
+    expect(headerValues(sealedInit().headers, COUNT)).toEqual([]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("does not quote caller count 1 over an explicitly multi-choice body", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    await routeRequest(client, { body: { max_tokens: 64, n: 3 }, headers: { [COUNT]: "1" } });
+    expect(headerValues(sealedInit().headers, COUNT)).toEqual(["1"]);
+    expect(headerValues(sealedInit().headers)).toEqual([]);
+    expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("requires both cap and count, and never applies the chat quote to Responses", async () => {
+    for (const options of [
+      { body: {}, headers: { [COUNT]: "1" } },
+      { path: "/v1/responses", body: { max_output_tokens: 64 }, headers: { [COUNT]: "1" } },
+      { path: "/v1/responses", body: { max_output_tokens: 64 } },
+    ]) {
+      const { client, providerManager } = setup({ advertisesCap: true });
+      await routeRequest(client, options);
+      expect(providerManager.getRequiredSatsForModel.mock.calls[0][5]).toBeUndefined();
+    }
+  });
+
+  it("preserves count 1 and its cap across routed 429 failover", async () => {
+    const { client, providerManager } = setup({ advertisesCap: true });
+    fetchTinfoilMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "rate limited", code: 429 } }), { status: 429 }));
+    await routeRequest(client, { body: { max_completion_tokens: 64 }, headers: { "x-tinfoil-completion-count": " 1 " } });
+    expect(fetchTinfoilMock).toHaveBeenCalledTimes(2);
+    for (const index of [0, 1]) {
+      expect(headerValues(sealedInit(index).headers)).toEqual(["64"]);
+      expect(headerValues(sealedInit(index).headers, COUNT)).toEqual([" 1 "]);
+    }
+    for (const call of providerManager.getRequiredSatsForModel.mock.calls) expect(call[5]).toBe(64);
   });
 });

@@ -11,7 +11,7 @@
  * travels outside the sealed body and the enclave *replaces* any body cap with
  * it, whether larger or smaller. That gives both ends of the connection the
  * same number — the enclave enforces it, and routstr-core can reserve against
- * it (see `features.ehbp_output_token_reservation` on `/v1/info`).
+ * it only with the single-choice capability contract on `/v1/info`.
  *
  * Enclave semantics this module mirrors (from the merged PR):
  *
@@ -43,7 +43,10 @@
  *    feature — no new 400s and no silently narrowed output.
  */
 
-/** The header the enclave enforces and routstr-core reserves against. */
+/** Router #532 makes the completion count visible outside EHBP on chat. */
+export const TINFOIL_COMPLETION_COUNT_HEADER = "X-Tinfoil-Completion-Count";
+
+/** The per-choice output cap the enclave enforces. */
 export const TINFOIL_MAX_OUTPUT_TOKENS_HEADER = "X-Tinfoil-Max-Output-Tokens";
 
 /**
@@ -88,6 +91,9 @@ export interface TinfoilOutputCapResolution {
    * This is the value the reservation must be priced against.
    */
   cap?: number;
+  /** Effective visible count; only chat honors this header. */
+  completionCount?: number;
+  injectCompletionCount?: string;
   /**
    * Header value the SDK should add. Absent when the caller already supplied
    * the header (never emit a second value: duplicates are a 400) or when no
@@ -253,7 +259,7 @@ function findHeader(
  * rather than replaced: forwarding it lets the enclave return the 400 it would
  * have returned anyway, and the caller's intent is never silently rewritten.
  */
-export function resolveTinfoilOutputCap(options: {
+function resolveOutputCap(options: {
   path?: string;
   body?: unknown;
   headers?: Record<string, string>;
@@ -326,8 +332,41 @@ export function resolveTinfoilOutputCap(options: {
   };
 }
 
+/** Prepare the cap and count once, before sanitization or EHBP sealing.
+ * Router #532 replaces hidden `n` on chat, but does not replace `best_of`.
+ * Never derive a count that silently changes a requested multi-choice call.
+ */
+export function resolveTinfoilOutputCap(options: {
+  path?: string;
+  body?: unknown;
+  headers?: Record<string, string>;
+}): TinfoilOutputCapResolution {
+  const resolution = resolveOutputCap(options);
+  if (resolution.endpoint !== "chat" || resolution.cap === undefined) {
+    return resolution;
+  }
+  const existing = findHeader(options.headers, TINFOIL_COMPLETION_COUNT_HEADER);
+  if (existing) {
+    const count =
+      existing.count === 1
+        ? parseTinfoilOutputCapHeader(existing.value)
+        : undefined;
+    return {
+      ...resolution,
+      cap: count === 1 ? resolution.cap : undefined,
+      completionCount: count,
+    };
+  }
+  // Only absent/default or explicitly numeric n=1 is safe to rewrite.
+  const n = isPlainObject(options.body) ? options.body.n : undefined;
+  if (n !== undefined && n !== null && n !== 1) {
+    return { ...resolution, cap: undefined, injectValue: undefined };
+  }
+  return { ...resolution, completionCount: 1, injectCompletionCount: "1" };
+}
+
 /**
- * Attach the visible cap to the outgoing headers.
+ * Attach the prepared visible cap and completion count to outgoing headers.
  *
  * Returns the input object untouched (`===`) when there is nothing to add, so
  * callers can rely on identity. An existing header — the caller's, or one a
@@ -338,17 +377,20 @@ export function withTinfoilOutputCapHeader(
   headers: Record<string, string>,
   resolution: TinfoilOutputCapResolution
 ): Record<string, string> {
-  if (findHeader(headers, TINFOIL_MAX_OUTPUT_TOKENS_HEADER)) return headers;
-  if (resolution.injectValue === undefined) {
-    // Nothing to derive, but a caller header may still need to survive the
-    // SDK's header allowlist — handled by the caller, which copies it out of
-    // the inbound headers explicitly.
-    return headers;
+  let result = headers;
+  if (
+    !findHeader(result, TINFOIL_MAX_OUTPUT_TOKENS_HEADER) &&
+    resolution.injectValue !== undefined
+  ) {
+    result = { ...result, [TINFOIL_MAX_OUTPUT_TOKENS_HEADER]: resolution.injectValue };
   }
-  return {
-    ...headers,
-    [TINFOIL_MAX_OUTPUT_TOKENS_HEADER]: resolution.injectValue,
-  };
+  if (
+    !findHeader(result, TINFOIL_COMPLETION_COUNT_HEADER) &&
+    resolution.injectCompletionCount !== undefined
+  ) {
+    result = { ...result, [TINFOIL_COMPLETION_COUNT_HEADER]: resolution.injectCompletionCount };
+  }
+  return result;
 }
 
 /**
@@ -369,14 +411,14 @@ export function capHeaderNominatedInConnection(
   for (const [name, value] of Object.entries(headers)) {
     if (name.toLowerCase() !== "connection") continue;
     for (const token of String(value).split(",")) {
-      if (trimAsciiWhitespace(token).toLowerCase() === wanted) return true;
+      if ([wanted, TINFOIL_COMPLETION_COUNT_HEADER.toLowerCase()].includes(trimAsciiWhitespace(token).toLowerCase())) return true;
     }
   }
   return false;
 }
 
 /**
- * Carry a caller-supplied cap header onto the outbound request.
+ * Carry caller-supplied cap/count headers onto the outbound request.
  *
  * The SDK rebuilds outbound headers from an allowlist and never spreads
  * caller headers (credentials must not leak upstream), so an explicitly
@@ -392,7 +434,7 @@ export function forwardCallerTinfoilOutputCapHeaders(
   if (!inbound) return;
   const wanted = TINFOIL_MAX_OUTPUT_TOKENS_HEADER.toLowerCase();
   for (const [name, value] of Object.entries(inbound)) {
-    if (name.toLowerCase() !== wanted) continue;
+    if (![wanted, TINFOIL_COMPLETION_COUNT_HEADER.toLowerCase()].includes(name.toLowerCase())) continue;
     outbound[name] = String(value);
   }
 }
