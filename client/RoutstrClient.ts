@@ -3456,7 +3456,8 @@ export class RoutstrClient {
     resolution?: TinfoilOutputCapResolution,
     signal?: AbortSignal
   ): Promise<number | undefined> {
-    if (!tinfoilEnabled || resolution?.cap === undefined) return undefined;
+    if (!tinfoilEnabled || resolution?.cap === undefined ||
+        resolution.endpoint !== "chat" || resolution.completionCount !== 1) return undefined;
     // A host app may inject its own provider manager; one without the
     // capability probe cannot discount, so keep the full reserve.
     const probe = this.providerManager?.supportsSealedOutputTokenReservation;

@@ -128,39 +128,29 @@ whole `max_cost` envelope for every Tinfoil request, even a 64-token answer.
 makes the cap visible in a request header that travels *outside* the EHBP body
 and that the enclave enforces **in place of** any body cap, larger or smaller.
 
-> **State of this feature — read this first.**
+> **Single-choice capability, not a request-total token cap.**
 >
-> - **Header forwarding is live.** On a single-choice (`n <= 1`) sealed request
->   to `chat/completions` or `responses`, the SDK derives and sends
->   `X-Tinfoil-Max-Output-Tokens` today, and the deployed enclave honors it today
->   per choice (probe-verified). The caller's output limit is therefore applied
->   end to end even though the body stays sealed.
-> - **The reservation discount is DISABLED.** No node advertises
->   `features.ehbp_output_token_reservation_total_cap`, because the enclave's
->   cap is enforced *per choice* (probe-verified), so it does not bound the
->   request total that a direct adversarial EHBP client can ask for. Until the
->   enclave guarantees a request-total (or single-choice) cap, the SDK reserves
->   the **full `max_cost` envelope**, exactly as it did before this feature.
-> - **Enabling it is not an operator flag toggle.** The `/v1/info` keys are a
->   *statement of capability*, not a switch. Advertising them is a future
->   prerequisite: the guarantee must be implemented in an attested router version
->   and verified against the deployed enclave, including adversarial
->   multi-choice/`best_of` probes. Until that lands, flipping the flag would
->   claim a guarantee that does not exist — it would move the risk onto the
->   node's balance without changing what the enclave bills. The upstream
->   enforcement change (confidential-model-router) plus attestation and
->   verification must land first; only then does core advertise, and only then
->   does the SDK quote a cap.
-> - **What the current evidence does and does not show.** Attestation establishes
->   code/version identity; probes corroborate behavior but do not alone prove
->   every budget path. The probes we have prove the *unsafety* of the per-choice
->   cap (`header=8` with `n=3` billed 24 completion tokens), not the safety of a
->   total cap. A successful `n=1` request does not prove a total cap, and no
->   probe yet proves safety. That is why nothing is discounted today.
+> Router PR #518 enforces the output cap **per choice**. Router PR #532 adds
+> `X-Tinfoil-Completion-Count`, which replaces hidden `n` on chat/completions
+> but leaves `best_of` unchanged. For capped single-choice chat, the SDK sends
+> count `1` before EHBP sealing. This bounds one completion in one inference
+> call; it is not an aggregate budget for multiple requests or agent/tool loops.
 >
-> The client-side `n > 1` guard below does **not** justify turning the discount
-> on: it only protects callers of this SDK, while the node's hold has to survive
-> any EHBP client.
+> Discounting requires a verified deployment: core must advertise
+> `features.ehbp_single_choice_output_token_reservation === true` plus
+> `features.ehbp_single_choice_output_token_reservation_routes` containing
+> `chat/completions`. This is a capability
+> statement, not an operator toggle. **Reservation remains OFF:** core leaves
+> this capability disabled/unadvertised pending a request-total cost guarantee.
+> PR #532 is already deployed at `inference.tinfoil.sh`: hidden `n=3` with
+> count `1` and cap `8` produced one choice / eight completion tokens. A
+> `best_of=3` probe also reported eight tokens on the tested backend only.
+> Neither observation proves request-total safety: hidden tool profiles can
+> trigger repeated model calls and aggregate usage (`toolruntime/tool_loop.go`
+> lines 139–218; `main.go` lines 917–953 in the researched router version).
+> Thus activation is blocked on request-total accounting/enforcement, **not**
+> on deploying #532. This SDK patch only integrates the paired headers;
+> legacy flags or absent capability keep the full reserve.
 
 The SDK therefore derives the header before sealing, on sealed (`tinfoil-*`)
 requests only:
@@ -205,28 +195,30 @@ before the EHBP transport.
 
 Emitting the header is unconditional; *reserving* against it is not.
 
-Quoting a cap needs three additive `/v1/info` capability values, because a
-client can verify none of them and only one describes what the enclave actually
-enforces:
+Quoting requires **both visible headers**: a valid output cap and exactly one
+canonical completion-count value equal to `1`, on chat/completions only.
+The SDK also requires these `/v1/info` capabilities:
 
 | Key | Meaning |
 |---|---|
-| `features.ehbp_output_token_reservation` | the node trims its sealed-body reservation from `X-Tinfoil-Max-Output-Tokens` |
-| `features.ehbp_output_token_reservation_total_cap` | the enclave's cap bounds the **whole request**, not each of `n` choices |
-| `features.ehbp_output_token_reservation_routes` | the exact canonical routes the node will quote (`chat/completions`, `responses`, ...). **Authoritative**: a route outside it keeps the full envelope even when both booleans are true, or the SDK would under-fund a request the node prices at `max_cost` (402) |
+| `features.ehbp_single_choice_output_token_reservation` | exactly `true`: node supports the verified single-choice cap/count contract |
+| `features.ehbp_single_choice_output_token_reservation_routes` | authoritative nonempty canonical route list, including `chat/completions` |
 
-The second key is the precondition for the first being sound. Today the cap is
-per choice, so an adversarial EHBP client (which can send any `n` inside the
-sealed body) could be billed up to `n × cap` against a hold sized for one
-completion. Until the enclave divides the cap across choices, rejects `n > 1`
-alongside the header, or exposes `n` in a form it validates, no node advertises
-the whole set and the SDK keeps the full-envelope reserve — the same posture as
-an old node. A node that advertises a partial set is logged and still reserves
-the full envelope: `supportsSealedOutputTokenReservation()` requires both
-booleans *and* a usable route list containing the request's canonical route,
-and the tests pin the resulting deposit at the envelope (`tests/unit/
-tinfoilOutputTokens.test.ts`, "reservation stays disabled until the cap is a
-request-total bound" and "gates on the advertised route set").
+The old `ehbp_output_token_reservation` and
+`ehbp_output_token_reservation_total_cap` booleans and legacy
+`ehbp_output_token_reservation_routes` list do **not** enable this quote.
+The dedicated and legacy route sets are separate protocols: they are never
+unioned, even when both flags are true.
+Responses ignores completion-count, so it always keeps the full sealed reserve,
+even if advertised in the route list. Count headers supplied by callers are
+forwarded verbatim, never replaced or duplicated; malformed, repeated, or
+count-greater-than-one values are never quoted. Without a usable cap no count
+is derived. With `n > 1` or `best_of > 1`, no paired headers are derived and no
+quote is made, even if the caller supplies count `1` (which the enclave would
+otherwise use to override `n`). Either header nominated in `Connection` also
+suppresses derivation and quoting. The exact prepared cap/count decision is
+reused for transport, retries and failover, rather than re-derived after header
+sanitization has dropped `Connection`.
 
 When a node advertises the full set, `getRequiredSatsForModel` prices a sealed request
 from the cap using routstr-core's worst case over the whole context window —
