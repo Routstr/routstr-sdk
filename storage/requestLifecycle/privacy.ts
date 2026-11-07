@@ -77,17 +77,33 @@ export function safeUrl(value: string): string {
     return "[invalid-url]";
   }
 }
+// Route IDs may contain slash-separated provider/model names. Keep this
+// separate from diagnostic codes: no URLs, query text, whitespace or credentials.
+const SAFE_ROUTE_IDENTIFIER = /^[a-zA-Z0-9_.:-]+(?:\/[a-zA-Z0-9_.:-]+)*$/;
+function safeRouteIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    value.length <= 120 && SAFE_ROUTE_IDENTIFIER.test(value)
+    ? value
+    : undefined;
+}
 export function safeModelPath(value: string): string {
   if (value.includes("=")) {
     const input = new URLSearchParams(value);
     const output = new URLSearchParams();
+    // Budget serialized (percent-encoded) fields, not decoded identifiers.
+    // Never persist a partial field: lifecycle recorders and drivers both
+    // sanitize, so truncation could otherwise change identity on the next pass.
+    const append = (key: string, field: string) => {
+      output.set(key, field);
+      if (output.toString().length > 512) output.delete(key);
+    };
     const url = input.get("url");
-    if (url) output.set("url", safeUrl(url));
+    if (url) append("url", safeUrl(url));
     for (const key of ["model-id", "endpoint"]) {
-      const code = safeCode(input.get(key));
-      if (code) output.set(key, code);
+      const code = safeRouteIdentifier(input.get(key));
+      if (code) append(key, code);
     }
-    return output.toString().slice(0, 512);
+    return output.toString() || "[redacted-model-path]";
   }
   return value.includes("://")
     ? safeUrl(value)
