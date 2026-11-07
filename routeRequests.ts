@@ -80,6 +80,9 @@ export interface RouteRequestOptions {
   discoveryAdapter: DiscoveryAdapter;
   /** Optional: additional provider URLs to include */
   includeProviderUrls?: string[];
+  /** Optional: skip announced provider URLs on localhost or a private network.
+   * Off by default; see ModelManagerConfig.filterLocalNetworkUrls. */
+  filterLocalNetworkUrls?: boolean;
   /** Optional: Tor mode for onion routing */
   torMode?: boolean;
   /** Optional: force refresh of cached data */
@@ -146,6 +149,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
     storageAdapter,
     discoveryAdapter,
     includeProviderUrls = [],
+    filterLocalNetworkUrls = false,
     torMode = false,
     forceRefresh = false,
     modelManager: providedModelManager,
@@ -178,6 +182,7 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
       storageAdapter,
       discoveryAdapter,
       includeProviderUrls,
+      filterLocalNetworkUrls,
       torMode,
       forceRefresh,
       modelManager: providedModelManager,

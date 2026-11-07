@@ -227,7 +227,38 @@ describe("ModelManager Nostr collection", () => {
     expect(bases).toEqual([]);
   });
 
-  it("drops announced localhost and private-network URLs unless included", async () => {
+  it("keeps announced localhost and private-network URLs by default", async () => {
+    // A node reachable only inside one home or LAN is a real provider there,
+    // so the filter is opt-in and the default behaviour is unchanged.
+    const local = [
+      "http://localhost:8000",
+      "http://127.0.0.1:8000",
+      "http://192.168.1.20:8000",
+      "http://umbrel:8000",
+    ];
+    const announced = makeProviderEvent("evt-local-default", "pk-a", [
+      PROVIDER_A_URL,
+      ...local,
+    ]);
+    relayStream.current = () => of(announced);
+
+    const discovered: string[] = [];
+    const manager = new ModelManager(makeAdapter(), { logger: silentLogger });
+    const bases = await manager.bootstrapProviders(false, true, {
+      onProvider: (baseUrl) => discovered.push(baseUrl),
+    });
+
+    expect(discovered).toEqual([
+      NORMALIZED_A,
+      "http://localhost:8000/",
+      "http://127.0.0.1:8000/",
+      "http://192.168.1.20:8000/",
+      "http://umbrel:8000/",
+    ]);
+    expect(bases.sort()).toEqual([...discovered].sort());
+  });
+
+  it("drops announced localhost and private-network URLs when filtering is on", async () => {
     const local = [
       "http://localhost:8000",
       "http://127.0.0.1:8000",
@@ -258,6 +289,7 @@ describe("ModelManager Nostr collection", () => {
     const discovered: string[] = [];
     const manager = new ModelManager(makeAdapter(), {
       logger: silentLogger,
+      filterLocalNetworkUrls: true,
       includeProviderUrls: ["http://127.0.0.1:8000"],
     });
     const bases = await manager.bootstrapProviders(false, true, {
@@ -277,11 +309,32 @@ describe("ModelManager Nostr collection", () => {
     adapter.setBaseUrlsList([NORMALIZED_A, "http://127.0.0.1:8000/"]);
     adapter.getBaseUrlsLastUpdate = () => Date.now();
 
-    const manager = new ModelManager(adapter, { logger: silentLogger });
+    const manager = new ModelManager(adapter, {
+      logger: silentLogger,
+      filterLocalNetworkUrls: true,
+    });
     const bases = await manager.bootstrapProviders(false, false);
 
     expect(bases).toEqual([NORMALIZED_B]);
     expect(adapter.getBaseUrlsList()).toEqual([NORMALIZED_B]);
+  });
+
+  it("serves a saved list that holds a local URL while filtering is off", async () => {
+    // The relays announce a different node; the cache wins, so B never shows up.
+    relayStream.current = () =>
+      of(makeProviderEvent("evt-b", "pk-b", [PROVIDER_B_URL]));
+    const adapter = makeAdapter();
+    adapter.setBaseUrlsList([NORMALIZED_A, "http://127.0.0.1:8000/"]);
+    adapter.getBaseUrlsLastUpdate = () => Date.now();
+
+    const manager = new ModelManager(adapter, { logger: silentLogger });
+    const bases = await manager.bootstrapProviders(false, false);
+
+    expect(bases).toEqual([NORMALIZED_A, "http://127.0.0.1:8000/"]);
+    expect(adapter.getBaseUrlsList()).toEqual([
+      NORMALIZED_A,
+      "http://127.0.0.1:8000/",
+    ]);
   });
 
   it("skips the review query when the adapter cannot store its result", async () => {
