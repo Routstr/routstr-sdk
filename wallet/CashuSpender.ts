@@ -1,3 +1,4 @@
+import { throwIfFundingAborted } from "./fundingCancellation";
 /**
  * CashuSpender - Core spending logic for Cashu tokens
  *
@@ -27,6 +28,7 @@ import { getTokenMetadata } from "@cashu/cashu-ts";
  * Options for spending cashu tokens
  */
 export interface SpendOptions {
+  signal?: AbortSignal;
   /** The mint URL to send from (can be overridden if insufficient balance) */
   mintUrl: string;
 
@@ -239,6 +241,7 @@ export class CashuSpender {
       p2pkPubkey,
       excludeMints = [],
       retryCount = 0,
+      signal,
     } = options;
 
     this._isBusy = true;
@@ -251,6 +254,7 @@ export class CashuSpender {
         p2pkPubkey,
         excludeMints,
         retryCount,
+        signal,
       });
 
       if (result.status === "failed" || !result.token) {
@@ -312,6 +316,7 @@ export class CashuSpender {
       p2pkPubkey,
       excludeMints,
       retryCount,
+      signal,
     } = options;
 
     this._log(
@@ -336,6 +341,7 @@ export class CashuSpender {
 
     // Get current balance state
     const balanceState = await this._getBalanceState();
+    throwIfFundingAborted(signal);
     const totalAvailableBalance = balanceState.totalBalance;
 
     this._log(
@@ -368,6 +374,7 @@ export class CashuSpender {
         p2pkPubkey,
         excludeMints,
         retryCount,
+        signal,
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -418,7 +425,9 @@ export class CashuSpender {
         token = await this.walletAdapter.sendToken(
           mintUrl,
           adjustedAmount,
-          p2pkPubkey
+          p2pkPubkey,
+          undefined,
+          signal
         );
         selectedMintUrl = mintUrl;
       } catch (error) {

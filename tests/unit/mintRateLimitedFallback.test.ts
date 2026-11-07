@@ -418,7 +418,8 @@ describe("RoutstrClient._handleErrorResponse — 503 cashu_mint_rate_limited", (
       FALLBACK_MINT_URL,
       7,
       undefined,
-      expect.any(Function)
+      expect.any(Function),
+      undefined
     );
   });
 });

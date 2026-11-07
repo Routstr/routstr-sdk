@@ -1,3 +1,4 @@
+import { FundingCallers, throwIfFundingAborted } from "./fundingCancellation";
 /**
  * BalanceManager - Handles refunding and topping up tokens from providers
  *
@@ -57,6 +58,7 @@ export interface RefundApiKeyOptions {
  * Options for topping up API key balance
  */
 export interface TopUpOptions {
+  signal?: AbortSignal;
   /** The mint URL to spend from */
   mintUrl: string;
 
@@ -71,6 +73,7 @@ export interface TopUpOptions {
 }
 
 export interface CreateProviderTokenOptions {
+  signal?: AbortSignal;
   mintUrl: string;
   baseUrl: string;
   amount: number;
@@ -131,6 +134,8 @@ function runWalletSend<T>(
 type ResolvedTopUpOptions = TopUpOptions & { token: string };
 
 interface QueuedTopUp {
+  contributions: ResolvedTopUpOptions[];
+  callers: FundingCallers;
   amount: number;
   result: Promise<TopUpResult>;
 }
@@ -628,6 +633,7 @@ export class BalanceManager {
    * Top up API key balance with a cashu token
    */
   async topUp(options: TopUpOptions): Promise<TopUpResult> {
+    throwIfFundingAborted(options.signal);
     const { mintUrl, baseUrl, amount, token: providedToken } = options;
 
     const guard = this._canRunProviderWalletOperation(baseUrl, "topup");
@@ -650,7 +656,7 @@ export class BalanceManager {
     this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
-      return await this._queueTopUp({ mintUrl, baseUrl, amount, token: apiKey });
+      return await this._queueTopUp({ ...options, token: apiKey });
     } finally {
       this._endProviderWalletOperation(baseUrl, "topup");
     }
@@ -664,22 +670,29 @@ export class BalanceManager {
     }
     const key = JSON.stringify([options.baseUrl, options.token]);
     let batch = walletTopUps.get(key);
+    if (batch?.callers.controller.signal.aborted) batch = undefined;
     if (batch) {
-      batch.amount += options.amount;
+      batch.contributions.push(options);
+      batch.callers.add(options.signal);
     } else {
       const sends = walletSendQueues.get(this.walletAdapter) ?? Promise.resolve();
+      const callers = new FundingCallers();
+      callers.add(options.signal);
       const started: QueuedTopUp = {
-        amount: options.amount,
+        contributions: [options],
+        callers,
+        amount: 0,
         result: sends.then(() => {
-          walletTopUps.delete(key);
-          return this._topUpImpl({ ...options, amount: started.amount });
-        }),
+          if (walletTopUps.get(key) === started) walletTopUps.delete(key);
+          return this._runQueuedTopUp(started, options);
+        }).finally(() => callers.dispose()),
       };
       batch = started;
       walletTopUps.set(key, batch);
     }
 
     const result = await batch.result;
+    throwIfFundingAborted(options.signal);
     // A wallet too short for the merged deposit may still cover this one.
     if (
       !result.success &&
@@ -691,10 +704,34 @@ export class BalanceManager {
     return result;
   }
 
+  private async _runQueuedTopUp(
+    batch: QueuedTopUp, options: ResolvedTopUpOptions
+  ): Promise<TopUpResult> {
+    // A contribution can disappear during balance/recovery waits, not just
+    // while queued. Invalidate that pre-send attempt and recompute for survivors.
+    // Once sendToken starts financial work it must settle, ignoring cancellation.
+    for (;;) {
+      throwIfFundingAborted(batch.callers.controller.signal);
+      const live = batch.contributions.filter((entry) => !entry.signal?.aborted);
+      const controller = new AbortController();
+      const invalidate = () => controller.abort();
+      for (const entry of live) entry.signal?.addEventListener("abort", invalidate, { once: true });
+      batch.amount = live.reduce((sum, entry) => sum + entry.amount, 0);
+      try {
+        return await this._topUpImpl({ ...options, amount: batch.amount, signal: controller.signal });
+      } catch (error) {
+        if (!controller.signal.aborted || (error as Error)?.name !== "AbortError") throw error;
+      } finally {
+        for (const entry of live) entry.signal?.removeEventListener("abort", invalidate);
+      }
+    }
+  }
+
   private async _topUpImpl(
     options: ResolvedTopUpOptions,
     excludeMints: string[] = []
   ): Promise<TopUpResult> {
+    throwIfFundingAborted(options.signal);
     const { mintUrl, baseUrl, amount, token: apiKey } = options;
 
     let cashuToken: string | null = null;
@@ -711,6 +748,7 @@ export class BalanceManager {
         baseUrl,
         amount,
         excludeMints: [...excludeMints, ...rateLimited],
+        signal: options.signal,
       });
 
       if (!tokenResult.success || !tokenResult.token) {
@@ -806,6 +844,7 @@ export class BalanceManager {
         requestId,
       };
     } catch (error) {
+      if (!cashuToken && (error as Error)?.name === "AbortError") throw error;
       this.logger.log(`topup error for ${baseUrl}: ${error}`);
       if (cashuToken && (await this._recoverFailedTopUp(cashuToken))) {
         this.storageAdapter.removeXcashuToken(baseUrl, cashuToken);
@@ -818,9 +857,10 @@ export class BalanceManager {
   async createProviderToken(
     options: CreateProviderTokenOptions
   ): Promise<ProviderTokenResult> {
-    return runWalletSend(this.walletAdapter, () =>
-      this._createProviderToken(options)
-    );
+    return runWalletSend(this.walletAdapter, () => {
+      throwIfFundingAborted(options.signal);
+      return this._createProviderToken(options);
+    });
   }
 
   private async _createProviderToken(
@@ -835,6 +875,7 @@ export class BalanceManager {
       p2pkPubkey,
     } = options;
 
+    throwIfFundingAborted(options.signal);
     const adjustedAmount = Math.ceil(amount);
     this.logger.log(`createProviderToken: baseUrl=${baseUrl} mintUrl=${mintUrl} amount=${amount} adjustedAmount=${adjustedAmount} retryCount=${retryCount}`);
     if (!adjustedAmount || isNaN(adjustedAmount)) {
@@ -850,6 +891,7 @@ export class BalanceManager {
     const balanceState = await this.getBalanceState();
     const balances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
+    throwIfFundingAborted(options.signal);
 
     const totalMintBalance = Object.values(balanceState.mintBalances).reduce(
       (sum, value) => sum + value,
@@ -866,7 +908,7 @@ export class BalanceManager {
       totalMintBalance + refundableProviderBalance >= adjustedAmount &&
       retryCount < 3
     ) {
-      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount);
+      await this._refundOtherProvidersForTopUp(baseUrl, mintUrl, retryCount, adjustedAmount, options.signal);
       return this._createProviderToken({
         ...options,
         retryCount: retryCount + 1,
@@ -978,6 +1020,7 @@ export class BalanceManager {
 
     let lastError: string | undefined;
     for (const candidateMint of candidates) {
+      throwIfFundingAborted(options.signal);
       try {
         this.logger.log(`createProviderToken: attempting mint=${candidateMint} amount=${requiredAmount}`);
         const token = await this.walletAdapter.sendToken(
@@ -993,7 +1036,8 @@ export class BalanceManager {
               this.storageAdapter.removeXcashuToken(baseUrl, sentToken);
               throw error;
             }
-          }
+          },
+          options.signal
         );
         this.logger.log(`createProviderToken: success from mint=${candidateMint}`);
         return {
@@ -1003,6 +1047,9 @@ export class BalanceManager {
           amountSpent: requiredAmount,
         };
       } catch (error) {
+        // Only the adapter's explicit pre-send cancellation is retryable for
+        // surviving batch callers. An in-flight send failure stays a failure.
+        if (options.signal?.aborted && (error as Error)?.name === "AbortError") throw error;
         const errorMsg = error instanceof Error ? error.message : String(error);
         this.logger.error(`createProviderToken: mint=${candidateMint} failed: ${errorMsg}`);
         if (error instanceof Error) {
@@ -1101,7 +1148,8 @@ export class BalanceManager {
     baseUrl: string,
     mintUrl: string,
     retryCount: number,
-    requiredAmount: number
+    requiredAmount: number,
+    signal?: AbortSignal
   ): Promise<void> {
     const apiKeyDistribution = this.storageAdapter.getApiKeyDistribution();
 
@@ -1126,6 +1174,7 @@ export class BalanceManager {
       .filter((c) => c.key != null && !this._refundTimedOutProviders.has(c.baseUrl))
       .sort((a, b) => a.lastUsed - b.lastUsed); // oldest first
 
+    throwIfFundingAborted(signal);
     if (candidates.length === 0) return;
 
     if (forceRefund) {
@@ -1136,6 +1185,7 @@ export class BalanceManager {
       // NOTE: refundApiKey() already calls removeApiKey() on success, so we
       // don't need to update the balance here — the key is gone.
       for (const candidate of candidates) {
+        throwIfFundingAborted(signal);
         const refundResult = await this.refundApiKey({
           mintUrl,
           baseUrl: candidate.baseUrl,
