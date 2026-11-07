@@ -1,7 +1,9 @@
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient, type RoutstrResponse } from "../../client/RoutstrClient";
-import { InsufficientBalanceError } from "../../core/errors";
+import { FailoverError, InsufficientBalanceError } from "../../core/errors";
+import { routeRequests } from "../../routeRequests";
+import * as requestContext from "../../client/resolveRequestContext";
 import type { Model } from "../../core/types";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -517,6 +519,58 @@ describe("reserved-balance inference waits", () => {
     expect(result.value?.status).toBe(200);
     expect(makeRequest).toHaveBeenCalledTimes(5);
     expect(makeRequest.mock.calls.map(([request]) => request.retryCount ?? 0)).toEqual([0, 0, 0, 0, 0]);
+  });
+
+  it("retains the ordinary retry cap when fresh reads become sufficient without any hold settling", async () => {
+    const hold = await openHold();
+    const waiter = createClient();
+    const makeRequest = vi.spyOn(waiter.client as any, "_makeRequest");
+    let reads = 0;
+    waiter.getBalance.mockImplementation(async () => ({
+      ...balance,
+      // Each 402 validation sees a shortfall; the helper's immediate fresh
+      // read then sees enough funds. No inference settlement earned a retry.
+      amount: ++reads % 2 === 1 ? 20 : REQUIRED_SATS,
+    }));
+    for (let i = 0; i < 3; i++) rejectNextRequest();
+
+    const result = observe(route(waiter.client));
+    await flush();
+    expect(result.error).toBeInstanceOf(FailoverError);
+    expect(fetchMock).toHaveBeenCalledTimes(4); // One holder + three waiter attempts.
+    expect(makeRequest).toHaveBeenCalledTimes(3);
+    expect(makeRequest.mock.calls.map(([request]) => request.retryCount ?? 0)).toEqual([0, 1, 2]);
+    expect(waiter.ensureBalance).toHaveBeenCalledTimes(3);
+    expect(waiter.getBalance).toHaveBeenCalledTimes(6);
+    expect(hold.accounting).not.toHaveBeenCalled();
+    await hold.settle();
+  });
+
+  it.each([0, 37, undefined])("forwards reservedBalanceWaitMs=%s through routeRequests", async (reservedBalanceWaitMs) => {
+    const fixture = createClient();
+    const response = Response.json({ choices: [] }) as RoutstrResponse;
+    const routeRequest = vi.spyOn(fixture.client, "routeRequest").mockResolvedValue(response);
+    vi.spyOn(requestContext, "resolveRequestContext").mockResolvedValue({
+      client: fixture.client,
+      baseUrl: BASE_URL,
+      mintUrl: MINT_URL,
+      selectedModel: model,
+      requestedModelId: model.id,
+    });
+
+    const result = await routeRequests({
+      modelId: model.id,
+      requestBody: { messages: [] },
+      walletAdapter: fixture.wallet,
+      storageAdapter: createStorage(),
+      discoveryAdapter: createDiscovery(),
+      trackLifecycle: false,
+      reservedBalanceWaitMs,
+    });
+    responses.push(result);
+    expect(result).toBe(response);
+    expect(routeRequest).toHaveBeenCalledOnce();
+    expect(routeRequest).toHaveBeenCalledWith(expect.objectContaining({ reservedBalanceWaitMs }));
   });
 
   it("keeps one absolute deadline across multiple reservation retry races", async () => {
