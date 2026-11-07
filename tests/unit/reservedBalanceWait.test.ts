@@ -521,6 +521,29 @@ describe("reserved-balance inference waits", () => {
     expect(makeRequest.mock.calls.map(([request]) => request.retryCount ?? 0)).toEqual([0, 0, 0, 0, 0]);
   });
 
+  it("retries when the last hold settles during failed funding before reservation waiting begins", async () => {
+    const hold = await openHold();
+    const waiter = createClient();
+    const makeRequest = vi.spyOn(waiter.client as any, "_makeRequest");
+    waiter.ensureBalance.mockImplementationOnce(async () => {
+      // Funding can take long enough for inference to finish. By the time it
+      // fails there are no live holds, but this request observed the settlement.
+      balance.amount = REQUIRED_SATS;
+      balance.reserved = 0;
+      await hold.settle();
+      return fundingFailure;
+    });
+    rejectNextRequest();
+
+    const response = await route(waiter.client);
+    expect(response.status).toBe(200);
+    expect(hold.accounting).toHaveBeenCalledOnce();
+    expect(waiter.ensureBalance).toHaveBeenCalledOnce();
+    expect(waiter.getBalance).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(makeRequest.mock.calls.map(([request]) => request.retryCount ?? 0)).toEqual([0, 0]);
+  });
+
   it("retains the ordinary retry cap when fresh reads become sufficient without any hold settling", async () => {
     const hold = await openHold();
     const waiter = createClient();
