@@ -65,6 +65,9 @@ export interface FetchOptions {
   forcedProvider?: string;
   /** Additional provider URLs to include */
   includeProviderUrls?: string[];
+  /** Skip announced provider URLs on localhost or a private network. Off by
+   * default; see ModelManagerConfig.filterLocalNetworkUrls. */
+  filterLocalNetworkUrls?: boolean;
   /** Tor mode for onion routing */
   torMode?: boolean;
   /** Force refresh of cached data */
@@ -224,6 +227,7 @@ export async function fetchAIResponse(
         storageAdapter,
         discoveryAdapter,
         includeProviderUrls: options.includeProviderUrls,
+        filterLocalNetworkUrls: options.filterLocalNetworkUrls,
         torMode: options.torMode,
         forceRefresh: options.forceRefresh,
         mode: options.mode,

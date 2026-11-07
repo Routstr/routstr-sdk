@@ -63,6 +63,9 @@ export interface ResolveContextInput {
   discoveryAdapter: DiscoveryAdapter;
   /** Optional: additional provider URLs to include. */
   includeProviderUrls?: string[];
+  /** Optional: skip announced provider URLs on localhost or a private network.
+   * Off by default; see ModelManagerConfig.filterLocalNetworkUrls. */
+  filterLocalNetworkUrls?: boolean;
   /** Optional: Tor mode for onion routing. */
   torMode?: boolean;
   /** Optional: force refresh of cached data. */
@@ -140,6 +143,7 @@ export async function resolveRequestContext(
     storageAdapter,
     discoveryAdapter,
     includeProviderUrls = [],
+    filterLocalNetworkUrls = false,
     torMode = false,
     forceRefresh = false,
     modelManager: providedModelManager,
@@ -167,6 +171,7 @@ export async function resolveRequestContext(
       includeProviderUrls: forcedProvider
         ? [forcedProvider, ...includeProviderUrls]
         : includeProviderUrls,
+      filterLocalNetworkUrls,
       routstrPubkey,
       routstrModelsPubkey,
       logger,

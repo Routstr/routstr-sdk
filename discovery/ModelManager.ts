@@ -20,6 +20,7 @@ import {
   NoProvidersAvailableError,
   ProviderBootstrapError,
 } from "../core/errors";
+import { isLocalNetworkUrl } from "../utils/torUtils";
 import { RelayPool } from "applesauce-relay";
 import { EventStore } from "applesauce-core";
 import type { IEventDatabase } from "applesauce-core";
@@ -153,8 +154,15 @@ export interface ModelManagerConfig {
   eventStore?: EventStore;
   /** URL to fetch provider directory from */
   providerDirectoryUrl?: string;
-  /** Additional provider base URLs to include */
+  /** Additional provider base URLs to include. Also the only way a localhost or
+   * private-network provider survives `filterLocalNetworkUrls`. */
   includeProviderUrls?: string[];
+  /** Skip announced provider URLs that point at localhost or a private network.
+   * Off by default: a node reachable only inside one home or LAN is a real
+   * provider for the people on that network. Turn it on for public web apps,
+   * where fetching such a URL makes every visitor's browser ask for local
+   * network access and the fetch fails anyway. */
+  filterLocalNetworkUrls?: boolean;
   /** Provider base URLs to exclude */
   excludeProviderUrls?: string[];
   /** Cache TTL in milliseconds (default: 21 minutes) */
@@ -228,6 +236,7 @@ export class ModelManager {
   private readonly providerDirectoryUrl: string;
   private readonly includeProviderUrls: string[];
   private readonly excludeProviderUrls: string[];
+  private readonly filterLocalNetworkUrls: boolean;
   private readonly routstrPubkey: string;
   private readonly routstrModelsPubkey: string;
   private readonly nostrRelays: string[] | undefined;
@@ -270,6 +279,7 @@ export class ModelManager {
     this.cacheTTL = config.cacheTTL || 21 * 60 * 1000; // 21 minutes
     this.includeProviderUrls = config.includeProviderUrls || [];
     this.excludeProviderUrls = config.excludeProviderUrls || [];
+    this.filterLocalNetworkUrls = config.filterLocalNetworkUrls ?? false;
     this.routstrPubkey =
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
@@ -701,7 +711,12 @@ export class ModelManager {
         const lastUpdate = this.adapter.getBaseUrlsLastUpdate();
         const cacheValid =
           lastUpdate && Date.now() - lastUpdate <= this.cacheTTL;
-        if (cacheValid) {
+        // Only when filtering: a saved list that still holds a local URL is out
+        // of date, so discovery runs again and stores a clean one.
+        const cachedUrlsUsable =
+          !this.filterLocalNetworkUrls ||
+          cachedUrls.every((url) => this.reachable(url));
+        if (cacheValid && cachedUrlsUsable) {
           const filteredCachedUrls = this.filterBaseUrlsForTor(
             cachedUrls,
             torMode
@@ -869,6 +884,7 @@ export class ModelManager {
     let eventsFound = 0;
 
     const addBase = (url: string, pubkey?: string) => {
+      if (!this.reachable(url)) return;
       const isNew = !bases.has(url);
       bases.add(url);
       this.addProviderNode(this.providerNodePubkeysByUrl, url, pubkey);
@@ -984,6 +1000,7 @@ export class ModelManager {
       for (const p of providers) {
         const endpoints = this.getProviderEndpoints(p, torMode);
         for (const endpoint of endpoints) {
+          if (!this.reachable(endpoint)) continue;
           bases.add(endpoint);
           this.addProviderNode(this.providerNodePubkeysByUrl, endpoint, p?.pubkey);
         }
@@ -1671,6 +1688,17 @@ export class ModelManager {
       url = `https://${url}`;
     }
     return url.endsWith("/") ? url : `${url}/`;
+  }
+
+  /**
+   * Localhost and private-network providers are dropped only when the app opts
+   * in with `filterLocalNetworkUrls`, and never when it lists the URL itself.
+   */
+  private reachable(url: string): boolean {
+    if (!this.filterLocalNetworkUrls || !isLocalNetworkUrl(url)) return true;
+    return this.includeProviderUrls.some(
+      (include) => this.normalizeUrl(include) === url
+    );
   }
 
   private whitelistMappingsKey: string | undefined;
