@@ -117,6 +117,7 @@ const REDACTED_CREDENTIAL = "[REDACTED]";
 
 interface RequestFailures {
   attemptedProviders: Set<string>;
+  statuses?: number[];
   errors: Array<{
     status: number;
     type?: string;
@@ -1683,6 +1684,7 @@ export class RoutstrClient {
     const failures = params.failures ?? { attemptedProviders: new Set<string>(), errors: [] };
     params = { ...params, failures };
     failures.attemptedProviders.add(baseUrl);
+    (failures.statuses ??= []).push(status);
 
     const errorMessage = responseBody;
 
@@ -1720,14 +1722,28 @@ export class RoutstrClient {
         !selectedModel?.architecture?.input_modalities?.includes("image"));
     const unknownPathError = isUnknownPathError(status, parsedError);
     const aggregateFailure = upstreamRequestError || status >= 500 ||
-      status === 424 || status === 429 || status === -1;
+      status === 424 || status === 429 || status === -1 ||
+      ([401, 402, 403].includes(status) &&
+        !(Object.values(CoreErrorType) as string[]).includes(parsedError.type ?? ""));
     // Keep only diagnostic fields, never raw envelopes containing refund proofs.
     if (aggregateFailure) {
-      const redact = (value: string) => [params.token, xCashuRefundToken]
+      const inputStrings: string[] = [];
+      const collectInput = (value: unknown): void => {
+        if (typeof value === "string" && value.length > 0) inputStrings.push(value);
+        else if (Array.isArray(value)) value.forEach(collectInput);
+        else if (value && typeof value === "object") {
+          for (const [name, child] of Object.entries(value)) {
+            if (["content", "text", "input", "messages"].includes(name)) collectInput(child);
+          }
+        }
+      };
+      collectInput(params.body);
+      const redact = (value: string) => [params.token, xCashuRefundToken, ...inputStrings]
         .filter((secret): secret is string => !!secret)
         .reduce((text, secret) => text.split(secret).join("[REDACTED]"), value)
         .replace(/cashu[AB][A-Za-z0-9_-]+/g, "[REDACTED]")
-        .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+        .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+        .replace(/https?:\/\/[^\s<>"']+/gi, "[REDACTED_URL]");
       const message = redact(parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`));
       const type = parsedError.type ? redact(parsedError.type) : undefined;
       let code: string | number | undefined = parsedError.code ? redact(parsedError.code) : undefined;
@@ -2887,8 +2903,26 @@ export class RoutstrClient {
     // Financial and pinned-path failures above retain their typed semantics.
     // Ordinary upstream failures return a deduplicated diagnostic envelope.
     if (aggregateFailure) {
+      // A final validation rejection cannot explain earlier infrastructure,
+      // authentication, or provider-quota failures. Never classify the caller
+      // by the arbitrary order in which eligible providers were attempted.
+      const statuses = failures.statuses ?? failures.errors.map(error => error.status);
+      const validationOnly = statuses.every(value => value === 400 || value === 422);
+      const uniform = statuses.every(value => value === statuses[0]);
+      const responseStatus = validationOnly
+        ? (statuses.includes(400) ? 400 : 422)
+        : uniform && statuses[0] === 404
+          ? 404
+        : uniform && statuses[0] >= 500 && statuses[0] <= 599
+          ? statuses[0]
+          : uniform && (statuses[0] === 429 || statuses[0] === 424)
+            ? statuses[0]
+            : 502;
+      // These headers describe a single node's envelope, not an aggregate.
+      // In particular do not forward its auth, cookies, URLs, or retry budget.
       const response = this._upstreamErrorResponse(
-        upstream ?? { status: 502, statusText: "Bad Gateway", headers: {} },
+        { status: responseStatus, statusText: upstream?.status === responseStatus ? upstream.statusText : "",
+          headers: upstream?.headers["x-routstr-request-id"] ? { "x-routstr-request-id": upstream.headers["x-routstr-request-id"] } : {} },
         JSON.stringify({ error: {
           type: "all_providers_failed",
           message: failures.errors.map((error) => error.message).join("; "),
@@ -2898,6 +2932,7 @@ export class RoutstrClient {
       )!;
       response.headers.set("content-type", "application/json");
       response.headers.delete("x-routstr-error-scope");
+      response.headers.delete("x-routstr-provider");
       (response as any).passthrough = true;
       return response;
     }

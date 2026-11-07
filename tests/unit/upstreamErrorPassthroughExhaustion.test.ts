@@ -233,6 +233,62 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     expect((await response.json()).error.errors[0].status).toBe(-1);
   });
 
+  it.each([[503, 400], [400, 503], [429, 400], [402, 400], [401, 400], [424, 422]])(
+    "does not misclassify mixed %i then %i as a caller error", async (first, last) => {
+      const { client } = setup();
+      stubFetchByProvider({
+        [baseUrl]: { status: first, statusText: "Failure", body: providerBody("first"), requestId: "first" },
+        [nextUrl]: { status: last, statusText: "Failure", body: providerBody("last"), requestId: "last" },
+      });
+      const response = await routeRequest(client);
+      expect(response.status).toBe(502);
+      expect((await response.json()).error.errors.map((e: any) => e.status)).toEqual([first, last]);
+    }
+  );
+
+  it.each([[400, 422, 400], [422, 400, 400], [422, 422, 422], [401, 401, 502], [403, 403, 502], [503, 502, 502], [424, 424, 424]])(
+    "uses deterministic status for %i then %i", async (first, last, expected) => {
+      const { client } = setup();
+      stubFetchByProvider({
+        [baseUrl]: { status: first, statusText: "Failure", body: providerBody("first"), requestId: "first" },
+        [nextUrl]: { status: last, statusText: "Failure", body: providerBody("last"), requestId: "last" },
+      });
+      const response = await routeRequest(client);
+      expect(response.status).toBe(expected);
+    }
+  );
+
+  it("does not expose request content, provider URLs or unsafe headers in diagnostics", async () => {
+    const { client } = setup();
+    const privateText = "private prompt that must not be echoed";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: {
+      type: "invalid_request_error", message: `temperature: expected number; ${privateText}; https://internal.invalid/path?key=secret; Bearer secret; cashuBsecret`,
+      refund_token: "cashuBrefund",
+    } }, { status: 400, headers: { "set-cookie": "secret", "authorization": "Bearer secret", "retry-after": "123", "x-routstr-provider": "https://internal.invalid" } })));
+    const response = await client.routeRequest({ path: "/v1/chat/completions", method: "POST",
+      body: { model: model.id, messages: [{ role: "user", content: privateText }] }, baseUrl, mintUrl, modelId: model.id, headers: {} });
+    const text = await response.text();
+    expect(text).toContain("temperature: expected number");
+    expect(text).not.toContain(privateText);
+    expect(text).not.toContain("internal.invalid");
+    expect(text).not.toContain("secret");
+    expect(text).not.toContain("refund_token");
+    for (const name of ["set-cookie", "authorization", "retry-after", "x-routstr-provider"]) expect(response.headers.has(name)).toBe(false);
+  });
+
+  it("preserves useful validation details without retrying the same node", async () => {
+    const { client } = setup();
+    const body = JSON.stringify({ error: { type: "invalid_request_error", message: "temperature: expected number", code: "invalid_type" } });
+    const fetch = stubFetchByProvider({
+      [baseUrl]: { status: 400, statusText: "Bad Request", body, requestId: "first" },
+      [nextUrl]: { status: 400, statusText: "Bad Request", body, requestId: "last" },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(400);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect((await response.json()).error.errors[0]).toMatchObject({ status: 400, code: "invalid_type", message: "temperature: expected number" });
+  });
+
   it("still throws TokenAlreadySpentError at exhaustion", async () => {
     const { client } = setup();
     const body = JSON.stringify({
@@ -315,7 +371,7 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
   });
 
-  it("keeps 402 typed: a payment failure is not forwarded as a passthrough", async () => {
+  it("treats upstream account quota exhaustion as infrastructure, not caller payment", async () => {
     const { client } = setup();
     const body = JSON.stringify({
       error: {
@@ -339,6 +395,8 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
       },
     });
 
-    await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.errors[0].status).toBe(402);
   });
 });
