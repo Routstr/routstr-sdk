@@ -1,3 +1,4 @@
+import { providerKey } from "../utils/providerKey";
 import { FundingCallers, throwIfFundingAborted } from "./fundingCancellation";
 /**
  * BalanceManager - Handles refunding and topping up tokens from providers
@@ -665,7 +666,7 @@ export class BalanceManager {
       queues = new Map();
       balanceEnsures.set(this.walletAdapter, queues);
     }
-    const key = JSON.stringify([options.baseUrl.replace(/\/+$/, ""), options.token]);
+    const key = providerKey(options.baseUrl, options.token);
     const previous = queues.get(key) ?? Promise.resolve();
     const current = previous.then(async () => {
       // Wait for earlier wallet sends before reading, not while holding that queue
