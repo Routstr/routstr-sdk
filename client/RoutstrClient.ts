@@ -3313,9 +3313,16 @@ export class RoutstrClient {
   ): Promise<TopUpResult> {
     throwIfFundingAborted(signal);
     const existing = this._inflightTopups.get(key);
-    if (existing && !existing.callers.controller.signal.aborted) {
+    if (existing) {
       existing.callers.add(signal);
-      return existing.promise;
+      // An aborted signal does not mean the financial operation stopped. Wait
+      // for settlement; only explicit pre-send cancellation permits replacement.
+      const joined = existing.promise.catch((error) => {
+        if ((error as Error)?.name !== "AbortError" || !existing.callers.controller.signal.aborted) throw error;
+        throwIfFundingAborted(signal);
+        return this._topUpOnce(key, start, signal);
+      });
+      return awaitWithAbort(joined, signal);
     }
     const callers = new FundingCallers();
     callers.add(signal);
@@ -3327,7 +3334,7 @@ export class RoutstrClient {
       if (this._inflightTopups.get(key) === entry) this._inflightTopups.delete(key);
     }) };
     this._inflightTopups.set(key, entry);
-    return entry.promise;
+    return awaitWithAbort(entry.promise, signal);
   }
 
   /**

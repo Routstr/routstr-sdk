@@ -135,6 +135,7 @@ type ResolvedTopUpOptions = TopUpOptions & { token: string };
 
 interface QueuedTopUp {
   contributions: ResolvedTopUpOptions[];
+  fundedContributions?: ResolvedTopUpOptions[];
   callers: FundingCallers;
   amount: number;
   result: Promise<TopUpResult>;
@@ -692,7 +693,7 @@ export class BalanceManager {
     }
 
     const result = await batch.result;
-    throwIfFundingAborted(options.signal);
+    if (!batch.fundedContributions?.includes(options)) throwIfFundingAborted(options.signal);
     // A wallet too short for the merged deposit may still cover this one.
     if (
       !result.success &&
@@ -716,6 +717,7 @@ export class BalanceManager {
       const controller = new AbortController();
       const invalidate = () => controller.abort();
       for (const entry of live) entry.signal?.addEventListener("abort", invalidate, { once: true });
+      batch.fundedContributions = live;
       batch.amount = live.reduce((sum, entry) => sum + entry.amount, 0);
       try {
         return await this._topUpImpl({ ...options, amount: batch.amount, signal: controller.signal });
