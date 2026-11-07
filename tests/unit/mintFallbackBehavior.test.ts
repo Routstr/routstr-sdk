@@ -58,7 +58,8 @@ describe("BalanceManager request-scoped mint selection", () => {
       MINT_B,
       10,
       undefined,
-      expect.any(Function)
+      expect.any(Function),
+      undefined
     );
   });
 
@@ -149,12 +150,14 @@ describe("BalanceManager request-scoped mint selection", () => {
 
     expect(result.success).toBe(true);
     expect(createTokenSpy).toHaveBeenNthCalledWith(1, {
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_A,
       baseUrl: PROVIDER,
       amount: 10,
       excludeMints: [],
     });
     expect(createTokenSpy).toHaveBeenNthCalledWith(2, {
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_A,
       baseUrl: PROVIDER,
       amount: 10,
@@ -200,6 +203,7 @@ describe("BalanceManager request-scoped mint selection", () => {
     expect(result.success).toBe(true);
     expect(postSpy).toHaveBeenCalledTimes(2);
     expect(createTokenSpy).toHaveBeenNthCalledWith(2, {
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_A,
       baseUrl: PROVIDER,
       amount: 10,
@@ -247,6 +251,7 @@ describe("BalanceManager request-scoped mint selection", () => {
     // The throttled mint is excluded, so the retry draws from the wallet's
     // other provider-supported mint instead of the same rate-limited bucket.
     expect(createTokenSpy).toHaveBeenNthCalledWith(2, {
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_A,
       baseUrl: PROVIDER,
       amount: 10,
@@ -257,6 +262,7 @@ describe("BalanceManager request-scoped mint selection", () => {
     postSpy.mockResolvedValueOnce({ success: true });
     await manager.topUp({ mintUrl: MINT_A, baseUrl: PROVIDER, amount: 10, token: "api-key" });
     expect(createTokenSpy).toHaveBeenNthCalledWith(3, {
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_A,
       baseUrl: PROVIDER,
       amount: 10,

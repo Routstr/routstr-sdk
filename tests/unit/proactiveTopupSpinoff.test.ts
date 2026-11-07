@@ -166,6 +166,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // target = 100 * 1.4 = 140; shortfall = 140 - 20 = 120 (floor 21)
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 120,
@@ -198,6 +199,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 21,
@@ -230,6 +232,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     // floor = 0.21 * 100 = 21
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 21,
@@ -249,6 +252,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 7,
@@ -278,6 +282,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
 
     await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 120, // shortfall vs target from the snapshot (140 - 20)
@@ -404,7 +409,7 @@ describe("RoutstrClient proactive (pre-request) topup", () => {
     // Both pre-request callers wait on the same deposit.
     const first = topUpIfNeeded(client);
     const second = topUpIfNeeded(client);
-    expect(topUp).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(topUp).toHaveBeenCalledOnce());
     resolveTopUp({ success: true, toppedUpAmount: 112, message: "ok" });
     await Promise.all([first, second]);
     expect(topUp).toHaveBeenCalledOnce();

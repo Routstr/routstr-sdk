@@ -178,6 +178,7 @@ describe("RoutstrClient 402 top-up validation", () => {
     expect(response.status).toBe(200);
     expect(topUp).toHaveBeenCalledOnce();
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 80 * 1.4,
@@ -214,6 +215,7 @@ describe("RoutstrClient 402 top-up validation", () => {
     );
 
     expect(topUp).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       mintUrl: MINT_URL,
       baseUrl: BASE_URL,
       amount: 7,

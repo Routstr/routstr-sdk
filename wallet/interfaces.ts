@@ -35,7 +35,9 @@ export interface WalletAdapter {
     mintUrl: string,
     amount: number,
     p2pkPubkey?: string,
-    persistToken?: (token: string) => Promise<void>
+    persistToken?: (token: string) => Promise<void>,
+    /** Check after wallet recovery/queue waits, before starting a send. */
+    signal?: AbortSignal
   ): Promise<string>;
 
   /**

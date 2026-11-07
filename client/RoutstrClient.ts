@@ -1,3 +1,4 @@
+import { FundingCallers, throwIfFundingAborted } from "../wallet/fundingCancellation";
 import { awaitWithAbort } from "./abortable";
 import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecycleContext, type RequestLifecycleDriver } from "../storage/requestLifecycle";
 /**
@@ -333,7 +334,7 @@ export class RoutstrClient {
   /** In-flight topup promises keyed by `${baseUrl}:${apiKey}`. Concurrent
    *  callers — proactive spin-offs and 402 handlers alike — share a single
    *  topUp call instead of stacking multiple deposits. */
-  private _inflightTopups = new Map<string, Promise<TopUpResult>>();
+  private _inflightTopups = new Map<string, { promise: Promise<TopUpResult>; callers: FundingCallers }>();
 
   constructor(
     private walletAdapter: WalletAdapter,
@@ -916,11 +917,14 @@ export class RoutstrClient {
       }
     }
 
+    throwIfFundingAborted(params.signal);
+
     // Spend tokens for the actual request
     const spendResult = await this._spendToken({
       mintUrl,
       amount: requiredSats,
       baseUrl,
+      signal: params.signal,
     });
 
     const {
@@ -944,6 +948,7 @@ export class RoutstrClient {
       tokenReserved,
       tokenBalanceUnit,
       tokenBalanceUnknown,
+      signal: params.signal,
     });
 
     // Build final request headers (auth + Tinfoil model hint)
@@ -1696,6 +1701,7 @@ export class RoutstrClient {
           amount: params.requiredSats,
           baseUrl,
           excludeMints,
+          signal: params.signal,
         });
       } catch (error) {
         this._log(
@@ -1864,13 +1870,15 @@ export class RoutstrClient {
           await params.lifecycle?.event("topup_started", undefined, { baseUrl });
           const topupResult = await this._topUpOnce(
             `${baseUrl}:${params.token}`,
-            () =>
+            (signal) =>
               this.balanceManager.topUp({
+                signal,
                 mintUrl,
                 baseUrl,
                 amount: Math.max(topupAmount * TOPUP_MARGIN, MIN_DEPOSIT_SATS),
                 token: params.token,
-              })
+              }),
+            params.signal
           );
           this._log(
             "DEBUG",
@@ -2458,6 +2466,7 @@ export class RoutstrClient {
         try {
           spendResult = await this._spendToken({
             mintUrl,
+            signal: params.signal,
             amount: newRequiredSats,
             baseUrl: nextProvider,
           });
@@ -3149,7 +3158,9 @@ export class RoutstrClient {
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
     tokenBalanceUnknown: boolean;
+    signal?: AbortSignal;
   }): Promise<void> {
+    throwIfFundingAborted(snapshot.signal);
     if (this.mode !== "apikeys" || !snapshot.token) return;
     if (snapshot.tokenBalanceUnknown) return;
 
@@ -3178,7 +3189,7 @@ export class RoutstrClient {
 
     // Concurrent callers join the same deposit. In the margin zone this is
     // deliberately detached; below the request price we wait for it first.
-    const topup = this._topUpOnce(key, () => this._runProactiveTopup(snapshot));
+    const topup = this._topUpOnce(key, (signal) => this._runProactiveTopup({ ...snapshot, signal }), snapshot.signal);
     if (mustWait) {
       try {
         await topup;
@@ -3205,7 +3216,8 @@ export class RoutstrClient {
    * trigger already confirmed available < required x TOPUP_MARGIN, so we
    * deposit exactly the shortfall to land at the margin. No extra balance
    * round-trip: the post-topup total is persisted from topUp's
-   * toppedUpAmount so future snapshots aren't stale. Never throws.
+   * toppedUpAmount so future snapshots aren't stale. Only pre-send cancellation
+   * throws; other failures remain TopUpResult values.
    */
   private async _runProactiveTopup(snapshot: {
     token: string;
@@ -3215,7 +3227,9 @@ export class RoutstrClient {
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
+    signal?: AbortSignal;
   }): Promise<TopUpResult> {
+    throwIfFundingAborted(snapshot.signal);
     try {
       // Provider-reported available sats (`total_balance`); `reserved` is
       // carried only to keep the stored snapshot's diagnostics intact.
@@ -3249,6 +3263,7 @@ export class RoutstrClient {
         MIN_DEPOSIT_SATS
       );
       const result = await this.balanceManager.topUp({
+        signal: snapshot.signal,
         mintUrl: snapshot.mintUrl,
         baseUrl: snapshot.baseUrl,
         // The target already includes TOPUP_MARGIN — deposit the shortfall.
@@ -3275,6 +3290,9 @@ export class RoutstrClient {
       }
       return result;
     } catch (e) {
+      // Preserve explicit pre-send cancellation for _topUpOnce's live-newcomer
+      // retry. Financial work that started reports its settlement result instead.
+      if ((e as Error)?.name === "AbortError") throw e;
       this._log(
         "WARN",
         `[RoutstrClient] _runProactiveTopup: failed for ${snapshot.baseUrl}`,
@@ -3294,15 +3312,33 @@ export class RoutstrClient {
    */
   private _topUpOnce(
     key: string,
-    start: () => Promise<TopUpResult>
+    start: (signal: AbortSignal) => Promise<TopUpResult>,
+    signal?: AbortSignal
   ): Promise<TopUpResult> {
+    throwIfFundingAborted(signal);
     const existing = this._inflightTopups.get(key);
-    if (existing) return existing;
-    const promise = start().finally(() => {
-      this._inflightTopups.delete(key);
-    });
-    this._inflightTopups.set(key, promise);
-    return promise;
+    if (existing) {
+      existing.callers.add(signal);
+      // An aborted signal does not mean the financial operation stopped. Wait
+      // for settlement; only explicit pre-send cancellation permits replacement.
+      const joined = existing.promise.catch((error) => {
+        if ((error as Error)?.name !== "AbortError" || !existing.callers.controller.signal.aborted) throw error;
+        throwIfFundingAborted(signal);
+        return this._topUpOnce(key, start, signal);
+      });
+      return awaitWithAbort(joined, signal);
+    }
+    const callers = new FundingCallers();
+    callers.add(signal);
+    const entry = { callers, promise: Promise.resolve().then(() => {
+      throwIfFundingAborted(callers.controller.signal);
+      return start(callers.controller.signal);
+    }).finally(() => {
+      callers.dispose();
+      if (this._inflightTopups.get(key) === entry) this._inflightTopups.delete(key);
+    }) };
+    this._inflightTopups.set(key, entry);
+    return awaitWithAbort(entry.promise, signal);
   }
 
   /**
@@ -3313,6 +3349,7 @@ export class RoutstrClient {
     amount: number;
     baseUrl: string;
     excludeMints?: string[];
+    signal?: AbortSignal;
   }): Promise<{
     token: string;
     tokenBalance: number;
@@ -3321,6 +3358,7 @@ export class RoutstrClient {
     tokenBalanceUnknown: boolean;
     selectedMintUrl?: string;
   }> {
+    throwIfFundingAborted(params.signal);
     const { mintUrl, amount, baseUrl, excludeMints = [] } = params;
 
     this._log(
@@ -3365,6 +3403,7 @@ export class RoutstrClient {
         }
       }
 
+      throwIfFundingAborted(params.signal);
       if (!parentApiKey) {
         this._log(
           "DEBUG",
@@ -3379,6 +3418,7 @@ export class RoutstrClient {
           amount: initialAmount,
           baseUrl,
           excludeMints,
+          signal: params.signal,
         });
 
         selectedMintUrl = spendResult.selectedMintUrl;
@@ -3541,6 +3581,7 @@ export class RoutstrClient {
       amount,
       baseUrl,
       excludeMints,
+      signal: params.signal,
     });
 
     if (!spendResult.token) {

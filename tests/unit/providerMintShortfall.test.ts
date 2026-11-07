@@ -86,7 +86,8 @@ describe("BalanceManager provider-mint shortfall", () => {
       CUBABITCOIN,
       50,
       undefined,
-      expect.any(Function)
+      expect.any(Function),
+      undefined
     );
   });
 
