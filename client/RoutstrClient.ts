@@ -565,9 +565,16 @@ export class RoutstrClient {
         })();
         return terminal;
       };
+      // Transport completion and accounting settlement are separate boundaries.
+      let transportComplete = false;
+      let accountingPromise: Promise<number> | undefined;
+      const accounting = () => accountingPromise ??= Promise.resolve().then(() => original.finalize?.() ?? 0);
+      let settlement: Promise<void> | undefined;
+      const logSettlementError = (error: unknown) => this._log("ERROR", "[RoutstrClient] stream settlement failed:", error);
       let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
       let streamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       const onAbort = () => {
+        if (transportComplete) return;
         void finish("aborted").then(() => {
           try { streamController?.error(new DOMException("Request aborted", "AbortError")); } catch { /* already closed */ }
           void streamReader?.cancel().catch(() => {});
@@ -585,9 +592,17 @@ export class RoutstrClient {
           try {
             const result = await reader.read();
             if (result.done) {
-              await original.finalize?.();
-              await finish((original as any).streamError ? "failed" : "succeeded");
+              transportComplete = true;
+              params.signal?.removeEventListener("abort", onAbort);
+              params.signal?.removeEventListener("abort", abort);
+              // Deliver EOF before the wallet read / usage persistence. Keep the
+              // settlement observable through finalize(), even if it is ignored.
               controller.close();
+              settlement = accounting().then(
+                () => finish((original as any).streamError ? "failed" : "succeeded"),
+                async error => { await finish("failed", error); throw error; },
+              );
+              void settlement.catch(logSettlementError);
             } else controller.enqueue(result.value);
           } catch (error) {
             await finish(params.signal?.aborted ? "aborted" : "failed", error);
@@ -597,8 +612,14 @@ export class RoutstrClient {
         async cancel(reason) { controller.abort(reason); await finish("aborted"); void reader.cancel(reason).catch(() => {}); },
       }, { highWaterMark: 0 });
       response = rewrapRoutstrResponse(original, stream, headers);
-      const accounting = original.finalize;
-      response.finalize = async () => { const value = await accounting?.() ?? 0; if (terminal) await terminal; return value; };
+      response.finalize = async () => {
+        try {
+          return await accounting();
+        } finally {
+          if (settlement) await settlement;
+          if (terminal) await terminal;
+        }
+      };
       params.signal?.addEventListener("abort", onAbort, { once: true });
       if (params.signal?.aborted) onAbort();
       return response;
