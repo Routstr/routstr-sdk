@@ -44,6 +44,8 @@ export interface RouteRequestOptions {
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
   trackLifecycle?: boolean;
+  /** Reservation-wait budget after automatic funding fails (default 120s; 0 disables). */
+  reservedBalanceWaitMs?: number;
   /** The model ID to route (e.g., "gpt-4o") */
   modelId: string;
   /** The request body to proxy to the provider */
@@ -270,6 +272,7 @@ export async function routeRequests(
       requestLifecycleDriver: options.requestLifecycleDriver,
       trackLifecycle: options.trackLifecycle,
       signal: options.signal,
+      reservedBalanceWaitMs: options.reservedBalanceWaitMs,
       path,
       method: "POST",
       body: proxiedBody,

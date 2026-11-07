@@ -1,5 +1,6 @@
 import { FundingCallers, throwIfFundingAborted } from "../wallet/fundingCancellation";
 import { awaitWithAbort } from "./abortable";
+import { providerKey } from "../utils/providerKey";
 import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecycleContext, type RequestLifecycleDriver } from "../storage/requestLifecycle";
 /**
  * RoutstrClient - Main API client for Routstr
@@ -194,6 +195,50 @@ const PROACTIVE_TOPUP_MIN_FRACTION = 0.21;
  */
 const MIN_DEPOSIT_SATS = 7;
 
+// Module-level: `routeRequests` builds a new client per call. Reservations
+// belong to a provider/key, even when callers use different wallet adapters.
+const inFlightRequests = new Map<string, Set<Promise<void>>>();
+
+function trackInFlight(key: string, signal?: AbortSignal): () => void {
+  let settle!: () => void;
+  const settled = new Promise<void>(resolve => { settle = resolve; });
+  const requests = inFlightRequests.get(key) ?? new Set<Promise<void>>();
+  inFlightRequests.set(key, requests);
+  requests.add(settled);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    signal?.removeEventListener("abort", release);
+    requests.delete(settled);
+    if (requests.size === 0 && inFlightRequests.get(key) === requests) inFlightRequests.delete(key);
+    settle();
+  };
+  signal?.addEventListener("abort", release, { once: true });
+  if (signal?.aborted) release();
+  return release;
+}
+
+interface ReservationWaitState { deadline?: number }
+const DEFAULT_RESERVED_BALANCE_WAIT_MS = 120_000;
+
+/** Bound both settlement waits and balance reads; expiry retains normal 402 handling. */
+async function withinReservationBudget<T>(
+  operation: Promise<T>, deadline: number, signal?: AbortSignal
+): Promise<{ value: T } | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await awaitWithAbort(Promise.race([
+      operation.then(value => ({ value })),
+      new Promise<undefined>(resolve => {
+        timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+      }),
+    ]), signal);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /**
  * An SDK-pinned x-routstr-model-path selector and the per-route pricing the
  * node advertised for it. Marks the request as auto-pinned (failover may
@@ -273,6 +318,9 @@ export interface RouteRequestParams {
   userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
+  /** Total reservation-wait budget after automatic funding fails. Defaults to 120s;
+   *  0 disables waiting. Expiry uses the existing 402/failover path. */
+  reservedBalanceWaitMs?: number;
   /**
    * Set by the SDK's automatic model-path pinning (see resolveRequestContext).
    */
@@ -572,96 +620,112 @@ export class RoutstrClient {
   }
 
   private async _routeRequest(params: RouteRequestParams): Promise<Response> {
-    const prepared = await awaitWithAbort(this._prepareRoutedRequestWithMintFailover(params), params.signal);
-    const contentType =
-      prepared.response.headers.get("content-type") || "";
-    const isSSE = contentType.includes("text/event-stream");
-
-    // Error payment recovery is handled in _handleErrorResponse. There is no
-    // successful usage to account for; keep finalization off passthrough errors.
-    if ((prepared.response as any).passthrough) {
-      return prepared.response;
+    const preparing = this._prepareRoutedRequestWithMintFailover(params);
+    let prepared: Awaited<typeof preparing>;
+    try {
+      prepared = await awaitWithAbort(preparing, params.signal);
+    } catch (error) {
+      // An abort can win the race even if a transport ignores cancellation.
+      void preparing.then(result => result.releaseHold?.(), () => {});
+      throw error;
     }
+    try {
+      const contentType =
+        prepared.response.headers.get("content-type") || "";
+      const isSSE = contentType.includes("text/event-stream");
 
-    // Accounting never runs in front of the answer. A balance read or a usage
-    // write is bookkeeping for a reply the caller has already paid for, so it
-    // settles behind `finalize()` instead of holding the response: a node that
-    // answers the request and then stalls on `/v1/wallet/info` would otherwise
-    // delay (or, with an abort, discard) a completed answer.
-    //
-    // For SSE the body is only readable as the client consumes it, so usage
-    // arrives through the inspector. A non-SSE body is read from its own copy
-    // before the response is handed out: the caller may start reading the
-    // moment this returns (`clone()` throws after that), and the reply's own
-    // provider ID is published as `requestId`, which callers read straight
-    // away. Accounting reuses the parsed body, so nothing is parsed twice.
-    let jsonBody: unknown;
-    if (!isSSE) {
-      try {
-        jsonBody = await prepared.response.clone().json();
-        const bodyResponseId = extractResponseId(jsonBody);
-        if (bodyResponseId) {
-          (prepared.response as RoutstrResponse).upstreamResponseId =
-            bodyResponseId;
+      // Error payment recovery is handled in _handleErrorResponse. There is no
+      // successful usage to account for; keep finalization off passthrough errors.
+      if ((prepared.response as any).passthrough) {
+        return prepared.response;
+      }
+
+      // Accounting never runs in front of the answer. A balance read or a usage
+      // write is bookkeeping for a reply the caller has already paid for, so it
+      // settles behind `finalize()` instead of holding the response: a node that
+      // answers the request and then stalls on `/v1/wallet/info` would otherwise
+      // delay (or, with an abort, discard) a completed answer.
+      //
+      // For SSE the body is only readable as the client consumes it, so usage
+      // arrives through the inspector. A non-SSE body is read from its own copy
+      // before the response is handed out: the caller may start reading the
+      // moment this returns (`clone()` throws after that), and the reply's own
+      // provider ID is published as `requestId`, which callers read straight
+      // away. Accounting reuses the parsed body, so nothing is parsed twice.
+      let jsonBody: unknown;
+      if (!isSSE) {
+        try {
+          jsonBody = await prepared.response.clone().json();
+          const bodyResponseId = extractResponseId(jsonBody);
+          if (bodyResponseId) {
+            (prepared.response as RoutstrResponse).upstreamResponseId =
+              bodyResponseId;
+          }
+        } catch {
+          // Encrypted (EHBP/Tinfoil) or non-JSON body: usage then comes from the
+          // response headers, exactly as when accounting read the body itself.
+          jsonBody = undefined;
         }
-      } catch {
-        // Encrypted (EHBP/Tinfoil) or non-JSON body: usage then comes from the
-        // response headers, exactly as when accounting read the body itself.
-        jsonBody = undefined;
       }
-    }
-    const accountingResponse = isSSE
-      ? prepared.response
-      : prepared.response.clone();
+      const accountingResponse = isSSE
+        ? prepared.response
+        : prepared.response.clone();
 
-    // `requestId` is documented as immediately available, so publish it before
-    // the response leaves: the SDK UUID when the request is tracked, otherwise
-    // the provider ID already read from a non-SSE body. SSE supplies it later,
-    // when the inspector sees one.
-    const immediateRequestId =
-      params.lifecycle?.requestId ??
-      (prepared.response as RoutstrResponse).upstreamResponseId;
-    if (immediateRequestId !== undefined) {
-      (prepared.response as RoutstrResponse).requestId = immediateRequestId;
-    }
-
-    const runFinalize = async (): Promise<number> => {
-      const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
-      const usage = capturedUsage ?? prepared.capturedUsage;
-      const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
-      if (upstreamResponseId !== undefined) {
-        (prepared.response as any).upstreamResponseId = upstreamResponseId;
+      // `requestId` is documented as immediately available, so publish it before
+      // the response leaves: the SDK UUID when the request is tracked, otherwise
+      // the provider ID already read from a non-SSE body. SSE supplies it later,
+      // when the inspector sees one.
+      const immediateRequestId =
+        params.lifecycle?.requestId ??
+        (prepared.response as RoutstrResponse).upstreamResponseId;
+      if (immediateRequestId !== undefined) {
+        (prepared.response as RoutstrResponse).requestId = immediateRequestId;
       }
-      const requestId = params.lifecycle?.requestId ?? upstreamResponseId;
-      const satsSpent = await this._handlePostResponseBalanceUpdate({
-        token: prepared.tokenUsed,
-        baseUrl: prepared.baseUrlUsed,
-        initialTokenBalance: prepared.tokenBalanceInSats,
-        initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
-        fallbackSatsSpent: usage?.satsCost,
-        response: accountingResponse,
-        responseBody: jsonBody,
-        modelId: prepared.modelId,
-        usage,
-        requestId,
-        clientApiKey: prepared.clientApiKey,
-      });
-      (prepared.response as any).satsSpent = satsSpent;
-      (prepared.response as any).usage = usage;
-      (prepared.response as any).requestId =
-        requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
-      return satsSpent;
-    };
 
-    // Exposed as `finalize()` so a proxy can await accounting once it has
-    // forwarded the body, and started now so accounting still happens when the
-    // caller ignores it. `satsSpent` and `usage` are filled in when it settles.
-    const finalizePromise = runFinalize().catch((error) => {
-      this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
-      return 0;
-    });
-    (prepared.response as any).finalize = () => finalizePromise;
-    return prepared.response;
+      const runFinalize = async (): Promise<number> => {
+        const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
+        const usage = capturedUsage ?? prepared.capturedUsage;
+        const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
+        if (upstreamResponseId !== undefined) {
+          (prepared.response as any).upstreamResponseId = upstreamResponseId;
+        }
+        const requestId = params.lifecycle?.requestId ?? upstreamResponseId;
+        const satsSpent = await this._handlePostResponseBalanceUpdate({
+          token: prepared.tokenUsed,
+          baseUrl: prepared.baseUrlUsed,
+          initialTokenBalance: prepared.tokenBalanceInSats,
+          initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
+          fallbackSatsSpent: usage?.satsCost,
+          response: accountingResponse,
+          responseBody: jsonBody,
+          modelId: prepared.modelId,
+          usage,
+          requestId,
+          clientApiKey: prepared.clientApiKey,
+        });
+        (prepared.response as any).satsSpent = satsSpent;
+        (prepared.response as any).usage = usage;
+        (prepared.response as any).requestId =
+          requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
+        return satsSpent;
+      };
+
+      // Exposed as `finalize()` so a proxy can await accounting once it has
+      // forwarded the body, and started now so accounting still happens when the
+      // caller ignores it. `satsSpent` and `usage` are filled in when it settles.
+      const finalizePromise = runFinalize()
+        .catch((error) => {
+          this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
+          return 0;
+        })
+        .finally(() => prepared.releaseHold?.());
+      (prepared.response as any).finalize = () => finalizePromise;
+      return prepared.response;
+    } catch (error) {
+      // Includes failures before the eager finalizer has taken ownership.
+      prepared.releaseHold?.();
+      throw error;
+    }
   }
 
   /**
@@ -782,6 +846,7 @@ export class RoutstrClient {
       capturedUsage?: UsageTrackingData;
       capturedResponseId?: string;
     }>;
+    releaseHold?: () => void;
   }> {
     const {
       path: requestPath,
@@ -992,6 +1057,7 @@ export class RoutstrClient {
       userCacheSecret,
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
+      reservedBalanceWaitMs: params.reservedBalanceWaitMs,
       lifecycle: params.lifecycle,
       transportState: params.transportState,
       // The SDK auto-pin marker must reach _handleErrorResponse to
@@ -1004,102 +1070,108 @@ export class RoutstrClient {
       requestedModelId: modelId,
     });
 
-    let tokenBalanceInSats = getBalanceInSats(tokenBalance, tokenBalanceUnit);
-    let initialTokenBalanceUnknown = tokenBalanceUnknown;
-    const baseUrlUsed = (response as any).baseUrl || baseUrl;
-    const tokenUsed = (response as any).token || token;
+    try {
+      let tokenBalanceInSats = getBalanceInSats(tokenBalance, tokenBalanceUnit);
+      let initialTokenBalanceUnknown = tokenBalanceUnknown;
+      const baseUrlUsed = (response as any).baseUrl || baseUrl;
+      const tokenUsed = (response as any).token || token;
 
-    // If failover occurred, use the initial balance captured when the
-    // failover token was created. Do not query here: by the time fetch returns,
-    // the provider may already have charged the request.
-    if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
-      if (typeof (response as any).initialTokenBalanceInSats === "number") {
-        tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
-        initialTokenBalanceUnknown = Boolean(
-          (response as any).initialTokenBalanceUnknown
-        );
-      } else {
-        initialTokenBalanceUnknown = true;
-      }
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    let processedResponse = response;
-    let capturedUsage: UsageTrackingData | undefined;
-    let capturedResponseId: string | undefined;
-    let usagePromise: Promise<{
-      capturedUsage?: UsageTrackingData;
-      capturedResponseId?: string;
-    }> = Promise.resolve({});
-
-    if (
-      !(response as any).passthrough &&
-      contentType.includes("text/event-stream") &&
-      response.body
-    ) {
-      // Tee the upstream Web stream: one branch goes untouched to the client,
-      // the other is consumed by an inspector that extracts usage / responseId.
-      const [clientStream, inspectStream] = response.body.tee();
-      const requestResponseLogId = (response as any).requestResponseLogId as
-        | string
-        | undefined;
-
-      processedResponse = new Response(clientStream, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      });
-
-      (processedResponse as any).lifecycleAttemptId = (response as any).lifecycleAttemptId;
-      (processedResponse as any).baseUrl = (response as any).baseUrl;
-      (processedResponse as any).token = (response as any).token;
-      (processedResponse as any).selectedMintUrl =
-        (response as any).selectedMintUrl;
-      (processedResponse as any).requestResponseLogId = requestResponseLogId;
-
-      usagePromise = inspectSSEWebStream(
-        inspectStream,
-        (usage) => {
-          capturedUsage = usage;
-          (processedResponse as any).usage = usage;
-        },
-        (responseId) => {
-          capturedResponseId = responseId;
-          (processedResponse as any).upstreamResponseId = responseId;
-        },
-        {
-          onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
-          onRawChunk: (_chunk, sequence, text) => {
-            void this.requestResponseLogSink?.logResponseChunk?.(
-              requestResponseLogId,
-              sequence,
-              text
-            );
-          },
+      // If failover occurred, use the initial balance captured when the
+      // failover token was created. Do not query here: by the time fetch returns,
+      // the provider may already have charged the request.
+      if (baseUrlUsed !== baseUrl || tokenUsed !== token) {
+        if (typeof (response as any).initialTokenBalanceInSats === "number") {
+          tokenBalanceInSats = (response as any).initialTokenBalanceInSats;
+          initialTokenBalanceUnknown = Boolean(
+            (response as any).initialTokenBalanceUnknown
+          );
+        } else {
+          initialTokenBalanceUnknown = true;
         }
-      ).then(async (result) => {
-        await this.requestResponseLogSink?.logResponseEnd?.(requestResponseLogId);
-        return result;
-      }).catch(async (error) => {
-        await this.requestResponseLogSink?.logResponseError?.(requestResponseLogId, error);
-        throw error;
-      });
+      }
 
-      (processedResponse as any).usagePromise = usagePromise;
+      const contentType = response.headers.get("content-type") || "";
+      let processedResponse = response;
+      let capturedUsage: UsageTrackingData | undefined;
+      let capturedResponseId: string | undefined;
+      let usagePromise: Promise<{
+        capturedUsage?: UsageTrackingData;
+        capturedResponseId?: string;
+      }> = Promise.resolve({});
+
+      if (
+        !(response as any).passthrough &&
+        contentType.includes("text/event-stream") &&
+        response.body
+      ) {
+        // Tee the upstream Web stream: one branch goes untouched to the client,
+        // the other is consumed by an inspector that extracts usage / responseId.
+        const [clientStream, inspectStream] = response.body.tee();
+        const requestResponseLogId = (response as any).requestResponseLogId as
+          | string
+          | undefined;
+
+        processedResponse = new Response(clientStream, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+
+        (processedResponse as any).lifecycleAttemptId = (response as any).lifecycleAttemptId;
+        (processedResponse as any).baseUrl = (response as any).baseUrl;
+        (processedResponse as any).token = (response as any).token;
+        (processedResponse as any).selectedMintUrl =
+          (response as any).selectedMintUrl;
+        (processedResponse as any).requestResponseLogId = requestResponseLogId;
+
+        usagePromise = inspectSSEWebStream(
+          inspectStream,
+          (usage) => {
+            capturedUsage = usage;
+            (processedResponse as any).usage = usage;
+          },
+          (responseId) => {
+            capturedResponseId = responseId;
+            (processedResponse as any).upstreamResponseId = responseId;
+          },
+          {
+            onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
+            onRawChunk: (_chunk, sequence, text) => {
+              void this.requestResponseLogSink?.logResponseChunk?.(
+                requestResponseLogId,
+                sequence,
+                text
+              );
+            },
+          }
+        ).then(async (result) => {
+          await this.requestResponseLogSink?.logResponseEnd?.(requestResponseLogId);
+          return result;
+        }).catch(async (error) => {
+          await this.requestResponseLogSink?.logResponseError?.(requestResponseLogId, error);
+          throw error;
+        });
+
+        (processedResponse as any).usagePromise = usagePromise;
+      }
+
+      return {
+        response: processedResponse,
+        tokenUsed,
+        baseUrlUsed,
+        tokenBalanceInSats,
+        tokenBalanceUnknown: initialTokenBalanceUnknown,
+        modelId,
+        capturedUsage,
+        capturedResponseId,
+        clientApiKey,
+        usagePromise,
+        releaseHold: (response as any).releaseHold,
+      };
+    } catch (error) {
+      (response as any).releaseHold?.();
+      throw error;
     }
-
-    return {
-      response: processedResponse,
-      tokenUsed,
-      baseUrlUsed,
-      tokenBalanceInSats,
-      tokenBalanceUnknown: initialTokenBalanceUnknown,
-      modelId,
-      capturedUsage,
-      capturedResponseId,
-      clientApiKey,
-      usagePromise,
-    };
   }
 
   /**
@@ -1151,6 +1223,8 @@ export class RoutstrClient {
     headers: Record<string, string>;
     baseHeaders: Record<string, string>;
     retryCount?: number;
+    reservedBalanceWaitMs?: number;
+    reservationWait?: ReservationWaitState;
     /**
      * Same-provider retries already spent for `baseUrl` after transient socket
      * failures. Reset to 0 whenever the request moves to another provider.
@@ -1215,8 +1289,9 @@ export class RoutstrClient {
       modelId: params.selectedModel?.id, modelPath: this._findModelPathHeader(params.baseHeaders),
       kind: params.attemptKind });
     if (params.transportState) params.transportState.attemptId = attempt?.attemptId;
-    params = { ...params, attemptKind: undefined };
+    params = { ...params, attemptKind: undefined, reservationWait: params.reservationWait ?? {} };
     let headersReceived = false;
+    const releaseHold = trackInFlight(providerKey(baseUrl, token), signal);
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
       let requestLogId: string | undefined;
@@ -1260,6 +1335,7 @@ export class RoutstrClient {
             signal,
           });
       headersReceived = true;
+      if (!response.ok) releaseHold();
       if (params.transportState) params.transportState.nodeRequestId = response.headers.get("x-routstr-request-id") ?? undefined;
       if (attempt) {
         (response as any).lifecycleAttemptId = attempt.attemptId;
@@ -1358,8 +1434,10 @@ export class RoutstrClient {
         void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
       }
 
+      (response as any).releaseHold = releaseHold;
       return response;
     } catch (error: any) {
+      releaseHold();
       if (attempt && !headersReceived) await params.lifecycle?.updateAttempt(attempt.attemptId, {
         endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
         failurePhase: "network", errorType: error?.name,
@@ -1511,6 +1589,47 @@ export class RoutstrClient {
     );
   }
 
+  /** Inference reservations belong to the provider/key, regardless of funding wallet.
+   *  Gross balance is only eligibility: settlement may charge rather than refund it. */
+  private async _waitForReservedBalance(params: {
+    baseUrl: string; token: string; requiredSats: number; signal?: AbortSignal;
+    reservedBalanceWaitMs?: number; reservationWait?: ReservationWaitState;
+  }, priorRequests: Promise<void>[] = []): Promise<"settled" | "sufficient" | false> {
+    const budget = params.reservedBalanceWaitMs ?? DEFAULT_RESERVED_BALANCE_WAIT_MS;
+    if (!Number.isFinite(budget) || budget <= 0) return false;
+    const key = providerKey(params.baseUrl, params.token);
+    if (!priorRequests.length && !inFlightRequests.get(key)?.size) return false;
+    const state = params.reservationWait ??= {};
+    const deadline = state.deadline ??= Date.now() + budget;
+    // A request may finish while the failed funding attempt is settling.
+    let settled = priorRequests.some(request => !inFlightRequests.get(key)?.has(request));
+    try {
+      while (Date.now() < deadline) {
+        throwIfFundingAborted(params.signal);
+        // Snapshot BEFORE reading: a hold settling during the read must still wake us.
+        const requests = [...(inFlightRequests.get(key) ?? [])];
+        const result = await withinReservationBudget(
+          this.balanceManager.getTokenBalance(params.token, params.baseUrl), deadline, params.signal
+        );
+        if (!result || Date.now() >= deadline) return false;
+        settled ||= requests.some(request => !inFlightRequests.get(key)?.has(request));
+        const balance = result.value;
+        const available = getAvailableBalanceInSats(balance.amount, balance.unit);
+        const reserved = getBalanceInSats(balance.reserved ?? 0, balance.unit);
+        if (balance.balanceUnknown || balance.isInvalidApiKey || !Number.isFinite(available) ||
+            !Number.isFinite(reserved)) return false;
+        if (available >= params.requiredSats) return settled ? "settled" : "sufficient";
+        if (!requests.length || reserved <= 0 || available + reserved < params.requiredSats) return false;
+        if (!await withinReservationBudget(Promise.race(requests), deadline, params.signal)) return false;
+        settled = true;
+      }
+    } catch (error) {
+      if (params.signal?.aborted || (error as any)?.name === "AbortError") throw error;
+      this._log("WARN", "[RoutstrClient] Could not revalidate reserved balance", error);
+    }
+    return false;
+  }
+
   /**
    * Handle error responses with failover
    */
@@ -1531,6 +1650,8 @@ export class RoutstrClient {
       baseHeaders: Record<string, string>;
       tinfoilEnabled?: boolean;
       signal?: AbortSignal;
+      reservedBalanceWaitMs?: number;
+      reservationWait?: ReservationWaitState;
       /** Same-provider transient-socket retries spent for this provider. */
       networkRetryCount?: number;
       /** SDK-pinned model path for this request, if any. */
@@ -1867,6 +1988,10 @@ export class RoutstrClient {
       } else {
         let balanceValidated = false;
         let balanceSufficient = false;
+        let reservationRetry = false;
+        let reservationWaitResult: "settled" | "sufficient" | false;
+        let availableBalance = 0;
+        let reservedBalance = 0;
 
         try {
           const currentBalanceInfo = await this.balanceManager.getTokenBalance(
@@ -1884,11 +2009,11 @@ export class RoutstrClient {
             // compares the request price against. Do not subtract `reserved`
             // again: that understates available funds by the held amount and
             // inflates the resulting topup by the same margin.
-            const availableBalance = getAvailableBalanceInSats(
+            availableBalance = getAvailableBalanceInSats(
               currentBalanceInfo.amount,
               currentBalanceInfo.unit
             );
-            const reservedBalance = getBalanceInSats(
+            reservedBalance = getBalanceInSats(
               currentBalanceInfo.reserved ?? 0,
               currentBalanceInfo.unit
             );
@@ -1927,9 +2052,10 @@ export class RoutstrClient {
         } else {
           // A proactive (pre-request) topup may already be in flight for
           // this key — join it instead of stacking a second deposit.
+          const pendingReservations = [...(inFlightRequests.get(providerKey(baseUrl, params.token)) ?? [])];
           await params.lifecycle?.event("topup_started", undefined, { baseUrl });
           const topupResult = await this._topUpOnce(
-            `${baseUrl}:${params.token}`,
+            providerKey(baseUrl, params.token),
             (signal) =>
               this.balanceManager.ensureBalance({
                 signal, mintUrl, baseUrl, token: params.token,
@@ -1966,6 +2092,15 @@ export class RoutstrClient {
                 topupResult.maxMintUrl ?? ""
               );
               tryNextProvider = true;
+            } else if (
+              message.includes("Insufficient balance") &&
+              reservedBalance > 0 &&
+              availableBalance + reservedBalance >= params.requiredSats &&
+              (reservationWaitResult = await this._waitForReservedBalance(params, pendingReservations))
+            ) {
+              // Only observed settlement earns a retry outside the ordinary cap.
+              reservationRetry = reservationWaitResult === "settled";
+              this._log("DEBUG", `[RoutstrClient] Reserved balance became available on ${baseUrl}; retrying`);
             } else if (message.includes("Insufficient balance")) {
               // Parse decimals and the largest-mint hint so the final 402
               // JSON reports the real shortfall instead of 0/"".
@@ -2010,7 +2145,7 @@ export class RoutstrClient {
           }
         }
         if (!tryNextProvider) {
-          if (retryCount < MAX_RETRIES_PER_PROVIDER) {
+          if (reservationRetry || retryCount < MAX_RETRIES_PER_PROVIDER) {
             this._log(
               "DEBUG",
               `[RoutstrClient] _handleErrorResponse: Retrying 402 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
@@ -2024,7 +2159,7 @@ export class RoutstrClient {
                 params.tinfoilEnabled,
                 params.selectedModel?.id
               ),
-              retryCount: retryCount + 1,
+              retryCount: reservationRetry ? retryCount : retryCount + 1,
             });
           } else {
             this._log(
@@ -3244,7 +3379,7 @@ export class RoutstrClient {
     const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
     if (snapshotAvailableSats >= targetSats) return;
 
-    const key = `${snapshot.baseUrl}:${snapshot.token}`;
+    const key = providerKey(snapshot.baseUrl, snapshot.token);
     const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
