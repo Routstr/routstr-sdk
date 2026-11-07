@@ -227,3 +227,34 @@ Inference routing now exposes an SDK lifecycle UUID separately from node and
 upstream response IDs, with persistent request/attempt/event traces. See
 [request lifecycle tracking](./REQUEST_LIFECYCLE.md) for driver setup, daemon
 integration, retention, privacy, streaming finalization, and usage compatibility.
+
+### Structured core payment errors
+
+`parseCoreError(body, status, requestId?)` supports both the canonical top-level
+`error` and its `detail.error` mirror, plus older string/flat `detail` responses.
+For new core HTTP 402 responses it exposes validated non-negative integer
+`requiredMsats`, `availableMsats`, `shortfallMsats`, optional `reservedMsats`,
+`model`, `unit`, and the unmodified `pricing` audit trail. Header request IDs
+retain precedence over `request_id` in the body.
+
+```ts
+import { parseCoreError, isPaymentRequiredError } from "@routstr/sdk";
+
+const parsed = parseCoreError(bodyText, response.status);
+if (isPaymentRequiredError(parsed)) {
+  console.log(parsed.requiredMsats / 1000, "sats required", parsed.pricing);
+}
+```
+
+The guard requires a local balance discriminator, status 402, `unit: "msat"`,
+and all three canonical amounts. Old flat X-Cashu errors may expose only
+`requiredMsats`; missing balances are never invented. Old-node English balance
+messages remain a deprecated compatibility fallback only when structured details
+are absent. Structured numbers always take precedence over message text.
+
+Automatic API-key 402 funding uses the node's structured requirement instead of
+cached model pricing, while still checking the key's **current** available balance
+before depositing. Upstream-provider 402s and spending-limit errors do not authorize
+top-ups. `toInsufficientBalanceError(parsed)` converts complete local balances into
+the existing error's **satoshi** units; `error.parsedError` retains millisatoshi
+amounts, pricing, and request context. Retry and provider-failover limits are unchanged.

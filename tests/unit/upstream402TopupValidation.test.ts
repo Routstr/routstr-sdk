@@ -187,6 +187,57 @@ describe("RoutstrClient 402 top-up validation", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
 
+  const structuredDetails = {
+    unit: "msat", required_msats: 28989, available_msats: 21000, shortfall_msats: 7989,
+    pricing: { base_source: "model_sats_pricing", max_cost_formula: "context_only" },
+  };
+  const structuredError = {
+    type: "insufficient_quota", code: "insufficient_balance",
+    message: "Insufficient balance: 15.2208 sats required; 1 sats available.",
+    details: structuredDetails,
+  };
+
+  it("sizes a top-up using server msats rather than the cached estimate or English message", async () => {
+    const { client } = createClient();
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 21000, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
+    const topUp = vi.spyOn(client.getBalanceManager(), "topUp").mockResolvedValue({
+      success: true, message: "ok",
+    });
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(Response.json({}));
+    await handle402(client, JSON.stringify({ error: structuredError }));
+    expect(topUp).toHaveBeenCalledWith(expect.objectContaining({ amount: (28.989 - 21) * 1.4 }));
+  });
+
+  it("retains fresh balance validation rather than trusting stale 402 available_msats", async () => {
+    const { client } = createClient();
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 30000, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
+    const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
+    const retry = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(Response.json({}));
+    await handle402(client, JSON.stringify({ error: structuredError }));
+    expect(topUp).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
+  it("maps structured top-up shortfalls to sats and exposes pricing after failover exhaustion", async () => {
+    const { parseCoreError } = await import("../../core/errorTypes");
+    const { client } = createClient();
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 0, reserved: 0, unit: "msat", apiKey: API_KEY,
+    });
+    const parsedError = parseCoreError(JSON.stringify({ error: structuredError, request_id: "node-id" }), 402);
+    vi.spyOn(client.getBalanceManager(), "topUp").mockResolvedValue({
+      success: false, message: "no English amount matching required", parsedError,
+    });
+    await expect(handle402(client, JSON.stringify({ error: structuredError }))).rejects.toMatchObject({
+      name: "InsufficientBalanceError", required: 28.989, available: 21,
+      parsedError: { pricing: structuredDetails.pricing, requestId: "node-id" },
+    });
+  });
+
   it("never tops up less than the minimum deposit", async () => {
     const { client } = createClient();
     const balanceManager = client.getBalanceManager();

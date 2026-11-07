@@ -7,6 +7,9 @@
  * field for finer granularity. The SDK parses these to classify failures
  * instead of treating all errors generically.
  *
+ * Canonical HTTP 402 errors add msat amounts and a pricing audit trail in
+ * `error.details`; legacy envelopes remain supported.
+ *
  * Envelope formats vary by endpoint:
  *
  * - **X-Cashu header payments** (chat completions + Responses API):
@@ -91,6 +94,7 @@ export const CoreErrorCode = {
   REFUND_ONGOING_REQUESTS: "refund_ongoing_requests",
   /** The API key's available balance is below the request requirement */
   INSUFFICIENT_BALANCE: "insufficient_balance",
+  MINIMUM_BALANCE_REQUIRED: "minimum_balance_required",
   /** A configured spending cap was reached; adding funds will not fix it */
   BALANCE_LIMIT_EXCEEDED: "balance_limit_exceeded",
 } as const;
@@ -110,6 +114,15 @@ export interface ParsedCoreError {
   message?: string;
   /** Additional details object from the error envelope */
   details?: Record<string, unknown>;
+  /** Canonical payment amounts are non-negative safe integers in millisatoshis. */
+  requiredMsats?: number;
+  availableMsats?: number;
+  shortfallMsats?: number;
+  reservedMsats?: number;
+  model?: string;
+  unit?: string;
+  /** Unmodified pricing audit trail; fields depend on the core pricing source. */
+  pricing?: Record<string, unknown>;
   /** HTTP status code from the response */
   status?: number;
   /** The request ID from headers or response body */
@@ -118,6 +131,31 @@ export interface ParsedCoreError {
   raw: boolean;
   /** `true` when the response body was valid JSON */
   json?: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMsats(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** A fully structured local payment shortfall, not an upstream-provider 402. */
+export interface PaymentRequiredError extends ParsedCoreError {
+  type: "insufficient_quota" | "minimum_balance_required";
+  code: "insufficient_balance" | "minimum_balance_required";
+  requiredMsats: number;
+  availableMsats: number;
+  shortfallMsats: number;
+  unit: "msat";
+}
+
+export function isPaymentRequiredError(e: ParsedCoreError): e is PaymentRequiredError {
+  return e.status === 402 && e.unit === "msat" &&
+    (e.type === CoreErrorType.INSUFFICIENT_QUOTA || e.type === CoreErrorType.MINIMUM_BALANCE_REQUIRED) &&
+    (e.code === CoreErrorCode.INSUFFICIENT_BALANCE || e.code === CoreErrorCode.MINIMUM_BALANCE_REQUIRED) &&
+    isMsats(e.requiredMsats) && isMsats(e.availableMsats) && isMsats(e.shortfallMsats);
 }
 
 /**
@@ -159,68 +197,64 @@ export function parseCoreError(
 
   const obj = data as Record<string, unknown>;
 
-  // Extract request_id from top level (X-Cashu envelope)
-  if (obj.request_id && !result.requestId) {
-    result.requestId = String(obj.request_id);
+  if (typeof obj.request_id === "string" && !result.requestId) {
+    result.requestId = obj.request_id;
   }
 
-  // Format 1: top-level `error` object (X-Cashu header payments)
-  // { "error": { "type": "...", "message": "...", "code": "..." } }
-  if (obj.error && typeof obj.error === "object") {
-    const err = obj.error as Record<string, unknown>;
+  // The canonical top-level error wins over the compatibility mirror.
+  const detail = isRecord(obj.detail) ? obj.detail : undefined;
+  const err = isRecord(obj.error) ? obj.error
+    : isRecord(detail?.error) ? detail.error
+    : detail;
+  if (err && (err !== detail || err.type || err.code || err.message)) {
     result.type = typeof err.type === "string" ? err.type : undefined;
     result.code = typeof err.code === "string" ? err.code : undefined;
     result.message = typeof err.message === "string" ? err.message : undefined;
-    result.details =
-      typeof err.details === "object" && err.details !== null
-        ? (err.details as Record<string, unknown>)
-        : undefined;
+    result.details = isRecord(err.details) ? err.details : undefined;
+    const d = result.details;
+    if (d) {
+      if (isMsats(d.required_msats)) result.requiredMsats = d.required_msats;
+      if (isMsats(d.available_msats)) result.availableMsats = d.available_msats;
+      if (isMsats(d.shortfall_msats)) result.shortfallMsats = d.shortfall_msats;
+      if (isMsats(d.reserved_msats)) result.reservedMsats = d.reserved_msats;
+      if (typeof d.model === "string") result.model = d.model;
+      if (typeof d.unit === "string") result.unit = d.unit;
+      if (isRecord(d.pricing)) result.pricing = d.pricing;
+    } else if (err === detail && err.type === CoreErrorType.MINIMUM_BALANCE_REQUIRED) {
+      result.code ??= CoreErrorCode.MINIMUM_BALANCE_REQUIRED;
+      if (isMsats(err.amount_required_msat)) {
+        result.requiredMsats = err.amount_required_msat;
+        result.unit = "msat";
+      }
+      if (typeof err.model === "string") result.model = err.model;
+      if (typeof err.reason === "string") result.message ??= err.reason;
+    } else if (err.details === undefined && status === 402 && result.type === CoreErrorType.INSUFFICIENT_QUOTA &&
+      result.code === CoreErrorCode.INSUFFICIENT_BALANCE) {
+      // TODO: retire this compatibility fallback once old nodes are uncommon.
+      // Never consult English amounts when a structured details object exists.
+      const message = result.message ?? "";
+      const required = message.match(/([\d.]+) sats(?: \((\d+) msats\))? required\b/);
+      const available = message.match(/([\d.]+) sats(?: \((\d+) msats\))? available\b/);
+      const amount = (match: RegExpMatchArray | null) => {
+        const n = match ? (match[2] ? Number(match[2]) : Number(match[1]) * 1000) : undefined;
+        return isMsats(n) ? n : undefined;
+      };
+      result.requiredMsats = amount(required);
+      result.availableMsats = amount(available);
+      if (result.requiredMsats !== undefined && result.availableMsats !== undefined) {
+        result.shortfallMsats = Math.max(0, result.requiredMsats - result.availableMsats);
+        result.unit = "msat";
+      }
+    }
     result.raw = false;
     return result;
   }
 
-  // Format 2: `detail` wrapping an `error` object (Bearer token)
-  // { "detail": { "error": { "type": "...", "code": "...", "message": "..." } } }
-  if (
-    obj.detail &&
-    typeof obj.detail === "object" &&
-    (obj.detail as Record<string, unknown>).error &&
-    typeof (obj.detail as Record<string, unknown>).error === "object"
-  ) {
-    const err = (obj.detail as Record<string, unknown>).error as Record<
-      string,
-      unknown
-    >;
-    result.type = typeof err.type === "string" ? err.type : undefined;
-    result.code = typeof err.code === "string" ? err.code : undefined;
-    result.message = typeof err.message === "string" ? err.message : undefined;
-    result.details =
-      typeof err.details === "object" && err.details !== null
-        ? (err.details as Record<string, unknown>)
-        : undefined;
-    result.raw = false;
-    return result;
-  }
-
-  // Format 3: `detail` as a plain string (POST /v1/wallet/topup)
-  // { "detail": "Cashu mint is unreachable" }
+  // Legacy plain-string detail (e.g. wallet/topup).
   if (typeof obj.detail === "string") {
     result.message = obj.detail;
     result.raw = false;
     return result;
-  }
-
-  // Format 4: `detail` is an object with type/code/message directly
-  if (obj.detail && typeof obj.detail === "object") {
-    const det = obj.detail as Record<string, unknown>;
-    if (det.type || det.code || det.message) {
-      result.type = typeof det.type === "string" ? det.type : undefined;
-      result.code = typeof det.code === "string" ? det.code : undefined;
-      result.message =
-        typeof det.message === "string" ? det.message : undefined;
-      result.raw = false;
-      return result;
-    }
   }
 
   // Fallback: extract whatever fields we can find
