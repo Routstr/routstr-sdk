@@ -153,9 +153,57 @@ describe("client lifecycle terminal boundary", () => {
       "in_progress",
     );
     await response.text();
+    await response.finalize();
     expect((await driver.getTrace(response.requestId))?.request.outcome).toBe(
       "succeeded",
     );
+  });
+  it("delivers EOF before accounting settles and retains awaitable once-only finalization", async () => {
+    const driver = createMemoryRequestLifecycleDriver();
+    const c = client();
+    c.requestLifecycleDriver = driver;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    c._prepareRoutedRequestWithMintFailover = vi.fn(async () => prepared(
+      new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+    ));
+    c._handlePostResponseBalanceUpdate = vi.fn(async () => { await gate; return 7; });
+    const abort = new AbortController();
+    const response = await c.routeRequest({ ...params, signal: abort.signal });
+    try {
+      expect(await Promise.race([
+        response.text(),
+        new Promise(resolve => setTimeout(() => resolve("EOF BLOCKED"), 100)),
+      ])).toBe("data: [DONE]\n\n");
+      let settled = false;
+      const finalizing = response.finalize().then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      // Disconnect after delivered EOF must not change the completed transport to aborted.
+      abort.abort();
+      release();
+      await finalizing;
+      expect(await response.finalize()).toBe(7);
+      expect(c._handlePostResponseBalanceUpdate).toHaveBeenCalledTimes(1);
+      const trace = await driver.getTrace(response.requestId);
+      expect(trace?.request.outcome).toBe("succeeded");
+      expect(trace?.events.filter(e => e.type === "request_finished")).toHaveLength(1);
+    } finally { release(); }
+  });
+  it("retains rejected settlement without rejecting an already delivered body", async () => {
+    const driver = createMemoryRequestLifecycleDriver();
+    const c = client();
+    c.requestLifecycleDriver = driver;
+    const original = new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    const accounting = vi.fn(async () => { throw new Error("accounting failed"); });
+    Object.assign(original, { finalize: accounting });
+    c._routeRequest = vi.fn(async () => original);
+    const response = await c.routeRequest(params);
+    expect(await response.text()).toBe("data: [DONE]\n\n");
+    await expect(response.finalize()).rejects.toThrow("accounting failed");
+    await expect(response.finalize()).rejects.toThrow("accounting failed");
+    expect((await driver.getTrace(response.requestId))?.request.outcome).toBe("failed");
+    expect(accounting).toHaveBeenCalledTimes(1);
   });
   it("marks SSE read errors failed and cancellations aborted, including finalize races", async () => {
     for (const cancel of [false, true]) {
@@ -470,6 +518,7 @@ it("detects HTTP200 SSE error envelopes even when the stream closes cleanly", as
   try {
     const response = await c.routeRequest(params);
     await response.text();
+    await response.finalize();
     const trace = await driver.getTrace(response.requestId);
     expect(trace?.request.outcome).toBe("failed");
     expect(trace?.attempts[0]).toMatchObject({

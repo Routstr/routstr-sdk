@@ -112,7 +112,6 @@ function makeClient(deps: { usageTrackingDriver?: unknown; sdkStore?: unknown } 
   client.sdkStore = deps.sdkStore;
   client._log = vi.fn();
   client._checkBalance = vi.fn().mockResolvedValue(undefined);
-  client._headerSatsCost = vi.fn().mockReturnValue(0);
   client.balanceManager = {
     getTokenBalance: vi
       .fn()

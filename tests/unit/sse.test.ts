@@ -46,6 +46,7 @@ describe("createSSEParserTransform", () => {
       totalTokens: 15,
       cost: 0.001,
       satsCost: 100,
+      reportedSatsCost: 100,
     });
   });
 
@@ -112,6 +113,7 @@ describe("inspectSSEWebStream", () => {
       totalTokens: 10,
       cost: 0.002,
       satsCost: 42,
+      reportedSatsCost: 42,
     });
     expect(result.capturedResponseId).toBe("chatcmpl-web");
     expect(result.capturedUsage).toEqual(usage);
@@ -164,4 +166,47 @@ describe("native SSE lifecycle correlation", () => {
     await inspectSSEWebStream(stream, () => {}, undefined, { onErrorEnvelope: () => { failed = true; } });
     expect(failed).toBe(true);
   });
+});
+
+
+describe("SSE reported sats-cost merging", () => {
+  async function inspect(payloads: unknown[], web: boolean) {
+    const events = payloads.map(p => `data: ${JSON.stringify(p)}\n\n`);
+    const updates: any[] = [];
+    if (web) {
+      const stream = new ReadableStream<Uint8Array>({ start(controller) {
+        for (const event of events) controller.enqueue(new TextEncoder().encode(event));
+        controller.close();
+      } });
+      await inspectSSEWebStream(stream, usage => updates.push(usage));
+    } else {
+      await pipeline(Readable.from(events), createSSEParserTransform(usage => updates.push(usage)),
+        new Writable({ write(_chunk, _encoding, callback) { callback(); } }));
+    }
+    return updates;
+  }
+
+  for (const web of [false, true]) {
+    it(`preserves a later explicit zero after complete usage (${web ? "Web" : "Node"})`, async () => {
+      const updates = await inspect([
+        { id: "gen-1", provider: "provider", usage: { total_tokens: 1 }, cost: { total_msats: 125 } },
+        { cost: { total_msats: 0 } },
+        { usage: { total_tokens: 2 } },
+      ], web);
+      expect(updates).toHaveLength(3);
+      expect(updates[0]).toMatchObject({ satsCost: 0.125, reportedSatsCost: 0.125 });
+      expect(updates[1]).toMatchObject({ satsCost: 0, reportedSatsCost: 0, totalMsats: 0 });
+      expect(updates[2]).toMatchObject({ satsCost: 0, reportedSatsCost: 0, totalMsats: 0, totalTokens: 2 });
+    });
+
+    it(`notifies when only cost provenance changes (${web ? "Web" : "Node"})`, async () => {
+      const updates = await inspect([
+        { usage: { total_tokens: 1 } },
+        { usage: { cost_sats: 0 } },
+      ], web);
+      expect(updates).toHaveLength(2);
+      expect(updates[0]).not.toHaveProperty("reportedSatsCost");
+      expect(updates[1]).toMatchObject({ satsCost: 0, reportedSatsCost: 0, totalTokens: 1 });
+    });
+  }
 });

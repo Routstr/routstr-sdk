@@ -243,7 +243,9 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
  * Route an OpenAI-compatible request to the cheapest provider.
  *
  * The returned response carries `finalize()`, which settles accounting: the
- * provider balance read and the usage row. It is already running and never
+ * provider balance read and the usage row. In API-key mode its result is the
+ * provider-reported request cost, or 0 if unavailable (not a wallet delta).
+ * It is already running and never
  * holds the response, so a proxy should forward the body first and then
  * `await response.finalize()` instead of waiting on it up front.
  */
