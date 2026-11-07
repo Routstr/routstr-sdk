@@ -218,6 +218,28 @@ for (const [name, factory] of factories)
         .toBe(expected);
       expect(JSON.stringify(trace)).not.toContain("SECRET");
     });
+    it.each([512, 513, 532])("persists stable whole fields at serialized length %i", async (length) => {
+      const driver = factory();
+      const c = await beginRequestLifecycle({ driver, method: "POST", path: "/v1/chat/completions" });
+      const id = "a/".repeat(59) + "aa";
+      const fields = length === 532
+        ? { url: "https://provider.test/v1", "model-id": id, endpoint: id }
+        : { url: "https://provider.test/", "model-id": "a/b", endpoint: "v/f" };
+      if (length !== 532)
+        fields.url += "x".repeat(length - new URLSearchParams(fields).toString().length);
+      const input = new URLSearchParams(fields).toString();
+      expect(input.length).toBe(length);
+      const expected = new URLSearchParams(fields);
+      if (length > 512) expected.delete("endpoint");
+      const a = await c.beginAttempt({ baseUrl: "https://provider.test", modelPath: input });
+      expect((await driver.getTrace(c.requestId))!.attempts[0].modelPath).toBe(expected.toString());
+      await c.updateAttempt(a.attemptId, { modelPath: input });
+      await c.event("response_received", { modelPath: input });
+      const trace = (await driver.getTrace(c.requestId))!;
+      expect(trace.attempts[0].modelPath).toBe(expected.toString());
+      expect(trace.events.find((event) => event.type === "response_received")?.data?.modelPath)
+        .toBe(expected.toString());
+    });
     it("does not persist payloads, secrets, raw errors, or URL credentials", async () => {
       const driver = factory();
       const c = await beginRequestLifecycle({

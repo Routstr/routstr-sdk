@@ -43,3 +43,55 @@ describe("model-path route identifiers", () => {
     expect(safeModelPath("venice/fp8")).toBe("[redacted-model-path]");
   });
 });
+
+
+describe("serialized model-path budget", () => {
+  it("omits overflowing slash identifiers whole and remains idempotent", () => {
+    const id = "a/".repeat(59) + "aa";
+    const input = new URLSearchParams({
+      url: "https://provider.test/v1", "model-id": id, endpoint: id,
+    }).toString();
+    expect(input.length).toBe(532);
+    const expected = new URLSearchParams({
+      url: "https://provider.test/v1", "model-id": id,
+    }).toString();
+    expect(safeModelPath(input)).toBe(expected);
+    expect(safeModelPath(expected)).toBe(expected);
+  });
+
+  it.each([512, 513])("budgets encoded fields at %i characters", (length) => {
+    const fields = { url: "https://provider.test/", "model-id": "a/b", endpoint: "v/f" };
+    const padding = length - new URLSearchParams(fields).toString().length;
+    fields.url += "x".repeat(padding);
+    const input = new URLSearchParams(fields).toString();
+    expect(input.length).toBe(length);
+    const expected = new URLSearchParams(fields);
+    if (length > 512) expected.delete("endpoint");
+    const result = safeModelPath(input);
+    expect(result).toBe(expected.toString());
+    expect(result.length).toBeLessThanOrEqual(512);
+    expect(safeModelPath(result)).toBe(result);
+  });
+
+  it("can retain an endpoint after omitting an over-budget model ID", () => {
+    const fields = {
+      url: "https://provider.test/" + "x".repeat(300),
+      "model-id": "a/".repeat(59) + "aa",
+      endpoint: "v/f",
+    };
+    const expected = new URLSearchParams({ url: fields.url, endpoint: fields.endpoint }).toString();
+    const result = safeModelPath(new URLSearchParams(fields).toString());
+    expect(result).toBe(expected);
+    expect(safeModelPath(result)).toBe(result);
+  });
+
+  it("omits oversized URLs whole, retaining other safe fields", () => {
+    const url = `https://user:SECRET@provider.test/${"x".repeat(600)}?key=SECRET#SECRET`;
+    const expected = new URLSearchParams({ "model-id": "a/b", endpoint: "v/f" }).toString();
+    const result = safeModelPath(new URLSearchParams({ url, "model-id": "a/b", endpoint: "v/f" }).toString());
+    expect(result).toBe(expected);
+    expect(safeModelPath(result)).toBe(result);
+    expect(safeModelPath(new URLSearchParams({ url }).toString())).toBe("[redacted-model-path]");
+    expect(safeModelPath("[redacted-model-path]")).toBe("[redacted-model-path]");
+  });
+});
