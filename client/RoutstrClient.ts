@@ -1727,23 +1727,77 @@ export class RoutstrClient {
         !(Object.values(CoreErrorType) as string[]).includes(parsedError.type ?? ""));
     // Keep only diagnostic fields, never raw envelopes containing refund proofs.
     if (aggregateFailure) {
-      const inputStrings: string[] = [];
-      const collectInput = (value: unknown): void => {
-        if (typeof value === "string" && value.length > 0) inputStrings.push(value);
-        else if (Array.isArray(value)) value.forEach(collectInput);
-        else if (value && typeof value === "object") {
-          for (const [name, child] of Object.entries(value)) {
-            if (["content", "text", "input", "messages"].includes(name)) collectInput(child);
+      // Match only the ORIGINAL diagnostic. Sequential replacement can expand
+      // markers recursively and can hide a credential prefix before its payload
+      // is recognized. Explicit budgets fail closed on adversarial input sizes.
+      const secrets = new Set<string>();
+      let inputBytes = 0;
+      let visits = 0;
+      let overBudget = false;
+      const addSecret = (value: string | undefined): void => {
+        if (!value || secrets.has(value)) return;
+        inputBytes += value.length;
+        if (secrets.size >= 512 || inputBytes > 65536) overBudget = true;
+        else secrets.add(value);
+      };
+      addSecret(params.token);
+      addSecret(xCashuRefundToken);
+      const collectInput = (value: unknown, depth = 0): void => {
+        if (overBudget) return;
+        if (++visits > 4096 || depth > 32) { overBudget = true; return; }
+        if (typeof value === "string") addSecret(value);
+        else if (Array.isArray(value)) {
+          for (const child of value) {
+            collectInput(child, depth + 1);
+            if (overBudget) break;
+          }
+        } else if (value && typeof value === "object") {
+          // Only supported user-input branches; do not redact parameter names
+          // or model identifiers needed to explain a validation error.
+          for (const name of ["content", "text", "input", "messages", "prompt", "instructions"]) {
+            if (Object.prototype.hasOwnProperty.call(value, name)) {
+              collectInput((value as Record<string, unknown>)[name], depth + 1);
+            }
           }
         }
       };
       collectInput(params.body);
-      const redact = (value: string) => [params.token, xCashuRefundToken, ...inputStrings]
-        .filter((secret): secret is string => !!secret)
-        .reduce((text, secret) => text.split(secret).join("[REDACTED]"), value)
-        .replace(/cashu[AB][A-Za-z0-9_-]+/g, "[REDACTED]")
-        .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-        .replace(/https?:\/\/[^\s<>"']+/gi, "[REDACTED_URL]");
+      const redact = (value: string): string => {
+        if (overBudget || value.length > 8192) return "[REDACTED]";
+        const spans: Array<[number, number]> = [];
+        const addSpan = (start: number, end: number): void => {
+          if (spans.length >= 4096) overBudget = true;
+          else spans.push([start, end]);
+        };
+        // Entire credential spans are found before any literal input matching.
+        for (const match of value.matchAll(/cashu[AB][A-Za-z0-9_-]+|Bearer\s+\S+|https?:\/\/[^\s<>"']+/gi)) {
+          addSpan(match.index!, match.index! + match[0].length);
+          if (overBudget) return "[REDACTED]";
+        }
+        for (const secret of secrets) {
+          let start = value.indexOf(secret);
+          while (start !== -1) {
+            addSpan(start, start + secret.length);
+            if (overBudget) return "[REDACTED]";
+            // Include overlapping matches, still bounded by the span budget.
+            start = value.indexOf(secret, start + 1);
+          }
+        }
+        spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+        let cursor = 0;
+        let result = "";
+        for (let i = 0; i < spans.length; i++) {
+          const [start, firstEnd] = spans[i];
+          let end = firstEnd;
+          while (i + 1 < spans.length && spans[i + 1][0] <= end) {
+            end = Math.max(end, spans[++i][1]);
+          }
+          result += value.slice(cursor, start) + "[REDACTED]";
+          cursor = end;
+        }
+        result += value.slice(cursor);
+        return result.length <= 8192 ? result : "[REDACTED]";
+      };
       const message = redact(parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`));
       const type = parsedError.type ? redact(parsedError.type) : undefined;
       let code: string | number | undefined = parsedError.code ? redact(parsedError.code) : undefined;

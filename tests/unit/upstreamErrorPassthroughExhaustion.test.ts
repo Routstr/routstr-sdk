@@ -276,6 +276,31 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     for (const name of ["set-cookie", "authorization", "retry-after", "x-routstr-provider"]) expect(response.headers.has(name)).toBe(false);
   });
 
+  it.each([
+    { name: "duplicate short input", fields: { messages: Array.from({ length: 20 }, () => ({ content: "E" })) }, message: "Expected number", absent: ["Expected"] },
+    { name: "credential prefixes in input", fields: { messages: [{ content: "cashu" }, { content: "Bearer" }] }, message: "refund cashuBprivateproof; Authorization: Bearer privatekey", absent: ["privateproof", "privatekey"] },
+    { name: "completions and Responses fields", fields: { prompt: "private completion prompt", instructions: "private responses instructions" }, message: "private completion prompt; private responses instructions", absent: ["private completion prompt", "private responses instructions"] },
+    { name: "overlapping inputs", fields: { input: ["abcd", "bcdef", "a", "abcd"] }, message: "abcdef", absent: ["abcd", "bcdef", "abcdef"] },
+  ])("redacts original spans safely: $name", async ({ fields, message, absent }) => {
+    const { client } = setup();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { type: "invalid_request_error", message } }, { status: 400 })));
+    const response = await client.routeRequest({ path: "/v1/chat/completions", method: "POST",
+      body: { model: model.id, ...fields }, baseUrl, mintUrl, modelId: model.id, headers: {} });
+    const text = await response.text();
+    expect(text.length).toBeLessThan(2000);
+    for (const value of absent) expect(text).not.toContain(value);
+  });
+
+  it("fails closed within bounded output for excessive redaction inputs", async () => {
+    const { client } = setup();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { type: "invalid_request_error", message: "private instructions " + "E".repeat(20000) } }, { status: 400 })));
+    const response = await client.routeRequest({ path: "/v1/responses", method: "POST",
+      body: { model: model.id, instructions: "private instructions", input: Array.from({ length: 2000 }, (_, i) => `input-${i}`) }, baseUrl, mintUrl, modelId: model.id, headers: {} });
+    const text = await response.text();
+    expect(text.length).toBeLessThan(2000);
+    expect(text).not.toContain("private instructions");
+  });
+
   it("preserves useful validation details without retrying the same node", async () => {
     const { client } = setup();
     const body = JSON.stringify({ error: { type: "invalid_request_error", message: "temperature: expected number", code: "invalid_type" } });

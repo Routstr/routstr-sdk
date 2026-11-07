@@ -38,7 +38,13 @@ Aggregate headers are rebuilt rather than copied from the final node: only the
 existing node request-ID correlation header is retained. Retry headers, cookies,
 authorization and provider URL headers are not meaningful for the entire chain.
 Known payment credentials, Cashu tokens, Bearer credentials, exact request input
-strings and URLs in diagnostic fields are redacted. Raw bodies are never copied;
+strings (including completions `prompt` and Responses `instructions`) and URLs
+in diagnostic fields are redacted. Matching uses original-text spans, merging
+overlaps before inserting markers; a marker is never reprocessed. Inputs are
+deduplicated. Complexity is capped at 512 literals/64 KiB of literal text,
+4,096 visited input values, depth 32, 8,192 diagnostic characters and 4,096 spans;
+exceeding a budget suppresses the diagnostic field instead of partially exposing
+it. Each output field is also capped at 8,192 characters. Raw bodies are never copied;
 this is not a guarantee against a malicious node paraphrasing input in its error.
 Selected public provider URLs remain in the existing `providers` diagnostic list.
 
@@ -50,3 +56,6 @@ financial safeguards require it.
 This deliberately replaces verbatim upstream error bodies at exhaustion with an
 SDK-generated envelope. Consumers may read `error.errors` for all distinct
 failures; `error.message` remains a summary for existing chat consumers.
+
+This contract covers returned aggregate diagnostics only, not existing SDK debug
+logs; raw upstream-body logging is outside this change.
