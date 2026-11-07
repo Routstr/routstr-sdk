@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractUsageFromResponseBody,
+  extractUsageFromResponseHeaders,
   extractUsageFromSSEJson,
 } from "../../client/usage";
 
@@ -39,6 +40,7 @@ describe("usage extraction", () => {
       totalTokens: 371,
       cost: usage.cost,
       satsCost: 0.087,
+      reportedSatsCost: 0.087,
       provider: undefined,
       baseMsats: 0,
       inputMsats: 24,
@@ -165,10 +167,74 @@ describe("usage extraction", () => {
       totalTokens: 20,
       cost: 0.001,
       satsCost: 5,
+      reportedSatsCost: 5,
       provider: "test-provider",
     });
     expect(extractUsageFromResponseBody(response)).toEqual(
       extractUsageFromSSEJson(response)
     );
+  });
+});
+
+
+describe("reported sats-cost provenance", () => {
+  it("distinguishes missing cost from an explicitly free response", () => {
+    const missing = extractUsageFromResponseBody({ usage: { total_tokens: 1 } }, 7);
+    expect(missing?.satsCost).toBe(7);
+    expect(missing).not.toHaveProperty("reportedSatsCost");
+    expect(extractUsageFromResponseBody({ usage: {} })).toBeNull();
+    expect(extractUsageFromResponseBody({ usage: { cost_sats: 0 } }, 7))
+      .toMatchObject({ satsCost: 0, reportedSatsCost: 0 });
+    expect(extractUsageFromResponseBody({ usage: {}, cost: { total_msats: 0 } }, 7))
+      .toMatchObject({ satsCost: 0, reportedSatsCost: 0 });
+  });
+
+  it.each([0, 0.125, 1.5])("preserves fractional or zero explicit cost: %s", value => {
+    for (const extract of [extractUsageFromResponseBody, extractUsageFromSSEJson]) {
+      expect(extract({ usage: { cost_sats: value } }, 7))
+        .toMatchObject({ satsCost: value, reportedSatsCost: value });
+      expect(extract({ usage: { cost_sats: 9 }, cost: { total_msats: value } }, 7))
+        .toMatchObject({ satsCost: value / 1000, reportedSatsCost: value / 1000 });
+    }
+    expect(extractUsageFromSSEJson({ cost: { total_msats: value } }, 7))
+      .toMatchObject({ satsCost: value / 1000, reportedSatsCost: value / 1000 });
+  });
+
+  it.each([-1, NaN, Infinity, -Infinity, "100", "", null, undefined])(
+    "does not treat invalid body/standalone cost as reported: %s", value => {
+      for (const field of ["cost_sats", "total_msats"]) {
+        const body = field === "cost_sats"
+          ? { usage: { total_tokens: 1, cost_sats: value } }
+          : { usage: { total_tokens: 1 }, cost: { total_msats: value } };
+        const result = extractUsageFromResponseBody(body, 7);
+        expect(result?.satsCost).toBe(7);
+        expect(result).not.toHaveProperty("reportedSatsCost");
+      }
+      const result = extractUsageFromSSEJson({ cost: { total_msats: value } }, 7);
+      expect(result?.satsCost).toBe(7);
+      expect(result).not.toHaveProperty("reportedSatsCost");
+    },
+  );
+
+  it("falls back to valid cost_sats when total_msats is invalid", () => {
+    expect(extractUsageFromResponseBody({ usage: { cost_sats: 0.25 }, cost: { total_msats: -1 } }))
+      .toMatchObject({ satsCost: 0.25, reportedSatsCost: 0.25 });
+  });
+
+  it.each(["0", "0.5", "125"])("extracts valid header cost: %s", value => {
+    for (const headers of [new Headers({ "X-Routstr-Cost-Msats": value }), { "x-routstr-cost-msats": value }]) {
+      expect(extractUsageFromResponseHeaders(headers)).toMatchObject({
+        satsCost: Number(value) / 1000,
+        reportedSatsCost: Number(value) / 1000,
+      });
+    }
+  });
+
+  it.each(["", " ", "-1", "NaN", "Infinity", "invalid"])("rejects invalid header cost: %s", value => {
+    expect(extractUsageFromResponseHeaders(new Headers({ "X-Routstr-Cost-Msats": value }))).toBeNull();
+  });
+
+  it("does not mistake missing header for zero", () => {
+    expect(extractUsageFromResponseHeaders(new Headers())).toBeNull();
   });
 });

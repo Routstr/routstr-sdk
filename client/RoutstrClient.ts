@@ -255,8 +255,10 @@ export interface RoutstrResponse extends Response {
   nodeRequestId?: string;
   upstreamResponseId?: string;
   /** Settles accounting for this reply (provider balance read, usage row) and
-   *  returns the sats spent. Started when the response is handed out, so it
-   *  never delays the body; await it before reading `satsSpent`/`usage`. */
+   *  returns the sats spent. In API-key mode this is the provider-reported
+   *  request cost (0 when unavailable), not a shared-wallet balance delta.
+   *  Started when the response is handed out, so it never delays the body;
+   *  await it before reading `satsSpent`/`usage`. */
   finalize?: () => Promise<number>;
 }
 
@@ -705,7 +707,8 @@ export class RoutstrClient {
 
       const runFinalize = async (): Promise<number> => {
         const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
-        const usage = capturedUsage ?? prepared.capturedUsage;
+        const usage = capturedUsage ?? prepared.capturedUsage ??
+          (!isSSE ? extractUsageFromResponseBody(jsonBody) ?? undefined : undefined);
         const upstreamResponseId = capturedResponseId ?? prepared.capturedResponseId;
         if (upstreamResponseId !== undefined) {
           (prepared.response as any).upstreamResponseId = upstreamResponseId;
@@ -715,8 +718,6 @@ export class RoutstrClient {
           token: prepared.tokenUsed,
           baseUrl: prepared.baseUrlUsed,
           initialTokenBalance: prepared.tokenBalanceInSats,
-          initialTokenBalanceUnknown: prepared.tokenBalanceUnknown,
-          fallbackSatsSpent: usage?.satsCost,
           response: accountingResponse,
           responseBody: jsonBody,
           modelId: prepared.modelId,
@@ -3062,8 +3063,6 @@ export class RoutstrClient {
     token: string;
     baseUrl: string;
     initialTokenBalance: number;
-    initialTokenBalanceUnknown?: boolean;
-    fallbackSatsSpent?: number;
     response?: Response;
     /** Body already read from `response` (non-SSE). Saves a second read and
      *  keeps accounting off a body the caller may already have consumed. */
@@ -3077,8 +3076,6 @@ export class RoutstrClient {
       token,
       baseUrl,
       initialTokenBalance,
-      initialTokenBalanceUnknown,
-      fallbackSatsSpent,
       response,
       responseBody,
       modelId,
@@ -3108,6 +3105,15 @@ export class RoutstrClient {
         }
       }
     } else if (this.mode === "apikeys") {
+      // A shared wallet's delta may include other requests, reservations or
+      // topups. EOF must not wait for reconciliation, and neither should the
+      // next request: attribute only this reply's explicit provider cost.
+      // Missing cost remains unavailable (0 under the numeric API), not an
+      // invented charge. Headers override body/SSE, including an explicit 0.
+      const headerCost = response
+        ? extractUsageFromResponseHeaders(response.headers)?.reportedSatsCost
+        : undefined;
+      satsSpent = headerCost ?? usage?.reportedSatsCost ?? 0;
       try {
         const latestBalanceInfo = await this.balanceManager.getTokenBalance(
           token,
@@ -3134,26 +3140,11 @@ export class RoutstrClient {
           latestBalanceInfo.apiKey ?? token,
           latestBalanceInfo
         );
-        // Persistence can reject an otherwise valid read when a newer snapshot
-        // has already settled (or the stored key rotated). That must not erase
-        // this request's balance delta: accounting uses its own provider read.
-        const latestTokenBalance =
-          !latestBalanceInfo.balanceUnknown &&
-          latestBalanceInfo.amount >= 0 &&
-          latestBalanceInfo.reserved >= 0
-            ? Math.floor(getBalanceInSats(latestBalanceInfo.amount, latestBalanceInfo.unit))
-            : undefined;
         if (latestBalance) {
           this.storageAdapter.touchApiKeyLastUsed(baseUrl);
         }
-
-        satsSpent =
-          latestTokenBalance !== undefined && !initialTokenBalanceUnknown
-            ? Math.max(0, initialTokenBalance - latestTokenBalance)
-            : (fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0);
       } catch (e) {
         this._log("WARN", "Could not get updated API key balance:", e);
-        satsSpent = fallbackSatsSpent ?? usage?.satsCost ?? this._headerSatsCost(response) ?? 0;
       }
     }
 
@@ -3185,16 +3176,6 @@ export class RoutstrClient {
     })();
 
     return satsSpent;
-  }
-
-  /**
-   * Extract sats cost from EHBP/Tinfoil response headers as a last-resort
-   * fallback when neither balance delta nor SSE/body usage provides a cost.
-   */
-  private _headerSatsCost(response?: Response): number | undefined {
-    if (!response) return undefined;
-    const headerUsage = extractUsageFromResponseHeaders(response.headers);
-    return headerUsage?.satsCost;
   }
 
   private async _trackResponseUsage(params: {
@@ -3273,13 +3254,14 @@ export class RoutstrClient {
         // Merge header-based costs into SSE/body-extracted usage. For EHBP
         // requests, the SSE body may have token counts but no cost breakdown;
         // the headers carry the authoritative cost. Header values take
-        // priority when non-zero.
+        // priority when explicitly reported, including zero.
         const headerUsage = extractUsageFromResponseHeaders(response.headers);
         if (headerUsage) {
           // Only override cost fields that headers actually have
-          if (headerUsage.totalMsats) {
+          if (headerUsage.reportedSatsCost !== undefined) {
             usage.totalMsats = headerUsage.totalMsats;
-            usage.satsCost = headerUsage.satsCost;
+            usage.satsCost = headerUsage.reportedSatsCost;
+            usage.reportedSatsCost = headerUsage.reportedSatsCost;
           }
           if (headerUsage.cost) usage.cost = headerUsage.cost;
           if (headerUsage.inputMsats) usage.inputMsats = headerUsage.inputMsats;

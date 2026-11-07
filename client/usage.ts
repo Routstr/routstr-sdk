@@ -6,6 +6,8 @@ export interface UsageTrackingData {
   totalTokens: number;
   cost: number;
   satsCost: number;
+  /** Explicit finite, nonnegative provider cost in sats; absent when cost is unknown. */
+  reportedSatsCost?: number;
   /** Upstream provider/route that handled the request (e.g. "openrouter:openrouter:Anthropic"). */
   provider?: string;
   /** Full cost breakdown emitted by the upstream `cost` object. */
@@ -24,6 +26,11 @@ export interface UsageTrackingData {
 const numOrUndef = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
+const nonnegativeOrUndef = (value: unknown): number | undefined => {
+  const number = numOrUndef(value);
+  return number !== undefined && number >= 0 ? number : undefined;
+};
+
 /**
  * Extract the detailed cost breakdown from an upstream `cost` object.
  * Returns the camelCased fields we persist on a UsageTrackingData/entry.
@@ -36,7 +43,7 @@ function extractCostBreakdown(
     baseMsats: numOrUndef(costObj.base_msats),
     inputMsats: numOrUndef(costObj.input_msats),
     outputMsats: numOrUndef(costObj.output_msats),
-    totalMsats: numOrUndef(costObj.total_msats),
+    totalMsats: nonnegativeOrUndef(costObj.total_msats),
     totalUsd: numOrUndef(costObj.total_usd),
     cacheReadInputTokens: numOrUndef(costObj.cache_read_input_tokens),
     cacheCreationInputTokens: numOrUndef(costObj.cache_creation_input_tokens),
@@ -96,11 +103,11 @@ export function extractUsageFromResponseBody(
       : numOrUndef(usageCost?.total_usd) ??
         numOrUndef(breakdownCost?.total_usd) ??
         0;
-  const totalMsats = numOrUndef(breakdownCost?.total_msats) ?? 0;
-  const satsCost =
-    totalMsats > 0
-      ? totalMsats / 1000
-      : numOrUndef(usage.cost_sats) ?? fallbackSatsCost;
+  const totalMsats = nonnegativeOrUndef(breakdownCost?.total_msats);
+  const reportedSatsCost = totalMsats !== undefined
+    ? totalMsats / 1000
+    : nonnegativeOrUndef(usage.cost_sats);
+  const satsCost = reportedSatsCost ?? fallbackSatsCost;
 
   const provider =
     typeof (body as { provider?: unknown }).provider === "string"
@@ -112,7 +119,8 @@ export function extractUsageFromResponseBody(
     completionTokens === 0 &&
     totalTokens === 0 &&
     cost === 0 &&
-    satsCost === 0
+    satsCost === 0 &&
+    reportedSatsCost === undefined
   ) {
     return null;
   }
@@ -123,6 +131,7 @@ export function extractUsageFromResponseBody(
     totalTokens,
     cost,
     satsCost,
+    ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
     provider,
     ...breakdown,
     cacheReadInputTokens:
@@ -155,15 +164,18 @@ export function extractUsageFromSSEJson(
   // Handle standalone cost chunk: {"cost":{"base_msats":...,"input_msats":...,"output_msats":...,"total_msats":2,...}}
   if (!parsed.usage && parsed.cost && typeof parsed.cost === "object") {
     const costObj = parsed.cost;
-    const msats = costObj.total_msats ?? 0;
-    const cost = costObj.total_usd ?? 0;
-    if (msats === 0 && cost === 0) return null;
+    const msats = nonnegativeOrUndef(costObj.total_msats);
+    const reportedSatsCost = msats !== undefined ? msats / 1000 : undefined;
+    const cost = numOrUndef(costObj.total_usd) ?? 0;
+    const satsCost = reportedSatsCost ?? fallbackSatsCost;
+    if (reportedSatsCost === undefined && satsCost === 0 && cost === 0) return null;
     return {
       promptTokens: Number(costObj.input_tokens ?? 0),
       completionTokens: Number(costObj.output_tokens ?? 0),
       totalTokens: Number((costObj.input_tokens ?? 0) + (costObj.output_tokens ?? 0)),
       cost: Number(cost),
-      satsCost: msats > 0 ? msats / 1000 : fallbackSatsCost,
+      satsCost,
+      ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
       provider,
       ...extractCostBreakdown(costObj),
     };
@@ -193,8 +205,10 @@ export function extractUsageFromResponseHeaders(
     return null;
   };
 
-  const totalMsats = Number(get("X-Routstr-Cost-Msats"));
-  if (!totalMsats || !Number.isFinite(totalMsats)) return null;
+  const rawTotalMsats = get("X-Routstr-Cost-Msats");
+  if (rawTotalMsats === null || rawTotalMsats.trim() === "") return null;
+  const totalMsats = nonnegativeOrUndef(Number(rawTotalMsats));
+  if (totalMsats === undefined) return null;
 
   return {
     promptTokens: 0,
@@ -202,6 +216,7 @@ export function extractUsageFromResponseHeaders(
     totalTokens: 0,
     cost: Number(get("X-Routstr-Cost-Usd")) || 0,
     satsCost: totalMsats / 1000,
+    reportedSatsCost: totalMsats / 1000,
     totalMsats,
     inputMsats: Number(get("X-Routstr-Input-Cost-Msats")) || 0,
     outputMsats: Number(get("X-Routstr-Output-Cost-Msats")) || 0,

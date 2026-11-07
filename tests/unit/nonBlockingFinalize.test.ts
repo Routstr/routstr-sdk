@@ -18,10 +18,10 @@ const KEY = "sk-key-123";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 
-/** A reply carrying usage, so accounting can derive a cost from the body. */
+/** Cost belongs to this reply; wallet balance is only reconciliation. */
 const answerBody = JSON.stringify({
   id: "gen-1",
-  usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+  usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_sats: 0.125 },
 });
 
 type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
@@ -93,8 +93,43 @@ describe("non-streaming accounting is not on the response path", () => {
     expect(read.promise).toBeDefined();
 
     read.resolve({ amount: 150_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 1 });
-    expect(await response.finalize?.()).toBe(50);
-    expect(response.satsSpent).toBe(50);
+    expect(await response.finalize?.()).toBe(0.125);
+    expect(response.satsSpent).toBe(0.125);
+  });
+
+  it("returns 0, not a shared-wallet delta, when a JSON reply omits cost", async () => {
+    const { client, read, rows } = makeClient();
+    const prepare = client._prepareRoutedRequestWithMintFailover.getMockImplementation()!;
+    client._prepareRoutedRequestWithMintFailover.mockImplementation(async () => {
+      const result = await prepare();
+      result.response = new Response(JSON.stringify({ id: "gen-missing", usage: { total_tokens: 2 } }), {
+        headers: JSON_HEADERS,
+      });
+      return result;
+    });
+    const response = await client.routeRequest(params);
+    read.resolve({ amount: 150_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 1 });
+    expect(await response.finalize()).toBe(0);
+    expect(rows[0].satsCost).toBe(0);
+    expect(rows[0]).not.toHaveProperty("reportedSatsCost");
+  });
+
+  it("keeps xcashu refund-based accounting unchanged", async () => {
+    const { client, rows } = makeClient();
+    client.mode = "xcashu";
+    client.cashuSpender = { receiveToken: vi.fn(async () => ({ success: true, amount: 150, unit: "sat" })) };
+    client.storageAdapter.removeXcashuToken = vi.fn();
+    const prepare = client._prepareRoutedRequestWithMintFailover.getMockImplementation()!;
+    client._prepareRoutedRequestWithMintFailover.mockImplementation(async () => {
+      const result = await prepare();
+      result.response.headers.set("x-cashu", "refund-token");
+      return result;
+    });
+    const response = await client.routeRequest(params);
+    expect(await response.finalize()).toBe(50); // 200 deposited minus 150 refunded
+    expect(rows[0].satsCost).toBe(50); // refund, not body cost 0.125
+    expect(client.balanceManager.getTokenBalance).not.toHaveBeenCalled();
+    expect(client.cashuSpender.receiveToken).toHaveBeenCalledWith("refund-token");
   });
 
   it("leaves the body untouched for the caller, and still accounts from it", async () => {
@@ -150,7 +185,7 @@ describe("non-streaming accounting is not on the response path", () => {
 });
 
 describe("out-of-order accounting", () => {
-  it("keeps the older read's cost without overwriting the newer snapshot", async () => {
+  it("keeps each reply's cost without overwriting the newer snapshot", async () => {
     const { client, rows, storage } = makeClient();
     const olderRead = deferred<any>();
     const newerRead = deferred<any>();
@@ -162,7 +197,7 @@ describe("out-of-order accounting", () => {
     const makePrepared = prepare.getMockImplementation()!;
     prepare.mockImplementationOnce(async () => {
       const prepared = await makePrepared();
-      prepared.response = new Response(answerBody.replace("gen-1", "gen-older"), {
+      prepared.response = new Response(answerBody.replace("gen-1", "gen-older").replace("0.125", "0.25"), {
         headers: JSON_HEADERS,
       });
       return prepared;
@@ -171,12 +206,12 @@ describe("out-of-order accounting", () => {
     const older = await client.routeRequest(params);
     const newer = await client.routeRequest(params);
     newerRead.resolve({ amount: 150_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 2 });
-    expect(await newer.finalize()).toBe(50);
+    expect(await newer.finalize()).toBe(0.125);
     olderRead.resolve({ amount: 170_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 1 });
-    expect(await older.finalize()).toBe(30);
-    expect(older.satsSpent).toBe(30);
+    expect(await older.finalize()).toBe(0.25);
+    expect(older.satsSpent).toBe(0.25);
     expect(rows).toHaveLength(2);
-    expect(rows.find((row) => row.id === "gen-older")).toMatchObject({ satsCost: 30 });
+    expect(rows.find((row) => row.id === "gen-older")).toMatchObject({ satsCost: 0.25 });
     expect(storage.updateApiKeyBalance).toHaveBeenCalledTimes(1);
     expect(storage.updateApiKeyBalance).toHaveBeenCalledWith(baseUrl, 150, 0);
   });
@@ -185,11 +220,11 @@ describe("out-of-order accounting", () => {
     { amount: 170_000, reserved: 0, balanceUnknown: true },
     { amount: -1, reserved: 0 },
     { amount: 170_000, reserved: -1 },
-  ])("does not calculate a delta from an unusable read: %j", async (readResult) => {
+  ])("preserves reported cost despite an unusable balance read: %j", async (readResult) => {
     const { client, storage, read } = makeClient();
     const response = await client.routeRequest(params);
     read.resolve({ ...readResult, unit: "msat", apiKey: KEY, readSeq: 1 });
-    expect(await response.finalize()).toBe(0);
+    expect(await response.finalize()).toBe(0.125);
     expect(storage.updateApiKeyBalance).not.toHaveBeenCalled();
   });
 });

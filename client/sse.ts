@@ -4,7 +4,7 @@ import { extractUsageFromSSEJson, type UsageTrackingData } from "./usage";
 
 /**
  * Merge previously captured usage with a newly seen usage payload, preferring
- * non-zero fields from the new payload.
+ * non-zero fields from the new payload, except explicit cost (where zero is valid).
  */
 function mergeUsage(
   previous: UsageTrackingData | null,
@@ -15,6 +15,7 @@ function mergeUsage(
     n: number | undefined,
     p: number | undefined
   ): number | undefined => (typeof n === "number" && n > 0 ? n : p ?? n);
+  const reportedSatsCost = next.reportedSatsCost ?? previous.reportedSatsCost;
   return {
     promptTokens:
       next.promptTokens > 0 ? next.promptTokens : previous.promptTokens,
@@ -25,12 +26,16 @@ function mergeUsage(
     totalTokens:
       next.totalTokens > 0 ? next.totalTokens : previous.totalTokens,
     cost: next.cost > 0 ? next.cost : previous.cost,
-    satsCost: next.satsCost > 0 ? next.satsCost : previous.satsCost,
+    satsCost: reportedSatsCost ??
+      (next.satsCost > 0 ? next.satsCost : previous.satsCost),
+    ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
     provider: next.provider ?? previous.provider,
     baseMsats: pickNum(next.baseMsats, previous.baseMsats),
     inputMsats: pickNum(next.inputMsats, previous.inputMsats),
     outputMsats: pickNum(next.outputMsats, previous.outputMsats),
-    totalMsats: pickNum(next.totalMsats, previous.totalMsats),
+    totalMsats: next.reportedSatsCost !== undefined
+      ? next.totalMsats
+      : previous.totalMsats,
     totalUsd: pickNum(next.totalUsd, previous.totalUsd),
     cacheReadInputTokens: pickNum(
       next.cacheReadInputTokens,
@@ -63,6 +68,7 @@ function hasUsageChanged(
     previous.totalTokens !== next.totalTokens ||
     previous.cost !== next.cost ||
     previous.satsCost !== next.satsCost ||
+    previous.reportedSatsCost !== next.reportedSatsCost ||
     previous.provider !== next.provider ||
     previous.totalMsats !== next.totalMsats ||
     previous.cacheReadInputTokens !== next.cacheReadInputTokens ||
@@ -70,23 +76,6 @@ function hasUsageChanged(
     previous.cacheReadMsats !== next.cacheReadMsats ||
     previous.cacheCreationMsats !== next.cacheCreationMsats ||
     previous.remainingBalanceMsats !== next.remainingBalanceMsats
-  );
-}
-
-/**
- * The inspector can stop early once we've seen the response id, a provider,
- * usage with token counts, and the detailed cost breakdown (total_msats).
- */
-function isInspectionComplete(
-  responseIdCaptured: boolean,
-  usage: UsageTrackingData | null
-): boolean {
-  return (
-    responseIdCaptured &&
-    !!usage &&
-    usage.totalTokens > 0 &&
-    typeof usage.totalMsats === "number" &&
-    !!usage.provider
   );
 }
 
@@ -138,10 +127,8 @@ export async function inspectSSEWebStream(
       const data = JSON.parse(trimmed) as any;
       if (data?.error || data?.type === "error" || data?.type === "response.failed" || data?.response?.error) options?.onErrorEnvelope?.();
 
-      if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
-        return;
-      }
-
+      // Keep inspecting after complete usage: a later cost event can correct it,
+      // including an explicitly free (zero-cost) final result.
       if (!responseIdCaptured) {
         const responseId = data?.response?.id ?? data?.message?.id ?? data?.id;
         if (typeof responseId === "string" && responseId.trim().length > 0) {
@@ -263,10 +250,8 @@ export function createSSEParserTransform(
     try {
       const data = JSON.parse(trimmed) as any;
 
-      if (isInspectionComplete(responseIdCaptured, capturedUsage)) {
-        return;
-      }
-
+      // Keep inspecting after complete usage: a later cost event can correct it,
+      // including an explicitly free (zero-cost) final result.
       if (!responseIdCaptured) {
         const responseId = data?.response?.id ?? data?.message?.id ?? data?.id;
         if (typeof responseId === "string" && responseId.trim().length > 0) {
