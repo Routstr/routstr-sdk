@@ -78,6 +78,9 @@ export const CoreErrorCode = {
   CASHU_TOKEN_CONSUMED: "cashu_token_consumed",
   INTERNAL_ERROR: "internal_error",
   INVALID_API_KEY: "invalid_api_key",
+  KEY_EXPIRED: "key_expired",
+  UNAUTHORIZED: "unauthorized",
+  SEND_TOKEN_FAILED: "send_token_failed",
   /** A well-formed API key that the node has no record of */
   KEY_NOT_FOUND: "key_not_found",
   /**
@@ -230,6 +233,24 @@ export function parseCoreError(
   if (result.message || result.type || result.code) result.raw = false;
 
   return result;
+}
+
+/**
+ * Distinguish node authentication/payment failures from provider account errors.
+ * Explicit scope wins (upstreams may reuse the same codes). Older nodes identify
+ * local key failures by code even when their broad type is invalid_request_error.
+ */
+export function isNodeAccountError(parsed: ParsedCoreError, scope?: string): boolean {
+  if (scope === "node") return true;
+  if (scope === "upstream") return false;
+  return [
+    CoreErrorCode.INVALID_API_KEY,
+    CoreErrorCode.KEY_NOT_FOUND,
+    CoreErrorCode.KEY_EXPIRED,
+    CoreErrorCode.UNAUTHORIZED,
+    CoreErrorCode.SEND_TOKEN_FAILED,
+  ].some(code => code === parsed.code) ||
+    (Object.values(CoreErrorType) as string[]).includes(parsed.type ?? "");
 }
 
 /**

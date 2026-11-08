@@ -18,6 +18,7 @@ import { beginRequestLifecycle, shouldTrackRequestLifecycle, type RequestLifecyc
 import type { SdkLogger, TopUpResult } from "../core/types";
 import type { Model } from "../core/types";
 import { consoleLogger } from "../core/types";
+import { redactCredentials } from "../core/redact";
 import type {
   WalletAdapter,
   StorageAdapter,
@@ -56,6 +57,7 @@ import {
   isHandledRedemptionError,
   isUpstreamRequestError,
   isUnknownPathError,
+  isNodeAccountError,
   shouldFailoverToAnotherMint,
   shouldPurgeStoredCredential,
   type ParsedCoreError,
@@ -117,7 +119,9 @@ const REDACTED_CREDENTIAL = "[REDACTED]";
 
 interface RequestFailures {
   attemptedProviders: Set<string>;
-  statuses?: number[];
+  statuses: number[];
+  /** Earliest valid Retry-After deadline across rate-limited attempts. */
+  retryAfterAt?: number;
   errors: Array<{
     status: number;
     type?: string;
@@ -165,6 +169,33 @@ function forwardableErrorHeaders(headers: Headers): Record<string, string> {
     captured[lower] = value;
   });
   return captured;
+}
+
+/** Normalize delay-seconds or an HTTP date without accepting arbitrary Date.parse input. */
+function retryAfterDeadline(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const text = value.trim();
+  if (/^\d+$/.test(text)) {
+    const deadline = Date.now() + Number(text) * 1000;
+    return Number.isSafeInteger(deadline) ? deadline : undefined;
+  }
+  // Accept the three HTTP-date formats, but reject Date.parse's permissive
+  // normalization of impossible dates (e.g. February 30 becoming March 2).
+  const match = text.match(/^[A-Za-z]{3}, (\d{2}) ([A-Za-z]{3}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/) ??
+    text.match(/^[A-Za-z]+, (\d{2})-([A-Za-z]{3})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) GMT$/);
+  const asctime = text.match(/^[A-Za-z]{3} ([A-Za-z]{3}) +([\d]{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/);
+  const parts = match ? match.slice(1) : asctime
+    ? [asctime[2], asctime[1], asctime[6], asctime[3], asctime[4], asctime[5]] : undefined;
+  if (!parts) return undefined;
+  const [day, month, year, hours, minutes, seconds] = parts;
+  const monthIndex = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].indexOf(month);
+  const deadline = Date.parse(text);
+  if (!Number.isFinite(deadline)) return undefined;
+  const date = new Date(deadline);
+  return date.getUTCDate() === Number(day) && date.getUTCMonth() === monthIndex &&
+    (year.length === 2 ? date.getUTCFullYear() % 100 : date.getUTCFullYear()) === Number(year) &&
+    date.getUTCHours() === Number(hours) && date.getUTCMinutes() === Number(minutes) &&
+    date.getUTCSeconds() === Number(seconds) ? deadline : undefined;
 }
 
 function hasImageInput(body: unknown): boolean {
@@ -1703,10 +1734,16 @@ export class RoutstrClient {
     let tryNextProvider: boolean = false;
 
     // Request-local history is shared by retries, never by concurrent requests.
-    const failures = params.failures ?? { attemptedProviders: new Set<string>(), errors: [] };
+    const failures: RequestFailures = params.failures ?? { attemptedProviders: new Set<string>(), statuses: [], errors: [] };
     params = { ...params, failures };
     failures.attemptedProviders.add(baseUrl);
-    (failures.statuses ??= []).push(status);
+    failures.statuses.push(status);
+    if (status === 429) {
+      const retryAfterAt = retryAfterDeadline(upstream?.headers["retry-after"]);
+      if (retryAfterAt !== undefined) {
+        failures.retryAfterAt = Math.min(failures.retryAfterAt ?? Infinity, retryAfterAt);
+      }
+    }
 
     const errorMessage = responseBody;
 
@@ -1746,83 +1783,16 @@ export class RoutstrClient {
     const aggregateFailure = upstreamRequestError || status >= 500 ||
       status === 424 || status === 429 || status === -1 ||
       ([401, 402, 403].includes(status) &&
-        !(Object.values(CoreErrorType) as string[]).includes(parsedError.type ?? ""));
+        !isNodeAccountError(parsedError, upstream?.headers["x-routstr-error-scope"]));
     // Keep only diagnostic fields, never raw envelopes containing refund proofs.
     if (aggregateFailure) {
-      // Match only the ORIGINAL diagnostic. Sequential replacement can expand
-      // markers recursively and can hide a credential prefix before its payload
-      // is recognized. Explicit budgets fail closed on adversarial input sizes.
-      const secrets = new Set<string>();
-      let inputBytes = 0;
-      let visits = 0;
-      let overBudget = false;
-      const addSecret = (value: string | undefined): void => {
-        if (!value || secrets.has(value)) return;
-        inputBytes += value.length;
-        if (secrets.size >= 512 || inputBytes > 65536) overBudget = true;
-        else secrets.add(value);
-      };
-      addSecret(params.token);
-      addSecret(xCashuRefundToken);
-      const collectInput = (value: unknown, depth = 0): void => {
-        if (overBudget) return;
-        if (++visits > 4096 || depth > 32) { overBudget = true; return; }
-        if (typeof value === "string") addSecret(value);
-        else if (Array.isArray(value)) {
-          for (const child of value) {
-            collectInput(child, depth + 1);
-            if (overBudget) break;
-          }
-        } else if (value && typeof value === "object") {
-          // Only supported user-input branches; do not redact parameter names
-          // or model identifiers needed to explain a validation error.
-          for (const name of ["content", "text", "input", "messages", "prompt", "instructions"]) {
-            if (Object.prototype.hasOwnProperty.call(value, name)) {
-              collectInput((value as Record<string, unknown>)[name], depth + 1);
-            }
-          }
-        }
-      };
-      collectInput(params.body);
-      const redact = (value: string): string => {
-        if (overBudget || value.length > 8192) return "[REDACTED]";
-        const spans: Array<[number, number]> = [];
-        const addSpan = (start: number, end: number): void => {
-          if (spans.length >= 4096) overBudget = true;
-          else spans.push([start, end]);
-        };
-        // Entire credential spans are found before any literal input matching.
-        for (const match of value.matchAll(/cashu[AB][A-Za-z0-9_-]+|Bearer\s+\S+|https?:\/\/[^\s<>"']+/gi)) {
-          addSpan(match.index!, match.index! + match[0].length);
-          if (overBudget) return "[REDACTED]";
-        }
-        for (const secret of secrets) {
-          let start = value.indexOf(secret);
-          while (start !== -1) {
-            addSpan(start, start + secret.length);
-            if (overBudget) return "[REDACTED]";
-            // Include overlapping matches, still bounded by the span budget.
-            start = value.indexOf(secret, start + 1);
-          }
-        }
-        spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
-        let cursor = 0;
-        let result = "";
-        for (let i = 0; i < spans.length; i++) {
-          const [start, firstEnd] = spans[i];
-          let end = firstEnd;
-          while (i + 1 < spans.length && spans[i + 1][0] <= end) {
-            end = Math.max(end, spans[++i][1]);
-          }
-          result += value.slice(cursor, start) + "[REDACTED]";
-          cursor = end;
-        }
-        result += value.slice(cursor);
-        return result.length <= 8192 ? result : "[REDACTED]";
-      };
-      const message = redact(parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`));
-      const type = parsedError.type ? redact(parsedError.type) : undefined;
-      let code: string | number | undefined = parsedError.code ? redact(parsedError.code) : undefined;
+      const message = redactCredentials(
+        parsedError.message ?? (status === -1 ? "Network request failed" : `Upstream returned HTTP ${status}`),
+        [params.token, xCashuRefundToken]
+      );
+      // Machine-readable labels are part of the upstream error contract.
+      const type = parsedError.type;
+      let code: string | number | undefined = parsedError.code;
       // Provider envelopes also use numeric codes; the wallet parser only
       // recognizes strings, but diagnostics should preserve either format.
       if (code === undefined && responseBody) {
@@ -2982,7 +2952,7 @@ export class RoutstrClient {
       // A final validation rejection cannot explain earlier infrastructure,
       // authentication, or provider-quota failures. Never classify the caller
       // by the arbitrary order in which eligible providers were attempted.
-      const statuses = failures.statuses ?? failures.errors.map(error => error.status);
+      const statuses = failures.statuses;
       const validationOnly = statuses.every(value => value === 400 || value === 422);
       const uniform = statuses.every(value => value === statuses[0]);
       const responseStatus = validationOnly
@@ -2994,11 +2964,18 @@ export class RoutstrClient {
           : uniform && (statuses[0] === 429 || statuses[0] === 424)
             ? statuses[0]
             : 502;
-      // These headers describe a single node's envelope, not an aggregate.
-      // In particular do not forward its auth, cookies, URLs, or retry budget.
+      // Correlation is useful, but auth, cookies, URLs and per-node rate budgets
+      // do not describe the chain. Only a uniform 429 gets a retry deadline.
+      const headers: Record<string, string> = {};
+      if (upstream?.headers["x-routstr-request-id"]) {
+        headers["x-routstr-request-id"] = upstream.headers["x-routstr-request-id"];
+      }
+      if (responseStatus === 429 && failures.retryAfterAt !== undefined) {
+        headers["retry-after"] = String(Math.max(0, Math.ceil((failures.retryAfterAt - Date.now()) / 1000)));
+      }
       const response = this._upstreamErrorResponse(
         { status: responseStatus, statusText: upstream?.status === responseStatus ? upstream.statusText : "",
-          headers: upstream?.headers["x-routstr-request-id"] ? { "x-routstr-request-id": upstream.headers["x-routstr-request-id"] } : {} },
+          headers },
         JSON.stringify({ error: {
           type: "all_providers_failed",
           message: failures.errors.map((error) => error.message).join("; "),

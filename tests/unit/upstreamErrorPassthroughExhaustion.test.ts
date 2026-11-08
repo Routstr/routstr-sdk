@@ -1,13 +1,9 @@
 import { createMemoryRequestLifecycleDriver } from "../../storage/requestLifecycle";
 /**
- * L3: forward the last upstream envelope at failover exhaustion.
- *
- * Once L2 short-circuits request errors, anything that reaches the end of
- * `_handleErrorResponse` is a provider/infrastructure failure (5xx, 424, 429,
- * network). Previously that end always threw `FailoverError`, which routstrd maps
- * to a 500 — so the last node's real complaint was replaced by
- * "All providers failed". These tests pin the new forwarding, and the typed-error
- * guard rails that must survive it.
+ * Exhausted failover aggregates diagnostic entries across all attempts and
+ * classifies status from the entire chain. Credentials are removed from
+ * messages without damaging caller-visible diagnostics or machine labels.
+ * Typed node-authentication, wallet and pinned-path errors retain precedence.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -95,7 +91,7 @@ function setup() {
   return { client, providerManager };
 }
 
-/** Distinguishable per-provider bodies so "last envelope" is provable. */
+/** Distinguishable per-provider bodies expose both entries in the aggregate. */
 function providerBody(name: string, type = "upstream_error") {
   return JSON.stringify({
     error: { type, message: `${name} says no`, code: 503 },
@@ -103,7 +99,7 @@ function providerBody(name: string, type = "upstream_error") {
 }
 
 function stubFetchByProvider(
-  responses: Record<string, { status: number; statusText: string; body: string; requestId: string }>
+  responses: Record<string, { status: number; statusText: string; body: string; requestId: string; headers?: Record<string, string> }>
 ) {
   const fetchMock = vi.fn(async (url: string | URL | Request) => {
     const key = Object.keys(responses).find((k) => String(url).startsWith(k));
@@ -115,6 +111,7 @@ function stubFetchByProvider(
       headers: {
         "content-type": "application/json",
         "x-routstr-request-id": spec.requestId,
+        ...spec.headers,
       },
     });
   });
@@ -134,7 +131,7 @@ function routeRequest(client: RoutstrClient) {
   });
 }
 
-describe("L3 failover exhaustion forwards the last envelope", () => {
+describe("failover exhaustion aggregates diagnostics across the chain", () => {
   it("records real 400 failover recursion then 200 under a single SDK ID", async () => {
     const { client, providerManager } = setup();
     (providerManager as any).recordSuccess = vi.fn();
@@ -155,7 +152,7 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns both diagnostics with the last provider's 503 status", async () => {
+  it("returns both diagnostics with the uniform 503 status", async () => {
     const { client, providerManager } = setup();
     const fetchMock = stubFetchByProvider({
       [baseUrl]: {
@@ -184,7 +181,7 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     );
     expect(providerManager.findNextBestProvider).toHaveBeenCalledTimes(2);
 
-    // The LAST node's answer reaches the caller intact.
+    // Uniform status is preserved; diagnostics from both nodes are retained.
     expect(response.status).toBe(503);
     expect(response.statusText).toBe("Service Unavailable");
     expect((response as any).passthrough).toBe(true);
@@ -194,7 +191,7 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     ]);
   });
 
-  it("forwards a 429 envelope at exhaustion", async () => {
+  it("preserves the smallest retry-after for homogeneous 429 exhaustion", async () => {
     const { client } = setup();
     stubFetchByProvider({
       [baseUrl]: {
@@ -202,21 +199,88 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
         statusText: "Too Many Requests",
         body: providerBody("first-node"),
         requestId: "req-first",
+        headers: { "retry-after": "30" },
       },
       [nextUrl]: {
         status: 429,
         statusText: "Too Many Requests",
         body: providerBody("second-node"),
         requestId: "req-second",
+        headers: { "retry-after": "60" },
       },
     });
 
     const response = await routeRequest(client);
 
     expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("30");
     expect((await response.json()).error.errors.map((error: any) => error.message)).toEqual([
       "first-node says no", "second-node says no",
     ]);
+  });
+
+  it.each([
+    { name: "date before numeric", first: "Thu, 01 Jan 2026 00:00:20 GMT", last: "60", expected: "20" },
+    { name: "numeric before date", first: "30", last: "Thu, 01 Jan 2026 00:01:00 GMT", expected: "30" },
+    { name: "earlier of two dates", first: "Thu, 01 Jan 2026 00:01:00 GMT", last: "Thu, 01 Jan 2026 00:00:30 GMT", expected: "30" },
+    { name: "malformed first value", first: "not-a-delay", last: "60", expected: "60" },
+    { name: "malformed last value", first: "30", last: "-1", expected: "30" },
+    { name: "no valid value", first: "not-a-delay", last: "-1", expected: null },
+    { name: "decimal delay ignored", first: "1.5", last: "60", expected: "60" },
+    { name: "Infinity ignored", first: "Infinity", last: "60", expected: "60" },
+    { name: "overflow delay ignored", first: "9".repeat(400), last: "60", expected: "60" },
+    { name: "past HTTP date", first: "Wed, 31 Dec 2025 23:59:00 GMT", last: "60", expected: "0" },
+    { name: "invalid calendar date ignored", first: "Mon, 30 Feb 2026 00:00:00 GMT", last: "60", expected: "60" },
+    { name: "RFC 850 date", first: "Thursday, 01-Jan-26 00:00:20 GMT", last: "60", expected: "20" },
+    { name: "asctime date", first: "Thu Jan  1 00:00:20 2026", last: "60", expected: "20" },
+  ])("uses valid retry-after delays for homogeneous 429: $name", async ({ first, last, expected }) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-01T00:00:00Z"));
+    const { client } = setup();
+    stubFetchByProvider({
+      [baseUrl]: { status: 429, statusText: "Too Many Requests", body: providerBody("first"), requestId: "first", headers: { "retry-after": first } },
+      [nextUrl]: { status: 429, statusText: "Too Many Requests", body: providerBody("last"), requestId: "last", headers: { "retry-after": last } },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe(expected);
+  });
+
+  it("omits retry-after when neither 429 attempt supplied it", async () => {
+    const { client } = setup();
+    stubFetchByProvider({
+      [baseUrl]: { status: 429, statusText: "Too Many Requests", body: providerBody("first"), requestId: "first" },
+      [nextUrl]: { status: 429, statusText: "Too Many Requests", body: providerBody("last"), requestId: "last" },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(429);
+    expect(response.headers.has("retry-after")).toBe(false);
+  });
+
+  it.each([[10, "20"], [40, "0"]])("subtracts %i elapsed seconds from the first numeric retry deadline", async (elapsed, expected) => {
+    let now = Date.parse("2026-01-01T00:00:00Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { client } = setup();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const first = String(url).startsWith(baseUrl);
+      if (!first) now += elapsed * 1000;
+      return Response.json({ error: { type: "upstream_error", message: first ? "first" : "last" } }, {
+        status: 429, headers: { "retry-after": first ? "30" : "60" },
+      });
+    }));
+    const response = await routeRequest(client);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe(expected);
+  });
+
+  it.each([[429, 400], [400, 429], [429, 503]])("omits retry-after for a mixed %i then %i chain", async (first, last) => {
+    const { client } = setup();
+    stubFetchByProvider({
+      [baseUrl]: { status: first, statusText: "Failure", body: providerBody("first"), requestId: "first", headers: { "retry-after": "30" } },
+      [nextUrl]: { status: last, statusText: "Failure", body: providerBody("last"), requestId: "last", headers: { "retry-after": "60" } },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect(response.headers.has("retry-after")).toBe(false);
   });
 
   it("returns a 502 aggregate when network failures exhaust the chain", async () => {
@@ -258,47 +322,77 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     }
   );
 
-  it("does not expose request content, provider URLs or unsafe headers in diagnostics", async () => {
+  it("redacts credentials from messages only, preserving labels, docs and safe headers", async () => {
     const { client } = setup();
-    const privateText = "private prompt that must not be echoed";
+    const type = "invalid_request_error";
+    const code = "invalid_type";
+    const documentation = "https://docs.example.com/models";
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: {
-      type: "invalid_request_error", message: `temperature: expected number; ${privateText}; https://internal.invalid/path?key=secret; Bearer secret; cashuBsecret`,
+      type, code,
+      message: `Invalid model. See ${documentation}; cashuBprivateproof; Bearer privatekey\n${credential}`,
       refund_token: "cashuBrefund",
-    } }, { status: 400, headers: { "set-cookie": "secret", "authorization": "Bearer secret", "retry-after": "123", "x-routstr-provider": "https://internal.invalid" } })));
+    } }, { status: 400, headers: {
+      "set-cookie": "secret", authorization: "Bearer privatekey", "retry-after": "123",
+      "x-routstr-provider": "https://internal.invalid", "x-routstr-request-id": "node-id",
+    } })));
     const response = await client.routeRequest({ path: "/v1/chat/completions", method: "POST",
-      body: { model: model.id, messages: [{ role: "user", content: privateText }] }, baseUrl, mintUrl, modelId: model.id, headers: {} });
-    const text = await response.text();
-    expect(text).toContain("temperature: expected number");
-    expect(text).not.toContain(privateText);
-    expect(text).not.toContain("internal.invalid");
-    expect(text).not.toContain("secret");
-    expect(text).not.toContain("refund_token");
-    for (const name of ["set-cookie", "authorization", "retry-after", "x-routstr-provider"]) expect(response.headers.has(name)).toBe(false);
+      body: { model: model.id, messages: [{ content: "a" }, { content: "no" }] },
+      baseUrl, mintUrl, modelId: model.id, headers: {} });
+    const result = await response.json();
+    expect(result.error.errors[0]).toMatchObject({
+      type, code, message: `Invalid model. See ${documentation}; [REDACTED]; [REDACTED]\n[REDACTED]`,
+    });
+    expect(JSON.stringify(result)).not.toMatch(/privateproof|privatekey|sk-test-key|refund_token/);
+    for (const name of ["set-cookie", "authorization", "retry-after", "x-routstr-provider"]) {
+      expect(response.headers.has(name)).toBe(false);
+    }
+    expect(response.headers.get("x-routstr-request-id")).toBe("node-id");
   });
 
   it.each([
-    { name: "duplicate short input", fields: { messages: Array.from({ length: 20 }, () => ({ content: "E" })) }, message: "Expected number", absent: ["Expected"] },
-    { name: "credential prefixes in input", fields: { messages: [{ content: "cashu" }, { content: "Bearer" }] }, message: "refund cashuBprivateproof; Authorization: Bearer privatekey", absent: ["privateproof", "privatekey"] },
-    { name: "completions and Responses fields", fields: { prompt: "private completion prompt", instructions: "private responses instructions" }, message: "private completion prompt; private responses instructions", absent: ["private completion prompt", "private responses instructions"] },
-    { name: "overlapping inputs", fields: { input: ["abcd", "bcdef", "a", "abcd"] }, message: "abcdef", absent: ["abcd", "bcdef", "abcdef"] },
-  ])("redacts original spans safely: $name", async ({ fields, message, absent }) => {
+    { name: "short chat replies", fields: { messages: ["no", "a", "ok", "y"].map(content => ({ content })) }, message: "max_tokens: value is not a valid integer" },
+    { name: "duplicate short input", fields: { messages: Array.from({ length: 20 }, () => ({ content: "E" })) }, message: "Expected number" },
+    { name: "completions and Responses fields", fields: { prompt: "private completion prompt", instructions: "private responses instructions" }, message: "private completion prompt; private responses instructions" },
+    { name: "overlapping inputs", fields: { input: ["abcd", "bcdef", "a", "abcd"] }, message: "abcdef" },
+  ])("does not redact caller input from diagnostics: $name", async ({ fields, message }) => {
     const { client } = setup();
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { type: "invalid_request_error", message } }, { status: 400 })));
+    const type = "invalid_request_error";
+    const code = "invalid_type";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { type, code, message } }, { status: 400 })));
     const response = await client.routeRequest({ path: "/v1/chat/completions", method: "POST",
       body: { model: model.id, ...fields }, baseUrl, mintUrl, modelId: model.id, headers: {} });
-    const text = await response.text();
-    expect(text.length).toBeLessThan(2000);
-    for (const value of absent) expect(text).not.toContain(value);
+    expect(response.status).toBe(400);
+    const result = await response.json();
+    expect(result.error.message).toBe(message);
+    expect(result.error.errors[0]).toMatchObject({ type, code, message });
   });
 
-  it("fails closed within bounded output for excessive redaction inputs", async () => {
+  it.each([
+    { name: "more than 512 strings", input: Array.from({ length: 600 }, (_, i) => `input-${i}`) },
+    { name: "more than 64 KiB of input", input: "a".repeat(65537) },
+  ])("preserves context-length diagnostics for $name", async ({ input }) => {
     const { client } = setup();
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { type: "invalid_request_error", message: "private instructions " + "E".repeat(20000) } }, { status: 400 })));
+    const error = { type: "invalid_request_error", code: "context_length_exceeded", message: "context length exceeded" };
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error }, { status: 400 })));
     const response = await client.routeRequest({ path: "/v1/responses", method: "POST",
-      body: { model: model.id, instructions: "private instructions", input: Array.from({ length: 2000 }, (_, i) => `input-${i}`) }, baseUrl, mintUrl, modelId: model.id, headers: {} });
-    const text = await response.text();
-    expect(text.length).toBeLessThan(2000);
-    expect(text).not.toContain("private instructions");
+      body: { model: model.id, instructions: "instructions", input }, baseUrl, mintUrl, modelId: model.id, headers: {} });
+    expect(response.status).toBe(400);
+    const result = await response.json();
+    expect(result.error.message).toBe(error.message);
+    expect(result.error.errors[0]).toMatchObject(error);
+  });
+
+  it("never redacts machine-readable type or code, even when they contain credential-like text", async () => {
+    const { client } = setup();
+    const error = {
+      type: "cashuBmachine_label", code: credential,
+      message: `cashuBprivateproof; Bearer privatekey\n${credential}`,
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error }, { status: 400 })));
+    const response = await routeRequest(client);
+    expect((await response.json()).error.errors[0]).toMatchObject({
+      type: error.type, code: error.code, message: "[REDACTED]; [REDACTED]\n[REDACTED]",
+    });
   });
 
   it("preserves useful validation details without retrying the same node", async () => {
@@ -394,6 +488,52 @@ describe("L3 failover exhaustion forwards the last envelope", () => {
     });
 
     await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
+  });
+
+  it.each([401, 403].flatMap(status =>
+    ["invalid_api_key", "key_expired", "unauthorized", "send_token_failed", "key_not_found"].map(code => ({ status, code }))
+  ))("keeps node authentication $status/$code as FailoverError", async ({ status, code }) => {
+    const { client } = setup();
+    const body = JSON.stringify({ error: { type: "invalid_request_error", code, message: "Node rejected SDK credentials" } });
+    stubFetchByProvider({
+      [baseUrl]: { status, statusText: "Rejected", body, requestId: "first" },
+      [nextUrl]: { status, statusText: "Rejected", body, requestId: "last" },
+    });
+    await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
+  });
+
+  it.each([401, 403])("keeps explicitly node-scoped %i as FailoverError", async status => {
+    const { client } = setup();
+    const body = JSON.stringify({ error: { type: "invalid_request_error", message: "Node rejected credentials" } });
+    stubFetchByProvider({
+      [baseUrl]: { status, statusText: "Rejected", body, requestId: "first", headers: { "x-routstr-error-scope": "node" } },
+      [nextUrl]: { status, statusText: "Rejected", body, requestId: "last", headers: { "x-routstr-error-scope": "node" } },
+    });
+    await expect(routeRequest(client)).rejects.toBeInstanceOf(FailoverError);
+  });
+
+  it.each([401, 403])("keeps explicitly upstream-scoped %i as a 502 aggregate", async status => {
+    const { client } = setup();
+    const body = JSON.stringify({ error: { type: "invalid_request_error", message: "Provider rejected credentials" } });
+    stubFetchByProvider({
+      [baseUrl]: { status, statusText: "Rejected", body, requestId: "first", headers: { "x-routstr-error-scope": "upstream" } },
+      [nextUrl]: { status, statusText: "Rejected", body, requestId: "last", headers: { "x-routstr-error-scope": "upstream" } },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.errors[0]).toMatchObject({ status, type: "invalid_request_error" });
+  });
+
+  it.each([401, 403])("lets explicit upstream scope override invalid_api_key on %i", async status => {
+    const { client } = setup();
+    const body = JSON.stringify({ error: { type: "invalid_request_error", code: "invalid_api_key", message: "Provider rejected credentials" } });
+    stubFetchByProvider({
+      [baseUrl]: { status, statusText: "Rejected", body, requestId: "first", headers: { "x-routstr-error-scope": "upstream" } },
+      [nextUrl]: { status, statusText: "Rejected", body, requestId: "last", headers: { "x-routstr-error-scope": "upstream" } },
+    });
+    const response = await routeRequest(client);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.errors[0]).toMatchObject({ status, code: "invalid_api_key" });
   });
 
   it("treats upstream account quota exhaustion as infrastructure, not caller payment", async () => {
