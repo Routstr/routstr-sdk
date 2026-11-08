@@ -3213,8 +3213,12 @@ export class RoutstrClient {
           baseUrl
         );
         const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
+        // Only promote the bootstrap credential this read belongs to. A
+        // refund/removal and recreation may have installed a different key
+        // while wallet-info was pending; its credential and balance are newer.
         if (
-          storedApiKeyEntry?.key.startsWith("cashu") &&
+          storedApiKeyEntry?.key === token &&
+          storedApiKeyEntry.key.startsWith("cashu") &&
           latestBalanceInfo.apiKey
         ) {
           this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
