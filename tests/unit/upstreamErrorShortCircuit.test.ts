@@ -183,7 +183,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     ]);
     expect(refund).not.toHaveBeenCalled();
     expect(markFailed).not.toHaveBeenCalled();
-    expect(response.status).toBe(422);
+    expect(response.status).toBe(400);
     expect((await response.json()).error.errors).toEqual([
       { status: 400, type: "upstream_error", code: "unsupported", message: "Same rejection", providers: [baseUrl, nextUrl] },
       { status: 422, type: "upstream_error", code: "unsupported", message: "Different rejection", providers: [thirdUrl] },

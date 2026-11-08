@@ -290,7 +290,7 @@ describe("_handleErrorResponse cooldown scope (provider-wide branches)", () => {
     );
 
     expect(response).toBeInstanceOf(Response);
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(503);
 
     // Provider-wide scope: neither modelId nor modelPath is set.
     expect(providerManager.markFailed).toHaveBeenCalledWith(

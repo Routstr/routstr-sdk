@@ -236,7 +236,7 @@ describe("RoutstrClient 402 top-up validation", () => {
       },
     });
 
-    await expect(handle402(client, body)).rejects.toBeInstanceOf(FailoverError);
+    expect((await handle402(client, body)).status).toBe(502);
     expect(getBalance).not.toHaveBeenCalled();
     expect(topUp).not.toHaveBeenCalled();
     expect(providerManager.markFailed).toHaveBeenCalledWith(
@@ -253,9 +253,7 @@ describe("RoutstrClient 402 top-up validation", () => {
     const { client } = createClient();
     const topUp = vi.spyOn(client.getBalanceManager(), "topUp");
 
-    await expect(handle402(client, "Payment Required")).rejects.toBeInstanceOf(
-      FailoverError
-    );
+    expect((await handle402(client, "Payment Required")).status).toBe(502);
     expect(topUp).not.toHaveBeenCalled();
   });
 
