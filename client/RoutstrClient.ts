@@ -189,7 +189,8 @@ function retryAfterDeadline(value: string | undefined): number | undefined {
   if (!parts) return undefined;
   const [day, month, year, hours, minutes, seconds] = parts;
   const monthIndex = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].indexOf(month);
-  const deadline = Date.parse(text);
+  // HTTP asctime dates imply GMT, unlike JavaScript's timezone-less parser.
+  const deadline = Date.parse(asctime ? `${text} GMT` : text);
   if (!Number.isFinite(deadline)) return undefined;
   const date = new Date(deadline);
   return date.getUTCDate() === Number(day) && date.getUTCMonth() === monthIndex &&
