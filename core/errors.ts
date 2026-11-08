@@ -9,6 +9,8 @@ import type { ParsedCoreError } from "./errorTypes";
  * Error thrown when balance is insufficient for an operation
  */
 export class InsufficientBalanceError extends Error {
+  /** Node payment context, including msat amounts and the pricing audit trail. */
+  parsedError?: ParsedCoreError;
   constructor(
     public required: number,
     public available: number,
@@ -25,6 +27,20 @@ export class InsufficientBalanceError extends Error {
     );
     this.name = "InsufficientBalanceError";
   }
+}
+
+/** Map node millisatoshis to the existing public error's satoshi units. */
+export function toInsufficientBalanceError(parsed: ParsedCoreError): InsufficientBalanceError | undefined {
+  if (parsed.status !== 402 || parsed.unit !== "msat" ||
+    (parsed.type !== "insufficient_quota" && parsed.type !== "minimum_balance_required") ||
+    (parsed.code !== "insufficient_balance" && parsed.code !== "minimum_balance_required") ||
+    !Number.isSafeInteger(parsed.requiredMsats) || parsed.requiredMsats! < 0 ||
+    !Number.isSafeInteger(parsed.availableMsats) || parsed.availableMsats! < 0) return undefined;
+  const error = new InsufficientBalanceError(
+    parsed.requiredMsats! / 1000, parsed.availableMsats! / 1000, 0, "", parsed.message
+  );
+  error.parsedError = parsed;
+  return error;
 }
 
 /**

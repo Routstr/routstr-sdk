@@ -35,6 +35,7 @@ import {
   ProviderError,
   FailoverError,
   InsufficientBalanceError,
+  toInsufficientBalanceError,
   ProviderMintBalanceError,
   TokenAlreadySpentError,
   MintError,
@@ -2049,6 +2050,12 @@ export class RoutstrClient {
         );
         tryNextProvider = true;
       } else {
+        // The node's current admission price supersedes a cached model estimate.
+        // Only structured msat amounts authorize this override (not legacy prose).
+        const requiredSats = parsedError.details && parsedError.unit === "msat" &&
+          parsedError.requiredMsats !== undefined
+          ? parsedError.requiredMsats / 1000 : params.requiredSats;
+        params = { ...params, requiredSats };
         let balanceValidated = false;
         let balanceSufficient = false;
         let reservationRetry = false;
@@ -2138,6 +2145,10 @@ export class RoutstrClient {
           await params.lifecycle?.event(topupResult.success ? "topup_succeeded" : "topup_failed", undefined, { baseUrl });
           if (!topupResult.success) {
             const message = topupResult.message || "";
+            const nodeBalanceError = topupResult.parsedError
+              ? toInsufficientBalanceError(topupResult.parsedError) : undefined;
+            const legacyInsufficient = !topupResult.parsedError?.details &&
+              message.includes("Insufficient balance");
             if (topupResult.providerMintsShort) {
               // The wallet is funded, but not on a mint this provider
               // accepts. Fail over to a provider that does; only surface
@@ -2156,7 +2167,7 @@ export class RoutstrClient {
               );
               tryNextProvider = true;
             } else if (
-              message.includes("Insufficient balance") &&
+              (nodeBalanceError || legacyInsufficient) &&
               reservedBalance > 0 &&
               availableBalance + reservedBalance >= params.requiredSats &&
               (reservationWaitResult = await this._waitForReservedBalance(params, pendingReservations))
@@ -2164,7 +2175,11 @@ export class RoutstrClient {
               // Only observed settlement earns a retry outside the ordinary cap.
               reservationRetry = reservationWaitResult === "settled";
               this._log("DEBUG", `[RoutstrClient] Reserved balance became available on ${baseUrl}; retrying`);
-            } else if (message.includes("Insufficient balance")) {
+            } else if (nodeBalanceError) {
+              insufficientBalance = nodeBalanceError;
+              tryNextProvider = true;
+            } else if (legacyInsufficient) {
+              // Legacy local-wallet prose, not the node's structured 402 amounts.
               // Parse decimals and the largest-mint hint so the final 402
               // JSON reports the real shortfall instead of 0/"".
               const needMatch = message.match(/need ([\d.]+)/);
@@ -2192,6 +2207,9 @@ export class RoutstrClient {
                 maxMintUrl,
                 message
               );
+              // Keep node pricing/request context without confusing API-key
+              // available funds with the wallet funds needed for this top-up.
+              insufficientBalance.parsedError = parsedError;
               tryNextProvider = true;
             } else {
               this._log(
