@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseCoreError,
   isCoreErrorType,
+  isNodeAccountError,
   isKeyNotFoundError,
   isNoBalanceToRefundError,
   shouldFailoverToAnotherMint,
@@ -526,5 +527,20 @@ describe("isKeyNotFoundError", () => {
       detail: { error: { message: "Key not found.", code: "key_not_found" } },
     });
     expect(isKeyNotFoundError(parseCoreError(body, 404))).toBe(false);
+  });
+});
+
+describe("node account error classification", () => {
+  it.each(["invalid_api_key", "key_not_found", "key_expired", "unauthorized", "send_token_failed"])(
+    "recognizes local %s with a generic request-error type", code => {
+      expect(isNodeAccountError({ raw: false, type: "invalid_request_error", code })).toBe(true);
+    }
+  );
+
+  it("honors explicit scope before broad error types or reused codes", () => {
+    expect(isNodeAccountError({ raw: false, type: "upstream_error" }, "node")).toBe(true);
+    expect(isNodeAccountError({ raw: false, type: "cashu_error", code: "invalid_api_key" }, "upstream")).toBe(false);
+    expect(isNodeAccountError({ raw: false, type: "invalid_request_error", code: "provider_key_invalid" })).toBe(false);
+    expect(isNodeAccountError({ raw: false, type: "insufficient_quota", code: "insufficient_balance" })).toBe(true);
   });
 });
