@@ -98,12 +98,11 @@ describe("pre-warm funds rule", () => {
     expect(prewarmFundsHeadroom({ fundsHeadroom: Number.NaN })).toBe(2);
   });
 
-  it("keeps fundsHeadroom × R plus the request's own margin while pre-warming", () => {
+  it("keeps the request's own margin plus fundsHeadroom × R while pre-warming", () => {
     expect(prewarmTopupFactor(undefined, 1.4)).toBe(1.4);
     expect(prewarmTopupFactor({ enabled: false }, 1.4)).toBe(1.4);
-    expect(prewarmTopupFactor({}, 1.4)).toBeCloseTo(2.4);
-    expect(prewarmTopupFactor({ fundsHeadroom: 3 }, 1.4)).toBeCloseTo(3.4);
-    // Never below the plain margin.
+    expect(prewarmTopupFactor({}, 1.4)).toBeCloseTo(3.4);
+    expect(prewarmTopupFactor({ fundsHeadroom: 1 }, 1.4)).toBeCloseTo(2.4);
     expect(prewarmTopupFactor({ fundsHeadroom: 0 }, 1.4)).toBe(1.4);
   });
 
@@ -112,7 +111,7 @@ describe("pre-warm funds rule", () => {
     const { client, topUp } = setup();
     await route(client, { trustedHosts: [], prewarm: { enabled: true, log: () => {} } });
     expect(topUp).toHaveBeenCalledTimes(1);
-    expect((topUp.mock.calls[0]![0] as { topupFactor: number }).topupFactor).toBeCloseTo(2.4);
+    expect((topUp.mock.calls[0]![0] as { topupFactor: number }).topupFactor).toBeCloseTo(3.4);
   });
 
   it("without pre-warming, and for plain requests, the margin is unchanged", async () => {
