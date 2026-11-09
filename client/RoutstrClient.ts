@@ -968,16 +968,16 @@ export class RoutstrClient {
       }
 
       const runFinalize = async (): Promise<number> => {
-      // A confidential response settles on the node after its body ends
-      // (usage proof + charge); balance accounting must read it afterwards.
-      // A failed settlement check already errored the response stream; the
-      // balance is still re-read, since the node may have charged.
-      // A one-off bearer's change comes with the settlement (a stream's
-      // wrapper copied the headers before the transport could set it).
-      const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
-        this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
-        return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
-      })) as { change?: unknown } | undefined;
+        // A confidential response settles on the node after its body ends
+        // (usage proof + charge); balance accounting must read it afterwards.
+        // A failed settlement check already errored the response stream; the
+        // balance is still re-read, since the node may have charged.
+        // A one-off bearer's change comes with the settlement (a stream's
+        // wrapper copied the headers before the transport could set it).
+        const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
+          this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
+          return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
+        })) as { change?: unknown } | undefined;
         const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
         const usage = capturedUsage ?? prepared.capturedUsage ??
           (!isSSE ? extractUsageFromResponseBody(jsonBody) ?? undefined : undefined);
@@ -992,8 +992,8 @@ export class RoutstrClient {
           initialTokenBalance: prepared.tokenBalanceInSats,
           response: accountingResponse,
           responseBody: jsonBody,
-        refundToken:
-          typeof settlement?.change === "string" ? settlement.change : undefined,
+          refundToken:
+            typeof settlement?.change === "string" ? settlement.change : undefined,
           modelId: prepared.modelId,
           usage,
           requestId,
@@ -1444,12 +1444,12 @@ export class RoutstrClient {
         const requestResponseLogId = (response as any).requestResponseLogId as
           | string
           | undefined;
-      // Raw logging is off for confidential responses unless the request
-      // opted in (see `_makeRequest`).
-      const logSink: RequestResponseLogSink | undefined = (response as any)
-        .requestResponseLogSuppressed
-        ? undefined
-        : this.requestResponseLogSink;
+        // Raw logging is off for confidential responses unless the request
+        // opted in (see `_makeRequest`).
+        const logSink: RequestResponseLogSink | undefined = (response as any)
+          .requestResponseLogSuppressed
+          ? undefined
+          : this.requestResponseLogSink;
 
         processedResponse = new Response(clientStream, {
           status: response.status,
@@ -1463,13 +1463,13 @@ export class RoutstrClient {
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
-      (processedResponse as any).requestResponseLogSuppressed = (
-        response as any
-      ).requestResponseLogSuppressed;
-      // finalize() awaits a confidential response's settlement through this.
-      (processedResponse as any).confidentialSettled = (
-        response as any
-      ).confidentialSettled;
+        (processedResponse as any).requestResponseLogSuppressed = (
+          response as any
+        ).requestResponseLogSuppressed;
+        // finalize() awaits a confidential response's settlement through this.
+        (processedResponse as any).confidentialSettled = (
+          response as any
+        ).confidentialSettled;
 
         usagePromise = inspectSSEWebStream(
           inspectStream,
@@ -1484,7 +1484,7 @@ export class RoutstrClient {
           {
             onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
             onRawChunk: (_chunk, sequence, text) => {
-            void logSink?.logResponseChunk?.(
+              void logSink?.logResponseChunk?.(
                 requestResponseLogId,
                 sequence,
                 text
@@ -1492,10 +1492,10 @@ export class RoutstrClient {
             },
           }
         ).then(async (result) => {
-        await logSink?.logResponseEnd?.(requestResponseLogId);
+          await logSink?.logResponseEnd?.(requestResponseLogId);
           return result;
         }).catch(async (error) => {
-        await logSink?.logResponseError?.(requestResponseLogId, error);
+          await logSink?.logResponseError?.(requestResponseLogId, error);
           throw error;
         });
 

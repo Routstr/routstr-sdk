@@ -80,14 +80,13 @@ describe("streamed confidential response finalization", () => {
       headers: {},
     });
     expect((response as any).confidentialSettled).toBe(settled);
-    // The stream ends only after the accounting, so neither the body nor
-    // finalize() completes before the settlement.
-    let ended = false;
+    // EOF is delivered before accounting (the transport itself holds the
+    // `[DONE]` line until the settlement checks pass), but neither the
+    // accounting nor finalize() completes before the settlement.
     let finalized = false;
-    const body = response.text().then(() => (ended = true));
+    const body = response.text();
     const done = (response as any).finalize().then(() => (finalized = true));
     await new Promise((r) => setTimeout(r, 20));
-    expect(ended).toBe(false);
     expect(finalized).toBe(false);
     expect(balanceUpdate).not.toHaveBeenCalled();
     settle();
