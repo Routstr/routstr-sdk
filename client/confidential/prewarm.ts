@@ -68,6 +68,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { PREWARM_FUNDS_HEADROOM, prewarmFundsHeadroom } from "./prewarmFunds";
 
 export interface PrewarmOptions {
   /** Default true (an options object opts in). */
@@ -90,7 +91,11 @@ export interface PrewarmOptions {
   backoffMaxMs?: number;
   /** Housekeeping interval while any key has state. */
   tickMs?: number;
-  /** Arm only if available balance ≥ fundsHeadroom × the key's reservation. */
+  /**
+   * Arm only if available balance ≥ fundsHeadroom × the key's reservation
+   * (default 2). The API-key top-up keeps the key at this line plus its own
+   * margin while pre-warming is on (`prewarmFunds.ts`).
+   */
   fundsHeadroom?: number;
   /** Concurrent arms across all keys. */
   maxConcurrentArms?: number;
@@ -121,7 +126,7 @@ export const PREWARM_DEFAULTS = {
   backoffBaseMs: 30_000,
   backoffMaxMs: 10 * 60_000,
   tickMs: 15_000,
-  fundsHeadroom: 2,
+  fundsHeadroom: PREWARM_FUNDS_HEADROOM,
   maxConcurrentArms: 1,
   maxSessionFeeMsat: 5000,
   maxArmedWithFee: 6,
@@ -310,6 +315,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       ...defined,
     } as Config;
     if (!(cfg.maxAgeMs >= PREWARM_MIN_MAX_AGE_MS)) cfg.maxAgeMs = PREWARM_MIN_MAX_AGE_MS;
+    cfg.fundsHeadroom = prewarmFundsHeadroom(cfg);
     return cfg;
   }
 

@@ -91,6 +91,7 @@ import type {
 } from "./confidential/transport";
 import type { ConfidentialOffer } from "./confidential/offer";
 import { chooseImageVariant } from "./confidential/imagePlan";
+import { prewarmTopupFactor } from "./confidential/prewarmFunds";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -1485,6 +1486,13 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       requiredSats,
+      // A pre-warmed confidential chat key arms only above fundsHeadroom × R
+      // (after the armed sessions' reservations); keep it there, or it never
+      // arms. Image sessions are never armed.
+      topupFactor:
+        params.confidential && !confidentialImages
+          ? prewarmTopupFactor(params.confidential.prewarm, TOPUP_MARGIN)
+          : TOPUP_MARGIN,
       tokenBalance,
       tokenReserved,
       tokenBalanceUnit,
@@ -4123,6 +4131,8 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     requiredSats: number;
+    /** Multiple of `requiredSats` to keep available (default TOPUP_MARGIN). */
+    topupFactor?: number;
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
@@ -4144,16 +4154,18 @@ export class RoutstrClient {
       snapshot.tokenBalanceUnit
     );
     // Maintain the margin up front: proactively top up whenever the available
-    // balance is below the request price scaled by TOPUP_MARGIN, so the
-    // key stays covered at the margin instead of reacting only after a 402.
-    const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
+    // balance is below the request price scaled by TOPUP_MARGIN (more for a
+    // pre-warmed confidential key), so the key stays covered at the margin
+    // instead of reacting only after a 402.
+    const factor = snapshot.topupFactor ?? TOPUP_MARGIN;
+    const targetSats = snapshot.requiredSats * factor;
     if (snapshotAvailableSats >= targetSats) return;
 
     const key = providerKey(snapshot.baseUrl, snapshot.token);
     const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
-      `[RoutstrClient] _topUpIfNeeded: snapshot available=${snapshotAvailableSats} sat, reserved=${snapshotReservedSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
+      `[RoutstrClient] _topUpIfNeeded: snapshot available=${snapshotAvailableSats} sat, reserved=${snapshotReservedSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${factor}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
     );
 
     // Concurrent callers join the same deposit. In the margin zone this is
@@ -4191,6 +4203,7 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     requiredSats: number;
+    topupFactor?: number;
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
@@ -4204,7 +4217,7 @@ export class RoutstrClient {
         baseUrl: snapshot.baseUrl,
         token: snapshot.token,
         requiredSats: snapshot.requiredSats,
-        targetSats: snapshot.requiredSats * TOPUP_MARGIN,
+        targetSats: snapshot.requiredSats * (snapshot.topupFactor ?? TOPUP_MARGIN),
         minimumFraction: PROACTIVE_TOPUP_MIN_FRACTION,
         minimumDeposit: MIN_DEPOSIT_SATS,
       });
