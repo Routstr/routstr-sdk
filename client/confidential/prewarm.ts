@@ -56,6 +56,9 @@
  *   reservation R), and only while the credential's available balance (the
  *   node's balance minus every reservation, armed sessions included) is at
  *   least `fundsHeadroom` × R (default 2: the new arm plus one cold request).
+ *   Too little balance is not a failure: the key retries when one of its
+ *   requests settles (a claimed session's reservation is then released), or
+ *   after `backoffBaseMs`, and the backoff does not escalate.
  * - Abandon fee: a node may charge a fee for a session that ends without a
  *   request reaching the provider (the signed offer's `abandon_fee_msat`, at
  *   least its `session_fee_msat`), so every armed session that is never
@@ -251,6 +254,12 @@ interface KeyState<S extends ArmedSessionLike, C> {
   /** Armed sessions that died before use since the last warm request served. */
   deaths: number;
   backoffUntil: number;
+  /**
+   * Too little balance for another arm: no arm before this time unless a
+   * request of the key settles first (that releases its reservation). Not a
+   * failure, so it never escalates the backoff.
+   */
+  fundsWaitUntil: number;
   fundsCheck?: Promise<void>;
   noted: Set<string>;
 }
@@ -424,6 +433,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         failures: 0,
         deaths: 0,
         backoffUntil: 0,
+        fundsWaitUntil: 0,
         noted: new Set(),
       };
       this.keys.set(key, k);
@@ -478,6 +488,8 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         clearCold();
         st.inFlight = Math.max(0, st.inFlight - 1);
         st.lastActivity = this.now();
+        // Its reservation is released (or charged): the balance changed.
+        st.fundsWaitUntil = 0;
         if (typeof reservedMsats === "number" && reservedMsats > 0) {
           // An armed session served a request to settlement: the node keeps
           // armed sessions alive, so earlier deaths stop counting.
@@ -611,6 +623,7 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
       if (pooled >= target || keyArming) continue;
       if (total >= this.cfg.maxTotal || arming >= this.cfg.maxConcurrentArms || coldPrep) continue;
       if (now < k.backoffUntil) continue;
+      if (now < k.fundsWaitUntil) continue;
       if (feeKey(k) && pooledWithFee >= this.cfg.maxArmedWithFee) continue;
       if (k.reservationMsats === undefined) {
         this.note(k, "await-receipt", `${k.label}: waiting for a settled request before arming (reservation unknown)`);
@@ -677,12 +690,23 @@ export class PrewarmPool<S extends ArmedSessionLike, C = unknown> {
         return;
       }
       const need = this.cfg.fundsHeadroom * reserve;
-      if (available === undefined || available < need) {
+      if (available === undefined) {
+        this.remove(k, entry);
+        reject(new Error("balance unknown"));
+        this.backoff(k, "available balance unknown");
+        return;
+      }
+      if (available < need) {
+        // Not a failure: a claimed or in-flight request still holds its
+        // reservation, or a top-up is pending. Retry when one of the key's
+        // requests settles, or after backoffBaseMs, without escalating.
         this.remove(k, entry);
         reject(new Error("insufficient balance for a pre-warmed session"));
-        this.backoff(
-          k,
-          `available balance ${available ?? "unknown"} msats < ${need} msats (${this.cfg.fundsHeadroom} × reservation)`,
+        k.fundsWaitUntil = this.now() + this.cfg.backoffBaseMs;
+        this.log(
+          `${k.label}: not arming yet (available balance ${available} msats < ${need} msats, ` +
+            `${this.cfg.fundsHeadroom} × reservation); retry after the next settled request or ` +
+            `${Math.round(this.cfg.backoffBaseMs / 1000)}s`,
         );
         return;
       }
