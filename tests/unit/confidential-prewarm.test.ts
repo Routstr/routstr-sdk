@@ -46,6 +46,7 @@ function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12, 
   const logs: string[] = [];
   let timerActive = false;
   let n = 0;
+  let bal = balance;
   const pool = new PrewarmPool<FakeSession, null>(
     { log: (m) => logs.push(m), ...opts },
     {
@@ -54,7 +55,7 @@ function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12, 
         timerActive = true;
         return () => (timerActive = false);
       },
-      availableMsats: async () => balance,
+      availableMsats: async () => bal,
       arm: (_info, _ctx, len): ArmHandle<FakeSession> => {
         const session = new FakeSession(len, `sid${++n}`);
         session.abandonFeeMsat = feeMsat;
@@ -86,6 +87,7 @@ function harness(opts: PrewarmOptions = {}, balance: number | undefined = 1e12, 
     info,
     flush,
     advance: (ms: number) => (now += ms),
+    setBalance: (b: number | undefined) => (bal = b),
     timerActive: () => timerActive,
     /** One complete cold request that settles with a 1000 msat reservation. */
     async request(len = 1000, info2 = info) {
@@ -111,6 +113,50 @@ async function completeArms(h: ReturnType<typeof harness>) {
 }
 
 describe("pre-warm heuristics", () => {
+  it("too little balance at a warm claim waits for the settlement, without a backoff", async () => {
+    // R = 1000 msats, fundsHeadroom 2. The claimed session still holds its
+    // reservation when the pool replenishes at the claim, so the check fails
+    // then; it must arm again as soon as that request settles.
+    const h = harness({}, 2500);
+    await h.request(); // cold, settles: R learned
+    await completeArms(h);
+    expect(h.pool.snapshot()[0]!.ready).toBe(1);
+    h.setBalance(1500); // the armed session holds R
+    const t = h.pool.begin(h.info, null, 1000);
+    const lease = t.take();
+    expect(lease?.ready).toBe(true);
+    await lease!.session;
+    t.warm();
+    await h.flush();
+    expect(h.arms).toHaveLength(1); // 1500 < 2000: not armed
+    expect(h.logs.some((l) => l.includes("not arming yet"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("backing off"))).toBe(false);
+    t.head();
+    h.setBalance(2500); // the claimed session settled
+    t.end(1000, 0);
+    await h.flush();
+    await h.flush();
+    expect(h.arms).toHaveLength(2);
+  });
+
+  it("too little balance retries after backoffBaseMs without escalating", async () => {
+    const h = harness({}, 1500);
+    await h.request();
+    await h.flush();
+    expect(h.arms).toHaveLength(0);
+    for (let i = 0; i < 3; i++) {
+      h.advance(PREWARM_DEFAULTS.backoffBaseMs + 1);
+      h.pool.reconcile();
+      await h.flush();
+    }
+    expect(h.logs.filter((l) => l.includes("not arming yet")).length).toBe(4);
+    h.setBalance(2500);
+    h.advance(PREWARM_DEFAULTS.backoffBaseMs + 1);
+    h.pool.reconcile();
+    await h.flush();
+    expect(h.arms).toHaveLength(1);
+  });
+
   it("never arms without traffic (no timer, nothing armed)", async () => {
     const h = harness();
     h.pool.reconcile();
