@@ -27,16 +27,17 @@ export function prewarmFundsHeadroom(prewarm: PrewarmFundsOptions | undefined): 
 /**
  * The multiple of a request's price the proactive top-up keeps available on
  * a key. Without pre-warming it is `topupMargin`. With pre-warming the pool
- * needs `fundsHeadroom` × R available after every armed session's
- * reservation, so the top-up keeps `fundsHeadroom` × R plus the margin the
- * request itself spends from (`topupMargin` − 1) × R. Because the available
- * balance already excludes the armed sessions, the key's balance grows with
- * the number of armed sessions, which `maxPerKey` / `maxTotal` bound.
+ * replaces a claimed session while the request it serves still holds its
+ * reservation, and needs `fundsHeadroom` × R available after every
+ * reservation; so the top-up keeps the request itself (`topupMargin` × R)
+ * plus `fundsHeadroom` × R. Because the available balance already excludes
+ * the armed sessions, the key's balance grows with the number of armed
+ * sessions, which `maxPerKey` / `maxTotal` bound.
  */
 export function prewarmTopupFactor(
   prewarm: PrewarmFundsOptions | undefined,
   topupMargin: number,
 ): number {
   if (prewarm === undefined || prewarm.enabled === false) return topupMargin;
-  return Math.max(topupMargin, prewarmFundsHeadroom(prewarm) + topupMargin - 1);
+  return topupMargin + prewarmFundsHeadroom(prewarm);
 }
