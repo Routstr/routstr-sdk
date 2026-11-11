@@ -1142,16 +1142,18 @@ describe("confidential deposit sizing", () => {
   const nodeReservation = (o: {
     limit?: number;
     maxCost: number;
-    rates: { in: number; out: number };
+    rates: { in: number; out: number; cache_write?: number };
     maxTokens: number;
     margin: number;
     pct: number;
     fee: number;
     abandon: number;
   }) => {
+    // The opaque prompt may be all cache writes: max(in, cache_write).
+    const promptRate = Math.max(o.rates.in, o.rates.cache_write ?? 0);
     const base =
       o.limit !== undefined
-        ? Math.ceil((o.limit * o.rates.in + (o.maxTokens + o.margin) * o.rates.out) / 1000)
+        ? Math.ceil((o.limit * promptRate + (o.maxTokens + o.margin) * o.rates.out) / 1000)
         : Math.ceil(Math.ceil(o.maxCost * 1000) * (1 + o.pct / 100) + (o.margin * o.rates.out) / 1000);
     return Math.max(1, base) + Math.max(o.fee, Math.max(o.abandon, o.fee));
   };
@@ -1198,14 +1200,66 @@ describe("confidential deposit sizing", () => {
     const atCap = confidentialReservationMsats(model({ contextLength: 131072 }), 4096, offer());
     expect(confidentialReservationMsats(model({ contextLength: 131072 }), 9999, offer())).toBe(atCap);
     expect(confidentialReservationMsats(model({ contextLength: 131072 }), undefined, offer())).toBe(atCap);
-    // The provider's context length comes first, like on the node.
-    expect(confidentialReservationMsats(model({ contextLength: 8192, top: 131072 }), 100, offer())).toBe(
-      confidentialReservationMsats(model({ contextLength: 131072 }), 100, offer()),
-    );
     // No margin in the offer: the node reserves none.
     expect(confidentialReservationMsats(model({ contextLength: 1000 }), 100, offer({ reserve_margin_tokens: undefined }))).toBe(
       nodeReservation({ limit: 1000, maxCost: 70, rates: { in: 360, out: 1440 }, maxTokens: 100, margin: 0, pct: 20, fee: 2000, abandon: 5000 }),
     );
+  });
+
+  it("prices the opaque prompt at max(in, cache_write), like the node", () => {
+    // Claude-style rates: a cache write costs 1.25 × the input rate.
+    const rates = { in: 6000, cached_in: 600, cache_write: 7500, out: 30_000 };
+    const withWrites = offer({ price_list: { m: rates }, max_tokens_cap: 32_768 });
+    for (const maxTokens of [1024, undefined]) {
+      const want = nodeReservation({
+        limit: 200_000,
+        maxCost: 70,
+        rates,
+        maxTokens: maxTokens ?? 32_768,
+        margin: 16,
+        pct: 20,
+        fee: 2000,
+        abandon: 5000,
+      });
+      expect(confidentialReservationMsats(model({ contextLength: 200_000 }), maxTokens, withWrites)).toBe(want);
+      // Not the reservation at `in`: that deposit is short and the node answers 402.
+      expect(want).toBeGreaterThan(
+        nodeReservation({ limit: 200_000, maxCost: 70, rates: { in: 6000, out: 30_000 }, maxTokens: maxTokens ?? 32_768, margin: 16, pct: 20, fee: 2000, abandon: 5000 }),
+      );
+    }
+    // A cache write cheaper than `in` changes nothing.
+    const cheap = offer({ price_list: { m: { ...rates, cache_write: 100 } } });
+    expect(confidentialReservationMsats(model({ contextLength: 1000 }), 100, cheap)).toBe(
+      nodeReservation({ limit: 1000, maxCost: 70, rates: { in: 6000, out: 30_000 }, maxTokens: 100, margin: 16, pct: 20, fee: 2000, abandon: 5000 }),
+    );
+    // Without the offer: the listing's cache-write price, raised by the surcharge.
+    const cu = { rate_surcharge_pct: 20, session_fee_msat: 2000, abandon_fee_msat: 5000 };
+    const listed = {
+      ...(model({ contextLength: 200_000, cu }) as object),
+      sats_pricing: { prompt: 0.005, completion: 0.025, input_cache_write: 0.00625, max_cost: 70, max_prompt_cost: 39.3, max_completion_cost: 4.9, request: 0 },
+    } as never;
+    const signedEquivalent = nodeReservation({
+      limit: 200_000,
+      maxCost: 70,
+      rates: { in: 6000, cache_write: 7500, out: 30_000 },
+      maxTokens: 1024,
+      margin: 16,
+      pct: 20,
+      fee: 2000,
+      abandon: 5000,
+    });
+    const got = confidentialReservationMsats(listed, 1024)!;
+    expect(got).toBeGreaterThanOrEqual(signedEquivalent);
+    expect(got - signedEquivalent).toBeLessThanOrEqual(1);
+  });
+
+  it("reserves for the larger of the two context lengths, like the node", () => {
+    const big = confidentialReservationMsats(model({ contextLength: 131072 }), 100, offer());
+    // The catalogue's top_provider entry may describe another provider.
+    expect(confidentialReservationMsats(model({ contextLength: 131072, top: 8192 }), 100, offer())).toBe(big);
+    expect(confidentialReservationMsats(model({ contextLength: 8192, top: 131072 }), 100, offer())).toBe(big);
+    // Zero and non-integers are "unknown", as on the node.
+    expect(confidentialReservationMsats(model({ contextLength: 131072, top: 0 }), 100, offer())).toBe(big);
   });
 
   it("equals the node's reservation without a context length (undiscounted max cost)", () => {
