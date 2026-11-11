@@ -91,6 +91,7 @@ import type {
 import type { ConfidentialOffer } from "./confidential/offer";
 import { chooseImageVariant } from "./confidential/imagePlan";
 import { prewarmTopupFactor } from "./confidential/prewarmFunds";
+import { confidentialKind } from "./confidential/endpoints";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -418,14 +419,6 @@ function requireConfidentialTransport(): ConfidentialTransport {
 /** The endpoints a confidential session implements (see the transport). */
 function isConfidentialEndpoint(method: string, path: string): boolean {
   return method.toUpperCase() === "POST" && confidentialKind(path) !== undefined;
-}
-
-/** `chat` or `images` for a confidential endpoint path. */
-function confidentialKind(path: string): "chat" | "images" | undefined {
-  const p = path.split("?")[0] ?? "";
-  if (/^(\/v1)?\/chat\/completions\/?$/.test(p)) return "chat";
-  if (/^(\/v1)?\/(images\/generations|image\/generate)\/?$/.test(p)) return "images";
-  return undefined;
 }
 
 /**

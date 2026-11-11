@@ -49,6 +49,7 @@ import {
   exposedProviderHeader,
   samePinValue,
 } from "./suffix";
+import { confidentialKind } from "./endpoints";
 import { encryptedNodeTransport } from "./hosts";
 import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
 import {
@@ -414,10 +415,7 @@ export async function qualifyConfidentialNode(
 
 /** The chat endpoint the confidential transport implements. */
 export function isConfidentialEndpoint(method: string | undefined, path: string | undefined): boolean {
-  return (
-    (method ?? "POST").toUpperCase() === "POST" &&
-    /^(\/v1)?\/chat\/completions\/?$/.test((path ?? "/v1/chat/completions").split("?")[0]!)
-  );
+  return (method ?? "POST").toUpperCase() === "POST" && confidentialKind(path ?? "/v1/chat/completions") === "chat";
 }
 
 /**
@@ -595,10 +593,7 @@ async function fetchConfidentialImageHttp2(
 
 /** The image endpoints the confidential transport implements. */
 export function isConfidentialImageEndpoint(method: string | undefined, path: string | undefined): boolean {
-  return (
-    (method ?? "POST").toUpperCase() === "POST" &&
-    /^(\/v1)?\/(images\/generations|image\/generate)\/?$/.test((path ?? "").split("?")[0]!)
-  );
+  return (method ?? "POST").toUpperCase() === "POST" && confidentialKind(path ?? "") === "images";
 }
 
 /**
