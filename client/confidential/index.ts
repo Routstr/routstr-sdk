@@ -211,6 +211,7 @@ export {
   type Http2KeyInfo,
   type Http2Lease,
 } from "./h2pool";
+export { offerSupportsHttp2Images } from "./offer";
 
 export {
   FrameReader,
