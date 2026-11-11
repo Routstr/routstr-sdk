@@ -32,7 +32,6 @@ import {
   ConfidentialError,
   ConfidentialTimeoutError,
   ConnectionDepositError,
-  ProverMissingError,
   ReceiptVerificationError,
   ResponseVerificationError,
   SessionProtocolError,
@@ -70,7 +69,7 @@ import {
   type VerifiedOffer,
 } from "./offer";
 import { checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from "./params";
-import { CuProverBackend, isExecutable } from "./prover";
+import { CuProverBackend } from "./prover";
 import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
 import {
   countKeyUpdates,
@@ -82,7 +81,7 @@ import {
 } from "./session";
 import { canonicalSuffix, effectiveModelFromText, validateChatSuffix, type UpstreamUsageEvent } from "./suffix";
 import { makeTLSClient } from "./tls-fork/lib/index.js";
-import { resolveTwoPcPath, TwoPcSession, type TwoPcApplicationSecrets } from "./twopc";
+import { requireHelperBinaries, TwoPcSession, type TwoPcApplicationSecrets } from "./twopc";
 import { ProofChannel } from "./zkchan";
 
 const H2_TIMEOUTS = {
@@ -818,17 +817,11 @@ export class ConfidentialH2Connection {
 
   /** Refuse to start when cu-prover or cu-2pc cannot be run (before the node sees a credential). */
   private checkBinaries(): void {
-    const needed: Array<[string, string]> = [];
-    if (typeof this.prover.path === "string") needed.push(["cu-prover", this.prover.path]);
-    if (!this.twoPcFactory) needed.push(["cu-2pc", resolveTwoPcPath(this.twoPcPath, this.prover.path)]);
-    for (const [name, path] of needed) {
-      if (!isExecutable(path)) {
-        throw new ProverMissingError(
-          `${name} not found or not executable at ${path}`,
-          name === "cu-2pc" ? "set CU_2PC_BIN or put cu-2pc next to cu-prover" : "set CU_PROVER_BIN or the proverPath option",
-        );
-      }
-    }
+    requireHelperBinaries({
+      proverPath: typeof this.prover.path === "string" ? this.prover.path : undefined,
+      twoPcPath: this.twoPcPath,
+      twoPc: !this.twoPcFactory,
+    });
   }
 
   /**

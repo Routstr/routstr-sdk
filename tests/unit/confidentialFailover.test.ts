@@ -38,16 +38,22 @@ const logger: SdkLogger = {
 const TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
 const QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
 
-function setup(opts: { qualify?: (baseUrl: string) => void } = {}) {
+function setup(
+  opts: {
+    qualify?: (baseUrl: string, model: string, request: unknown) => void;
+    /** Node A lists the model under its own id, mapped to the canonical one. */
+    nativeIdOnA?: string;
+  } = {},
+) {
   const models: Record<string, Model[]> = {
-    [A]: [entry(1, { confidential_upstream: cu })],
+    [A]: [entry(1, { confidential_upstream: cu, ...(opts.nativeIdOnA ? { id: opts.nativeIdOnA } : {}) })],
     // Cheaper than C but serves the model in plaintext only.
     [PLAIN]: [entry(2)],
     [C]: [entry(3, { confidential_upstream: cu })],
   };
   const registry = {
     getCachedModels: () => models,
-    getModelIdMappings: () => ({}),
+    getModelIdMappings: () => (opts.nativeIdOnA ? { [opts.nativeIdOnA]: MODEL } : {}),
     getDisabledProviders: () => [],
     getCachedMints: () => ({}),
     getCachedProviderInfo: () => ({}),
@@ -84,21 +90,23 @@ function setup(opts: { qualify?: (baseUrl: string) => void } = {}) {
 
   const sessions: string[] = [];
   const qualified: string[] = [];
+  const bodies: unknown[] = [];
   setConfidentialTransport(
-    async ({ baseUrl }) => {
+    async ({ baseUrl, body }) => {
       sessions.push(baseUrl);
-      if (baseUrl === A) throw new TypeError("Failed to fetch");
+      bodies.push(body);
+      if (baseUrl === A && !opts.nativeIdOnA) throw new TypeError("Failed to fetch");
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     },
-    async (baseUrl) => {
+    async (baseUrl, model, _options, _kind, request) => {
       qualified.push(baseUrl);
-      opts.qualify?.(baseUrl);
+      opts.qualify?.(baseUrl, model, request);
     },
   );
-  return { client, spent, sessions, qualified };
+  return { client, spent, sessions, qualified, bodies };
 }
 
 const route = (client: RoutstrClient) =>
@@ -155,5 +163,24 @@ describe("confidential failover", () => {
     await expect(route(client)).rejects.toThrow(/offer unavailable/);
     expect(spent).toEqual([]);
     expect(sessions).toEqual([]);
+  });
+
+  it("qualifies the id the body carries to the node (its own spelling), with the request", async () => {
+    const seen: { model: string; request: unknown }[] = [];
+    const { client, sessions, bodies } = setup({
+      nativeIdOnA: "z-m-1",
+      qualify: (_baseUrl, model, request) => {
+        seen.push({ model, request });
+        // The node's offer prices its own id only.
+        if (model !== "z-m-1") throw new Error(`node does not serve ${model} confidentially`);
+      },
+    });
+    const res = await route(client);
+    expect(res.status).toBe(200);
+    expect(seen.map((q) => q.model)).toEqual(["z-m-1"]);
+    // The request is handed over, so the transport can refuse one it cannot pin.
+    expect((seen[0]!.request as { messages?: unknown }).messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(sessions).toEqual([A]);
+    expect((bodies[0] as { model: string }).model).toBe("z-m-1");
   });
 });
