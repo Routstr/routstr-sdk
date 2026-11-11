@@ -1419,11 +1419,16 @@ async function failureChange(
   return withdrawBalance(params.baseUrl, params.bearer, 5);
 }
 
-/** A thrown error carrying the withdrawn change (`cashuChange`) to the caller. */
+/**
+ * A thrown error carrying the withdrawn change (`cashuChange`) to the caller.
+ * The token is spendable by whoever reads it, so the property is not
+ * enumerable: logging or serializing the error (`console.error` prints an
+ * error's own enumerable properties) does not show it.
+ */
 function withChange(error: unknown, change: string | undefined): unknown {
   if (!change) return error;
   const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
-  (e as { cashuChange?: string }).cashuChange = change;
+  Object.defineProperty(e, "cashuChange", { value: change, enumerable: false, writable: true, configurable: true });
   return e;
 }
 

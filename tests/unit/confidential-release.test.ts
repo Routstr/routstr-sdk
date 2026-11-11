@@ -4,6 +4,7 @@
  * session's own release guards and the model the receipt may name.
  */
 
+import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
@@ -313,6 +314,24 @@ describe("provider text in response headers", () => {
       await res.text();
       vi.restoreAllMocks();
     }
+  });
+});
+
+describe("the change token never reaches a log", () => {
+  it("an error carries it where logging and serializing do not look", async () => {
+    mockNode();
+    fakeRun(async (s) => {
+      released(s);
+      throw new ReceiptVerificationError("bad receipt");
+    });
+    const error = (await call({ returnChange: true }).catch((e: unknown) => e)) as Error & { cashuChange?: string };
+    // The caller still reads it...
+    expect(error.cashuChange).toBe(CHANGE);
+    // ...but console.error / util.inspect print an error's own enumerable
+    // properties, and the token is spendable by whoever reads the log.
+    expect(inspect(error)).not.toContain(CHANGE);
+    expect(Object.keys(error)).not.toContain("cashuChange");
+    expect(JSON.stringify({ ...error })).not.toContain(CHANGE);
   });
 });
 

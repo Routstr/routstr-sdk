@@ -173,4 +173,34 @@ describe("streamed confidential response finalization", () => {
     expect(await (response as any).finalize()).toBe(1.234);
     expect((response as any).satsSpent).toBe(1.234);
   });
+
+  it("a failed settlement is logged without the change token it carries", async () => {
+    const { client } = setup("xcashu");
+    const logged: unknown[][] = [];
+    for (const level of ["log", "warn", "error", "debug"] as const) {
+      vi.spyOn((client as any).logger, level).mockImplementation((...args: unknown[]) => void logged.push(args));
+    }
+    const upstream = new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    // An older transport, or any caller-built error: the token as a plain property.
+    const failed = Promise.reject(Object.assign(new Error("bad receipt"), { cashuChange: "cashuBchange" }));
+    failed.catch(() => {});
+    (upstream as any).confidentialSettled = failed;
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstream);
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { model: model.id, messages: [{ role: "user", content: "hi" }], stream: true },
+      baseUrl,
+      mintUrl,
+      modelId: model.id,
+      headers: {},
+    });
+    await response.text();
+    await (response as any).finalize();
+    const { inspect } = await import("node:util");
+    const text = logged.map((args) => args.map((a) => (typeof a === "string" ? a : inspect(a))).join(" ")).join("\n");
+    expect(text).toContain("confidential settlement check failed");
+    expect(text).toContain("bad receipt");
+    expect(text).not.toContain("cashuBchange");
+  });
 });

@@ -1000,7 +1000,13 @@ export class RoutstrClient {
         // A one-off bearer's change comes with the settlement (a stream's
         // wrapper copied the headers before the transport could set it).
         const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
-          this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
+          // The message only: the error may carry a one-off bearer's change
+          // token (`cashuChange`), which must never reach a log.
+          this._log(
+            "ERROR",
+            "[RoutstrClient] confidential settlement check failed:",
+            error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+          );
           return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
         })) as { change?: unknown; costMsats?: unknown } | undefined;
         // The node's charge from the verified receipt. A confidential chat
