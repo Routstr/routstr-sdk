@@ -48,6 +48,27 @@ function offer(extra: Record<string, unknown>): Record<string, unknown> {
 }
 const H2 = { http: ["1.1", "2"], h2: { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 100 } };
 
+const IMAGES = {
+  head_template:
+    "POST /api/v1/image/generate HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\n" +
+    "Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
+  response_shape: "venice",
+  response_idle_s: 300,
+  max_count: 4,
+  count_key: "variants",
+  fixed_pins: [["return_binary", false]],
+  param_space: { format: ["webp"] },
+  price_list: { "z-image-turbo": [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 12100 }] },
+};
+/** An offer that serves images, and (with `kinds`) serves them on `http: 2` connections too. */
+const H2_IMAGES = {
+  http: ["1.1", "2"],
+  h2: { ...H2.h2, kinds: ["chat", "images"] },
+  capabilities: ["chat", "images"],
+  images: IMAGES,
+};
+const IMAGE_BODY = JSON.stringify({ id: "x", images: ["aGVsbG8="], request: { model: "z-image-turbo", variants: 1 } });
+
 const realFetch = globalThis.fetch;
 function mockNode(extra: Record<string, unknown> = H2) {
   globalThis.fetch = (async () => new Response(JSON.stringify(offer(extra)), { status: 200 })) as typeof fetch;
@@ -82,8 +103,10 @@ function fakeConnections(behave: Behaviour = () => ({})) {
         conn.fail(b.fail);
         throw b.fail;
       }
-      opts.onResponseHead?.({ status: 200, statusText: "", headers: { "content-type": "text/event-stream" } });
-      opts.onResponseBody?.(enc(SSE));
+      const image = opts.image !== undefined;
+      const type = image ? "application/json" : "text/event-stream";
+      opts.onResponseHead?.({ status: 200, statusText: "", headers: { "content-type": type } });
+      opts.onResponseBody?.(enc(image ? IMAGE_BODY : SSE));
       conn.cur = undefined;
       conn.tLastSettled = Date.now();
       settled = true;
@@ -93,9 +116,9 @@ function fakeConnections(behave: Behaviour = () => ({})) {
         stream: 2 * n + 1,
         model: opts.model,
         status: 200,
-        headers: { "content-type": "text/event-stream" },
-        body: enc(SSE),
-        receipt: { sid: conn.sid, model: opts.model, usage: {} },
+        headers: { "content-type": type },
+        body: enc(image ? IMAGE_BODY : SSE),
+        receipt: { sid: conn.sid, model: opts.model, usage: {}, cost_msats: image ? 12100 : undefined },
         attestation: {},
         timings: { startedAt: Date.now(), totalMs: 1, proofs: [] },
         bytes: { relaySent: 1, relayRecv: 2, controlSent: 3, controlRecv: 4, twoPcSent: 0, twoPcRecv: 0, zkSent: 5, zkRecv: 6 },
@@ -258,6 +281,91 @@ describe("http 2 transport: when it is used", () => {
     expect(connect).toHaveBeenCalledTimes(4);
     await call(url);
     expect(connect).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("http 2 transport: image requests", () => {
+  const image = (baseUrl: string, extra: Record<string, unknown> = {}, options: Record<string, unknown> = {}) =>
+    fetchConfidential({
+      baseUrl,
+      method: "POST",
+      path: "/v1/images/generations",
+      body: { model: "z-image-turbo", prompt: "a red circle", output_format: "webp" },
+      bearer: "sk-x",
+      options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex], http2: quiet, ...options },
+      ...extra,
+    });
+
+  it("runs an image request on the connection a chat request left", async () => {
+    const { connect, request } = fakeConnections();
+    const v2 = vi.spyOn(ConfidentialSession.prototype, "run");
+    mockNode(H2_IMAGES);
+    const node = freshNode();
+    const chat = await call(node);
+    await (chat as any).confidentialSettled;
+    const stats: any[] = [];
+    const res = await image(node, {}, { http2: { ...quiet, onRequest: (s: unknown) => stats.push(s) } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-routstr-confidential-http")).toBe("2");
+    expect(res.headers.get("x-routstr-confidential-connection")).toBe("reused; request=2");
+    expect(res.headers.get("x-routstr-confidential-variant")).toBe("webp");
+    expect(res.headers.get("x-routstr-cost-msats")).toBe("12100");
+    // The provider's shape, presented as an OpenAI images response.
+    const json = (await res.json()) as { data: { b64_json: string }[] };
+    expect(json.data).toEqual([{ b64_json: "aGVsbG8=" }]);
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(v2).not.toHaveBeenCalled();
+    // The request named the variant and the count, and its body ends with the image suffix.
+    const opts = request.mock.calls[1]![0] as H2RequestOptions;
+    expect(opts.image).toEqual({ variant: "webp", count: 1 });
+    expect(new TextDecoder().decode(opts.body)).toMatch(
+      /^\{"prompt":"a red circle","model":"z-image-turbo","variants":1,"return_binary":false,"format":"webp"\}$/,
+    );
+    expect(stats).toHaveLength(1);
+    expect(stats[0].kind).toBe("images");
+    expect(stats[0].reused).toBe(true);
+    // A chat request follows on the same connection.
+    const again = await call(node);
+    expect(again.headers.get("x-routstr-confidential-connection")).toBe("reused; request=3");
+    await (again as any).confidentialSettled;
+  });
+
+  it("keeps the v2 image flow when the offer does not serve images over http 2", async () => {
+    const { connect } = fakeConnections();
+    const v2 = vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: any) {
+      this.sid = "ab".repeat(32);
+      return {
+        http: { status: 200, statusText: "OK", headers: {} },
+        image: { created: 1, data: [{ b64_json: "aGVsbG8=" }] },
+        receipt: {},
+        sid: this.sid,
+      } as never;
+    });
+    // No `kinds` in the h2 block; http2 switched off; a one-off Cashu bearer;
+    // a deposit above the caller's maximum.
+    mockNode({ ...H2_IMAGES, h2: H2.h2 });
+    expect((await image(freshNode())).headers.has("x-routstr-confidential-http")).toBe(false);
+    mockNode(H2_IMAGES);
+    await image(freshNode(), {}, { http2: { ...quiet, enabled: false } });
+    await image(freshNode(), { bearer: "cashuBtoken" });
+    mockNode({ ...H2_IMAGES, h2: { ...H2_IMAGES.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 } });
+    await image(freshNode(), {}, { http2: { ...quiet, maxConnectionDepositMsat: 6999 } });
+    expect(v2).toHaveBeenCalledTimes(4);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("a node refusal before the release is the HTTP error; a released image request is never run again", async () => {
+    mockNode(H2_IMAGES);
+    let behave: Behaviour = () => ({ fail: new SessionRejectedError("node rejected: Insufficient balance", undefined, 402, { error: { code: "insufficient_balance" } }) });
+    const { request } = fakeConnections((c, n, o) => behave(c, n, o));
+    const refused = await image(freshNode());
+    expect(refused.status).toBe(402);
+    behave = (_c, _n, opts) => (opts.image ? { released: true, fail: new Error("connection closed") } : {});
+    const node = freshNode();
+    await (await call(node) as any).confidentialSettled;
+    request.mockClear();
+    await expect(image(node)).rejects.toThrow(/connection closed/);
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -1,9 +1,11 @@
 // SDK-level end-to-end check of `http: 2` sessions against a local node.
 //   CU_PROVER=…/cu-prover bun scripts/confidential-h2-e2e.ts <node url> <sk-key> <model> [cases...]
-// Cases (default: all): seq overlap error unknown deposit idle v2. Real requests (max_tokens 20)
+// Cases (default: all): seq overlap error unknown deposit image idle v2. Real requests (max_tokens 20)
 // on the credential; `idle` waits for the offer's h2.idle_timeout_s (E2E_IDLE_WAIT_MS overrides).
 // With a node that takes a connection deposit, `seq` checks that the first request's receipt
 // returns it, and `deposit` that a lower client maximum keeps the request on the v2 flow.
+// `image` (a node whose h2 block lists images) generates ONE image of E2E_IMAGE_MODEL
+// (default z-image-turbo, about $0.01 at the provider) on the connection a chat request left.
 import {
   closeConfidentialHttp2,
   closeConfidentialPrewarm,
@@ -160,6 +162,71 @@ if (want("deposit")) {
     check(confidentialHttp2Snapshot().length === 0, "the pool is empty");
   } else {
     console.log("== (this node takes no connection deposit: case skipped)");
+  }
+  stats.splice(0);
+}
+
+if (want("image")) {
+  const imageModel = process.env.E2E_IMAGE_MODEL ?? "z-image-turbo";
+  const variant = offer.images?.price_list?.[imageModel]?.[0];
+  if (offer.h2?.kinds?.includes("images") && variant) {
+    console.log(`== an image request on the connection a chat request left (${imageModel}, ${variant.id})`);
+    closeConfidentialHttp2();
+    const first = await chat("Reply with OK.");
+    show(first);
+    stats.splice(0);
+    const t0 = Date.now();
+    const res = await fetchConfidential({
+      baseUrl: node!,
+      method: "POST",
+      path: "/v1/images/generations",
+      body: { model: imageModel, prompt: "a red circle on a white background", n: 1, output_format: "webp" },
+      bearer: bearer!,
+      options: options() as never,
+    });
+    const json = (await res.json()) as { data?: { b64_json: string }[] };
+    const total = Date.now() - t0;
+    const bytes = Buffer.from(json.data?.[0]?.b64_json ?? "", "base64");
+    const r = {
+      status: res.status,
+      http: res.headers.get("x-routstr-confidential-http"),
+      conn: res.headers.get("x-routstr-confidential-connection"),
+      variant: res.headers.get("x-routstr-confidential-variant"),
+      cost: res.headers.get("x-routstr-cost-msats"),
+      warnings: res.headers.get("x-routstr-confidential-warnings"),
+      images: json.data?.length,
+      imageBytes: bytes.length,
+      total,
+    };
+    show(r);
+    check(r.status === 200 && r.http === "2", "the image request ran over http 2");
+    check(r.conn === "reused; request=2" && res.headers.get("x-routstr-confidential-sid") === first.sid, "on the chat request's connection, as its request 2");
+    check(r.images === 1 && bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP", "one WebP image came back");
+    check(r.warnings === null, "nothing fell short in the response");
+    const fee = Number(offer.session_fee_msat ?? 0);
+    check(Number(r.cost) === variant.msat_per_image + fee && r.variant === variant.id, `charged the signed price (${variant.msat_per_image} msat + fee ${fee})`);
+    check(stats.length === 1 && stats[0].kind === "images" && stats[0].reused === true, "request statistics name an image request on a reused connection");
+    console.log("   stats:", JSON.stringify(stats.splice(0)));
+    const next = await chat("Reply with OK.");
+    show(next);
+    check(next.status === 200 && next.settled === "ok" && next.conn === "reused; request=3", "a chat request follows on the same connection");
+    // The same request on the v2 flow (one session per image), for the comparison.
+    if (process.env.E2E_IMAGE_V2 === "1") {
+      const t1 = Date.now();
+      const v2 = await fetchConfidential({
+        baseUrl: node!,
+        method: "POST",
+        path: "/v1/images/generations",
+        body: { model: imageModel, prompt: "a red circle on a white background", n: 1, output_format: "webp" },
+        bearer: bearer!,
+        options: options({ enabled: false }) as never,
+      });
+      const j2 = (await v2.json()) as { data?: unknown[] };
+      console.log("  ", JSON.stringify({ v2: true, status: v2.status, http: v2.headers.get("x-routstr-confidential-http"), images: j2.data?.length, total: Date.now() - t1 }));
+      check(v2.status === 200 && v2.headers.get("x-routstr-confidential-http") === null && j2.data?.length === 1, "the v2 image flow still works (http2 disabled)");
+    }
+  } else {
+    console.log("== (this node serves no images over http 2: case skipped)");
   }
   stats.splice(0);
 }

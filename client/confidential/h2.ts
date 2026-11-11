@@ -311,6 +311,8 @@ export interface H2OfferBlock {
   connection_deposit_msat: number
   /** The node closes a connection with no request in flight for this long (seconds). */
   idle_timeout_s: number
+  /** The request kinds a connection serves: `chat`, and `images` when the offer has an images block. */
+  kinds: string[]
 }
 
 /**
@@ -338,7 +340,24 @@ export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
   const idleTimeout = b.idle_timeout_s === undefined ? idle : b.idle_timeout_s
   if (!(Number.isSafeInteger(deposit) && deposit >= 0)) fail('offer_malformed: h2 connection_deposit_msat')
   if (!(Number.isSafeInteger(idleTimeout) && idleTimeout >= 10 && idleTimeout <= idle)) fail('offer_malformed: h2 idle_timeout_s')
-  return { probe_path: b.probe_path, idle_secs: idle, max_requests: max, connection_deposit_msat: deposit, idle_timeout_s: idleTimeout }
+  // The request kinds: chat, or chat and images (absent: chat only).
+  const kinds = b.kinds === undefined ? ['chat'] : b.kinds
+  if (
+    !Array.isArray(kinds) ||
+    kinds[0] !== 'chat' ||
+    kinds.length > 2 ||
+    (kinds.length === 2 && kinds[1] !== 'images')
+  ) {
+    fail('offer_malformed: h2 kinds')
+  }
+  return {
+    probe_path: b.probe_path,
+    idle_secs: idle,
+    max_requests: max,
+    connection_deposit_msat: deposit,
+    idle_timeout_s: idleTimeout,
+    kinds: [...kinds],
+  }
 }
 
 /** The request path of an `http: 2` chat request: the route of the offer's (already checked) head template. */

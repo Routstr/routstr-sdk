@@ -58,10 +58,20 @@ import {
   type WinSource,
 } from "./h2";
 import { encryptedNodeTransport } from "./hosts";
-import { offerAbandonFeeMsat, offerSessionFeeMsat, type ConfidentialH2Offer, type VerifiedOffer } from "./offer";
+import {
+  imageCountKey,
+  imagesOfferProblem,
+  offerAbandonFeeMsat,
+  offerSessionFeeMsat,
+  offerSupportsImages,
+  renderImageSuffix,
+  type ConfidentialH2Offer,
+  type ConfidentialImageVariant,
+  type VerifiedOffer,
+} from "./offer";
 import { checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from "./params";
 import { CuProverBackend, isExecutable } from "./prover";
-import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt";
+import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
 import {
   countKeyUpdates,
   cryptoRandom,
@@ -156,7 +166,15 @@ export interface H2RequestOptions {
    */
   offer?: VerifiedOffer;
   model: string;
+  /** The pinned completion cap of a chat request (unused for an image request). */
   maxTokens: number;
+  /**
+   * An image request (PROTOCOL-V3-DESIGN.md A.13): the offered variant id and
+   * the image count. The body then ends with the image suffix of the signed
+   * offer, a 2xx is settled by `accept` at the signed price per image, and
+   * the result's body is the provider's JSON as received.
+   */
+  image?: { variant: string; count: number };
   /** The whole JSON body; it must end with the canonical suffix. */
   body: Uint8Array;
   onResponseHead?: (head: { status: number; statusText: string; headers: Record<string, string> }) => void;
@@ -254,11 +272,14 @@ interface Cur {
   opts: H2RequestOptions;
   /** The offer the request is priced by. */
   offer: VerifiedOffer;
+  /** An image request's terms from that offer. */
+  image?: { variant: ConfidentialImageVariant; count: number };
   tStart: number;
   /** Server application-data records decrypted when the request was sent. */
   recvAtSend: number;
-  /** Stream offset of the first frame on the request's stream. */
+  /** Stream offset of the first frame on the request's stream, and the server record that holds it. */
   firstFrameOff?: number;
+  firstFrameAbs?: number;
   seqs: number[];
   dataLens: number[];
   upto: number;
@@ -1042,7 +1063,10 @@ export class ConfidentialH2Connection {
 
   private onFrame(f: RxFrame): void {
     const cur = this.cur;
-    if (cur && f.stream === cur.stream && cur.firstFrameOff === undefined) cur.firstFrameOff = f.off;
+    if (cur && f.stream === cur.stream && cur.firstFrameOff === undefined) {
+      cur.firstFrameOff = f.off;
+      cur.firstFrameAbs = this.reader.recordAt(f.off).abs;
+    }
     switch (f.type) {
       case FRAME.SETTINGS:
         if (f.flags & FLAG.ACK) break;
@@ -1105,6 +1129,9 @@ export class ConfidentialH2Connection {
         if (!cur.tFirstData) cur.tFirstData = cur.tLastData;
         this.dataBytes += f.payload.length;
         cur.parts.push({ off: f.off + 9, data: f.payload });
+        // A successful image response is megabytes and is never disclosed:
+        // its records need not be kept beyond the frame being read.
+        if (cur.image && (cur.status ?? 0) < 300 && cur.parts.length % 64 === 0) this.reader.dropBefore(f.off);
         if (f.payload.length) cur.opts.onResponseBody?.(f.payload);
         if (f.flags & FLAG.END_STREAM) this.streamEnded(cur);
         break;
@@ -1218,7 +1245,12 @@ export class ConfidentialH2Connection {
     if (offer !== this.offer && h2ConnectionTerms(offer) !== this.terms) {
       throw new SessionProtocolError("the request's offer has other connection terms than this connection was opened on");
     }
-    const suffix = new TextEncoder().encode(canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens));
+    const image = opts.image ? this.imageTerms(offer, opts.model, opts.image) : undefined;
+    const suffix = new TextEncoder().encode(
+      image
+        ? renderImageSuffix(opts.model, image.count, imageCountKey(offer.images!), offer.images!.fixed_pins, image.variant.pins)
+        : canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens),
+    );
     const body = opts.body;
     if (body.length < suffix.length || !suffix.every((b, i) => body[body.length - suffix.length + i] === b)) {
       throw new SessionProtocolError("request body does not end with the pinned suffix");
@@ -1230,6 +1262,7 @@ export class ConfidentialH2Connection {
       model: opts.model,
       opts,
       offer,
+      image,
       tStart: Date.now(),
       recvAtSend: this.recvCount(),
       seqs: [],
@@ -1283,11 +1316,37 @@ export class ConfidentialH2Connection {
     };
   }
 
+  /**
+   * The terms of an image request from the signed offer it is priced by: the
+   * connection serves images, the images block is one this client accepts,
+   * the variant is offered for the model and the count is within its limit.
+   */
+  private imageTerms(
+    offer: VerifiedOffer,
+    model: string,
+    want: { variant: string; count: number },
+  ): { variant: ConfidentialImageVariant; count: number } {
+    const images = offer.images;
+    if (!this.h2.kinds.includes("images") || !offerSupportsImages(offer) || !images) {
+      throw new SessionProtocolError("the signed offer serves no image requests over http: 2");
+    }
+    const problem = imagesOfferProblem(images, offer.upstream_host);
+    if (problem) throw new SessionProtocolError(`the signed offer's images block is refused: ${problem}`);
+    const variant = images.price_list[model]?.find((v) => v.id === want.variant);
+    if (!variant) throw new SessionProtocolError(`the signed offer has no variant ${want.variant} for ${model}`);
+    const maxCount = Math.min(images.max_count, variant.max_count ?? images.max_count);
+    if (!Number.isSafeInteger(want.count) || want.count < 1 || want.count > maxCount) {
+      throw new SessionProtocolError(`image count ${want.count} is outside 1..${maxCount}`);
+    }
+    return { variant, count: want.count };
+  }
+
   private async runRequest(cur: Cur, suffix: Uint8Array, onSent: () => void): Promise<H2RequestResult> {
     const { opts, n, stream } = cur;
     const bytes0 = this.byteCounts();
     const host = this.offer.upstream_host;
-    const path = chatPath(this.offer.head_template);
+    // The route: the chat template's, or the images template's (both `POST <path> HTTP/1.1`).
+    const path = chatPath(cur.image ? cur.offer.images!.head_template : this.offer.head_template);
 
     // The records of the request: HEADERS (public in full), then DATA frames
     // (header and type byte public; the last one also its tail, the suffix).
@@ -1307,14 +1366,11 @@ export class ConfidentialH2Connection {
     // reserves), and takes any SETTINGS acknowledgement and the records as
     // one π_WIN batch. The same rates and fees as a v2 setup accepts.
     this.requestOpen = true;
-    const req: Record<string, unknown> = {
-      type: "request",
-      n,
-      kind: "chat",
-      model: opts.model,
-      max_tokens: opts.maxTokens,
-      body_len: bodyLen,
-    };
+    // An image request names the variant and the count: the node renders
+    // the suffix from its own signed offer and echoes it in `request_ok`.
+    const req: Record<string, unknown> = cur.image
+      ? { type: "request", n, kind: "images", model: opts.model, variant: cur.image.variant.id, count: cur.image.count, body_len: bodyLen }
+      : { type: "request", n, kind: "chat", model: opts.model, max_tokens: opts.maxTokens, body_len: bodyLen };
     if (cur.offer.sig) req.offer_sig = cur.offer.sig;
     const fee = offerSessionFeeMsat(cur.offer);
     const abandonFee = offerAbandonFeeMsat(cur.offer);
@@ -1344,10 +1400,15 @@ export class ConfidentialH2Connection {
     // Released (in steps, as the provider's window opens) or refused early.
     const errored = () => (cur.status ?? 0) >= 400;
     await this.until(() => cur.released || errored() || cur.reset !== undefined, `body_released for request ${n}`, this.timeouts.released);
+    // An image response is silent until the image is done: wait as long as
+    // the signed offer says the provider may take.
+    const idleMs = cur.image
+      ? Math.max(this.timeouts.responseIdle, Math.max(1, cur.offer.images?.response_idle_s ?? 300) * 1000)
+      : this.timeouts.responseIdle;
     await this.until(
       () => cur.ended || cur.reset !== undefined || errored(),
       `the response to request ${n}`,
-      this.timeouts.responseIdle,
+      idleMs,
       () => Math.max(cur.tLastData, cur.tReleased ?? 0),
     );
     if (cur.reset !== undefined) {
@@ -1356,7 +1417,9 @@ export class ConfidentialH2Connection {
     const status = cur.status ?? 0;
     let receipt: ConfidentialReceipt;
     let attestation: unknown;
-    if (status >= 200 && status < 300) {
+    if (status >= 200 && status < 300 && cur.image) {
+      ({ receipt, attestation } = await this.settleAccept(cur));
+    } else if (status >= 200 && status < 300) {
       ({ receipt, attestation } = await this.settleUsage(cur));
     } else if (status >= 400) {
       // The error body is short; give it a moment (it stays private), no more.
@@ -1381,7 +1444,8 @@ export class ConfidentialH2Connection {
     this.tLastSettled = tEnd;
 
     const responseBody = concat(...cur.parts.map((p) => p.data));
-    const effectiveModel = status < 300 ? effectiveModelFromText(new TextDecoder().decode(responseBody)) : undefined;
+    const effectiveModel =
+      status < 300 && !cur.image ? effectiveModelFromText(new TextDecoder().decode(responseBody)) : undefined;
     let warnings: string[] | undefined;
     if (effectiveModel !== undefined && effectiveModel !== opts.model) {
       warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${opts.model}`];
@@ -1555,6 +1619,43 @@ export class ConfidentialH2Connection {
     }
   }
 
+  /**
+   * A successful image response (A.13): the price was fixed by the request,
+   * so nothing is disclosed and nothing proven. `accept` names the server
+   * records received; the node closes the request's interval there, attests
+   * it (checked as for chat: every record of the response is hashed) and
+   * charges the signed price per image × count plus the session fee.
+   */
+  private async settleAccept(cur: Cur): Promise<{ receipt: ConfidentialReceipt; attestation: unknown }> {
+    const terms = cur.image!;
+    for (let attempt = 0; ; attempt++) {
+      await this.drained();
+      if (this.failure) throw this.failure;
+      const serverRecords = this.recvCount();
+      this.sendOrdered({ type: "accept", n: cur.n, server_records: serverRecords });
+      const next = await this.wait(["accept_retry", "attestation"], this.timeouts.attestation);
+      if (next.key === "accept_retry") {
+        // More server records reached the node than we had parsed: catch up.
+        if (attempt >= 20) throw new SessionProtocolError("the node keeps asking for a newer accept");
+        const want = next.msg.server_records;
+        if (!Number.isSafeInteger(want)) throw new SessionProtocolError("accept_retry without a record count");
+        await this.until(() => this.recvCount() >= want, "the server records the node counts", 15_000);
+        continue;
+      }
+      const att = await this.checkAttestation(next.msg, cur, serverRecords);
+      const { receipt } = await this.takeReceipt(cur, att.json);
+      verifyFlatReceipt(receipt, {
+        model: cur.model,
+        variant: terms.variant.id,
+        count: terms.count,
+        msatPerImage: terms.variant.msat_per_image,
+        sessionFeeMsat: offerSessionFeeMsat(cur.offer),
+        abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+      });
+      return { receipt, attestation: att.a };
+    }
+  }
+
   /** The error head (A.7): the response HEADERS frame, which must start a record. */
   private async settleErrorHead(cur: Cur, status: number): Promise<{ receipt: ConfidentialReceipt; attestation: unknown }> {
     const ap = this.ap!;
@@ -1614,6 +1715,14 @@ export class ConfidentialH2Connection {
     const { receipt } = await this.takeReceipt(cur, att.json);
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, offerSessionFeeMsat(cur.offer), {
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+      image: cur.image
+        ? {
+            model: cur.model,
+            variant: cur.image.variant.id,
+            count: cur.image.count,
+            msatPerImage: cur.image.variant.msat_per_image,
+          }
+        : undefined,
     });
     if (!usageMatch) throw new ReceiptVerificationError("error receipt does not match the disclosed status");
     return { receipt, attestation: att.a };
@@ -1651,7 +1760,7 @@ export class ConfidentialH2Connection {
     const sK = a.s_k;
     const count = a.server_records;
     if (!Number.isSafeInteger(sK) || !Number.isSafeInteger(count) || sK < 0 || count < 0) bad("interval malformed");
-    const firstAbs = cur.firstFrameOff === undefined ? undefined : this.reader.recordAt(cur.firstFrameOff).abs;
+    const firstAbs = cur.firstFrameAbs;
     if (sK < cur.recvAtSend || (firstAbs !== undefined && sK > firstAbs)) bad("interval does not start at our request");
     const end = sK + count;
     if (upto !== undefined && end !== upto) bad("interval does not end at our disclosure");

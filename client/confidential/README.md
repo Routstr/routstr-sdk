@@ -146,9 +146,21 @@ request to a node opens a connection (the cost of a cold v2 session: the 2PC
 preprocessing, π_NK); it stays open, and later requests skip the handshake:
 they cost one π_WIN (the client's records), the usage proof π_C3S and the
 relayed records. Nothing is opened speculatively: "pre-warming" for `http: 2`
-is the connection the previous request left. A node that does not offer it, an
-image request, and a one-off Cashu bearer (`returnChange`, a `cashu…` bearer)
-run the v2 flow exactly as before, with `prewarm` if set.
+is the connection the previous request left. A node that does not offer it and
+a one-off Cashu bearer (`returnChange`, a `cashu…` bearer) run the v2 flow
+exactly as before, with `prewarm` if set.
+
+**Images.** When the offer's `h2.kinds` lists `images` (and the offer has an
+`images` block this client accepts), an image request is one more request on
+a pooled connection, in any order with chat requests: the same records and
+π_WIN, with the images route in the request's header block and the image
+suffix of the signed offer as the body's tail. A 2xx is settled by `accept`
+(no disclosure, no π_C3S) at the signed price per image × count plus the
+session fee, checked for equality in the receipt; an error status discloses
+its head as for chat. The response is one JSON body over DATA frames; its end
+is the stream's END_STREAM, and the client waits `images.response_idle_s` for
+it. Without `images` in `h2.kinds`, image requests keep the v2 flow (one
+session per image, never pre-warmed).
 
 | `confidential.http2` | Default | Meaning |
 |---|---|---|
@@ -228,9 +240,11 @@ Every v2 request, pre-warmed or not, moves the full 23.7 MB / 2.7 MB.
 `scripts/confidential-h2-e2e.ts` runs the live checks (sequential reuse,
 overlap, a provider error, an idle close).
 
-Not implemented: images over `http: 2`, parallel streams on one connection,
-client KeyUpdates, a fallback to the v2 flow when an `http: 2` connection
-cannot be opened.
+Not implemented: parallel streams on one connection, client KeyUpdates, a
+fallback to the v2 flow when an `http: 2` connection cannot be opened. An
+image response is held about three times in memory while its request runs
+(the decrypted body, the received records for the attestation's hash, and
+the result).
 
 ## What is checked
 

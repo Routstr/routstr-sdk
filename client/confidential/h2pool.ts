@@ -86,6 +86,8 @@ export interface Http2RequestStats {
   sid: string;
   /** The request's number on its connection. */
   n: number;
+  /** `images` for an image request (absent: chat). */
+  kind?: "images";
   /** True when the connection was open before the request arrived. */
   reused: boolean;
   status: number;

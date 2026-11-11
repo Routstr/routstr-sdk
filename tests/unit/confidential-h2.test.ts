@@ -145,6 +145,7 @@ describe("http 2: the offer's h2 block", () => {
       max_requests: 100,
       connection_deposit_msat: 0,
       idle_timeout_s: 300,
+      kinds: ["chat"],
     });
     const node = { ...offer, h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 } };
     const block = checkH2Offer(node, bases);
@@ -157,6 +158,55 @@ describe("http 2: the offer's h2 block", () => {
     for (const idle_timeout_s of [9, 301, 12.5, "120", null]) {
       expect(() => checkH2Offer({ ...node, h2: { ...node.h2, idle_timeout_s } }, bases)).toThrow(/idle_timeout_s/);
     }
+  });
+
+  it("reads the request kinds: chat, or chat and images", () => {
+    expect(checkH2Offer(offer, bases).kinds).toEqual(["chat"]);
+    const kinds = (k: unknown) => () => checkH2Offer({ ...offer, h2: { ...offer.h2, kinds: k } }, bases);
+    expect(kinds(["chat"])().kinds).toEqual(["chat"]);
+    expect(kinds(["chat", "images"])().kinds).toEqual(["chat", "images"]);
+    for (const bad of [[], ["images"], ["images", "chat"], ["chat", "video"], ["chat", "images", "images"], "chat", null]) {
+      expect(kinds(bad), JSON.stringify(bad)).toThrow(/h2 kinds/);
+    }
+  });
+
+  it("an image request needs a connection that serves images, an offered variant and a count in range", () => {
+    const images = {
+      head_template:
+        "POST /api/v1/image/generate HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\n" +
+        "Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
+      response_shape: "venice",
+      response_idle_s: 300,
+      max_count: 2,
+      count_key: "variants",
+      fixed_pins: [["return_binary", false]],
+      param_space: { format: ["webp"] },
+      price_list: { img: [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 12100 }] },
+    };
+    const open = (h2: Record<string, unknown>) => {
+      const good = signedOffer({ http: ["1.1", "2"], h2, capabilities: ["chat", "images"], images });
+      const conn = new ConfidentialH2Connection({
+        baseUrl: "https://node.example",
+        offer: verifyConfidentialOffer(good.offer, policy(good.pubHex)),
+        auth: "sk-x",
+        prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
+      });
+      (conn as unknown as { opened: boolean }).opened = true;
+      return conn;
+    };
+    const body = (suffix: string) => new TextEncoder().encode(`{"prompt":"x"${suffix}`);
+    const sfx = ',"model":"img","variants":1,"return_binary":false,"format":"webp"}';
+    const req = (conn: ConfidentialH2Connection, image: { variant: string; count: number }, b = body(sfx)) => () =>
+      conn.request({ model: "img", maxTokens: 0, image, body: b });
+    // A connection whose offer keeps images on the v2 flow.
+    expect(req(open({ ...offer.h2 }), { variant: "webp", count: 1 })).toThrow(/no image requests over http: 2/);
+    const conn = open({ ...offer.h2, kinds: ["chat", "images"] });
+    expect(req(conn, { variant: "png", count: 1 })).toThrow(/no variant png/);
+    expect(req(conn, { variant: "webp", count: 3 })).toThrow(/outside 1\.\.2/);
+    expect(req(conn, { variant: "webp", count: 0 })).toThrow(/outside 1\.\.2/);
+    // The body must end with the image suffix of the signed offer (here: another count).
+    expect(req(conn, { variant: "webp", count: 2 })).toThrow(/does not end with the pinned suffix/);
+    expect(conn.requests).toBe(0);
   });
 
   it("the pool's idle time stays below the node's idle timeout", () => {
@@ -181,7 +231,7 @@ describe("http 2: the offer's h2 block", () => {
       h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 },
     });
     const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
-    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 });
+    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120, kinds: ["chat"] });
     const open = (maxDepositMsat?: number) =>
       new ConfidentialH2Connection({
         baseUrl: "https://node.example",
@@ -237,7 +287,7 @@ describe("http 2: the offer's h2 block", () => {
     const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
     expect(offerSupportsHttp2(verified)).toBe(true);
     // The node's two terms default to "no deposit" and the sidecar's idle limit.
-    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 0, idle_timeout_s: 300 });
+    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 0, idle_timeout_s: 300, kinds: ["chat"] });
     expect(verified.http2Refused).toBeUndefined();
     // Verifying a verified offer again (the transport's cache) keeps it.
     expect(offerSupportsHttp2(verifyConfidentialOffer(verified, policy(good.pubHex)))).toBe(true);
