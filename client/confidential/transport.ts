@@ -586,7 +586,10 @@ async function fetchConfidentialImageHttp2(
     response = new Response(new Blob([r.body as BlobPart]), { status: r.status, headers });
   }
   (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
-    Promise.resolve({ change: undefined });
+    Promise.resolve({
+      change: undefined,
+      costMsats: typeof r.receipt.cost_msats === "number" ? r.receipt.cost_msats : undefined,
+    });
   return response;
 }
 
@@ -898,7 +901,7 @@ async function fetchConfidentialImageOnce(
   const change = params.returnChange ? await withdrawBalance(baseUrl, params.bearer) : undefined;
   if (change) response.headers.set("x-cashu", change);
   (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
-    Promise.resolve({ change });
+    Promise.resolve({ change, costMsats: receiptCostMsats(result) });
   return response;
 }
 
@@ -1219,12 +1222,12 @@ async function fetchConfidentialOnce(
   // bearer's deposit then stays on the node for the wallet to refund.
   const callerGone = () => abort.detached && !response;
   const settled = runP.then(
-    async () => {
+    async (r): Promise<ConfidentialSettlement> => {
       if (params.returnChange && !callerGone()) {
         change = await withdrawBalance(baseUrl, params.bearer);
         if (change) response?.headers.set("x-cashu", change);
       }
-      return { change };
+      return { change, costMsats: receiptCostMsats(r) };
     },
     async (error: unknown) => {
       throw callerGone() ? error : withChange(error, await failureChange(params, active(), runP));
@@ -1276,6 +1279,10 @@ async function fetchConfidentialOnce(
       response = new Response(new Blob([body as BlobPart]), { status: head.status, headers });
     }
     if (change) response.headers.set("x-cashu", change);
+    // What the node charged, as on any priced response (a stream's caller
+    // reads it from `confidentialSettled`: its headers left before the receipt).
+    const cost = receiptCostMsats(await runP);
+    if (cost !== undefined) response.headers.set("x-routstr-cost-msats", String(cost));
     const warnings = (await runP).warnings;
     if (warnings?.length) response.headers.set("x-routstr-confidential-warnings", warnings.join("; "));
   }
@@ -1292,6 +1299,18 @@ async function fetchConfidentialOnce(
  */
 export interface ConfidentialSettlement {
   change?: string;
+  /**
+   * What the node charged for the request (msats), from the verified
+   * receipt. A chat stream's response headers left before the receipt
+   * existed, so accounting reads the cost here.
+   */
+  costMsats?: number;
+}
+
+/** The verified receipt's charge, when it names one. */
+function receiptCostMsats(r: ConfidentialSessionResult): number | undefined {
+  const cost = r.receipt?.cost_msats;
+  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
 }
 
 /**

@@ -1002,7 +1002,24 @@ export class RoutstrClient {
         const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
           this._log("ERROR", "[RoutstrClient] confidential settlement check failed:", error);
           return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
-        })) as { change?: unknown } | undefined;
+        })) as { change?: unknown; costMsats?: unknown } | undefined;
+        // The node's charge from the verified receipt. A confidential chat
+        // response carries no cost of its own (the provider's usage event
+        // has none, and a stream's headers left before the receipt existed):
+        // without this the request is accounted at 0 sats.
+        if (
+          typeof settlement?.costMsats === "number" &&
+          Number.isFinite(settlement.costMsats) &&
+          settlement.costMsats >= 0
+        ) {
+          try {
+            if (!accountingResponse.headers.has("x-routstr-cost-msats")) {
+              accountingResponse.headers.set("x-routstr-cost-msats", String(settlement.costMsats));
+            }
+          } catch {
+            // Immutable headers: accounting falls back to the usage event.
+          }
+        }
         const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
         const usage = capturedUsage ?? prepared.capturedUsage ??
           (!isSSE ? extractUsageFromResponseBody(jsonBody) ?? undefined : undefined);
