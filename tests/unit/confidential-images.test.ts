@@ -12,6 +12,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 
 import { canonicalJson } from "../../client/confidential/canonical";
 import {
+  imageCountKeyForRoute,
   imagesOfferProblem,
   offerSupportsImages,
   renderImageSuffix,
@@ -274,6 +275,34 @@ describe("flat receipt", () => {
     ]) {
       expect(() => verifyFlatReceipt(receipt(o), own)).toThrow(ReceiptVerificationError);
     }
+  });
+});
+
+describe("the image count key", () => {
+  const bad = (images: unknown) => () => validateImagesOffer(images, "api.venice.ai");
+  const OPENAI_ROUTE = IMAGES.head_template.replace("/api/v1/image/generate", "/api/v1/images/generations");
+
+  it("is the one the endpoint reads: variants for /image/generate, n for /images/generations", () => {
+    expect(imageCountKeyForRoute(IMAGES.head_template)).toBe("variants");
+    expect(imageCountKeyForRoute(OPENAI_ROUTE)).toBe("n");
+    expect(imageCountKeyForRoute("POST /api/v1/other HTTP/1.1\r\n")).toBeUndefined();
+    expect(bad(IMAGES)).not.toThrow();
+    expect(bad({ ...IMAGES, head_template: OPENAI_ROUTE, count_key: "n" })).not.toThrow();
+  });
+
+  it("refuses a count key the provider would not read", () => {
+    // The count is pinned under this key and the price is count × the image
+    // price: under a key the endpoint ignores the provider makes one image
+    // and the client pays for four.
+    expect(bad({ ...IMAGES, count_key: "x_unused" })).toThrow(/count_key/);
+    expect(bad({ ...IMAGES, count_key: "n" })).toThrow(/count_key/);
+    expect(bad({ ...IMAGES, head_template: OPENAI_ROUTE })).toThrow(/count_key/);
+    expect(bad({ ...IMAGES, head_template: OPENAI_ROUTE, count_key: "variants" })).toThrow(/count_key/);
+    // A signed offer with such a block serves no confidential images (chat is unaffected).
+    const { offer, pubHex } = signedOffer({ images: { ...IMAGES, count_key: "x_unused" } });
+    const verified = verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: ["*.venice.ai"] });
+    expect(offerSupportsImages(verified)).toBe(false);
+    expect(Object.keys(verified.price_list)).toEqual(["cheap"]);
   });
 });
 

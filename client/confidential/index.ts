@@ -75,6 +75,7 @@ export {
   offerSupportsImages,
   offerSupportsHttp2,
   imageCountKey,
+  imageCountKeyForRoute,
   renderImageSuffix,
   type ConfidentialImagesOffer,
   type ConfidentialImageVariant,

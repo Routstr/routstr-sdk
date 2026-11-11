@@ -367,6 +367,14 @@ export function validateImagesOffer(images: unknown, upstreamHost: string): asse
   if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key)) {
     bad("count_key is not a non-empty string");
   }
+  // The count is pinned under this key and the charge is the price × count:
+  // under a key the endpoint does not read, the provider would make its
+  // default number of images while the client paid for `count`.
+  const routeKey = imageCountKeyForRoute(im.head_template as string);
+  if (routeKey === undefined) bad("head_template does not name an image endpoint with a known count key");
+  if (imageCountKey(im) !== routeKey) {
+    bad(`count_key ${JSON.stringify(imageCountKey(im))} is not the one the endpoint reads (${JSON.stringify(routeKey)})`);
+  }
   if (
     !isObject(im.param_space) ||
     !Object.values(im.param_space).every((vals) => Array.isArray(vals) && vals.every((x) => typeof x === "string"))
@@ -424,6 +432,19 @@ export function imagesOfferProblem(images: unknown, upstreamHost: string): strin
     if (error instanceof OfferMalformedError) return error.message;
     throw error;
   }
+}
+
+/**
+ * The request key an image endpoint reads the image count from, by the route
+ * its head template names: `n` for the OpenAI-style `/images/generations`,
+ * `variants` for `/image/generate`. Undefined for any other route (the head
+ * template check allows only these two).
+ */
+export function imageCountKeyForRoute(headTemplate: string): string | undefined {
+  const path = /^POST (\S+) HTTP\/1\.1\r\n/.exec(headTemplate)?.[1]?.split("?")[0] ?? "";
+  if (path.endsWith("/images/generations")) return "n";
+  if (path.endsWith("/image/generate")) return "variants";
+  return undefined;
 }
 
 /** The request key that carries the image count. */
