@@ -3246,17 +3246,29 @@ export class RoutstrClient {
             nextModelPathPricing
           );
         let failoverOffer: ConfidentialDepositOffer | undefined;
+        // An image request's deposit is the signed per-image price on this
+        // node, as for the first node; the chat formula would fall back to
+        // the model's listed maximum, far below what the node reserves.
+        let failoverImageSats: number | undefined;
         if (params.confidential) {
           // Never spend on a node that would refuse the session: qualify its
           // signed offer first, and move on to the next node if it fails.
           try {
+            const failoverKind = confidentialKind(params.path) === "images" ? "images" : "chat";
             failoverOffer = await qualifyConfidentialNode(
               nextProvider,
               newModel.id,
               params.confidential,
-              confidentialKind(params.path) === "images" ? "images" : "chat",
+              failoverKind,
               body
             );
+            if (failoverKind === "images") {
+              failoverImageSats = confidentialImageRequiredSats(
+                failoverOffer,
+                newModel.id,
+                (body ?? {}) as Record<string, unknown>
+              );
+            }
           } catch (error) {
             this._log(
               "WARN",
@@ -3278,7 +3290,9 @@ export class RoutstrClient {
           }
         }
         newRequiredSats = params.confidential
-          ? confidentialRequiredSats(newModel, params.maxTokens, failoverOffer) ?? plainRequiredSats()
+          ? failoverImageSats ??
+            confidentialRequiredSats(newModel, params.maxTokens, failoverOffer) ??
+            plainRequiredSats()
           : plainRequiredSats();
 
         if (params.tinfoilEnabled) {
