@@ -12,7 +12,7 @@
  * - A connection is kept after a settled 2xx request ("pre-warming" for
  *   `http: 2` is exactly this: nothing is opened speculatively). It is closed
  *   `idleMarginMs` before the node's idle limit (the signed offer's
- *   `h2.idle_secs`, counted from the last settlement), after
+ *   `h2.idle_timeout_s`, counted from the last settlement), after
  *   `maxRequestsPerConnection` requests (at most the offer's
  *   `h2.max_requests`), before the node's connection lifetime, and whenever it
  *   fails. The node closes a connection after any error, abort or non-2xx
@@ -52,10 +52,25 @@ export interface Http2Options {
   maxConnectionsPerKey?: number;
   /** Open connections in total (default 8). */
   maxConnections?: number;
-  /** Close an idle connection this long before the node would (default 20 000 ms). */
+  /**
+   * Close an idle connection this long before the node would (default
+   * 20 000 ms, and at most a quarter of the node's `h2.idle_timeout_s`, so a
+   * node with a short timeout still gets its connections reused).
+   */
   idleMarginMs?: number;
-  /** Close a connection idle this long, when shorter than the node's limit (ms). */
+  /**
+   * Close a connection idle this long (ms). Always clamped below the node's
+   * `h2.idle_timeout_s`: the node closes an idle connection at that time.
+   */
   maxIdleMs?: number;
+  /**
+   * The largest connection deposit (msat) to accept from a node's offer
+   * (`h2.connection_deposit_msat`; default 100 000). The node reserves it
+   * when a connection opens and releases it with the connection's first
+   * settled request; a connection that ends without one loses it. A node
+   * asking for more is not used over `http: 2` (its requests run the v2 flow).
+   */
+  maxConnectionDepositMsat?: number;
   /** Close a connection after this many requests (default: the offer's `h2.max_requests`). */
   maxRequestsPerConnection?: number;
   /** How long a request waits for a connection when the limits are reached (default 120 000 ms). */
@@ -85,6 +100,8 @@ export interface Http2RequestStats {
   /** The same for opening the connection, when this request did. */
   connectBytesSent?: number;
   connectBytesRecv?: number;
+  /** The connection deposit this request's receipt returned (the connection's first settled request), msat. */
+  depositReleasedMsat?: number;
 }
 
 export const HTTP2_DEFAULTS = {
@@ -124,6 +141,21 @@ export function http2PoolKey(info: Http2KeyInfo, reuse: Http2Options["reuse"]): 
   }
   if (reuse === "model") h.update(info.model);
   return h.digest("hex").slice(0, 32);
+}
+
+/**
+ * How long the pool keeps an idle connection (ms): below the node's idle
+ * timeout (the signed offer's `h2.idle_timeout_s`, which the node counts
+ * from its last settlement or from `head_written`) by the idle margin, and
+ * never longer than `maxIdleMs`.
+ */
+export function http2IdleMs(
+  h2: { idle_secs: number; idle_timeout_s?: number },
+  options: Pick<Http2Options, "idleMarginMs" | "maxIdleMs"> = {},
+): number {
+  const nodeMs = Math.min(h2.idle_timeout_s ?? h2.idle_secs, h2.idle_secs) * 1000;
+  const margin = Math.min(options.idleMarginMs ?? HTTP2_DEFAULTS.idleMarginMs, nodeMs / 4);
+  return Math.min(Math.max(nodeMs - margin, 1000), options.maxIdleMs ?? Infinity);
 }
 
 type ConnLike = Pick<
@@ -269,9 +301,7 @@ export class Http2Pool<C extends ConnLike = ConfidentialH2Connection> {
     if (conn.requests >= maxRequests) return this.retire(entry, "request limit reached");
     const lifetimeLeft = conn.tOpen + NODE_CONNECTION_LIFETIME_MS - LIFETIME_MARGIN_MS - now;
     if (lifetimeLeft <= 0) return this.retire(entry, "connection lifetime reached");
-    // The node counts idle time from its last settlement (or `head_written`).
-    const nodeIdle = conn.h2.idle_secs * 1000 - this.opt("idleMarginMs");
-    const idleFor = Math.min(Math.max(nodeIdle, 1000), this.options.maxIdleMs ?? Infinity, lifetimeLeft);
+    const idleFor = Math.min(http2IdleMs(conn.h2, this.options), lifetimeLeft);
     const closeAt = conn.tLastSettled + idleFor;
     if (closeAt <= now) return this.retire(entry, "idle");
     entry.state = "idle";

@@ -1,7 +1,9 @@
 // SDK-level end-to-end check of `http: 2` sessions against a local node.
 //   CU_PROVER=…/cu-prover bun scripts/confidential-h2-e2e.ts <node url> <sk-key> <model> [cases...]
-// Cases (default: all): seq overlap error unknown idle v2. Real requests (max_tokens 20) on
-// the credential; `idle` waits for the offer's h2.idle_secs (E2E_IDLE_WAIT_MS overrides).
+// Cases (default: all): seq overlap error unknown deposit idle v2. Real requests (max_tokens 20)
+// on the credential; `idle` waits for the offer's h2.idle_timeout_s (E2E_IDLE_WAIT_MS overrides).
+// With a node that takes a connection deposit, `seq` checks that the first request's receipt
+// returns it, and `deposit` that a lower client maximum keeps the request on the v2 flow.
 import {
   closeConfidentialHttp2,
   closeConfidentialPrewarm,
@@ -91,6 +93,13 @@ if (want("seq")) {
   check(new Set(rs.map((r) => r.sid)).size === 1, "one connection (one sid)");
   check(rs.map((r) => r.conn).join("|") === "new; request=1|reused; request=2|reused; request=3|reused; request=4|reused; request=5", "request numbers 1..5, first new, rest reused");
   check(confidentialHttp2Snapshot().length === 1, "one pooled connection");
+  const deposit = Number(offer.h2?.connection_deposit_msat ?? 0);
+  if (deposit > 0) {
+    check(
+      stats.length === 5 && stats[0].depositReleasedMsat === deposit && stats.slice(1).every((s) => s.depositReleasedMsat === undefined),
+      `the first request's receipt returns the connection deposit (${deposit} msat), the others none`,
+    );
+  }
   console.log("   stats:", JSON.stringify(stats.splice(0)));
 }
 
@@ -139,11 +148,27 @@ if (want("unknown")) {
   stats.splice(0);
 }
 
+if (want("deposit")) {
+  const deposit = Number(offer.h2?.connection_deposit_msat ?? 0);
+  if (deposit > 0) {
+    console.log(`== a connection deposit (${deposit} msat) above the client's maximum`);
+    closeConfidentialHttp2();
+    const r = await chat("Reply with OK.", {}, options({ maxConnectionDepositMsat: deposit - 1 }));
+    show(r);
+    check(r.status === 200 && r.http === null && r.settled === "ok", "no connection is opened: the request runs the v2 flow");
+    check(logs.some((l) => l.includes(`connection deposit of ${deposit} msat, above the maximum of ${deposit - 1} msat`)), "and the log says why");
+    check(confidentialHttp2Snapshot().length === 0, "the pool is empty");
+  } else {
+    console.log("== (this node takes no connection deposit: case skipped)");
+  }
+  stats.splice(0);
+}
+
 if (want("idle")) {
-  // The node's idle limit ends a pooled connection the client still holds
+  // The node's idle timeout ends a pooled connection the client still holds
   // (a negative margin keeps it past the limit): the next request must run.
-  const idle = Number(offer.h2?.idle_secs ?? 300);
-  console.log(`== a connection the node closed while idle (idle_secs ${idle})`);
+  const idle = Number(offer.h2?.idle_timeout_s ?? offer.h2?.idle_secs ?? 300);
+  console.log(`== a connection the node closed while idle (idle_timeout_s ${idle})`);
   closeConfidentialHttp2();
   const o = options({ idleMarginMs: -60_000 });
   const a = await chat("Reply with 1.", {}, o);

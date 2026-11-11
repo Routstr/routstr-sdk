@@ -131,7 +131,8 @@ download-limited link.
 ## HTTP/2 connections (`http: 2`, protocol v3 option A)
 
 Prototype. A node whose signed offer lists `"2"` in `http` (with an `h2`
-block: `probe_path`, `idle_secs`, `max_requests`) serves **`http: 2`
+block: `probe_path`, `idle_secs`, `max_requests`, and the node's
+`connection_deposit_msat` and `idle_timeout_s`) serves **`http: 2`
 sessions**: one two-party handshake per HTTP/2 connection to the provider,
 and then many chat requests on it, one at a time. The node writes the
 connection head in epoch 0 (its SETTINGS and one probe request, which puts the
@@ -155,10 +156,24 @@ run the v2 flow exactly as before, with `prewarm` if set.
 | `reuse` | `credential` | which requests may share a connection: `credential` (one node, one credential), `model` (and the same model), `none` (a connection per request: no linking, and slower than pre-warmed v2) |
 | `maxConnectionsPerKey` | 4 | open connections per reuse key. Requests on a connection are sequential, so a request that finds every connection busy opens another; at the limit it waits (`acquireTimeoutMs`, 120 s) |
 | `maxConnections` | 8 | open connections in total (an idle one of another key is closed to make room) |
-| `idleMarginMs` | 20 000 | an idle connection is closed this long before the node's limit (`h2.idle_secs` after the last settlement) |
-| `maxIdleMs` | none | a shorter idle limit of your own |
+| `idleMarginMs` | 20 000 | an idle connection is closed this long before the node's idle timeout (`h2.idle_timeout_s` after the last settlement); at most a quarter of that timeout |
+| `maxIdleMs` | none | a shorter idle limit of your own (a longer one is clamped below the node's timeout) |
+| `maxConnectionDepositMsat` | 100 000 | the largest connection deposit (`h2.connection_deposit_msat`) accepted; a node asking for more is served by the v2 flow |
 | `maxRequestsPerConnection` | the offer's `h2.max_requests` | rotate the connection after this many requests |
 | `log`, `onRequest` | `console.info`, none | pool events; per-request statistics (connection, reuse, times, bytes to and from the node) |
+
+**Deposit.** The node reserves `h2.connection_deposit_msat` from the
+credential when a connection is opened and releases it with the connection's
+first settled request (that request's signed receipt carries
+`deposit_released_msat`). A connection that ends without a settled request
+loses it, unless the node, its sidecar or the provider failed first; the
+node's last frame (`closed` or `error`) then carries the signed outcome
+(`ConfidentialH2Connection.deposit`). A balance that does not cover the
+deposit is refused at the setup with 402 (`ConnectionDepositError`), before
+any 2PC. The pool opens a connection only for a request, so the deposit is
+normally back within that request; it is lost when the connection's first
+request is refused by the node (a 402 on the reservation, an expired offer,
+a model the node does not serve) or abandoned before the provider had it.
 
 **Linkability.** Requests on one connection share a TLS connection to the
 provider, so the provider can tell that they come from the same client (it
@@ -215,8 +230,7 @@ overlap, a provider error, an idle close).
 
 Not implemented: images over `http: 2`, parallel streams on one connection,
 client KeyUpdates, a fallback to the v2 flow when an `http: 2` connection
-cannot be opened, fees for idle connections (the node reserves per request
-and nothing for an idle connection).
+cannot be opened.
 
 ## What is checked
 

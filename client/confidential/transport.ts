@@ -49,7 +49,13 @@ import {
 } from "./suffix";
 import { encryptedNodeTransport } from "./hosts";
 import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
-import { ConfidentialH2Connection, h2ConnectionTerms, type H2RequestHandle, type H2RequestResult } from "./h2conn";
+import {
+  ConfidentialH2Connection,
+  DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT,
+  h2ConnectionTerms,
+  type H2RequestHandle,
+  type H2RequestResult,
+} from "./h2conn";
 import { Http2Pool, http2PoolKey, type Http2Options } from "./h2pool";
 import {
   endsWith,
@@ -136,6 +142,19 @@ export function closeConfidentialHttp2(): void {
 /** The pooled `http: 2` connections, for status pages and tests. */
 export function confidentialHttp2Snapshot(): ReturnType<Http2Pool["snapshot"]> {
   return h2pool?.snapshot() ?? [];
+}
+
+/** Nodes whose connection deposit was refused, so the reason is logged once each. */
+const depositRefusedLogged = new Set<string>();
+
+function noteDepositRefused(baseUrl: string, deposit: number, max: number, log?: (m: string) => void): void {
+  const key = `${baseUrl}\0${deposit}\0${max}`;
+  if (depositRefusedLogged.has(key)) return;
+  depositRefusedLogged.add(key);
+  (log ?? console.info)(
+    `[confidential http2] ${baseUrl} asks for a connection deposit of ${deposit} msat, above the maximum of ${max} msat ` +
+      `(http2.maxConnectionDepositMsat): its requests use one session each`,
+  );
 }
 
 /** What the transport needs of the session or request a call is running on. */
@@ -725,11 +744,17 @@ async function fetchConfidentialOnce(
   // `http: 2` (protocol v3): when the verified offer lists it and the caller
   // did not switch it off. The gain is the reused connection, so the same
   // stable-credential rule applies; everything else runs the v2 flow.
-  const useH2 =
+  const h2Wanted =
     options.http2?.enabled !== false &&
     offerSupportsHttp2(offer) &&
     stableCredential &&
     endsWith(body, new TextEncoder().encode(suffix));
+  // A connection costs a deposit until its first request settles: a node
+  // that asks for more than the caller accepts is served by the v2 flow.
+  const h2Deposit = offer.h2?.connection_deposit_msat ?? 0;
+  const h2MaxDeposit = options.http2?.maxConnectionDepositMsat ?? DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT;
+  const useH2 = h2Wanted && h2Deposit <= h2MaxDeposit;
+  if (h2Wanted && !useH2) noteDepositRefused(baseUrl, h2Deposit, h2MaxDeposit, options.http2?.log);
   const usePool =
     !useH2 &&
     options.prewarm !== undefined &&
@@ -806,6 +831,7 @@ async function fetchConfidentialOnce(
             prover: new CuProverBackend({ binaryPath: options.proverPath }),
             twoPcPath: options.twoPcPath,
             allowInsecureTransport: options.allowInsecureTransport,
+            maxDepositMsat: h2MaxDeposit,
           }),
         params.signal,
       );
@@ -864,6 +890,8 @@ async function fetchConfidentialOnce(
           bytesRecv: recv(r.bytes),
           connectBytesSent: fresh ? sent(fresh) : undefined,
           connectBytesRecv: fresh ? recv(fresh) : undefined,
+          depositReleasedMsat:
+            typeof r.receipt.deposit_released_msat === "number" ? r.receipt.deposit_released_msat : undefined,
         });
         return h2SessionResult(r);
       } catch (error) {

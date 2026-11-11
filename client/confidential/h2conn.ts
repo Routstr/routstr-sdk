@@ -31,6 +31,7 @@ import { verifySchnorrSignature } from "./canonical";
 import {
   ConfidentialError,
   ConfidentialTimeoutError,
+  ConnectionDepositError,
   ProverMissingError,
   ReceiptVerificationError,
   ResponseVerificationError,
@@ -122,8 +123,27 @@ export interface ConfidentialH2ConnectionOptions {
   chunk?: number;
   /** Dev only: a plain-http node that is neither loopback nor an onion service. */
   allowInsecureTransport?: boolean;
+  /**
+   * The largest connection deposit (msat) accepted from the offer
+   * (`h2.connection_deposit_msat`); a larger one is refused before anything
+   * is sent. Default `DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT`.
+   */
+  maxDepositMsat?: number;
   /** Structured event sink (never receives secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
+}
+
+/** The largest connection deposit a client accepts unless told otherwise (100 sat). */
+export const DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT = 100_000;
+
+/** What became of a connection's deposit, as the node reported it. */
+export interface H2DepositOutcome {
+  msat: number;
+  outcome: "released" | "charged";
+  /** `request_settled`, or why a connection without a settled request kept or lost it. */
+  reason: string;
+  /** True when the report carried the node's signature (a receipt, or a signed last frame). */
+  signed: boolean;
 }
 
 export interface H2RequestOptions {
@@ -333,6 +353,13 @@ export class ConfidentialH2Connection {
   setupBytes?: H2Bytes;
   /** Phase times of the connection's setup (ms). */
   setupTimings: Record<string, number> = {};
+  /**
+   * The connection deposit: the amount the setup reserves (the offer's), and
+   * its outcome once the node reported one (released by the first request's
+   * receipt, or released/charged in the connection's last frame).
+   */
+  readonly depositMsat: number;
+  deposit?: H2DepositOutcome;
 
   private readonly auth: string;
   private readonly prover: CuProverBackend;
@@ -429,6 +456,14 @@ export class ConfidentialH2Connection {
     if (!options.allowInsecureTransport && !encryptedNodeTransport(this.baseUrl)) {
       throw new SessionProtocolError(
         `refusing plain http to ${this.baseUrl}: the node credential would travel unencrypted`,
+      );
+    }
+    this.depositMsat = this.h2.connection_deposit_msat;
+    const maxDeposit = options.maxDepositMsat ?? DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT;
+    if (this.depositMsat > maxDeposit) {
+      throw new ConnectionDepositError(
+        `the node's connection deposit of ${this.depositMsat} msat exceeds the client's maximum of ${maxDeposit} msat`,
+        this.depositMsat,
       );
     }
     this.terms = h2ConnectionTerms(options.offer);
@@ -626,12 +661,23 @@ export class ConfidentialH2Connection {
     }
     this.event({ ev: "frame", in: m.type });
     switch (m.type) {
-      case "error":
+      case "error": {
+        this.noteDeposit(m);
+        const type = (m.detail as { error?: { type?: unknown } } | undefined)?.error?.type;
         this.fail(
-          new SessionRejectedError(`node rejected: ${String(m.reason ?? "unknown")}`, undefined, m.status, m.detail),
+          type === "connection_deposit_unfunded"
+            ? new ConnectionDepositError(
+                `node rejected: ${String(m.reason ?? "the balance does not cover the connection deposit")}`,
+                this.depositMsat,
+                m.status,
+                m.detail,
+              )
+            : new SessionRejectedError(`node rejected: ${String(m.reason ?? "unknown")}`, undefined, m.status, m.detail),
         );
         return;
+      }
       case "closed":
+        this.noteDeposit(m);
         // An orderly end with no request in flight; the socket closes next.
         this.closedReason = String(m.reason ?? "closed").slice(0, 64);
         this.goaway = true;
@@ -657,6 +703,30 @@ export class ConfidentialH2Connection {
       default:
         this.inbox.push(m.type, m);
     }
+  }
+
+  /**
+   * The deposit's outcome in the connection's last frame (`closed` or
+   * `error`): `deposit`, with the node's signature over `deposit_json`.
+   */
+  private noteDeposit(m: any): void {
+    if (m.deposit === undefined || m.deposit === null) return;
+    const json = typeof m.deposit_json === "string" ? m.deposit_json : JSON.stringify(m.deposit);
+    let d: any;
+    try {
+      d = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (d === null || typeof d !== "object" || (d.outcome !== "released" && d.outcome !== "charged")) return;
+    const pubkey = this.ready?.pubkey ?? this.expectedPubkey;
+    const signed =
+      typeof m.deposit_sig === "string" &&
+      typeof pubkey === "string" &&
+      verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
+      (d.sid === this.sid || (d.sid === null && !this.sid));
+    this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
+    this.event({ ev: "h2_deposit", ...this.deposit });
   }
 
   /** The next control frame of one of `keys`, or the connection's failure, or a timeout. */
@@ -742,8 +812,9 @@ export class ConfidentialH2Connection {
 
   /**
    * setup → ready → 2PC → handshake (ALPN h2) → π_NK on the connection head →
-   * release_head → head_written → the provider's SETTINGS. Nothing is
-   * reserved: the node only checks the credential.
+   * release_head → head_written → the provider's SETTINGS. The node checks
+   * the credential and reserves the offer's connection deposit (released
+   * with the first settled request); no request is reserved yet.
    */
   async connect(): Promise<void> {
     if (this.connectStarted) throw new SessionProtocolError("connect() called twice");
@@ -777,6 +848,13 @@ export class ConfidentialH2Connection {
     }
     if (this.ready.v !== 2 || this.ready.http !== 2) {
       throw new SessionProtocolError("node did not start an http: 2 session");
+    }
+    // What the setup reserved must be the signed offer's deposit (a sidecar
+    // without a node names none).
+    if (this.ready.deposit_msat !== undefined && this.ready.deposit_msat !== this.depositMsat) {
+      throw new SessionProtocolError(
+        `node reserved a connection deposit of ${String(this.ready.deposit_msat)} msat, the signed offer's is ${this.depositMsat}`,
+      );
     }
     this.sid = this.ready.sid;
     const tReady = Date.now();
@@ -1618,6 +1696,18 @@ export class ConfidentialH2Connection {
     });
     if (receipt.http !== 2 || receipt.n !== cur.n) {
       throw new ReceiptVerificationError(`receipt is for request ${String(receipt.n)}, not http 2 request ${cur.n}`);
+    }
+    // The connection's first settled request returns the deposit: its
+    // (signed) receipt says so, once, with the offer's amount.
+    const back = receipt.deposit_released_msat;
+    if (back !== undefined) {
+      if (back !== this.depositMsat || this.depositMsat === 0 || this.deposit !== undefined) {
+        throw new ReceiptVerificationError(
+          `receipt ${cur.n} releases a connection deposit of ${String(back)} msat (the offer's is ${this.depositMsat})`,
+        );
+      }
+      this.deposit = { msat: this.depositMsat, outcome: "released", reason: "request_settled", signed: true };
+      this.event({ ev: "h2_deposit", ...this.deposit, n: cur.n });
     }
     return { receipt, receiptJson, sig: m.sig };
   }

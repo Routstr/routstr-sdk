@@ -301,12 +301,24 @@ export function splitBody(body: Uint8Array, suffixLen: number, chunk = MAX_DATA_
 
 const CANONICAL_PATH = /^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/
 
+/** The checked `h2` block of an offer. */
+export interface H2OfferBlock {
+  probe_path: string
+  /** The sidecar's own idle limit (seconds). */
+  idle_secs: number
+  max_requests: number
+  /** Reserved at the setup, released after the connection's first settled request (msat; 0: none). */
+  connection_deposit_msat: number
+  /** The node closes a connection with no request in flight for this long (seconds). */
+  idle_timeout_s: number
+}
+
 /**
  * The signed offer's `h2` block, held to what the node's sidecar enforces at
  * startup: `http` lists "2", the probe is a canonical path that is a trusted
  * API base plus `/models`, and the limits are in range. Returns the block.
  */
-export function checkH2Offer(offer: any, apiBases: string[]): { probe_path: string; idle_secs: number; max_requests: number } {
+export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
   if (!Array.isArray(offer?.http) || !offer.http.includes('2')) fail('offer_no_http2: the offer does not list http 2')
   const b = offer.h2
   if (!b || typeof b !== 'object') fail('offer_malformed: no h2 block')
@@ -320,7 +332,13 @@ export function checkH2Offer(offer: any, apiBases: string[]): { probe_path: stri
   if (!(Number.isSafeInteger(max) && max >= 1 && max <= 1000)) fail('offer_malformed: h2 max_requests')
   const host = offer.upstream_host
   if (typeof host !== 'string' || host.length >= 127 || !/^[A-Za-z0-9.-]+$/.test(host)) fail('offer_malformed: upstream_host')
-  return { probe_path: b.probe_path, idle_secs: idle, max_requests: max }
+  // A node's two terms (absent from a sidecar's own offer): the deposit it
+  // reserves when a connection is opened, and how long it keeps an idle one.
+  const deposit = b.connection_deposit_msat === undefined ? 0 : b.connection_deposit_msat
+  const idleTimeout = b.idle_timeout_s === undefined ? idle : b.idle_timeout_s
+  if (!(Number.isSafeInteger(deposit) && deposit >= 0)) fail('offer_malformed: h2 connection_deposit_msat')
+  if (!(Number.isSafeInteger(idleTimeout) && idleTimeout >= 10 && idleTimeout <= idle)) fail('offer_malformed: h2 idle_timeout_s')
+  return { probe_path: b.probe_path, idle_secs: idle, max_requests: max, connection_deposit_msat: deposit, idle_timeout_s: idleTimeout }
 }
 
 /** The request path of an `http: 2` chat request: the route of the offer's (already checked) head template. */

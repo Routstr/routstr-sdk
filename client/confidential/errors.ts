@@ -119,6 +119,21 @@ export class SessionRejectedError extends ConfidentialError {
 }
 
 /** The spawned `cu-prover` failed to run or exited non-zero. */
+/**
+ * An `http: 2` connection was not opened because of its deposit: the node's
+ * deposit exceeds the client's maximum (nothing was sent), or the balance
+ * does not cover it (the node refused the setup with 402 before any 2PC).
+ */
+export class ConnectionDepositError extends SessionRejectedError {
+  /** The deposit the node asks for (msat). */
+  readonly depositMsat: number;
+  constructor(message: string, depositMsat: number, status?: number, nodeDetail?: unknown) {
+    super(message, undefined, status, nodeDetail);
+    this.name = "ConnectionDepositError";
+    this.depositMsat = depositMsat;
+  }
+}
+
 export class ProverError extends ConfidentialError {
   constructor(message: string, detail?: string) {
     super("prover_failed", message, detail);

@@ -146,10 +146,19 @@ export interface ConfidentialOffer {
 export interface ConfidentialH2Offer {
   /** Path of the node's one probe request in the connection head (API base + `/models`). */
   probe_path: string;
-  /** The node closes a connection idle this long (seconds). */
+  /** The sidecar's own idle limit (seconds); the node's is `idle_timeout_s`. */
   idle_secs: number;
   /** Requests per connection. */
   max_requests: number;
+  /**
+   * The deposit (msat) the node reserves when a connection is opened. It is
+   * released when the connection's first request reaches settlement and
+   * charged when the connection ends without one (unless the node, its
+   * sidecar or the provider failed first). 0: none.
+   */
+  connection_deposit_msat: number;
+  /** The node closes a connection that had no request in flight for this long (seconds, at most `idle_secs`). */
+  idle_timeout_s: number;
 }
 
 export interface VerifyOfferOptions {
