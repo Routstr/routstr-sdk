@@ -308,10 +308,11 @@ describe("image deposit", () => {
     expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", n: 2, resolution: "2K" })).toBe(
       Math.ceil((2 * 278300 + 2000) / 1000),
     );
-    // A request the offer cannot serve is refused later; its deposit is the dearest single image.
-    expect(confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", resolution: "4K" })).toBe(
-      Math.ceil((278300 + 2000) / 1000),
+    // A request the offer cannot serve is refused here, before a deposit is spent on it.
+    expect(() => confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", resolution: "4K" })).toThrow(
+      /no confidential nano-banana-pro variant/,
     );
+    expect(() => confidentialImageRequiredSats(offer, "nano-banana-pro", { prompt: "p", n: 9 })).toThrow(/1 to 4 images/);
     expect(confidentialImageRequiredSats(offer, "z-image-turbo", { prompt: "p" })).toBe(Math.ceil((12100 + 2000) / 1000));
     expect(confidentialImageRequiredSats(offer, "unknown", {})).toBeUndefined();
     expect(confidentialImageRequiredSats(undefined, "z-image-turbo", {})).toBeUndefined();

@@ -347,13 +347,15 @@ type ConfidentialTransport = (params: ConfidentialFetchParams) => Promise<Respon
 /**
  * Checks, without a credential, that a node would run a confidential session
  * for a model (its signed offer verifies under the caller's policy and names
- * the model); throws the error the session would raise.
+ * the model) and, given the request body, that the request can be pinned
+ * under that offer; throws the error the session would raise.
  */
 type ConfidentialQualifier = (
   baseUrl: string,
   model: string,
   options: ConfidentialRequestOptions,
-  kind?: "chat" | "images"
+  kind?: "chat" | "images",
+  request?: unknown
 ) => Promise<unknown>;
 const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
 const CONFIDENTIAL_QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
@@ -375,14 +377,15 @@ async function qualifyConfidentialNode(
   baseUrl: string,
   model: unknown,
   options: ConfidentialRequestOptions,
-  kind: "chat" | "images" = "chat"
+  kind: "chat" | "images" = "chat",
+  request?: unknown
 ): Promise<ConfidentialDepositOffer | undefined> {
   requireConfidentialTransport();
   const qualify = (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] as
     | ConfidentialQualifier
     | undefined;
   if (!qualify) return undefined;
-  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options, kind);
+  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options, kind, request);
   return offer && typeof offer === "object" && "price_list" in offer
     ? (offer as ConfidentialDepositOffer)
     : undefined;
@@ -414,9 +417,10 @@ function confidentialKind(path: string): "chat" | "images" | undefined {
 }
 
 /**
- * The deposit (sats) a confidential image request needs: the dearest offered
- * variant of the model times the image count, plus the larger fee (the node
- * reserves the chosen variant's price, never more).
+ * The deposit (sats) a confidential image request needs: the price of the
+ * variant the request selects times the image count, plus the larger fee
+ * (what the node reserves). Undefined when the offer does not price the
+ * model; throws when the offer cannot serve the request.
  */
 export function confidentialImageRequiredSats(
   offer: ConfidentialDepositOffer | undefined,
@@ -427,17 +431,11 @@ export function confidentialImageRequiredSats(
   const variants = images?.price_list?.[model];
   if (!images || !Array.isArray(variants) || variants.length === 0) return undefined;
   // The variant and count the request itself will ask for. A request the
-  // offer cannot serve is refused later anyway; size it for the dearest.
-  let price: number;
-  let count: number;
-  try {
-    const chosen = chooseImageVariant({ ...body, model }, images);
-    price = chosen.variant.msat_per_image;
-    count = chosen.count;
-  } catch {
-    price = Math.max(...variants.map((v) => v.msat_per_image));
-    count = 1;
-  }
+  // offer cannot serve throws here, before a deposit is spent on it (the
+  // session would refuse it after the spend, with the same error).
+  const chosen = chooseImageVariant({ ...body, model }, images);
+  const price = chosen.variant.msat_per_image;
+  const count = chosen.count;
   const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
   const msats = Math.ceil(price * count) + Math.max(fee(offer!.session_fee_msat), fee(offer!.abandon_fee_msat));
   return Math.ceil(msats / 1000);
@@ -1182,19 +1180,6 @@ export class RoutstrClient {
 
     await this._checkBalance(baseUrl);
 
-    // A confidential request: the node must hold a valid offer for the model
-    // before a token is spent on it; the offer also sizes the deposit.
-    const confidentialImages =
-      params.confidential !== undefined && confidentialKind(requestPath) === "images";
-    const confidentialOffer = params.confidential
-      ? await qualifyConfidentialNode(
-          baseUrl,
-          (body as { model?: unknown } | undefined)?.model,
-          params.confidential,
-          confidentialImages ? "images" : "chat"
-        )
-      : undefined;
-
     let requiredSats = 1;
     let selectedModel: Model | undefined;
     let requestMaxTokens: number | undefined;
@@ -1204,6 +1189,29 @@ export class RoutstrClient {
         modelId
       );
       selectedModel = providerModel ?? undefined;
+    }
+
+    // A confidential request: the node must hold a valid offer for the model
+    // before a token is spent on it, and the request must be one the session
+    // can pin under that offer; the offer also sizes the deposit. The model
+    // is the id the body will carry to this node (its own spelling of the
+    // caller's id, see the body rewrite below), which is what its offer prices.
+    const confidentialImages =
+      params.confidential !== undefined && confidentialKind(requestPath) === "images";
+    const confidentialModelId = params.confidential
+      ? this._confidentialBodyModelId(body, headers, selectedModel)
+      : undefined;
+    const confidentialOffer = params.confidential
+      ? await qualifyConfidentialNode(
+          baseUrl,
+          confidentialModelId,
+          params.confidential,
+          confidentialImages ? "images" : "chat",
+          body
+        )
+      : undefined;
+
+    if (modelId) {
       if (selectedModel) {
         const requestMessages = Array.isArray(
           (body as { messages?: unknown })?.messages
@@ -1254,7 +1262,7 @@ export class RoutstrClient {
     if (confidentialImages) {
       const imageSats = confidentialImageRequiredSats(
         confidentialOffer,
-        String((body as { model?: unknown } | undefined)?.model ?? ""),
+        String(confidentialModelId ?? ""),
         (body ?? {}) as Record<string, unknown>
       );
       if (imageSats !== undefined) requiredSats = imageSats;
@@ -1973,6 +1981,23 @@ export class RoutstrClient {
     return requestedModelId !== undefined
       ? canonicalizeModelId(requestedModelId, this.discoveryAdapter.getModelIdMappings?.() ?? undefined)
       : canonicalIdForModel(selectedModel, this.discoveryAdapter.getModelIdMappings?.() ?? undefined);
+  }
+
+  /**
+   * The `model` a confidential request's body carries to a node: the id the
+   * body rewrite in `_prepareRoutedRequest` puts there (a pinned model path's
+   * model id, else the node's own id for the requested model), or the
+   * caller's own when nothing rewrites it.
+   */
+  private _confidentialBodyModelId(
+    body: unknown,
+    headers: Record<string, string>,
+    selectedModel: Model | undefined
+  ): unknown {
+    const bodyModel = (body as { model?: unknown } | undefined)?.model;
+    if (typeof bodyModel !== "string") return bodyModel;
+    const selector = this._findModelPathHeader(headers);
+    return (selector ? selectorModelId(selector) : null) ?? selectedModel?.id ?? bodyModel;
   }
 
   /**
@@ -3095,7 +3120,8 @@ export class RoutstrClient {
               nextProvider,
               newModel.id,
               params.confidential,
-              confidentialKind(params.path) === "images" ? "images" : "chat"
+              confidentialKind(params.path) === "images" ? "images" : "chat",
+              body
             );
           } catch (error) {
             this._log(
