@@ -27,6 +27,7 @@ const ADDED_COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
   { name: "cache_read_msats", type: "REAL" },
   { name: "cache_creation_msats", type: "REAL" },
   { name: "remaining_balance_msats", type: "REAL" },
+  { name: "output_images", type: "INTEGER" },
 ];
 
 const normalizeBaseUrl = (baseUrl: string): string =>
@@ -155,10 +156,11 @@ export const createBunSqliteUsageTrackingDriver = (
         client, session_id, tags,
         provider, base_msats, input_msats, output_msats, total_msats,
         total_usd, cache_read_input_tokens, cache_creation_input_tokens,
-        cache_read_msats, cache_creation_msats, remaining_balance_msats, node_request_id, upstream_response_id
+        cache_read_msats, cache_creation_msats, remaining_balance_msats, node_request_id, upstream_response_id,
+        output_images
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `).run(
       entry.id,
@@ -186,7 +188,8 @@ export const createBunSqliteUsageTrackingDriver = (
       entry.cacheCreationMsats ?? null,
       entry.remainingBalanceMsats ?? null,
       entry.nodeRequestId ?? null,
-      entry.upstreamResponseId ?? null
+      entry.upstreamResponseId ?? null,
+      entry.outputImages ?? null
     );
   };
 
@@ -217,6 +220,7 @@ export const createBunSqliteUsageTrackingDriver = (
     cacheReadMsats: row.cache_read_msats ?? undefined,
     cacheCreationMsats: row.cache_creation_msats ?? undefined,
     remainingBalanceMsats: row.remaining_balance_msats ?? undefined,
+    outputImages: row.output_images ?? undefined,
   });
 
   const ensureMigrated = async (): Promise<void> => {

@@ -312,6 +312,25 @@ describe("provider attribution from response headers", () => {
     expect(row.provider).toBe("body-provider");
   });
 
+  it("records a raw image reply from its headers", async () => {
+    // Venice /image/edit relays PNG bytes: no JSON body, so cost, provider and
+    // image count only exist as headers.
+    const row = await record(new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+      headers: {
+        "content-type": "image/png",
+        "x-routstr-cost-msats": "140577",
+        "x-routstr-input-cost-msats": "0",
+        "x-routstr-output-cost-msats": "140577",
+        "x-routstr-provider": "venice",
+        "x-routstr-image-count": "1",
+      },
+    }));
+    expect(row.provider).toBe("venice");
+    expect(row.totalMsats).toBe(140577);
+    expect(row.satsCost).toBeCloseTo(140.577);
+    expect(row.outputImages).toBe(1);
+  });
+
   it("uses the header for already-captured streaming usage", async () => {
     const row = await record(new Response("data: [DONE]\n\n", {
       headers: {

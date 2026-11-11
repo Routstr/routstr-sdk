@@ -3319,7 +3319,9 @@ export class RoutstrClient {
           // may have consumed `response` by now, and a second read would throw.
           let body = responseBody;
           if (body === undefined) {
-            body = await response.clone().json();
+            // Raw image bytes (Venice /image/edit) or an encrypted body is not
+            // JSON; its usage comes from the response headers below.
+            body = await response.clone().json().catch(() => undefined);
           }
           usage =
             usage ??
@@ -3356,6 +3358,9 @@ export class RoutstrClient {
           if (headerUsage.inputMsats) usage.inputMsats = headerUsage.inputMsats;
           if (headerUsage.outputMsats) usage.outputMsats = headerUsage.outputMsats;
           if (headerUsage.totalUsd) usage.totalUsd = headerUsage.totalUsd;
+          if (headerUsage.outputImages !== undefined) {
+            usage.outputImages = headerUsage.outputImages;
+          }
         }
       }
 
