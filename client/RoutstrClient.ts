@@ -461,8 +461,9 @@ type ConfidentialDepositOffer = Pick<
 /**
  * The reservation (msats) a confidential node holds for this request, by the
  * node's own formula. The prompt is opaque, so it reserves the model's full
- * context length plus the pinned completion cap and the offer's
- * `reserve_margin_tokens` at the signed (surcharged) rates; without a known
+ * context length (the larger of the model's and its `top_provider`'s, at the
+ * dearer of the input and cache-write rates) plus the pinned completion cap
+ * and the offer's `reserve_margin_tokens` at the signed (surcharged) rates; without a known
  * context length, the model's undiscounted maximum cost raised by the
  * surcharge plus the same margin. The larger of the session and abandon fees
  * comes on top. With the signed offer every input is the node's; without it
@@ -476,14 +477,25 @@ export function confidentialReservationMsats(
   offer?: ConfidentialDepositOffer
 ): number | undefined {
   const sp = model.sats_pricing as
-    | { max_cost?: number; max_completion_cost?: number; prompt?: number; completion?: number }
+    | {
+        max_cost?: number;
+        max_completion_cost?: number;
+        prompt?: number;
+        completion?: number;
+        input_cache_write?: number;
+      }
     | undefined;
   const cu = model.confidential_upstream;
   const positive = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
   const pct = positive(offer ? offer.rate_surcharge_pct : cu?.rate_surcharge_pct);
   const factor = 1 + pct / 100;
   const signed = offer?.price_list?.[model.id];
-  const inRate = signed ? Number(signed.in) : positive(sp?.prompt) * 1_000_000 * factor;
+  // The prompt is opaque and may be all prompt-cache writes: the node prices
+  // it at max(in, cache_write) (cache writes cost more than input on some
+  // models, and every signed entry carries the rate).
+  const inRate = signed
+    ? Math.max(Number(signed.in), positive(signed.cache_write))
+    : Math.max(positive(sp?.prompt), positive(sp?.input_cache_write)) * 1_000_000 * factor;
   const outRate = signed ? Number(signed.out) : positive(sp?.completion) * 1_000_000 * factor;
   // Integer offer fields as the offer helpers read them (kept local so the
   // browser bundle does not pull in the offer verifier).
@@ -506,11 +518,13 @@ export function confidentialReservationMsats(
   } else {
     completion = 4096;
   }
-  // The node's prompt limit: the first positive integer context length.
+  // The node's prompt limit: the larger of the positive integer context
+  // lengths (the catalogue's `top_provider` one may describe another provider).
   const top = (model as { top_provider?: { context_length?: unknown } }).top_provider;
-  const limit = [top?.context_length, model.context_length].find(
+  const known = [top?.context_length, model.context_length].filter(
     (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0
   );
+  const limit = known.length ? Math.max(...known) : undefined;
   let msats: number;
   if (limit !== undefined) {
     if (!inRate || !outRate) return undefined;
