@@ -21,6 +21,7 @@ import {
   verifyConfidentialOffer,
   type ConfidentialImagesOffer,
 } from "../../client/confidential/offer";
+import { confidentialKind } from "../../client/confidential/endpoints";
 import { verifyFlatReceipt } from "../../client/confidential/receipt";
 import {
   isConfidentialEndpoint,
@@ -229,6 +230,20 @@ describe("image request split", () => {
     expect(isConfidentialImageEndpoint("GET", "/v1/images/generations")).toBe(false);
     expect(isConfidentialImageEndpoint("POST", "/v1/images/edits")).toBe(false);
     expect(isConfidentialEndpoint("POST", "/v1/images/generations")).toBe(false);
+    // The client's pre-spend check and the transport read one definition.
+    for (const [path, kind] of [
+      ["/v1/chat/completions", "chat"],
+      ["/chat/completions/?x=1", "chat"],
+      ["/v1/images/generations", "images"],
+      ["/image/generate/", "images"],
+      ["/v1/images/edits", undefined],
+      ["/v1/v1/chat/completions", undefined],
+      ["/v1/responses", undefined],
+    ] as const) {
+      expect(confidentialKind(path), path).toBe(kind);
+      expect(isConfidentialEndpoint("POST", path), path).toBe(kind === "chat");
+      expect(isConfidentialImageEndpoint("POST", path), path).toBe(kind === "images");
+    }
   });
 });
 
