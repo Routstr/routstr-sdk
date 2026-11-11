@@ -16,7 +16,7 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fromHex, hex } from "./advice";
 import { ProverError, ProverMissingError } from "./errors";
-import { resolveProverPath, StdinBudget } from "./prover";
+import { isExecutable, resolveProverPath, StdinBudget } from "./prover";
 
 export const CU_2PC_ENV_VARS = ["CU_2PC_BIN", "CU_2PC"] as const;
 
@@ -43,6 +43,26 @@ export function resolveTwoPcPath(explicit?: string, proverPath?: string): string
   const slash = prover.lastIndexOf("/");
   if (slash >= 0) return `${prover.slice(0, slash + 1)}cu-2pc`;
   return "cu-2pc";
+}
+
+/**
+ * Refuse to start when a helper binary cannot be run: `cu-prover` (when
+ * `proverPath` is given) and `cu-2pc` (unless `twoPc` is false, resolved as
+ * `resolveTwoPcPath` does). Called before a setup is sent (the node reserves
+ * funds as soon as it accepts one) and before a deposit is spent on a node.
+ */
+export function requireHelperBinaries(o: { proverPath?: string; twoPcPath?: string; twoPc?: boolean }): void {
+  const needed: Array<[string, string]> = [];
+  if (typeof o.proverPath === "string") needed.push(["cu-prover", o.proverPath]);
+  if (o.twoPc !== false) needed.push(["cu-2pc", resolveTwoPcPath(o.twoPcPath, o.proverPath)]);
+  for (const [name, path] of needed) {
+    if (!isExecutable(path)) {
+      throw new ProverMissingError(
+        `${name} not found or not executable at ${path}`,
+        name === "cu-2pc" ? "set CU_2PC_BIN or put cu-2pc next to cu-prover" : "set CU_PROVER_BIN or the proverPath option",
+      );
+    }
+  }
 }
 
 /** Encode one `[channel][len BE][payload]` frame. */

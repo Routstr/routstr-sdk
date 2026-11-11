@@ -39,7 +39,8 @@ import {
   type ConfidentialImagesOffer,
   type VerifiedOffer,
 } from "./offer";
-import { CuProverBackend } from "./prover";
+import { CuProverBackend, resolveProverPath } from "./prover";
+import { requireHelperBinaries } from "./twopc";
 import { checkImageResponse, ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import {
   CHAT_PROTOCOL_KEYS,
@@ -380,20 +381,35 @@ async function qualifiedOffer(
 }
 
 /**
- * Check, with no credential, that `baseUrl` would run a confidential session
- * for `model`: its signed offer verifies under the caller's policy, the node
- * is reachable over an encrypted transport and its price list names the
- * model. Throws the error the session itself would raise; returns the
- * verified offer. The client calls this before it spends a token on a node,
- * and sizes the deposit from the offer.
+ * Check, with no credential, that this client and `baseUrl` would run a
+ * confidential session for `model`: the helper binaries can be run, the
+ * node's signed offer verifies under the caller's policy, the node is
+ * reachable over an encrypted transport and its price list names the model.
+ * With `request` (the body the session would send, `model` being the id the
+ * node lists), also that the request can be pinned under that offer: no
+ * parameter the offer pins to another value, and for an image request a
+ * variant and count the offer serves. Throws the error the session itself
+ * would raise; returns the verified offer. The client calls this before it
+ * spends a token on a node, and sizes the deposit from the offer: a one-off
+ * Cashu deposit minted for a session that then fails locally would stay in
+ * the store, unspent, until a refund sweep.
  */
 export async function qualifyConfidentialNode(
   baseUrl: string,
   model: string,
   options: ConfidentialRequestOptions,
   kind: "chat" | "images" = "chat",
+  request?: unknown,
 ): Promise<VerifiedOffer> {
-  return qualifiedOffer(baseUrl, model, options, false, kind);
+  // Local, so first: no node can run a session without them.
+  requireHelperBinaries({ proverPath: resolveProverPath(options.proverPath), twoPcPath: options.twoPcPath });
+  const offer = await qualifiedOffer(baseUrl, model, options, false, kind);
+  if (request !== null && typeof request === "object" && !Array.isArray(request)) {
+    const body = { ...(request as Record<string, unknown>), model };
+    if (kind === "images") planImageRequest(body, offer.images!);
+    else buildPinnedBody(body, model, maxTokensFor(body, Number(offer.max_tokens_cap ?? 4096)).maxTokens, offer.chat);
+  }
+  return offer;
 }
 
 /** The chat endpoint the confidential transport implements. */

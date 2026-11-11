@@ -119,6 +119,7 @@ export {
   TwoPcSession,
   TwoPcFrameDecoder,
   encodeTwoPcFrame,
+  requireHelperBinaries,
   resolveTwoPcPath,
   CU_2PC_ENV_VARS,
   type TwoPcOptions,
