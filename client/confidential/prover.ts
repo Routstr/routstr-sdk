@@ -135,6 +135,17 @@ export class CuProverBackend {
         error instanceof Error ? error.message : String(error),
       );
     }
+    // Before anything is written: an EPIPE after cu-prover exited early is an
+    // 'error' event on its stdin, and a missing binary an 'error' event on
+    // the child. Without a listener either is an uncaught exception in the
+    // host process. The stdin error needs no action (the exit code fails the
+    // proof); the child error fails the proof.
+    child.stdin.on("error", () => {});
+    let earlyChildError: Error | undefined;
+    let failChild = (err: Error): void => {
+      earlyChildError = err;
+    };
+    child.on("error", (err: Error) => failChild(err));
     const jobBytes = Buffer.from(
       JSON.stringify({ proof: job.proof, params: job.params, witness: job.witness ?? null }),
     );
@@ -160,6 +171,8 @@ export class CuProverBackend {
           () => reject(new ProverError(`zk timeout (${timeoutMs}ms) for ${job.proof}`)),
           timeoutMs,
         );
+        failChild = (err) => reject(new ProverError(String(err)));
+        if (earlyChildError) failChild(earlyChildError);
         // The node may refuse the proof connection before any proof runs
         // (the socket closes or errors without opening): fail at once
         // instead of waiting for the timeout.
@@ -197,7 +210,6 @@ export class CuProverBackend {
             if (code === 0) resolve();
             else reject(new ProverError(`cu-prover exited ${code} for ${job.proof}`));
           });
-          child.on("error", (err) => reject(new ProverError(String(err))));
         };
       });
     } finally {

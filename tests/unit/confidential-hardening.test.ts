@@ -415,4 +415,45 @@ describe("unflushed bytes to the helper processes", () => {
       (globalThis as { WebSocket: unknown }).WebSocket = real;
     }
   });
+
+  it("per-proof prover: a write to an exited cu-prover fails the proof, never the process", async () => {
+    // cu-prover exited early: the next write to its stdin is an EPIPE 'error'
+    // event, which without a listener is an uncaught exception in the host.
+    const { child, killed } = fakeChild(true);
+    const Ws = fakeSocketClass();
+    const real = (globalThis as { WebSocket: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = Ws;
+    try {
+      const prover = new CuProverBackend({ binaryPath: "/fake/cu-prover", spawnImpl: (() => child) as never });
+      const run = prover.run("ws://node/zk?proof=pi_c3s", { proof: "pi_c3s", role: "prover", params: {} }, 5_000);
+      run.catch(() => {});
+      const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      // Before the proof socket opened, and after.
+      expect(() => child.stdin.emit("error", epipe)).not.toThrow();
+      await tick();
+      expect(() => child.stdin.emit("error", epipe)).not.toThrow();
+      child.emit("close", 1);
+      await expect(run).rejects.toThrow(/cu-prover exited 1/);
+      expect(killed()).toBe(1);
+    } finally {
+      (globalThis as { WebSocket: unknown }).WebSocket = real;
+    }
+  });
+
+  it("per-proof prover: a spawn failure reported before the proof socket opens fails the proof", async () => {
+    const { child } = fakeChild(true);
+    const Ws = fakeSocketClass();
+    const real = (globalThis as { WebSocket: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = Ws;
+    try {
+      const prover = new CuProverBackend({ binaryPath: "/fake/cu-prover", spawnImpl: (() => child) as never });
+      const run = prover.run("ws://node/zk?proof=pi_nk", { proof: "pi_nk", role: "verifier", params: {} }, 5_000);
+      run.catch(() => {});
+      // Node reports a missing binary as an 'error' event after spawn() returned.
+      expect(() => child.emit("error", new Error("spawn /fake/cu-prover ENOENT"))).not.toThrow();
+      await expect(run).rejects.toThrow(/ENOENT/);
+    } finally {
+      (globalThis as { WebSocket: unknown }).WebSocket = real;
+    }
+  });
 });
