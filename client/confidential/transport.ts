@@ -1233,9 +1233,12 @@ async function fetchConfidentialOnce(
       throw callerGone() ? error : withChange(error, await failureChange(params, active(), runP));
     },
   );
-  // A stream ends only once settlement verified (and only then gets its
-  // `[DONE]`); a failed check errors it.
-  settled.then(
+  // A stream ends only once the session's settlement verified (and only then
+  // gets its `[DONE]`); a failed check errors it. It does not wait for a
+  // one-off bearer's change: that is a refund request to the node, which
+  // could hold a finished stream open for as long as it likes. The change
+  // comes with `confidentialSettled`.
+  runP.then(
     () => {
       const rest = doneHold.release();
       if (rest.length) void writer.write(rest).catch(() => {});
@@ -1479,20 +1482,30 @@ export class SseDoneHoldback {
 async function withdrawBalance(baseUrl: string, bearer: string, attempts = 2): Promise<string | undefined> {
   for (let i = 0; i < attempts; i++) {
     if (i > 0) await delay(500 * i);
+    // A node that does not answer must not hold the (paid) response: the
+    // balance then stays on the bearer for the wallet's refund sweep.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), WITHDRAW_TIMEOUT_MS);
     try {
       const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/wallet/refund`, {
         method: "POST",
         headers: { Authorization: `Bearer ${bearer}` },
+        signal: abort.signal,
       });
       if (!res.ok) continue;
       const j = (await res.json()) as { token?: string };
       return j.token;
     } catch {
       /* retry */
+    } finally {
+      clearTimeout(timer);
     }
   }
   return undefined;
 }
+
+/** How long one refund request may take before it is given up on. */
+const WITHDRAW_TIMEOUT_MS = 30_000;
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

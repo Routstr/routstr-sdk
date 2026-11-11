@@ -203,6 +203,71 @@ describe("the receipt's cost", () => {
   });
 });
 
+describe("a refund endpoint that does not answer", () => {
+  /** A node whose /v1/wallet/refund never answers (it still honours an abort). */
+  function hangingRefund() {
+    refunds = 0;
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/v1/wallet/refund")) {
+        refunds++;
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        });
+      }
+      return new Response(JSON.stringify(offer()), { status: 200 });
+    }) as typeof fetch;
+  }
+
+  it("does not hold a stream open: it ends once the session settled", async () => {
+    hangingRefund();
+    fakeRun(async (s) => {
+      released(s);
+      s.onResponseHead?.(SSE_HEAD);
+      s.onResponseBody?.(enc("data: hi\n\ndata: [DONE]\n\n"));
+      return RESULT;
+    });
+    const res = await call({ returnChange: true }, { stream: true });
+    const text = await Promise.race([res.text(), new Promise<string>((r) => setTimeout(() => r("<still open>"), 300))]);
+    expect(text).toBe("data: hi\n\ndata: [DONE]\n\n");
+    expect(refunds).toBe(1);
+  });
+
+  it("still errors a stream whose settlement checks failed", async () => {
+    hangingRefund();
+    fakeRun(async (s) => {
+      released(s);
+      s.onResponseHead?.(SSE_HEAD);
+      s.onResponseBody?.(enc("data: hi\n\ndata: [DONE]\n\n"));
+      throw new ReceiptVerificationError("bad receipt");
+    });
+    const res = await call({ returnChange: true }, { stream: true });
+    await expect(res.text()).rejects.toThrow(/bad receipt/);
+  });
+
+  it("is given up on after a timeout, so a non-streamed answer is not held either", async () => {
+    vi.useFakeTimers();
+    try {
+      hangingRefund();
+      fakeRun(async (s) => {
+        released(s);
+        s.onResponseHead?.(SSE_HEAD);
+        s.onResponseBody?.(enc('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'));
+        return RESULT;
+      });
+      let res: Response | undefined;
+      void call({ returnChange: true }).then((r) => (res = r));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(res).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(res?.status).toBe(200);
+      expect(res!.headers.has("x-cashu")).toBe(false);
+      expect(((await res!.json()) as any).choices[0].message.content).toBe("hi");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("caller abort", () => {
   it("never starts a session for an already-aborted signal", async () => {
     mockNode();
