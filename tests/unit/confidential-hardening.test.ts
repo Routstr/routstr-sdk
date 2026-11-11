@@ -7,7 +7,7 @@
 
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
@@ -24,7 +24,7 @@ import {
 } from "../../client/confidential/offer";
 import { headTemplateProblem } from "../../client/confidential/params";
 import { CuProverBackend, MAX_UNFLUSHED_STDIN, StdinBudget } from "../../client/confidential/prover";
-import { ConfidentialSession } from "../../client/confidential/session";
+import { ConfidentialSession, timeout } from "../../client/confidential/session";
 import { chatSuffixKeys, pinKeyProblem, validateChatSuffix } from "../../client/confidential/suffix";
 import { TwoPcSession } from "../../client/confidential/twopc";
 import { ProofChannel } from "../../client/confidential/zkchan";
@@ -454,6 +454,25 @@ describe("unflushed bytes to the helper processes", () => {
       await expect(run).rejects.toThrow(/ENOENT/);
     } finally {
       (globalThis as { WebSocket: unknown }).WebSocket = real;
+    }
+  });
+});
+
+describe("session wait timers", () => {
+  it("do not keep the process alive after the wait they bounded", async () => {
+    // Each wait of a session races a timer of up to 60 s that is never
+    // cleared: left ref'd, a script could not exit for a minute after its
+    // last request.
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const p = timeout(20, "ready");
+      const handle = spy.mock.results[spy.mock.results.length - 1]!.value as { hasRef?: () => boolean };
+      expect(typeof handle.hasRef).toBe("function");
+      expect(handle.hasRef!()).toBe(false);
+      // It still fires while something else keeps the process running.
+      await expect(p).rejects.toThrow(/timeout waiting for ready/);
+    } finally {
+      spy.mockRestore();
     }
   });
 });
