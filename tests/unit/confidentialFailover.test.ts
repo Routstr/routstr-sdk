@@ -109,8 +109,9 @@ function setup(
   return { client, spent, sessions, qualified, bodies };
 }
 
-const route = (client: RoutstrClient) =>
+const route = (client: RoutstrClient, extra: Record<string, unknown> = {}) =>
   client.routeRequest({
+    ...extra,
     path: "/v1/chat/completions",
     method: "POST",
     body: { model: MODEL, max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
@@ -182,5 +183,54 @@ describe("confidential failover", () => {
     expect((seen[0]!.request as { messages?: unknown }).messages).toEqual([{ role: "user", content: "hi" }]);
     expect(sessions).toEqual([A]);
     expect((bodies[0] as { model: string }).model).toBe("z-m-1");
+  });
+
+  it("moves on to the next confidential node when the first one does not qualify", async () => {
+    // The cheapest node is down, signs with a key the caller does not pin, or
+    // does not price the model: nothing was spent on it, another node can serve.
+    const { client, spent, sessions, qualified } = setup({
+      qualify: (baseUrl) => {
+        if (baseUrl === A) throw new Error("offer unpinned: node key not in nodePubkeys");
+      },
+      // A would also fail the session: it must never be reached.
+    });
+    const res = await route(client);
+    expect(res.status).toBe(200);
+    expect(qualified).toEqual([A, C]);
+    expect(spent.map((s) => s.baseUrl)).toEqual([C]);
+    expect(sessions).toEqual([C]);
+    // Never the plaintext-only node, although it is cheaper than C.
+    expect(qualified.includes(PLAIN)).toBe(false);
+  });
+
+  it("reports the first node's error when no node qualifies", async () => {
+    const { client, spent, qualified } = setup({
+      qualify: (baseUrl) => {
+        throw new Error(`offer unavailable at ${baseUrl}`);
+      },
+    });
+    await expect(route(client)).rejects.toThrow(`offer unavailable at ${A}`);
+    expect(qualified).toEqual([A, C]);
+    expect(spent).toEqual([]);
+  });
+
+  it("does not try other nodes when the caller pinned the provider or a helper binary is missing", async () => {
+    const pinned = setup({
+      qualify: (baseUrl) => {
+        if (baseUrl === A) throw new Error("offer unavailable");
+      },
+    });
+    await expect(route(pinned.client, { pinnedProvider: true })).rejects.toThrow(/offer unavailable/);
+    expect(pinned.qualified).toEqual([A]);
+    expect(pinned.spent).toEqual([]);
+
+    // A local failure is the same on every node.
+    const local = setup({
+      qualify: () => {
+        throw Object.assign(new Error("cu-prover not found"), { code: "prover_missing" });
+      },
+    });
+    await expect(route(local.client)).rejects.toThrow(/cu-prover not found/);
+    expect(local.qualified).toEqual([A]);
   });
 });
