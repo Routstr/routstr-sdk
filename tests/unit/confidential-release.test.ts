@@ -17,6 +17,7 @@ import {
   closeConfidentialPrewarm,
   confidentialPrewarmSnapshot,
   fetchConfidential,
+  headerSafeText,
 } from "../../client/confidential/transport";
 import {
   OfferUnpinnedError,
@@ -264,6 +265,53 @@ describe("a refund endpoint that does not answer", () => {
       expect(((await res!.json()) as any).choices[0].message.content).toBe("hi");
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("provider text in response headers", () => {
+  // The answer is paid for by the time these headers are set: a value the
+  // runtime refuses in a header must not throw the response away.
+  const MODEL_WARNING = 'the provider reports model "模型-β", the request pinned cheap';
+
+  it("a warning with characters outside Latin-1 is escaped, not thrown", async () => {
+    mockNode();
+    fakeRun(async (s) => {
+      released(s);
+      s.onResponseHead?.(SSE_HEAD);
+      s.onResponseBody?.(enc('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'));
+      return { ...RESULT, warnings: [MODEL_WARNING] };
+    });
+    const res = await call();
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).choices[0].message.content).toBe("hi");
+    expect(res.headers.get("x-routstr-confidential-warnings")).toBe(
+      'the provider reports model "\\u6a21\\u578b-\\u03b2", the request pinned cheap',
+    );
+    expect(headerSafeText("plain ASCII; stays")).toBe("plain ASCII; stays");
+    expect(headerSafeText("a\r\nb\u0000c\u00e9")).toBe("a\\u000d\\u000ab\\u0000c\\u00e9");
+  });
+
+  it("a provider header the runtime refuses is left out, the others are kept", async () => {
+    mockNode();
+    const head = {
+      status: 200,
+      statusText: "OK",
+      headers: { "content-type": "text/event-stream", "x-odd": "line\nbreak", "bad name": "v", "x-request-id": "r-1" },
+    };
+    for (const stream of [false, true]) {
+      fakeRun(async (s) => {
+        released(s);
+        s.onResponseHead?.(head);
+        s.onResponseBody?.(enc("data: [DONE]\n\n"));
+        return { ...RESULT, http: head };
+      });
+      const res = await call({}, { stream });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-request-id")).toBe("r-1");
+      expect(res.headers.has("x-odd")).toBe(false);
+      await res.text();
+      vi.restoreAllMocks();
     }
   });
 });

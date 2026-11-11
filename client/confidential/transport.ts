@@ -576,12 +576,12 @@ async function fetchConfidentialImageHttp2(
       { model: plan.model, count: plan.count, countKey: imageCountKey(offer.images!) },
     );
     headers.set("content-type", "application/json");
-    if (checked.warnings.length) headers.set("x-routstr-confidential-warnings", checked.warnings.join("; "));
+    if (checked.warnings.length) setWarnings(headers, checked.warnings);
     response = new Response(JSON.stringify(checked.image), { status: r.status, headers });
   } else {
     // An upstream error: its body as the provider sent it.
     for (const [k, v] of Object.entries(r.headers)) {
-      if (exposedProviderHeader(k) && !headers.has(k)) headers.set(k, v);
+      if (exposedProviderHeader(k)) setProviderHeader(headers, k, v, false);
     }
     response = new Response(new Blob([r.body as BlobPart]), { status: r.status, headers });
   }
@@ -889,12 +889,12 @@ async function fetchConfidentialImageOnce(
   if (result.image) {
     headers.set("content-type", "application/json");
     // What fell short in an accepted response (it was paid at the flat price).
-    if (result.imageWarnings?.length) headers.set("x-routstr-confidential-warnings", result.imageWarnings.join("; "));
+    if (result.imageWarnings?.length) setWarnings(headers, result.imageWarnings);
     response = new Response(JSON.stringify(result.image), { status: result.http.status, headers });
   } else {
     // An upstream error: its body as the provider sent it.
     for (const [k, v] of Object.entries(result.http.headers)) {
-      if (exposedProviderHeader(k) && !headers.has(k)) headers.set(k, v);
+      if (exposedProviderHeader(k)) setProviderHeader(headers, k, v, false);
     }
     response = new Response(new Blob([result.http.body as BlobPart]), { status: result.http.status, headers });
   }
@@ -1249,7 +1249,7 @@ async function fetchConfidentialOnce(
 
   const headers = new Headers();
   for (const [k, v] of Object.entries(head.headers)) {
-    if (exposedProviderHeader(k)) headers.set(k, v);
+    if (exposedProviderHeader(k)) setProviderHeader(headers, k, v, true);
   }
   headers.set("x-routstr-verify", "confidential");
   headers.set("x-routstr-confidential-sid", active()!.sid);
@@ -1287,7 +1287,7 @@ async function fetchConfidentialOnce(
     const cost = receiptCostMsats(await runP);
     if (cost !== undefined) response.headers.set("x-routstr-cost-msats", String(cost));
     const warnings = (await runP).warnings;
-    if (warnings?.length) response.headers.set("x-routstr-confidential-warnings", warnings.join("; "));
+    if (warnings?.length) setWarnings(response.headers, warnings);
   }
   settled.catch(() => {}); // observed by the stream and by finalize()
   (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled = settled;
@@ -1363,6 +1363,34 @@ function abortReason(signal: AbortSignal | undefined): unknown {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw abortReason(signal);
+}
+
+/**
+ * Text for a response header value: printable ASCII as it is, anything else
+ * (the provider's own strings may hold any character) as a `\uXXXX` escape.
+ * `Headers.set` throws on a character above U+00FF and on control characters,
+ * and by then the answer is paid for.
+ */
+export function headerSafeText(text: string): string {
+  return text.replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** The session's warnings as one response header. */
+function setWarnings(headers: Headers, warnings: readonly string[]): void {
+  headers.set("x-routstr-confidential-warnings", headerSafeText(warnings.join("; ")));
+}
+
+/**
+ * Pass one of the provider's response headers on. A name or value the
+ * runtime refuses in a header is left out: the response is already paid for
+ * and must not be lost to it.
+ */
+function setProviderHeader(headers: Headers, name: string, value: string, replace: boolean): void {
+  try {
+    if (replace || !headers.has(name)) headers.set(name, value);
+  } catch {
+    /* not a valid header for this runtime: dropped */
+  }
 }
 
 /** A node refusal as the HTTP error a normal request would get. */
