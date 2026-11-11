@@ -538,6 +538,85 @@ describe("receipt verification", () => {
     expect(maxChargeMsats(old, allWritten)).toBe(10_800);
   });
 
+  it("bounds a cached session at the cached price, not the uncached one", () => {
+    // The node bills cached reads at cached_in from the same disclosed usage,
+    // so the uncached price is no bound for a usage that reports them.
+    const priceEntry = { in: 1900, cached_in: 380, cache_write: 1900, out: 7500 };
+    const usage = { prompt_tokens: 50_000, completion_tokens: 200, prompt_tokens_details: { cached_tokens: 48_000 } };
+    const honest = Math.ceil((1900 * 2000 + 380 * 48_000 + 7500 * 200) / 1000);
+    const uncached = Math.ceil((1900 * 50_000 + 7500 * 200) / 1000);
+    expect(honest).toBe(23_540);
+    expect(uncached).toBe(96_500);
+    expect(maxChargeMsats(priceEntry, usage)).toBe(honest);
+    expect(maxChargeMsats(priceEntry, usage, 2000)).toBe(honest + 2000);
+    const own = { model: "m", usage } as never;
+    const check = (cost_msats: number) =>
+      verifyReceipt({
+        receipt: { sid: "s", model: "m", usage: { usage }, cost_msats } as never,
+        ownUsage: own,
+        priceEntry,
+      }).costWithinOffer;
+    expect(check(honest)).toBe(true);
+    expect(check(honest + 1)).toBe(false);
+    // The uncached price for a cached session is an overcharge.
+    expect(check(uncached)).toBe(false);
+    // Cache writes dearer than `in` raise the bound, exactly as the node bills them.
+    const dear = { ...priceEntry, cache_write: 2375 };
+    const writes = { ...usage, prompt_tokens_details: { cached_tokens: 48_000, cache_write_tokens: 1500 } };
+    expect(maxChargeMsats(dear, writes)).toBe(
+      Math.ceil((1900 * 500 + 380 * 48_000 + 2375 * 1500 + 7500 * 200) / 1000),
+    );
+    // Writes cheaper than `in`: a node that did not read the write count bills
+    // them at `in`, which stays within the bound (still below the uncached price).
+    const cheap = { ...priceEntry, cache_write: 950 };
+    expect(maxChargeMsats(cheap, writes)).toBe(honest);
+    // A usage without cached reads is bounded by the uncached price, as before.
+    expect(maxChargeMsats(priceEntry, { prompt_tokens: 50_000, completion_tokens: 200 })).toBe(uncached);
+  });
+
+  it("the bound is the node's own charge for any plain usage (cache_write ≥ in)", () => {
+    // routstr-core frozen_cost_msats, same operation order.
+    const node = (
+      r: { in: number; cached_in: number; cache_write?: number; out: number },
+      prompt: number,
+      cached: number,
+      written: number,
+      completion: number,
+    ) => {
+      const c = Math.min(Math.max(cached, 0), prompt);
+      const w = Math.min(written, prompt - c);
+      const cachedRate = Math.min(r.cached_in, r.in);
+      const writeRate = r.cache_write ?? r.in;
+      return Math.ceil((r.in * (prompt - c - w) + cachedRate * c + writeRate * w + r.out * completion) / 1000);
+    };
+    let seed = 12345;
+    const rnd = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let i = 0; i < 2000; i++) {
+      const inRate = (1 + rnd(50_000)) / 7;
+      const rates = {
+        in: inRate,
+        cached_in: inRate * (rnd(13) / 10),
+        cache_write: inRate * (1 + rnd(6) / 4),
+        out: (1 + rnd(200_000)) / 3,
+      };
+      const prompt = rnd(200_000);
+      const cached = rnd(3) === 0 ? 0 : rnd(prompt + 50);
+      const written = rnd(3) === 0 ? 0 : rnd(prompt + 50);
+      const completion = rnd(8000);
+      const usage = {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: written },
+      };
+      expect(maxChargeMsats(rates, usage), JSON.stringify({ rates, usage })).toBe(
+        node(rates, prompt, cached, written, completion),
+      );
+    }
+  });
+
   it("allows the signed session fee on top of the usage, never more", () => {
     // 10 msats of usage at the (already surcharged) signed rates + 2000 fee.
     const priceEntry = { in: 1000, out: 1000 };

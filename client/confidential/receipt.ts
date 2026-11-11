@@ -50,21 +50,25 @@ export interface ReceiptVerificationResult {
 }
 
 /**
- * The most a node may charge for a usage at the signed offer's terms:
- * ceil((in·prompt + out·completion)/1000) + the session fee. The rates already
- * include any surcharge (the node signs the surcharged price list).
+ * The most a node may charge for a usage at the signed offer's terms: the
+ * usage priced at the signed rates (below) + the session fee. The rates
+ * already include any surcharge (the node signs the surcharged price list).
  *
- * Cached prompt tokens may be billed at `cached_in` (never above `in`), and
- * prompt-cache writes at `cache_write` (`in` when the offer has none). The
- * node computes its charge as
+ * The node computes its charge from the same disclosed usage as
  * ceil((in·(prompt−cached−written) + min(cached_in, in)·cached
  *       + cache_write·written + out·completion)/1000)
- * in floating point, `written` being the first positive count of
+ * in floating point (routstr-core `frozen_cost_msats`): cached prompt tokens
+ * at `cached_in` (never above `in`), prompt-cache writes at `cache_write`
+ * (`in` when the offer has none), `written` being the first positive count of
  * `prompt_tokens_details.{cache_creation_input_tokens, cache_write_tokens,
  * cache_creation_tokens}` or the top-level `cache_creation_input_tokens`
- * (at most prompt−cached). The bound is the largest of that formula, the one
- * without writes and the uncached one, so an honest receipt is never refused
- * for rounding or for a count the node did not read.
+ * (at most prompt−cached).
+ *
+ * The bound is that formula, computed in the same order, or the same formula
+ * with the writes billed at `in` when that is larger (a node that did not
+ * read a write count bills them so). It is never the uncached price for a
+ * usage that reports cached reads: the node reads the same usage, so a
+ * charge that ignores the cache discount is an overcharge.
  */
 export function maxChargeMsats(
   priceEntry: { in: number; out: number; cached_in?: number; cache_write?: number },
@@ -100,7 +104,8 @@ export function maxChargeMsats(
             1000,
         )
       : withCached;
-  return Math.max(uncached, withCached, withWrites) + Math.max(0, sessionFeeMsat);
+  // `withCached` is the uncached price when no cached reads are reported.
+  return Math.max(withCached, withWrites) + Math.max(0, sessionFeeMsat);
 }
 
 /** Prompt-cache writes as the node reads them: nested names first, then
