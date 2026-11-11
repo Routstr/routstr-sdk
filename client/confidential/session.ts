@@ -84,10 +84,12 @@ import {
 setCryptoImplementation(webcryptoCrypto);
 
 /** The fork-patched TLS client surface we use (the shipped .d.ts predates the patches). */
-interface TlsHandle {
+export interface TlsHandle {
   startHandshake(): Promise<void>;
   handleReceivedBytes(data: Uint8Array): Promise<void>;
   write(data: Uint8Array): Promise<void>;
+  /** One record with exactly this inner plaintext (FORK PATCH v3). */
+  writeInner(inner: Uint8Array): Promise<void>;
 }
 
 export interface ConfidentialReceipt {
@@ -293,9 +295,9 @@ const BUS_MAX_PENDING = 256;
 /** Most entries the session's event log keeps (later ones are dropped). */
 const MAX_SESSION_EVENTS = 10_000;
 /** A session id as the sidecar makes it (a SHA-256, hex). */
-const SID_RE = /^[0-9a-f]{64}$/;
+export const SID_RE = /^[0-9a-f]{64}$/;
 
-class Bus {
+export class Bus {
   private pending = new Map<string, unknown[]>();
   private waiters = new Map<string, ((m: unknown) => void)[]>();
   private queued = 0;
@@ -336,7 +338,7 @@ class Bus {
  * Rejects after `ms` without progress (`last()` = time of the last progress),
  * for waits that last as long as the provider streams.
  */
-function idleTimeout(ms: number, what: string, last: () => number, stop: Promise<unknown>): Promise<never> {
+export function idleTimeout(ms: number, what: string, last: () => number, stop: Promise<unknown>): Promise<never> {
   return new Promise((_, rej) => {
     const timer = setInterval(() => {
       if (Date.now() - last() > ms) {
@@ -348,13 +350,13 @@ function idleTimeout(ms: number, what: string, last: () => number, stop: Promise
   });
 }
 
-function timeout(ms: number, what: string): Promise<never> {
+export function timeout(ms: number, what: string): Promise<never> {
   return new Promise((_, rej) =>
     setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${what}`)), ms),
   );
 }
 
-function cryptoRandom(n: number): Uint8Array {
+export function cryptoRandom(n: number): Uint8Array {
   const b = new Uint8Array(n);
   globalThis.crypto.getRandomValues(b);
   return b;
@@ -1479,7 +1481,7 @@ export function imageOutcome(status: number): "accept" | "disclose" | "refuse" {
 }
 
 /** The process opted into the insecure test hooks explicitly. */
-function insecureTestingEnabled(): boolean {
+export function insecureTestingEnabled(): boolean {
   const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
   return env?.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING === "1";
 }
@@ -1492,7 +1494,7 @@ function indexOfCrlfCrlf(b: Uint8Array): number {
 }
 
 /** KeyUpdate messages (type 24) in a decrypted handshake record. */
-function countKeyUpdates(content: Uint8Array): number {
+export function countKeyUpdates(content: Uint8Array): number {
   let n = 0;
   let i = 0;
   while (i + 4 <= content.length) {
