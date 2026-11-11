@@ -88,7 +88,7 @@ padding in this SDK). An `http: 2` session (`h2conn.ts`) sends exactly one
 HTTP/2 frame per record, up to the full 2^14 bytes of content, and must know
 each record's plaintext to check the node's π_WIN windows against it.
 
-## Security patches (TLS-01 … TLS-14)
+## Security patches (TLS-01 … TLS-16)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -174,6 +174,22 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   `verifyCertificateChain`). The leaf key signs the CertificateVerify, so a
   leaf keyUsage extension, if present, must include digitalSignature
   (RFC 8446 §4.4.2.2).
+- **TLS-15, application data only after the handshake** (`make-tls-client.js`
+  `processRecord`). A record of inner type application data is refused until
+  the server Finished verified (`handshakeDone`). Before that the read key is
+  the handshake traffic key, and in protocol v2 the node holds c_hs and s_hs
+  (public outputs of the two-party key schedule). Application data is not in
+  the transcript, so a node could seal its own HTTP response under s_hs, put
+  it between the ServerHello and the real server flight (re-sealed with the
+  next sequence numbers), and CertificateVerify and Finished still verified:
+  `onApplicationData` delivered the node's bytes as the provider's response.
+- **TLS-16, no plaintext records under TLS 1.3 record protection**
+  (`make-tls-client.js` `processPacketInner`). Once the handshake keys are
+  installed (after the ServerHello), a plaintext handshake or alert record
+  fails the connection; only the compatibility ChangeCipherSpec stays
+  accepted (RFC 8446 §5). A plaintext KeyUpdate after the handshake rotated
+  the read key, and a plaintext close_notify ended the connection as if the
+  server had closed it.
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider
