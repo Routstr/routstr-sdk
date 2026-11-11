@@ -349,10 +349,16 @@ export function idleTimeout(ms: number, what: string, last: () => number, stop: 
   });
 }
 
+/**
+ * Rejects after `ms`. The timer is never cleared (the waits race it), so it
+ * is unref'd: a wait that already ended must not keep the process alive for
+ * the rest of its timeout. While a session runs, its sockets do.
+ */
 export function timeout(ms: number, what: string): Promise<never> {
-  return new Promise((_, rej) =>
-    setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${what}`)), ms),
-  );
+  return new Promise((_, rej) => {
+    const t = setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${what}`)), ms);
+    (t as { unref?: () => void }).unref?.();
+  });
 }
 
 export function cryptoRandom(n: number): Uint8Array {
