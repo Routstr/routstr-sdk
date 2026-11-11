@@ -144,3 +144,57 @@ describe("a one-off deposit for a session that never sent it", () => {
     expect(stored.has(DEPOSIT)).toBe(false);
   });
 });
+
+describe("the change of an upstream error returned through a session", () => {
+  // The node settled the error (a 4xx at a fee) and the transport withdrew
+  // the rest of the deposit. The response is passed through as it is, with
+  // no accounting, so the change has to be received where it is passed on.
+  const upstreamError = (settled: Promise<unknown>, withHeader: boolean) => {
+    const headers = new Headers({ "content-type": "application/json", "x-routstr-confidential-sid": SID });
+    if (withHeader) headers.set("x-cashu", CHANGE);
+    const res = new Response(JSON.stringify({ error: { message: "context too long" } }), { status: 400, headers });
+    (res as any).confidentialSettled = settled;
+    return res;
+  };
+
+  it("is received for a non-streamed response", async () => {
+    const { client, stored, received } = setup(async () => upstreamError(Promise.resolve({ change: CHANGE }), true));
+    const res = await route(client);
+    expect(res.status).toBe(400);
+    expect((res as any).passthrough).toBe(true);
+    await vi.waitFor(() => expect(received).toEqual([CHANGE]));
+    expect(stored.has(DEPOSIT)).toBe(false);
+  });
+
+  it("is received for a streamed response once its settlement resolves", async () => {
+    let settle!: (v: unknown) => void;
+    const settled = new Promise((r) => (settle = r));
+    const { client, stored, received } = setup(async () => upstreamError(settled, false));
+    const res = await route(client, true);
+    expect(res.status).toBe(400);
+    await res.text();
+    expect(received).toEqual([]);
+    settle({ change: CHANGE });
+    await vi.waitFor(() => expect(received).toEqual([CHANGE]));
+    expect(stored.has(DEPOSIT)).toBe(false);
+  });
+
+  it("is received when the settlement check fails but the change was withdrawn", async () => {
+    const failed = Promise.reject(Object.assign(new Error("bad receipt"), { cashuChange: CHANGE }));
+    failed.catch(() => {});
+    const { client, received } = setup(async () => upstreamError(failed, false));
+    const res = await route(client, true);
+    expect(res.status).toBe(400);
+    await vi.waitFor(() => expect(received).toEqual([CHANGE]));
+  });
+
+  it("leaves the deposit stored when nothing could be withdrawn", async () => {
+    const { client, stored, received } = setup(async () => upstreamError(Promise.resolve({ change: undefined }), false));
+    const res = await route(client);
+    expect(res.status).toBe(400);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(received).toEqual([]);
+    // Still the node's to refund.
+    expect(stored.has(DEPOSIT)).toBe(true);
+  });
+});

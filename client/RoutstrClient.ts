@@ -1840,6 +1840,35 @@ export class RoutstrClient {
             status: response.status,
           });
           (response as any).passthrough = true;
+          // A passthrough is never finalized, so a one-off bearer's change
+          // is taken here: the transport withdrew what the node left of the
+          // deposit, and the bearer's stored copy is spent. A stream's
+          // settlement resolves after its body; a failed check still
+          // carries the change.
+          if (this.mode === "xcashu") {
+            const headerChange = response.headers.get("x-cashu") ?? undefined;
+            const settled = (response as any).confidentialSettled as
+              | Promise<{ change?: unknown } | undefined>
+              | undefined;
+            void Promise.resolve(settled)
+              .then(
+                (s) => s?.change,
+                (e: { cashuChange?: unknown } | undefined) => e?.cashuChange
+              )
+              .then((change) => {
+                const changeToken = typeof change === "string" ? change : headerChange;
+                return changeToken
+                  ? this._receiveConfidentialChange(baseUrl, token, changeToken)
+                  : undefined;
+              })
+              .catch((e: unknown) =>
+                this._log(
+                  "ERROR",
+                  "[xcashu] Failed to receive the change of a confidential upstream error:",
+                  e instanceof Error ? e.message : String(e)
+                )
+              );
+          }
           return response;
         }
         const requestId =
