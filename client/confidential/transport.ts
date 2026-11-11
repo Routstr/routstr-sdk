@@ -630,7 +630,9 @@ export function planImageRequest(
  * The protocol's own keys (model, caps, n, stream) never come from the
  * caller. Another key the offer pins is dropped when the caller asked for the
  * pinned value, and refused when it asked for another: the suffix would
- * silently override it.
+ * silently override it. `n` follows that rule too (one completion): the
+ * model and the caps are the session's own terms and `stream` is converted
+ * for the caller, but a second choice would simply be missing.
  */
 export function buildPinnedBody(
   request: Record<string, unknown>,
@@ -641,6 +643,17 @@ export function buildPinnedBody(
   const pinned = new Map(chat.fixed_pins);
   const priv: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(request)) {
+    if (k === "n" && v !== undefined && v !== null) {
+      // One completion per session (the offer's pin, else the provider's
+      // default): another count would be answered with one choice and no error.
+      const one = pinned.has("n") ? pinned.get("n") : 1;
+      if (!samePinValue(v, one)) {
+        throw new ConfidentialError(
+          "pinned_parameter",
+          `a confidential session returns n = ${JSON.stringify(one)} completion; this request sets n to ${JSON.stringify(v)}`,
+        );
+      }
+    }
     if (CHAT_PROTOCOL_KEYS.has(k)) continue;
     if (pinned.has(k)) {
       if (samePinValue(v, pinned.get(k))) continue;

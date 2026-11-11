@@ -736,7 +736,7 @@ describe("receipt verification", () => {
 describe("confidential transport body handling", () => {
   it("strips caller-supplied pinned keys and ends with the canonical suffix", () => {
     const body = buildPinnedBody(
-      { model: "evil", max_tokens: 99999, n: 4, messages: [{ role: "user", content: "hi" }], tools: [] },
+      { model: "evil", max_tokens: 99999, n: 1, messages: [{ role: "user", content: "hi" }], tools: [] },
       "deepseek-v4-flash",
       12,
       VENICE_CHAT,
@@ -763,7 +763,33 @@ describe("confidential transport body handling", () => {
     expect(err).toBeInstanceOf(ConfidentialError);
     expect((err as ConfidentialError).code).toBe("pinned_parameter");
     // The protocol's own keys are always the suffix's, whatever the caller set.
-    expect(() => buildPinnedBody({ messages, stream: false, n: 3, stream_options: {} }, "m", 3, VENICE_CHAT)).not.toThrow();
+    expect(() => buildPinnedBody({ messages, stream: false, n: 1, stream_options: {} }, "m", 3, VENICE_CHAT)).not.toThrow();
+  });
+
+  it("refuses more than one choice instead of quietly returning one", () => {
+    // The suffix pins `n` (a session is reserved, proven and billed for one
+    // completion): `n: 2` sent as `n: 1` would return one choice with no error.
+    const messages = [{ role: "user", content: "hi" }];
+    for (const n of [2, 4, 0, "2"]) {
+      let err: unknown;
+      try {
+        buildPinnedBody({ messages, n }, "m", 3, VENICE_CHAT);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, String(n)).toBeInstanceOf(ConfidentialError);
+      expect((err as ConfidentialError).code).toBe("pinned_parameter");
+      expect((err as Error).message).toMatch(/\bn\b/);
+    }
+    // The pinned value, or none, is fine and never sent privately.
+    for (const n of [1, null, undefined]) {
+      const text = new TextDecoder().decode(buildPinnedBody({ messages, n }, "m", 3, VENICE_CHAT));
+      expect(text.startsWith('{"messages":[{"role":"user","content":"hi"}],"model"')).toBe(true);
+    }
+    // An offer that does not pin `n` leaves the provider's default of one.
+    const noN = { ...VENICE_CHAT, fixed_pins: VENICE_CHAT.fixed_pins.filter(([k]) => k !== "n") };
+    expect(() => buildPinnedBody({ messages, n: 2 }, "m", 3, noN)).toThrow(/\bn\b/);
+    expect(() => buildPinnedBody({ messages, n: 1 }, "m", 3, noN)).not.toThrow();
   });
 
   it("pins the smallest token limit the caller set, clamped to the node's cap", () => {
