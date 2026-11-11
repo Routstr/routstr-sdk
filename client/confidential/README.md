@@ -58,7 +58,31 @@ discloses the error head for a 4xx/5xx as for chat. `verifyFlatReceipt`
 requires `cost_msats == ceil(msat_per_image × count + session fee)`. The
 response is OpenAI-shaped (`{created, data: [{b64_json}]}`); a node without the
 capability is refused with `offer_no_images`. Image requests never use the
-pre-warm pool. `confidentialImageRequiredSats` sizes the deposit.
+pre-warm pool. `confidentialImageRequiredSats` sizes the deposit (also on a
+failover node) and throws for a request the offer cannot serve. The offer's
+`count_key` must be the key its route reads (`n` for `/images/generations`,
+`variants` for `/image/generate`): the charge is the price × count, so a
+count pinned under a key the endpoint ignores would be paid and not made.
+
+## Before the deposit
+
+`RoutstrClient` qualifies a node before it spends a token on it
+(`qualifyConfidentialNode`): cu-prover and cu-2pc can be run, the node's
+signed offer verifies under the caller's policy and prices the model (under
+the id the body carries to that node, its own spelling of the requested
+model), and the request can be pinned under that offer (no parameter pinned
+to another value, `n` at most one, an image variant and count the offer
+serves). A node that does not qualify costs nothing and the next node that
+lists confidential sessions for the model is tried; a missing helper binary
+fails the request at once. In xcashu mode a one-off token minted for a
+session that then throws without change is received back, and the change of
+an upstream error returned through a session is received although such a
+response is passed through without `finalize()`.
+
+`confidentialSettled` resolves `{ change, costMsats }`: the one-off bearer's
+change and the verified receipt's cost, which `finalize()` accounts (a chat
+stream's headers left before the receipt existed). A stream ends when the
+session's settlement checks passed; it does not wait for the change.
 
 ## Protocol version
 
