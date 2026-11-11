@@ -79,6 +79,15 @@ external: {
   is `undefined`); client certificates are refused.
 - `getTranscriptHashes()` returns `{ thSH, thSF }`.
 
+## Protocol v3 hook: `writeInner`
+
+Marked `// FORK PATCH (v3)` (`lib/make-tls-client.js`), mirrored from the
+reference client. `writeInner(inner)` writes one TLS 1.3 record whose whole
+inner plaintext the caller supplies (content, the content-type byte, no
+padding in this SDK). An `http: 2` session (`h2conn.ts`) sends exactly one
+HTTP/2 frame per record, up to the full 2^14 bytes of content, and must know
+each record's plaintext to check the node's π_WIN windows against it.
+
 ## Security patches (TLS-01 … TLS-14)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are

@@ -30,6 +30,7 @@ import {
   fetchConfidentialOffer,
   offerAbandonFeeMsat,
   imageCountKey,
+  offerSupportsHttp2,
   offerSupportsImages,
   renderImageSuffix,
   verifyConfidentialOffer,
@@ -48,6 +49,8 @@ import {
 } from "./suffix";
 import { encryptedNodeTransport } from "./hosts";
 import { chooseImageVariant, IMAGE_SELECTOR_KEYS } from "./imagePlan";
+import { ConfidentialH2Connection, h2ConnectionTerms, type H2RequestHandle, type H2RequestResult } from "./h2conn";
+import { Http2Pool, http2PoolKey, type Http2Options } from "./h2pool";
 import {
   endsWith,
   padPinnedBody,
@@ -104,6 +107,87 @@ export interface ConfidentialRequestOptions {
    * Cashu bearers (`returnChange`).
    */
   prewarm?: PrewarmOptions;
+  /**
+   * `http: 2` sessions (protocol v3, option A; see `h2pool.ts`): with a node
+   * whose signed offer lists `"2"` in `http`, chat requests run on HTTP/2
+   * connections that are kept and reused, one two-party handshake per
+   * connection instead of one per request. On unless `enabled: false`. A
+   * node that does not offer it, an image request and a one-off Cashu bearer
+   * use the v2 flow (and `prewarm`) as before.
+   */
+  http2?: Http2Options;
+}
+
+/** The process-wide pool of `http: 2` connections (created on first use). */
+let h2pool: Http2Pool | undefined;
+
+function http2Pool(options: Http2Options | undefined): Http2Pool {
+  if (!h2pool) h2pool = new Http2Pool(options ?? {});
+  else h2pool.configure(options ?? {});
+  return h2pool;
+}
+
+/** Close every pooled `http: 2` connection. */
+export function closeConfidentialHttp2(): void {
+  h2pool?.close();
+  h2pool = undefined;
+}
+
+/** The pooled `http: 2` connections, for status pages and tests. */
+export function confidentialHttp2Snapshot(): ReturnType<Http2Pool["snapshot"]> {
+  return h2pool?.snapshot() ?? [];
+}
+
+/** What the transport needs of the session or request a call is running on. */
+interface ActiveSession {
+  readonly sid: string;
+  readonly bodyReleased: boolean;
+  readonly credentialSent: boolean;
+  close(): void;
+}
+
+/** An `http: 2` request's result in the shape the v2 session returns. */
+function h2SessionResult(r: H2RequestResult): ConfidentialSessionResult {
+  const bodyText = new TextDecoder().decode(r.body);
+  return {
+    sid: r.sid,
+    uuid: "",
+    model: r.model,
+    effectiveModel: r.effectiveModel,
+    http: {
+      status: r.status,
+      statusText: "",
+      headers: r.headers,
+      raw: new Uint8Array(0),
+      body: r.body,
+      bodyText,
+      contentType: r.headers["content-type"] ?? "",
+      complete: true,
+    },
+    responseText: bodyText,
+    receipt: r.receipt,
+    attestation: r.attestation,
+    receiptSigOk: true,
+    attestationSigOk: true,
+    usageMatch: true,
+    costMsats: r.costMsats,
+    ttftMs: r.timings.ttftMs ?? r.timings.totalMs,
+    totalMs: r.timings.totalMs,
+    timings: { totalMs: r.timings.totalMs },
+    proofs: ["twopc", "pi_nk", ...r.timings.proofs.map((p) => p.proof)],
+    protocol: 2,
+    warnings: r.warnings,
+  };
+}
+
+/**
+ * Whether a request that failed on a pooled connection, before anything of
+ * it was released, may run again on a fresh one: yes unless the node refused
+ * the request itself with a status (no funds, an expired offer, a bad
+ * request), which a new connection would not change.
+ */
+function retryOnFreshConnection(error: unknown): boolean {
+  return !(error instanceof SessionRejectedError && error.status !== undefined && error.status !== 408);
 }
 
 /** The process-wide pre-warm pool (created on first use). */
@@ -487,6 +571,11 @@ export interface ConfidentialFetchParams {
    * settlement (xcashu mode: the bearer was a one-off Cashu token).
    */
   returnChange?: boolean;
+  /**
+   * `http: 2` only: requests with different scopes never share a connection
+   * (a caller serving several users keeps them unlinkable to the provider).
+   */
+  reuseScope?: string;
   signal?: AbortSignal;
 }
 
@@ -632,7 +721,17 @@ async function fetchConfidentialOnce(
   // pinned suffix. A Cashu bearer is never pooled: a one-off one is spent per
   // request, and the bootstrap one of a new key is replaced by that key.
   const suffix = canonicalSuffix(offer.chat, model, maxTokens);
+  const stableCredential = !params.returnChange && !params.bearer.startsWith("cashu");
+  // `http: 2` (protocol v3): when the verified offer lists it and the caller
+  // did not switch it off. The gain is the reused connection, so the same
+  // stable-credential rule applies; everything else runs the v2 flow.
+  const useH2 =
+    options.http2?.enabled !== false &&
+    offerSupportsHttp2(offer) &&
+    stableCredential &&
+    endsWith(body, new TextEncoder().encode(suffix));
   const usePool =
+    !useH2 &&
     options.prewarm !== undefined &&
     options.prewarm.enabled !== false &&
     !params.returnChange &&
@@ -649,8 +748,12 @@ async function fetchConfidentialOnce(
   // progress, and that wait belongs in its timings.
   const tRequest = Date.now();
   const lease = ticket?.take();
-  let session: ConfidentialSession = lease ? (undefined as never) : coldSession();
+  let session: ConfidentialSession = lease || useH2 ? (undefined as never) : coldSession();
   let prewarmed = false;
+  // The `http: 2` request this call runs on, and whether its connection was reused.
+  let h2req: H2RequestHandle | undefined;
+  let h2reused = false;
+  const active = (): ActiveSession | undefined => h2req ?? session;
 
   const stream = new TransformStream<Uint8Array, Uint8Array>();
   const writer = stream.writable.getWriter();
@@ -673,8 +776,116 @@ async function fetchConfidentialOnce(
         else if (chunk.length) chunks.push(chunk);
       },
     );
-  if (!lease) attach(session);
-  const abort = callerAbort(params.signal, () => session, (reason) => void writer.abort(reason).catch(() => {}));
+  if (!lease && !useH2) attach(session);
+  const abort = callerAbort(params.signal, active, (reason) => void writer.abort(reason).catch(() => {}));
+
+  /**
+   * The request on an `http: 2` connection: an idle pooled one, else a new
+   * one. A pooled connection may have died since its last request; while
+   * nothing of this request was released the request runs again on a fresh
+   * connection. After a release it never does.
+   */
+  const runH2 = async (): Promise<ConfidentialSessionResult> => {
+    const h2opts = options.http2 ?? {};
+    const h2 = http2Pool(h2opts);
+    const log = (m: string) => (h2opts.log ?? console.info)(`[confidential http2] ${m}`);
+    const key = http2PoolKey(
+      { baseUrl, bearer: params.bearer, model, terms: h2ConnectionTerms(offer), scope: params.reuseScope },
+      h2opts.reuse,
+    );
+    for (let attempt = 0; ; attempt++) {
+      throwIfAborted(params.signal);
+      const tAcquire = Date.now();
+      const got = await h2.acquire(
+        key,
+        () =>
+          new ConfidentialH2Connection({
+            baseUrl,
+            offer,
+            auth: params.bearer,
+            prover: new CuProverBackend({ binaryPath: options.proverPath }),
+            twoPcPath: options.twoPcPath,
+            allowInsecureTransport: options.allowInsecureTransport,
+          }),
+        params.signal,
+      );
+      const conn = got.conn;
+      if (params.signal?.aborted) {
+        // The connection stays for the next request; this one never started.
+        got.release();
+        throw abortReason(params.signal);
+      }
+      let headSeen = false;
+      let handle: H2RequestHandle;
+      try {
+        handle = conn.request({
+          // Priced by the offer verified for this call (the node may have
+          // re-signed it since the connection opened).
+          offer,
+          model,
+          maxTokens,
+          body,
+          onResponseHead: (h) => {
+            headSeen = true;
+            resolveHead(h);
+          },
+          onResponseBody: (chunk) => {
+            if (!chunk.length) return;
+            if (wantStream) {
+              const now = doneHold.push(chunk);
+              if (now.length) void writer.write(now).catch(() => {});
+            } else chunks.push(chunk);
+          },
+        });
+      } catch (error) {
+        // The connection ended between the pool's check and now: nothing was sent.
+        got.release();
+        if (attempt < 2) continue;
+        throw error;
+      }
+      h2req = handle;
+      h2reused = got.reused;
+      try {
+        const r = await handle.done;
+        got.release();
+        const sent = (b: typeof r.bytes) => b.relaySent + b.controlSent + b.twoPcSent + b.zkSent;
+        const recv = (b: typeof r.bytes) => b.relayRecv + b.controlRecv + b.twoPcRecv + b.zkRecv;
+        const fresh = !got.reused && conn.setupBytes;
+        h2opts.onRequest?.({
+          baseUrl,
+          sid: r.sid,
+          n: r.n,
+          reused: got.reused,
+          status: r.status,
+          ttftMs: r.timings.ttftMs !== undefined ? r.timings.startedAt + r.timings.ttftMs - tRequest : undefined,
+          totalMs: Date.now() - tRequest,
+          connectMs: got.reused ? undefined : conn.setupTimings.connectMs,
+          bytesSent: sent(r.bytes),
+          bytesRecv: recv(r.bytes),
+          connectBytesSent: fresh ? sent(fresh) : undefined,
+          connectBytesRecv: fresh ? recv(fresh) : undefined,
+        });
+        return h2SessionResult(r);
+      } catch (error) {
+        got.release();
+        if (
+          handle.bodyReleased ||
+          headSeen ||
+          params.signal?.aborted ||
+          !got.reused ||
+          attempt >= 2 ||
+          !retryOnFreshConnection(error)
+        ) {
+          throw error;
+        }
+        log(
+          `sid=${handle.sid.slice(0, 8)} request ${handle.n} failed before release after ${Date.now() - tAcquire} ms ` +
+            `(${errorText(error)}); running it on a new connection`,
+        );
+        h2req = undefined;
+      }
+    }
+  };
 
   const runCold = (): Promise<ConfidentialSessionResult> => {
     ticket?.cold();
@@ -720,9 +931,10 @@ async function fetchConfidentialOnce(
   };
 
   // The whole session, including settlement and its checks.
-  const runP = (lease ? runWarm() : runCold()).finally(() => {
+  const runP = (useH2 ? runH2() : lease ? runWarm() : runCold()).finally(() => {
     abort.done();
-    session?.close();
+    // A settled `http: 2` request leaves its connection to the pool.
+    active()?.close();
   });
   runP.then(
     (r) =>
@@ -750,23 +962,23 @@ async function fetchConfidentialOnce(
       abort.aborted,
     ]);
   } catch (error) {
-    if (!abort.detached) session?.close();
+    if (!abort.detached) active()?.close();
     void writer.abort(error).catch(() => {});
     // Retried only while nothing can have reached the provider: the node
     // refuses an expired offer at setup, never after the body went out.
-    if (error instanceof SessionRejectedError && isOfferExpired(error) && !session?.bodyReleased) {
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !active()?.bodyReleased) {
       offerCache.delete(baseUrl.replace(/\/$/, ""));
       throw new OfferExpired(error.message);
     }
     // The caller left after the release: the session settles on its own.
     if (abort.detached) throw error;
-    const change = await failureChange(params, session, runP);
+    const change = await failureChange(params, active(), runP);
     // A node-side refusal (e.g. 402 insufficient balance) becomes the same
     // HTTP error a normal request would get, so the client's existing
     // top-up / failover handling applies. After release the provider has the
     // request: a node error is not a refusal, and failing over would run (and
     // pay for) it again.
-    if (error instanceof SessionRejectedError && error.status && !session?.bodyReleased) {
+    if (error instanceof SessionRejectedError && error.status && !active()?.bodyReleased) {
       return refusalResponse(error, change);
     }
     throw withChange(error, change);
@@ -786,7 +998,7 @@ async function fetchConfidentialOnce(
       return { change };
     },
     async (error: unknown) => {
-      throw callerGone() ? error : withChange(error, await failureChange(params, session, runP));
+      throw callerGone() ? error : withChange(error, await failureChange(params, active(), runP));
     },
   );
   // A stream ends only once settlement verified (and only then gets its
@@ -805,7 +1017,13 @@ async function fetchConfidentialOnce(
     if (exposedProviderHeader(k)) headers.set(k, v);
   }
   headers.set("x-routstr-verify", "confidential");
-  headers.set("x-routstr-confidential-sid", session.sid);
+  headers.set("x-routstr-confidential-sid", active()!.sid);
+  if (h2req) {
+    // An `http: 2` request: its number on the connection, and whether the
+    // connection was open before the request arrived.
+    headers.set("x-routstr-confidential-http", "2");
+    headers.set("x-routstr-confidential-connection", `${h2reused ? "reused" : "new"}; request=${h2req.n}`);
+  }
   // The node's cap lowered the caller's token limit: say so, since the answer
   // may end early (finish_reason "length") for that reason alone.
   if (clampedFrom !== undefined) {
@@ -858,7 +1076,7 @@ export interface ConfidentialSettlement {
  */
 function callerAbort(
   signal: AbortSignal | undefined,
-  current: () => ConfidentialSession | undefined,
+  current: () => ActiveSession | undefined,
   onReason?: (reason: unknown) => void,
 ): { aborted: Promise<never>; readonly detached: boolean; done(): void } {
   let detached = false;
@@ -914,7 +1132,7 @@ function refusalResponse(error: SessionRejectedError, change: string | undefined
  */
 async function failureChange(
   params: ConfidentialFetchParams,
-  session: ConfidentialSession | undefined,
+  session: ActiveSession | undefined,
   runP: Promise<unknown>,
 ): Promise<string | undefined> {
   if (!params.returnChange || !session?.credentialSent) return undefined;

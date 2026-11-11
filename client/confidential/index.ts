@@ -72,6 +72,7 @@ export {
   verifyOfferSignature,
   supportedVersion,
   offerSupportsImages,
+  offerSupportsHttp2,
   imageCountKey,
   renderImageSuffix,
   type ConfidentialImagesOffer,
@@ -173,6 +174,8 @@ export {
   qualifyConfidentialNode,
   closeConfidentialPrewarm,
   confidentialPrewarmSnapshot,
+  closeConfidentialHttp2,
+  confidentialHttp2Snapshot,
   buildPinnedBody,
   planImageRequest,
   isConfidentialImageEndpoint,
@@ -181,3 +184,38 @@ export {
   type ConfidentialRequestOptions,
   type ConfidentialSettlement,
 } from "./transport";
+
+// Protocol v3, option A: `http: 2` sessions (one two-party handshake per
+// HTTP/2 connection, sequential requests on it).
+export {
+  ConfidentialH2Connection,
+  h2ConnectionTerms,
+  type ConfidentialH2ConnectionOptions,
+  type H2RequestOptions,
+  type H2RequestResult,
+  type H2RequestHandle,
+  type H2ProofTiming,
+  type H2Bytes,
+} from "./h2conn";
+
+export {
+  Http2Pool,
+  HTTP2_DEFAULTS,
+  http2PoolKey,
+  type Http2Options,
+  type Http2RequestStats,
+  type Http2KeyInfo,
+  type Http2Lease,
+} from "./h2pool";
+
+export {
+  FrameReader,
+  checkH2Offer,
+  checkPiNKParamsH2,
+  checkPiWinParams,
+  decodeBlock,
+  h2Head,
+  requestBlock,
+  splitBody,
+  type WinSource,
+} from "./h2";
