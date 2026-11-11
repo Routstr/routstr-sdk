@@ -391,6 +391,18 @@ async function qualifyConfidentialNode(
     : undefined;
 }
 
+/**
+ * Errors raised while a node was being qualified for a confidential request
+ * (nothing was spent on it), so the first pick can be replaced like a
+ * failover candidate is.
+ */
+const confidentialQualifyFailures = new WeakSet<object>();
+
+/** A qualification failure that is this client's own: no other node would differ. */
+function isLocalConfidentialFailure(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === "prover_missing";
+}
+
 function requireConfidentialTransport(): ConfidentialTransport {
   const confidentialTransport = (globalThis as Record<symbol, unknown>)[
     CONFIDENTIAL_TRANSPORT
@@ -1052,14 +1064,69 @@ export class RoutstrClient {
     let previousPreflightBaseUrl = params.baseUrl;
     const attempted = new Set<string>();
     const triedModelPaths = new Set<string>();
+    let failoverReason = "preflight_funding";
+    // The first node that did not qualify for a confidential session: its
+    // error is the one reported when no other node qualifies either.
+    let firstQualifyError: unknown;
     for (;;) {
       if (current.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
       try {
-        if (current !== params) await current.lifecycle?.event("preflight_provider_failover", { from: previousPreflightBaseUrl, to: current.baseUrl, reason: "preflight_funding" });
+        if (current !== params) await current.lifecycle?.event("preflight_provider_failover", { from: previousPreflightBaseUrl, to: current.baseUrl, reason: failoverReason });
         previousPreflightBaseUrl = current.baseUrl;
         return await this._prepareRoutedRequest(current);
       } catch (error) {
+        // A node whose signed offer does not qualify (unreachable, not signed
+        // by a pinned key, another upstream host, the model not priced, the
+        // request not one it can pin): nothing was spent on it, so the next
+        // confidential node is tried, as the failover path does for its
+        // candidates. Never for a caller-pinned provider or model path, and
+        // never for a failure that is this client's own.
+        if (
+          error !== null &&
+          typeof error === "object" &&
+          confidentialQualifyFailures.has(error) &&
+          current.confidential
+        ) {
+          firstQualifyError ??= error;
+          const pinnedSelector = this._findModelPathHeader(current.headers ?? {});
+          if (
+            isLocalConfidentialFailure(error) ||
+            current.pinnedProvider ||
+            (pinnedSelector && !current.autoModelPath) ||
+            !current.modelId
+          ) {
+            throw firstQualifyError;
+          }
+          attempted.add(current.baseUrl);
+          const next = this._findNextBestProvider(
+            current.modelId,
+            current.baseUrl,
+            attempted,
+            await this._fundedMintUrls(),
+            true
+          );
+          if (!next || attempted.has(next)) throw firstQualifyError;
+          this._log(
+            "WARN",
+            `[RoutstrClient] routeRequest: ${current.baseUrl} does not qualify for a confidential session; trying ${next}`,
+            error instanceof Error ? error.message : String(error)
+          );
+          failoverReason = "confidential_not_qualified";
+          // An SDK-chosen model path belongs to the node it was chosen for.
+          current = {
+            ...current,
+            baseUrl: next,
+            headers: Object.fromEntries(
+              Object.entries(current.headers ?? {}).filter(
+                ([name]) => name.toLowerCase() !== MODEL_PATH_HEADER
+              )
+            ),
+            autoModelPath: undefined,
+          };
+          continue;
+        }
         if (!(error instanceof ProviderMintBalanceError)) throw error;
+        failoverReason = "preflight_funding";
         await current.lifecycle?.event("preflight_funding_failed", { reason: "provider_mint_balance" }, { baseUrl: current.baseUrl });
         const selector = this._findModelPathHeader(current.headers ?? {});
         if (current.pinnedProvider || (selector && !current.autoModelPath)) {
@@ -1067,13 +1134,7 @@ export class RoutstrClient {
         }
         attempted.add(current.baseUrl);
         if (!current.modelId) throw error;
-        const fundedMints = Object.entries(
-          await this.walletAdapter.getBalances()
-        )
-          .filter(([, balance]) => typeof balance === "number" && balance > 0)
-          .map(([mintUrl]) =>
-            mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl
-          );
+        const fundedMints = await this._fundedMintUrls();
         if (current.autoModelPath) {
           triedModelPaths.add(modelPathCandidateKey(
             current.baseUrl, current.autoModelPath.selector
@@ -1143,6 +1204,13 @@ export class RoutstrClient {
     }
   }
 
+  /** The mints the wallet holds a balance on (no trailing slash). */
+  private async _fundedMintUrls(): Promise<string[]> {
+    return Object.entries(await this.walletAdapter.getBalances())
+      .filter(([, balance]) => typeof balance === "number" && balance > 0)
+      .map(([mintUrl]) => (mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl));
+  }
+
   private async _prepareRoutedRequest(params: RouteRequestParams): Promise<{
     response: Response;
     tokenUsed: string;
@@ -1208,7 +1276,11 @@ export class RoutstrClient {
           params.confidential,
           confidentialImages ? "images" : "chat",
           body
-        )
+        ).catch((error: unknown) => {
+          // Nothing was spent on this node: the caller may try another one.
+          if (error !== null && typeof error === "object") confidentialQualifyFailures.add(error);
+          throw error;
+        })
       : undefined;
 
     if (modelId) {
