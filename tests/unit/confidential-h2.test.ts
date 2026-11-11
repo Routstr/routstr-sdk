@@ -37,6 +37,8 @@ import { ConnectionDepositError } from "../../client/confidential/errors";
 import { offerSupportsHttp2, verifyConfidentialOffer } from "../../client/confidential/offer";
 import { ConfidentialH2Connection, h2ConnectionTerms } from "../../client/confidential/h2conn";
 import { CuProverBackend } from "../../client/confidential/prover";
+import { deriveTrafficKeysForSide } from "../../client/confidential/tls-fork/lib/utils/decryption-utils.js";
+import { encryptWrappedRecord } from "../../client/confidential/tls-fork/lib/utils/wrapped-record.js";
 
 const v = JSON.parse(readFileSync(new URL("./fixtures/h2-vectors.json", import.meta.url), "utf8")) as {
   head: { host: string; probe_path: string; key_len: number; template: string; first_offset: number };
@@ -278,6 +280,64 @@ describe("http 2: the offer's h2 block", () => {
     return { offer: { ...o, sig, sig_payload: payload }, pubHex };
   }
   const policy = (pubHex: string) => ({ pinnedPubkey: pubHex, trustedHosts: ["api.venice.ai"] });
+
+  it("takes nothing from a record under the handshake traffic secret (the node holds s_hs)", async () => {
+    // Application data is not in the handshake transcript: a node could put
+    // its own HTTP/2 frames (a SETTINGS shrinking our window, a HEADERS)
+    // between the ServerHello and the real server flight.
+    const good = signedOffer({ http: ["1.1", "2"], h2: offer.h2 });
+    const conn = new ConfidentialH2Connection({
+      baseUrl: "https://node.example",
+      offer: verifyConfidentialOffer(good.offer, policy(good.pubHex)),
+      auth: "sk-x",
+      prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
+    });
+    const internals = conn as unknown as {
+      makeTls(external: unknown): void;
+      tls: { startHandshake(): Promise<void>; handleReceivedBytes(b: Uint8Array): Promise<void> };
+      gotSettings: boolean;
+      initialWindow: number;
+    };
+    const point = async () => {
+      const kp = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
+      return new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+    };
+    const sHs = crypto.getRandomValues(new Uint8Array(32));
+    internals.makeTls({
+      keyShare: await point(),
+      onServerHello: async () => ({ clientHs: crypto.getRandomValues(new Uint8Array(32)), serverHs: sHs }),
+      onServerFinished: async () => ({
+        serverAp0: crypto.getRandomValues(new Uint8Array(32)),
+        clientAp1: crypto.getRandomValues(new Uint8Array(32)),
+      }),
+    });
+    const windowBefore = internals.initialWindow;
+    await internals.tls.startHandshake();
+    const u16 = (n: number) => [(n >> 8) & 0xff, n & 0xff];
+    const ext = (type: number, data: number[]) => [...u16(type), ...u16(data.length), ...data];
+    const exts = [...ext(0x002b, [0x03, 0x04]), ...ext(0x0033, [0x00, 0x17, ...u16(65), ...Array.from(await point())])];
+    const sh = [0x03, 0x03, ...Array.from(crypto.getRandomValues(new Uint8Array(32))), 0x00, 0x13, 0x01, 0x00, ...u16(exts.length), ...exts];
+    await internals.tls.handleReceivedBytes(
+      new Uint8Array([0x16, 0x03, 0x03, ...u16(sh.length + 4), 0x02, 0x00, ...u16(sh.length), ...sh]),
+    );
+    // SETTINGS with INITIAL_WINDOW_SIZE = 1, as application data under s_hs.
+    const settings = frame(FRAME.SETTINGS, 0, 0, new Uint8Array([0x00, 0x04, 0x00, 0x00, 0x00, 0x01]));
+    const { encKey, iv } = await deriveTrafficKeysForSide(sHs, "TLS_AES_128_GCM_SHA256");
+    const { ciphertext } = (await encryptWrappedRecord(new Uint8Array([...settings, 0x17]), {
+      key: encKey,
+      iv,
+      recordNumber: 0,
+      cipherSuite: "TLS_AES_128_GCM_SHA256",
+      version: "TLS1_3",
+      recordHeaderOpts: { type: "WRAPPED_RECORD", version: "TLS1_2" },
+    } as never)) as { ciphertext: Uint8Array };
+    await expect(
+      internals.tls.handleReceivedBytes(new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext])),
+    ).rejects.toThrow(/application data before the handshake completed/);
+    expect(internals.gotSettings).toBe(false);
+    expect(internals.initialWindow).toBe(windowBefore);
+    conn.close();
+  });
 
   it("a verified offer serves http 2 only when it lists it with a valid block", () => {
     const plain = signedOffer();
