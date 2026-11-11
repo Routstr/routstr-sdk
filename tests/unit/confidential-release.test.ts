@@ -173,6 +173,36 @@ describe("one-off bearer change", () => {
   });
 });
 
+describe("the receipt's cost", () => {
+  const PAID = { ...RESULT, receipt: { cost_msats: 1234 } };
+
+  it("a stream's settlement carries it (the headers left before the receipt existed)", async () => {
+    mockNode();
+    fakeRun(async (s) => {
+      released(s);
+      s.onResponseHead?.(SSE_HEAD);
+      s.onResponseBody?.(enc("data: [DONE]\n\n"));
+      return PAID;
+    });
+    const res = await call({}, { stream: true });
+    await res.text();
+    expect(await (res as any).confidentialSettled).toEqual({ change: undefined, costMsats: 1234 });
+  });
+
+  it("a non-streamed chat response carries it as x-routstr-cost-msats", async () => {
+    mockNode();
+    fakeRun(async (s) => {
+      released(s);
+      s.onResponseHead?.(SSE_HEAD);
+      s.onResponseBody?.(enc('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'));
+      return PAID;
+    });
+    const res = await call();
+    expect(res.headers.get("x-routstr-cost-msats")).toBe("1234");
+    expect(await (res as any).confidentialSettled).toEqual({ change: undefined, costMsats: 1234 });
+  });
+});
+
 describe("caller abort", () => {
   it("never starts a session for an already-aborted signal", async () => {
     mockNode();

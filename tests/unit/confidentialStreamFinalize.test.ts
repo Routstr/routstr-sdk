@@ -124,4 +124,53 @@ describe("streamed confidential response finalization", () => {
       vi.restoreAllMocks();
     }
   });
+
+  it("finalize() accounts the receipt's cost, which a chat response's headers do not carry", async () => {
+    // The provider's usage event has no msat cost and a stream's headers left
+    // before the receipt existed: without the settlement's cost a confidential
+    // chat request is accounted at 0 sats in apikeys mode.
+    const { client, balanceUpdate } = setup();
+    const upstream = new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    });
+    (upstream as any).confidentialSettled = Promise.resolve({ change: undefined, costMsats: 1234 });
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstream);
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { model: model.id, messages: [{ role: "user", content: "hi" }], stream: true },
+      baseUrl,
+      mintUrl,
+      modelId: model.id,
+      headers: {},
+    });
+    await response.text();
+    await (response as any).finalize();
+    const accounted = balanceUpdate.mock.calls[0]![0] as { response: Response };
+    expect(accounted.response.headers.get("x-routstr-cost-msats")).toBe("1234");
+  });
+
+  it("finalize() returns the receipt's cost in sats (apikeys)", async () => {
+    const { client, balanceUpdate } = setup();
+    balanceUpdate.mockRestore();
+    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockRejectedValue(new Error("offline"));
+    vi.spyOn(client as any, "_trackResponseUsage").mockResolvedValue(undefined);
+    const upstream = new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    });
+    (upstream as any).confidentialSettled = Promise.resolve({ costMsats: 1234 });
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstream);
+    const response = await client.routeRequest({
+      path: "/v1/chat/completions",
+      method: "POST",
+      body: { model: model.id, messages: [{ role: "user", content: "hi" }], stream: true },
+      baseUrl,
+      mintUrl,
+      modelId: model.id,
+      headers: {},
+    });
+    await response.text();
+    expect(await (response as any).finalize()).toBe(1.234);
+    expect((response as any).satsSpent).toBe(1.234);
+  });
 });
