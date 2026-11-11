@@ -43,6 +43,8 @@ function setup(
     qualify?: (baseUrl: string, model: string, request: unknown) => void;
     /** Node A lists the model under its own id, mapped to the canonical one. */
     nativeIdOnA?: string;
+    /** The verified offer the qualifier returns (sizes the deposit). */
+    offer?: unknown;
   } = {},
 ) {
   const models: Record<string, Model[]> = {
@@ -104,6 +106,7 @@ function setup(
     async (baseUrl, model, _options, _kind, request) => {
       qualified.push(baseUrl);
       opts.qualify?.(baseUrl, model, request);
+      return opts.offer;
     },
   );
   return { client, spent, sessions, qualified, bodies };
@@ -111,7 +114,6 @@ function setup(
 
 const route = (client: RoutstrClient, extra: Record<string, unknown> = {}) =>
   client.routeRequest({
-    ...extra,
     path: "/v1/chat/completions",
     method: "POST",
     body: { model: MODEL, max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
@@ -119,6 +121,7 @@ const route = (client: RoutstrClient, extra: Record<string, unknown> = {}) =>
     mintUrl: MINT,
     modelId: MODEL,
     confidential: {},
+    ...extra,
   });
 
 afterEach(() => {
@@ -232,5 +235,33 @@ describe("confidential failover", () => {
     });
     await expect(route(local.client)).rejects.toThrow(/cu-prover not found/);
     expect(local.qualified).toEqual([A]);
+  });
+
+  it("sizes an image request's failover deposit by the signed image price", async () => {
+    const offer = {
+      price_list: {},
+      session_fee_msat: 0,
+      abandon_fee_msat: 2000,
+      images: {
+        max_count: 4,
+        count_key: "n",
+        fixed_pins: [],
+        price_list: { [MODEL]: [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 400_000 }] },
+      },
+    };
+    const { client, spent, sessions } = setup({ offer });
+    const res = await route(client, {
+      path: "/v1/images/generations",
+      body: { model: MODEL, prompt: "a cat", n: 2 },
+    });
+    expect(res.status).toBe(200);
+    expect(sessions).toEqual([A, C]);
+    // 2 × 400 sats + the larger fee, on the first node and on the failover node
+    // alike (the chat formula would deposit the model's listed maximum).
+    const want = Math.ceil((2 * 400_000 + 2000) / 1000);
+    expect(spent).toEqual([
+      { baseUrl: A, amount: want },
+      { baseUrl: C, amount: want },
+    ]);
   });
 });
