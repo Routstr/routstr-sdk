@@ -32,7 +32,8 @@ import {
   splitBody,
   type WinSource,
 } from "../../client/confidential/h2";
-import { Http2Pool, http2PoolKey } from "../../client/confidential/h2pool";
+import { Http2Pool, http2IdleMs, http2PoolKey } from "../../client/confidential/h2pool";
+import { ConnectionDepositError } from "../../client/confidential/errors";
 import { offerSupportsHttp2, verifyConfidentialOffer } from "../../client/confidential/offer";
 import { ConfidentialH2Connection, h2ConnectionTerms } from "../../client/confidential/h2conn";
 import { CuProverBackend } from "../../client/confidential/prover";
@@ -136,6 +137,72 @@ describe("http 2: the offer's h2 block", () => {
     expect(() => checkH2Offer(offer, ["/v1"])).toThrow();
   });
 
+  it("reads the node's connection deposit and idle timeout, and holds them to their ranges", () => {
+    // A sidecar's own block names neither: no deposit, the sidecar's idle limit.
+    expect(checkH2Offer(offer, bases)).toEqual({
+      probe_path: "/api/v1/models",
+      idle_secs: 300,
+      max_requests: 100,
+      connection_deposit_msat: 0,
+      idle_timeout_s: 300,
+    });
+    const node = { ...offer, h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 } };
+    const block = checkH2Offer(node, bases);
+    expect(block.connection_deposit_msat).toBe(7000);
+    expect(block.idle_timeout_s).toBe(120);
+    for (const connection_deposit_msat of [-1, 1.5, "7000", null, 2 ** 60]) {
+      expect(() => checkH2Offer({ ...node, h2: { ...node.h2, connection_deposit_msat } }, bases)).toThrow(/connection_deposit_msat/);
+    }
+    // Never longer than the sidecar's own limit, never under 10 s.
+    for (const idle_timeout_s of [9, 301, 12.5, "120", null]) {
+      expect(() => checkH2Offer({ ...node, h2: { ...node.h2, idle_timeout_s } }, bases)).toThrow(/idle_timeout_s/);
+    }
+  });
+
+  it("the pool's idle time stays below the node's idle timeout", () => {
+    const h2 = { idle_secs: 300, idle_timeout_s: 120 };
+    // The default margin (20 s) below the node's timeout.
+    expect(http2IdleMs(h2)).toBe(100_000);
+    // A caller's shorter idle time is kept; a longer one is clamped.
+    expect(http2IdleMs(h2, { maxIdleMs: 30_000 })).toBe(30_000);
+    expect(http2IdleMs(h2, { maxIdleMs: 600_000 })).toBe(100_000);
+    expect(http2IdleMs(h2, { idleMarginMs: 0, maxIdleMs: 600_000 })).toBe(120_000);
+    // A short node timeout: the margin shrinks to a quarter of it.
+    expect(http2IdleMs({ idle_secs: 300, idle_timeout_s: 12 })).toBe(9_000);
+    // Without the node's term (a sidecar's own offer): the sidecar's limit.
+    expect(http2IdleMs({ idle_secs: 300 })).toBe(280_000);
+    // A block that names a longer timeout than the sidecar's is not believed.
+    expect(http2IdleMs({ idle_secs: 60, idle_timeout_s: 600 })).toBe(45_000);
+  });
+
+  it("refuses to open a connection whose deposit exceeds the client's maximum", () => {
+    const good = signedOffer({
+      http: ["1.1", "2"],
+      h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 },
+    });
+    const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
+    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 });
+    const open = (maxDepositMsat?: number) =>
+      new ConfidentialH2Connection({
+        baseUrl: "https://node.example",
+        offer: verified,
+        auth: "sk-x",
+        prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
+        maxDepositMsat,
+      });
+    expect(open().depositMsat).toBe(7000);
+    expect(open(7000).depositMsat).toBe(7000);
+    let refused: unknown;
+    try {
+      open(6999);
+    } catch (e) {
+      refused = e;
+    }
+    expect(refused).toBeInstanceOf(ConnectionDepositError);
+    expect((refused as ConnectionDepositError).depositMsat).toBe(7000);
+    expect((refused as Error).message).toMatch(/7000 msat exceeds the client's maximum of 6999/);
+  });
+
   function signedOffer(overrides: Record<string, unknown> = {}) {
     const priv = new Uint8Array(32).fill(7);
     const pubHex = bytesToHex(schnorr.getPublicKey(priv));
@@ -169,7 +236,8 @@ describe("http 2: the offer's h2 block", () => {
     const good = signedOffer({ http: ["1.1", "2"], h2: offer.h2 });
     const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
     expect(offerSupportsHttp2(verified)).toBe(true);
-    expect(verified.h2).toEqual(offer.h2);
+    // The node's two terms default to "no deposit" and the sidecar's idle limit.
+    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 0, idle_timeout_s: 300 });
     expect(verified.http2Refused).toBeUndefined();
     // Verifying a verified offer again (the transport's cache) keeps it.
     expect(offerSupportsHttp2(verifyConfidentialOffer(verified, policy(good.pubHex)))).toBe(true);

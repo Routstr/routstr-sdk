@@ -19,6 +19,7 @@ export {
   TrustedHostError,
   SessionProtocolError,
   SessionRejectedError,
+  ConnectionDepositError,
   ProverError,
   ProverMissingError,
   ReceiptVerificationError,
@@ -189,8 +190,10 @@ export {
 // HTTP/2 connection, sequential requests on it).
 export {
   ConfidentialH2Connection,
+  DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT,
   h2ConnectionTerms,
   type ConfidentialH2ConnectionOptions,
+  type H2DepositOutcome,
   type H2RequestOptions,
   type H2RequestResult,
   type H2RequestHandle,
@@ -201,6 +204,7 @@ export {
 export {
   Http2Pool,
   HTTP2_DEFAULTS,
+  http2IdleMs,
   http2PoolKey,
   type Http2Options,
   type Http2RequestStats,

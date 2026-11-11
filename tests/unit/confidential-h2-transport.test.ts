@@ -198,6 +198,38 @@ describe("http 2 transport: when it is used", () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
+  it("keeps the v2 flow for a node whose connection deposit exceeds the caller's maximum", async () => {
+    const { connect } = fakeConnections();
+    const v2 = vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: any) {
+      this.sid = "ab".repeat(32);
+      return {
+        http: { status: 200, statusText: "OK", headers: { "content-type": "text/event-stream" } },
+        receipt: {},
+        sid: this.sid,
+      } as never;
+    });
+    const logs: string[] = [];
+    const log = (m: string) => logs.push(m);
+    // Above the default maximum (100 000 msat): no connection is opened.
+    mockNode({ http: ["1.1", "2"], h2: { ...H2.h2, connection_deposit_msat: 100_001, idle_timeout_s: 120 } });
+    const dear = freshNode();
+    await call(dear, {}, { http2: { log } });
+    await call(dear, {}, { http2: { log } });
+    expect(v2).toHaveBeenCalledTimes(2);
+    expect(connect).not.toHaveBeenCalled();
+    // Said once per node, with both numbers.
+    expect(logs.filter((l) => /connection deposit of 100001 msat, above the maximum of 100000 msat/.test(l))).toHaveLength(1);
+    // A caller that accepts it gets the connection; one that accepts less than a small deposit does not.
+    await call(freshNode(), {}, { http2: { log, maxConnectionDepositMsat: 100_001 } });
+    expect(connect).toHaveBeenCalledTimes(1);
+    mockNode({ http: ["1.1", "2"], h2: { ...H2.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 } });
+    await call(freshNode(), {}, { http2: { log } });
+    expect(connect).toHaveBeenCalledTimes(2);
+    await call(freshNode(), {}, { http2: { log, maxConnectionDepositMsat: 0 } });
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(v2).toHaveBeenCalledTimes(3);
+  });
+
   it("opens a second connection for an overlapping request", async () => {
     mockNode();
     let free!: () => void;
