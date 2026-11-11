@@ -31,6 +31,7 @@ import {
   offerAbandonFeeMsat,
   imageCountKey,
   offerSupportsHttp2,
+  offerSupportsHttp2Images,
   offerSupportsImages,
   renderImageSuffix,
   verifyConfidentialOffer,
@@ -39,7 +40,7 @@ import {
   type VerifiedOffer,
 } from "./offer";
 import { CuProverBackend } from "./prover";
-import { ConfidentialSession, type ConfidentialSessionResult } from "./session";
+import { checkImageResponse, ConfidentialSession, type ConfidentialSessionResult } from "./session";
 import {
   CHAT_PROTOCOL_KEYS,
   type ChatSuffixSpec,
@@ -117,8 +118,9 @@ export interface ConfidentialRequestOptions {
    * `http: 2` sessions (protocol v3, option A; see `h2pool.ts`): with a node
    * whose signed offer lists `"2"` in `http`, chat requests run on HTTP/2
    * connections that are kept and reused, one two-party handshake per
-   * connection instead of one per request. On unless `enabled: false`. A
-   * node that does not offer it, an image request and a one-off Cashu bearer
+   * connection instead of one per request. On unless `enabled: false`. An
+   * image request runs on such a connection too when the offer's `h2.kinds`
+   * lists `images`. A node that does not offer it and a one-off Cashu bearer
    * use the v2 flow (and `prewarm`) as before.
    */
   http2?: Http2Options;
@@ -402,6 +404,176 @@ export function isConfidentialEndpoint(method: string | undefined, path: string 
   );
 }
 
+/**
+ * One confidential image request on an `http: 2` connection: an idle pooled
+ * one, else a new one. As for chat, a pooled connection may have died since
+ * its last request; while nothing of this request was released towards the
+ * provider it runs again on a fresh connection, and never after.
+ */
+async function fetchConfidentialImageHttp2(
+  params: ConfidentialFetchParams,
+  offer: VerifiedOffer,
+  plan: ReturnType<typeof planImageRequest>,
+  maxDepositMsat: number,
+): Promise<Response> {
+  const { baseUrl, options } = params;
+  const h2opts = options.http2 ?? {};
+  const h2 = http2Pool(h2opts);
+  const log = (m: string) => (h2opts.log ?? console.info)(`[confidential http2] ${m}`);
+  const key = http2PoolKey(
+    { baseUrl, bearer: params.bearer, model: plan.model, terms: h2ConnectionTerms(offer), scope: params.reuseScope },
+    h2opts.reuse,
+  );
+  const tRequest = Date.now();
+  let handle: H2RequestHandle | undefined;
+  let reused = false;
+  const abort = callerAbort(params.signal, () => handle);
+  const run = async (): Promise<H2RequestResult> => {
+    for (let attempt = 0; ; attempt++) {
+      throwIfAborted(params.signal);
+      const tAcquire = Date.now();
+      const got = await h2.acquire(
+        key,
+        () =>
+          new ConfidentialH2Connection({
+            baseUrl,
+            offer,
+            auth: params.bearer,
+            prover: new CuProverBackend({ binaryPath: options.proverPath }),
+            twoPcPath: options.twoPcPath,
+            allowInsecureTransport: options.allowInsecureTransport,
+            maxDepositMsat,
+          }),
+        params.signal,
+      );
+      const conn = got.conn;
+      if (params.signal?.aborted) {
+        got.release();
+        throw abortReason(params.signal);
+      }
+      let current: H2RequestHandle;
+      try {
+        current = conn.request({
+          offer,
+          model: plan.model,
+          maxTokens: 0,
+          image: { variant: plan.variant.id, count: plan.count },
+          body: plan.body,
+        });
+      } catch (error) {
+        // The connection ended between the pool's check and now: nothing was sent.
+        got.release();
+        if (attempt < 2) continue;
+        throw error;
+      }
+      handle = current;
+      reused = got.reused;
+      try {
+        const r = await current.done;
+        got.release();
+        const sent = (b: typeof r.bytes) => b.relaySent + b.controlSent + b.twoPcSent + b.zkSent;
+        const recv = (b: typeof r.bytes) => b.relayRecv + b.controlRecv + b.twoPcRecv + b.zkRecv;
+        const fresh = !got.reused && conn.setupBytes;
+        h2opts.onRequest?.({
+          baseUrl,
+          sid: r.sid,
+          n: r.n,
+          kind: "images",
+          reused: got.reused,
+          status: r.status,
+          ttftMs: r.timings.ttftMs !== undefined ? r.timings.startedAt + r.timings.ttftMs - tRequest : undefined,
+          totalMs: Date.now() - tRequest,
+          connectMs: got.reused ? undefined : conn.setupTimings.connectMs,
+          bytesSent: sent(r.bytes),
+          bytesRecv: recv(r.bytes),
+          connectBytesSent: fresh ? sent(fresh) : undefined,
+          connectBytesRecv: fresh ? recv(fresh) : undefined,
+          depositReleasedMsat:
+            typeof r.receipt.deposit_released_msat === "number" ? r.receipt.deposit_released_msat : undefined,
+        });
+        return r;
+      } catch (error) {
+        got.release();
+        if (
+          current.bodyReleased ||
+          params.signal?.aborted ||
+          !got.reused ||
+          attempt >= 2 ||
+          !retryOnFreshConnection(error)
+        ) {
+          throw error;
+        }
+        log(
+          `sid=${current.sid.slice(0, 8)} image request ${current.n} failed before release after ${Date.now() - tAcquire} ms ` +
+            `(${errorText(error)}); running it on a new connection`,
+        );
+        handle = undefined;
+      }
+    }
+  };
+  const runP = run().finally(() => {
+    abort.done();
+    // A settled request leaves its connection to the pool.
+    handle?.close();
+  });
+  let r: H2RequestResult;
+  try {
+    r = await Promise.race([runP, abort.aborted]);
+  } catch (error) {
+    const released = handle?.bodyReleased ?? false;
+    if (error instanceof SessionRejectedError && isOfferExpired(error) && !released) {
+      offerCache.delete(baseUrl.replace(/\/$/, ""));
+      throw new OfferExpired(error.message);
+    }
+    // The caller left after the release: the request settles on its own.
+    if (abort.detached) throw error;
+    // After release the provider has the request: a node error is not a
+    // refusal, and failing over would run (and pay for) it again.
+    if (error instanceof SessionRejectedError && error.status && !released) {
+      return refusalResponse(error, undefined);
+    }
+    throw error;
+  }
+  const headers = new Headers();
+  headers.set("x-routstr-verify", "confidential");
+  headers.set("x-routstr-confidential-sid", r.sid);
+  headers.set("x-routstr-confidential-variant", plan.variant.id);
+  headers.set("x-routstr-confidential-http", "2");
+  headers.set("x-routstr-confidential-connection", `${reused ? "reused" : "new"}; request=${r.n}`);
+  if (typeof r.receipt.cost_msats === "number") headers.set("x-routstr-cost-msats", String(r.receipt.cost_msats));
+  let response: Response;
+  if (r.status >= 200 && r.status < 300) {
+    // Accepted and paid at the flat price: what fell short is reported, not thrown.
+    const checked = checkImageResponse(
+      {
+        status: r.status,
+        statusText: "",
+        headers: r.headers,
+        raw: new Uint8Array(0),
+        body: r.body,
+        bodyText: new TextDecoder().decode(r.body),
+        contentType: r.headers["content-type"] ?? "",
+        // The stream ended with END_STREAM (the request settled only then).
+        complete: true,
+      },
+      offer.images!.response_shape,
+      { model: plan.model, count: plan.count, countKey: imageCountKey(offer.images!) },
+    );
+    headers.set("content-type", "application/json");
+    if (checked.warnings.length) headers.set("x-routstr-confidential-warnings", checked.warnings.join("; "));
+    response = new Response(JSON.stringify(checked.image), { status: r.status, headers });
+  } else {
+    // An upstream error: its body as the provider sent it.
+    for (const [k, v] of Object.entries(r.headers)) {
+      if (exposedProviderHeader(k) && !headers.has(k)) headers.set(k, v);
+    }
+    response = new Response(new Blob([r.body as BlobPart]), { status: r.status, headers });
+  }
+  (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
+    Promise.resolve({ change: undefined });
+  return response;
+}
+
 /** The image endpoints the confidential transport implements. */
 export function isConfidentialImageEndpoint(method: string | undefined, path: string | undefined): boolean {
   return (
@@ -633,6 +805,19 @@ async function fetchConfidentialImageOnce(
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer, "images");
   const plan = planImageRequest(request, offer.images!);
   throwIfAborted(params.signal);
+  // `http: 2` (protocol v3, A.13): an image request is one more request on a
+  // pooled connection when the verified offer serves images there. The rules
+  // of the chat path apply: a stable credential only, and no connection whose
+  // deposit exceeds the caller's maximum.
+  const h2Wanted =
+    options.http2?.enabled !== false &&
+    offerSupportsHttp2Images(offer) &&
+    !params.returnChange &&
+    !params.bearer.startsWith("cashu");
+  const h2Deposit = offer.h2?.connection_deposit_msat ?? 0;
+  const h2MaxDeposit = options.http2?.maxConnectionDepositMsat ?? DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT;
+  if (h2Wanted && h2Deposit > h2MaxDeposit) noteDepositRefused(baseUrl, h2Deposit, h2MaxDeposit, options.http2?.log);
+  else if (h2Wanted) return fetchConfidentialImageHttp2(params, offer, plan, h2MaxDeposit);
   const session = new ConfidentialSession({
     baseUrl,
     offer,

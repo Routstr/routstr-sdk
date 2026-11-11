@@ -159,6 +159,21 @@ export interface ConfidentialH2Offer {
   connection_deposit_msat: number;
   /** The node closes a connection that had no request in flight for this long (seconds, at most `idle_secs`). */
   idle_timeout_s: number;
+  /**
+   * The request kinds a connection serves: `["chat"]`, or `["chat", "images"]`
+   * when image requests (the offer's `images` block) may run on it too.
+   */
+  kinds: string[];
+}
+
+/** True when the verified offer serves image requests on `http: 2` connections. */
+export function offerSupportsHttp2Images(offer: ConfidentialOffer): boolean {
+  return (
+    offerSupportsHttp2(offer) &&
+    offerSupportsImages(offer) &&
+    Array.isArray(offer.h2?.kinds) &&
+    offer.h2!.kinds.includes("images")
+  );
 }
 
 export interface VerifyOfferOptions {
