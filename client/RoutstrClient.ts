@@ -1997,6 +1997,22 @@ export class RoutstrClient {
         );
         // return await this._handleNetworkError(error, params);
       }
+      // A confidential session that failed without handing back change may
+      // never have sent the one-off token to the node (a local failure, an
+      // abort or a refused request before the setup): take the token back.
+      // One the node already redeemed fails to receive and stays stored for
+      // the refund sweep. Only when the transport itself threw: an error
+      // response went through `_handleErrorResponse`, which recovers the
+      // token itself.
+      if (
+        params.confidential &&
+        this.mode === "xcashu" &&
+        !headersReceived &&
+        typeof error?.cashuChange !== "string" &&
+        token.startsWith("cashu")
+      ) {
+        await this._reclaimUnsentConfidentialToken(baseUrl, token);
+      }
       throw error;
     }
   }
@@ -3657,6 +3673,38 @@ export class RoutstrClient {
       this._log(
         "ERROR",
         `[xcashu] Failed to receive confidential change token: ${receiveResult.message}`
+      );
+    }
+  }
+
+  /**
+   * Take back a one-off xcashu token minted for a confidential session that
+   * failed without change. Never throws: the session's own error is the one
+   * the caller gets.
+   */
+  private async _reclaimUnsentConfidentialToken(
+    baseUrl: string,
+    token: string
+  ): Promise<void> {
+    try {
+      const receiveResult = await this.cashuSpender.receiveToken(token, false);
+      if (receiveResult.success) {
+        this.storageAdapter.removeXcashuToken(baseUrl, token);
+        this._log(
+          "DEBUG",
+          `[xcashu] confidential session failed before its deposit was used; token restored, amount=${receiveResult.amount}`
+        );
+      } else {
+        this._log(
+          "WARN",
+          `[xcashu] confidential session failed and its deposit could not be taken back (left for the refund sweep): ${receiveResult.message}`
+        );
+      }
+    } catch (error) {
+      this._log(
+        "WARN",
+        "[xcashu] confidential deposit recovery failed (left for the refund sweep):",
+        error instanceof Error ? error.message : String(error)
       );
     }
   }
