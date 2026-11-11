@@ -140,6 +140,9 @@ function hexField(m: Record<string, unknown>, key: string, len: number): Uint8Ar
 
 /** One 2PC run: preprocessing + key share, phase A (handshake), phase B (application). */
 export class TwoPcSession {
+  /** Bytes on the 2PC websocket, each way. */
+  bytesSent = 0;
+  bytesRecv = 0;
   readonly binary: string;
   readonly timings: TwoPcTiming[] = [];
   private readonly spawnImpl: typeof nodeSpawn;
@@ -203,6 +206,7 @@ export class TwoPcSession {
       }
       const bytes =
         d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+      this.bytesRecv += bytes.length;
       this.writeChild(TWOPC_CHANNEL_NET, bytes);
     };
     ws.onerror = () => this.fail(new ProverError("2PC websocket error"));
@@ -234,6 +238,7 @@ export class TwoPcSession {
     }
     for (const f of frames) {
       if (f.channel === TWOPC_CHANNEL_NET) {
+        this.bytesSent += f.payload.length;
         if (this.wsOpen && this.ws) this.ws.send(f.payload);
         else this.outbox.push(f.payload);
       } else if (f.channel === TWOPC_CHANNEL_CONTROL) {

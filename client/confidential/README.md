@@ -128,6 +128,96 @@ the handshake). Cold ones are dominated by receiving the ~22 MB of 2PC data: sec
 about 14–16 s from a good home connection (100 Mbit/s down), about 45–70 s on a slow,
 download-limited link.
 
+## HTTP/2 connections (`http: 2`, protocol v3 option A)
+
+Prototype. A node whose signed offer lists `"2"` in `http` (with an `h2`
+block: `probe_path`, `idle_secs`, `max_requests`) serves **`http: 2`
+sessions**: one two-party handshake per HTTP/2 connection to the provider,
+and then many chat requests on it, one at a time. The node writes the
+connection head in epoch 0 (its SETTINGS and one probe request, which puts the
+credential into the provider's HPACK table); every later request names the
+credential by table index, so the client still never holds it. The design and
+the wire format are in routstr-confidential `PROTOCOL-V3-DESIGN.md` (A, A.11).
+
+`fetchConfidential` uses it automatically for chat requests when the verified
+offer lists it (`confidential.http2`, on unless `enabled: false`). The first
+request to a node opens a connection (the cost of a cold v2 session: the 2PC
+preprocessing, π_NK); it stays open, and later requests skip the handshake:
+they cost one π_WIN (the client's records), the usage proof π_C3S and the
+relayed records. Nothing is opened speculatively: "pre-warming" for `http: 2`
+is the connection the previous request left. A node that does not offer it, an
+image request, and a one-off Cashu bearer (`returnChange`, a `cashu…` bearer)
+run the v2 flow exactly as before, with `prewarm` if set.
+
+| `confidential.http2` | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false`: never use `http: 2` |
+| `reuse` | `credential` | which requests may share a connection: `credential` (one node, one credential), `model` (and the same model), `none` (a connection per request: no linking, and slower than pre-warmed v2) |
+| `maxConnectionsPerKey` | 4 | open connections per reuse key. Requests on a connection are sequential, so a request that finds every connection busy opens another; at the limit it waits (`acquireTimeoutMs`, 120 s) |
+| `maxConnections` | 8 | open connections in total (an idle one of another key is closed to make room) |
+| `idleMarginMs` | 20 000 | an idle connection is closed this long before the node's limit (`h2.idle_secs` after the last settlement) |
+| `maxIdleMs` | none | a shorter idle limit of your own |
+| `maxRequestsPerConnection` | the offer's `h2.max_requests` | rotate the connection after this many requests |
+| `log`, `onRequest` | `console.info`, none | pool events; per-request statistics (connection, reuse, times, bytes to and from the node) |
+
+**Linkability.** Requests on one connection share a TLS connection to the
+provider, so the provider can tell that they come from the same client (it
+still sees only the node's key, and on the v2 flow every request is its own
+connection). The node sees the credential on every request in either flow.
+`reuse` narrows what shares a connection, `maxRequestsPerConnection` and
+`maxIdleMs` bound how long one lives, and `ConfidentialFetchParams.reuseScope`
+partitions the pool by a caller-chosen string (a daemon serving several users
+passes one per user). `enabled: false` gives the v2 behaviour.
+
+**Lifecycle and failures.** A connection is closed when it has been idle (see
+above), reached its request limit or the node's lifetime (one hour), after a
+GOAWAY, and after any error, abort, or non-2xx response (the node closes it
+then anyway; the next request opens a new one). A pooled connection is a
+cache, never a promise: if it turns out dead when a request arrives, or fails
+before the request was released towards the provider (no `release` frame was
+sent; the client sends it only after the node's `request_ok`), the request
+runs again on a fresh connection, at most twice. A refusal by the node itself
+(a status: 402 no funds, 409 expired offer) is returned as that HTTP error
+and not retried on another connection. After the release nothing is ever run
+again, on any connection or node, as for v2. A caller abort before the
+release closes the connection; after it the request settles in the
+background and the connection returns to the pool.
+
+**What the client checks** (ported from the reference client, with the
+sidecar's vectors in `tests/unit/fixtures/h2-vectors.json`): the π_NK
+statement against the connection head rebuilt from the signed offer (host,
+probe path, key length: SETTINGS with no response table and no push, the one
+probe request); every π_WIN window the node asks for against the client's own
+records (the ciphertext is ours, the compared bytes are ours and lie in a
+public range: a frame header, the pinned HEADERS block, the pinned suffix, the
+final content-type byte, the disclosed error head), since the node chooses
+the windows and the proof would otherwise be a decryption oracle; the π_C3S
+parameters against the disclosed tail; the per-request attestation (session,
+request number and stream, an interval that starts at this request, the
+hashes of the records received and sent); and the receipt (signature, `sid`,
+`n`, attestation hash, usage and cost against the signed rates).
+
+Responses carry `x-routstr-confidential-http: 2` and
+`x-routstr-confidential-connection: new|reused; request=<n>`.
+`closeConfidentialHttp2()` closes every pooled connection;
+`confidentialHttp2Snapshot()` lists them.
+
+Measured on loopback against a local node and the real provider (2026-11-11,
+`mistral-small-3-2-24b-instruct`, 20 tokens; no bandwidth limit, so the 2PC
+download costs almost nothing here): opening a connection moves 23.7 MB to
+the client and 2.6 MB to the node (about 1.0 s); a request on an open
+connection moves 0.5-1.0 MB to the client and 85 kB to the node (the proof
+channel extends its correlations online) and reached the first token in
+0.5-0.7 s, against 0.9-1.0 s for a pre-warmed v2 session and 1.6-1.8 s cold.
+Every v2 request, pre-warmed or not, moves the full 23.7 MB / 2.7 MB.
+`scripts/confidential-h2-e2e.ts` runs the live checks (sequential reuse,
+overlap, a provider error, an idle close).
+
+Not implemented: images over `http: 2`, parallel streams on one connection,
+client KeyUpdates, a fallback to the v2 flow when an `http: 2` connection
+cannot be opened, fees for idle connections (the node reserves per request
+and nothing for an idle connection).
+
 ## What is checked
 
 - The node's offer: Schnorr signature, pinned node key, protocol version and a
@@ -196,6 +286,7 @@ client with only the environment it needs, and use only prover and 2PC binaries 
 | `twopc.ts` | `cu-2pc` runner: stdio frame codec, websocket bridge |
 | `zkchan.ts` | the pre-warmed proof channel (`cu-prover --channel`) |
 | `prewarm.ts` | traffic-driven pool of armed sessions, body-length buckets and padding |
+| `h2conn.ts`, `h2pool.ts`, `h2.ts`, `hpack-tables.ts` | `http: 2` sessions: one connection (handshake, request loop, disclosures, receipt), the connection pool, HTTP/2 framing + HPACK decoding + the π_NK/π_WIN parameter checks |
 | `offer.ts`, `hosts.ts`, `canonical.ts` | signed offer verification, trusted-host wildcards, Schnorr/canonical JSON |
 | `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned chat suffix (rendered from the offer's `chat` block and held to the pin policy, routstr-confidential `docs/CHAT-SUFFIX.md`) and response parsing, receipt checks, proof-parameter checks, byte helpers, `cu-prover` runner |
 | `tls-fork/` | vendored `@reclaimprotocol/tls@0.1.4` (MIT) with the patches in `FORK-NOTES.md` |

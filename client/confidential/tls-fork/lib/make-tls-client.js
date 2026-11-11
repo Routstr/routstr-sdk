@@ -919,6 +919,25 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             recordSendCount = 0;
             logger.info('updated client traffic keys');
         },
+        // FORK PATCH (v3): write one record whose whole inner plaintext the
+        // caller supplies: content, the inner content type byte and any zero
+        // padding (RFC 8446 §5.4). Protocol v3 (`http: 2`) sends exactly one
+        // HTTP/2 frame per record, up to the full 2^14 bytes of content.
+        async writeInner(inner) {
+            if (!handshakeDone) {
+                throw new Error('Handshake not done');
+            }
+            if (keyUpdateReplyOwed) {
+                throw new Error('Server KeyUpdate with update_requested before the client finished writing is not supported');
+            }
+            if (connTlsVersion !== 'TLS1_3' || inner.length < 1 || inner.length > 16385) {
+                throw new Error('writeInner: one TLS 1.3 inner plaintext of 1..16385 bytes');
+            }
+            await writeEncryptedPacket({
+                data: inner,
+                type: 'WRAPPED_RECORD'
+            });
+        },
         async write(data) {
             if (!handshakeDone) {
                 throw new Error('Handshake not done');

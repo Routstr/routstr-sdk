@@ -16,6 +16,7 @@ import {
   verifySchnorrSignature,
 } from "./canonical";
 import { TrustedHostMatcher } from "./hosts";
+import { checkH2Offer } from "./h2";
 import { headRouteProblem, headTemplateProblem } from "./params";
 import {
   OfferBadSignatureError,
@@ -126,11 +127,29 @@ export interface ConfidentialOffer {
   capabilities?: string[];
   /** Image generation terms, present with the `images` capability. */
   images?: ConfidentialImagesOffer;
+  /** HTTP versions the node's sessions speak to the provider; absent: `["1.1"]`. */
+  http?: string[];
+  /**
+   * Terms of `http: 2` sessions (protocol v3, option A: one two-party
+   * handshake per HTTP/2 connection, sequential requests on it), present when
+   * `http` lists `"2"`.
+   */
+  h2?: ConfidentialH2Offer;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
   sig_payload?: string;
   [key: string]: unknown;
+}
+
+/** The `h2` block of an offer that lists `"2"` in `http`. */
+export interface ConfidentialH2Offer {
+  /** Path of the node's one probe request in the connection head (API base + `/models`). */
+  probe_path: string;
+  /** The node closes a connection idle this long (seconds). */
+  idle_secs: number;
+  /** Requests per connection. */
+  max_requests: number;
 }
 
 export interface VerifyOfferOptions {
@@ -161,6 +180,16 @@ export interface VerifiedOffer extends ConfidentialOffer {
    * unaffected); an image request names this reason.
    */
   imagesRefused?: string;
+  /**
+   * Why the offer's `http: 2` terms were refused (`http` then no longer lists
+   * `"2"` and `h2` is dropped; the v2 flow is unaffected).
+   */
+  http2Refused?: string;
+}
+
+/** True when the verified offer serves `http: 2` sessions. */
+export function offerSupportsHttp2(offer: ConfidentialOffer): boolean {
+  return Array.isArray(offer.http) && offer.http.includes("2") && offer.h2 !== undefined;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -567,6 +596,23 @@ export function verifyConfidentialOffer(
     if (route) throw new TrustedHostError(`offer head_template: ${route}`);
   }
 
+  // `http: 2` (protocol v3): held to what the node's sidecar enforces. A
+  // refused block switches http 2 off for this offer; v2 sessions on the
+  // same signed terms still work.
+  let http2Refused: string | undefined;
+  if (offer.http !== undefined || offer.h2 !== undefined) {
+    const lists = Array.isArray(offer.http) && offer.http.includes("2");
+    const { h2: _block, ...rest } = offer;
+    try {
+      offer = lists
+        ? { ...rest, http: ["1.1", "2"], h2: checkH2Offer(offer, apiBases) }
+        : { ...rest, http: ["1.1"] };
+    } catch (error) {
+      http2Refused = error instanceof Error ? error.message : String(error);
+      offer = { ...rest, http: ["1.1"] };
+    }
+  }
+
   if (offer.images !== undefined) {
     const images = offer.images as { head_template?: unknown };
     const problem =
@@ -575,10 +621,10 @@ export function verifyConfidentialOffer(
     if (problem) {
       // Images off for this offer; chat on the same signed terms still works.
       const { images: _refused, ...rest } = offer;
-      return { ...rest, signedPayload: payload, imagesRefused: problem };
+      return { ...rest, signedPayload: payload, imagesRefused: problem, ...(http2Refused ? { http2Refused } : {}) };
     }
   }
-  return { ...offer, signedPayload: payload };
+  return { ...offer, signedPayload: payload, ...(http2Refused ? { http2Refused } : {}) };
 }
 
 /**

@@ -34,6 +34,12 @@ export interface ProofChannelOptions {
   binaryPath?: string;
   /** Override the preallocated correlation counts (the smaller of the two sides' values is used). */
   prealloc?: { nk?: number; cp?: number };
+  /**
+   * An `http: 2` session (protocol v3): π_WIN and π_C3S run once per request,
+   * so the channel repeats them and extends its correlations online
+   * (`cu-prover --channel --multi`).
+   */
+  multi?: boolean;
   /** Injectable spawn (tests). */
   spawnImpl?: typeof nodeSpawn;
   /** Injectable WebSocket constructor (tests). */
@@ -64,6 +70,10 @@ export class ProofChannel {
   private readonly spawnImpl: typeof nodeSpawn;
   private readonly WS: typeof WebSocket;
   private readonly prealloc?: { nk?: number; cp?: number };
+  private readonly multi: boolean;
+  /** Bytes on the proof-channel websocket, each way. */
+  bytesSent = 0;
+  bytesRecv = 0;
   private child?: ChildProcessWithoutNullStreams;
   private ws?: WebSocket;
   private wsOpen = false;
@@ -83,6 +93,7 @@ export class ProofChannel {
     this.spawnImpl = options.spawnImpl ?? nodeSpawn;
     this.WS = options.webSocketImpl ?? WebSocket;
     this.prealloc = options.prealloc;
+    this.multi = options.multi === true;
     this.readyP = new Promise<void>((res, rej) => {
       this.readyRes = res;
       this.readyRej = rej;
@@ -95,6 +106,7 @@ export class ProofChannel {
   /** Spawn `cu-prover --channel` and connect it to the node's zkchan websocket. */
   start(url: string): void {
     const args = ["--channel"];
+    if (this.multi) args.push("--multi");
     if (this.prealloc?.nk) args.push("--prealloc-nk", String(this.prealloc.nk));
     if (this.prealloc?.cp) args.push("--prealloc-cp", String(this.prealloc.cp));
     let child: ChildProcessWithoutNullStreams;
@@ -138,6 +150,7 @@ export class ProofChannel {
       }
       const bytes =
         d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+      this.bytesRecv += bytes.length;
       this.writeChild(TWOPC_CHANNEL_NET, bytes);
     };
     ws.onerror = () => this.fail(new ProverError("proof channel websocket error"));
@@ -167,6 +180,7 @@ export class ProofChannel {
     }
     for (const f of frames) {
       if (f.channel === TWOPC_CHANNEL_NET) {
+        this.bytesSent += f.payload.length;
         if (this.wsOpen && this.ws) this.ws.send(f.payload);
         else this.outbox.push(f.payload);
       } else if (f.channel === TWOPC_CHANNEL_CONTROL) {
