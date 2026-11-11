@@ -31,6 +31,10 @@ import { deriveTrafficKeysForSide } from "../../client/confidential/tls-fork/lib
 import { encryptWrappedRecord } from "../../client/confidential/tls-fork/lib/utils/wrapped-record.js";
 import { packFinishMessagePacket } from "../../client/confidential/tls-fork/lib/utils/finish-messages.js";
 import { getSignatureDataTls13 } from "../../client/confidential/tls-fork/lib/utils/parse-certificate.js";
+import { CuProverBackend } from "../../client/confidential/prover";
+import { ConfidentialSession } from "../../client/confidential/session";
+import { chatSuffixKeys } from "../../client/confidential/suffix";
+import { VENICE_CHAT } from "./fixtures/chat";
 
 setCryptoImplementation(webcryptoCrypto);
 x509.cryptoProvider.set(globalThis.crypto);
@@ -514,10 +518,13 @@ class FakeServer {
     return msg;
   }
 
-  /** One encrypted handshake record; `padding` zero bytes after the type. */
-  async seal(msg: Uint8Array, padding = 0): Promise<Uint8Array> {
+  /**
+   * One encrypted record (a handshake record unless `type` says otherwise);
+   * `padding` zero bytes after the type.
+   */
+  async seal(msg: Uint8Array, padding = 0, type = 0x16): Promise<Uint8Array> {
     const { encKey, iv } = await deriveTrafficKeysForSide(this.sHs, SUITE);
-    const plaintext = concatenateUint8Arrays([msg, new Uint8Array([0x16]), new Uint8Array(padding)]);
+    const plaintext = concatenateUint8Arrays([msg, new Uint8Array([type]), new Uint8Array(padding)]);
     const { ciphertext } = (await encryptWrappedRecord(plaintext, {
       key: encKey,
       iv,
@@ -533,6 +540,7 @@ class FakeServer {
 async function externalClient(root: Issued) {
   const written: Uint8Array[] = [];
   const ended: unknown[] = [];
+  const appData: Uint8Array[] = [];
   let handshakes = 0;
   const cHs = crypto.getRandomValues(new Uint8Array(32));
   const sHs = crypto.getRandomValues(new Uint8Array(32));
@@ -549,6 +557,9 @@ async function externalClient(root: Issued) {
     },
     onHandshake: () => {
       handshakes++;
+    },
+    onApplicationData: (data: Uint8Array) => {
+      appData.push(data);
     },
     onTlsEnd: (err?: Error) => {
       ended.push(err);
@@ -569,6 +580,7 @@ async function externalClient(root: Issued) {
     client,
     server,
     ended,
+    appData,
     handshakes: () => handshakes,
   };
 }
@@ -689,5 +701,182 @@ describe("tls-fork server flight (TLS-11, TLS-12)", () => {
     await expect(
       client.handleReceivedBytes(new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext])),
     ).rejects.toThrow(/without a content type/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Application data only under the application traffic keys (TLS-15), and no
+// plaintext records once the handshake keys are installed (TLS-16).
+//
+// In protocol v2 the node holds c_hs and s_hs (they are public outputs of the
+// two-party key schedule), so a record sealed under s_hs is the node's, not
+// the provider's. Application data is not in the handshake transcript: a
+// node could put its own "response" in front of the real server flight and
+// CertificateVerify and Finished would still verify.
+
+describe("tls-fork application data and plaintext records (TLS-15, TLS-16)", () => {
+  let root: Issued;
+  let leaf: Issued;
+  const FORGED = new TextEncoder().encode(
+    'HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {"choices":[{"delta":{"content":"FORGED"}}]}\n\n',
+  );
+  const plain = (type: number, body: Uint8Array | number[]) =>
+    new Uint8Array([type, 0x03, 0x03, ...u16(body.length), ...Array.from(body)]);
+
+  beforeAll(async () => {
+    root = await issue({ subject: "CN=Test Root", ca: true, keyUsage: keyCertSign | cRLSign });
+    leaf = await issue({
+      subject: `CN=${HOST}`,
+      issuer: root,
+      ca: false,
+      keyUsage: digitalSignature,
+      eku: [SERVER_AUTH],
+      san: [HOST],
+    });
+  });
+
+  async function completed() {
+    const c = await externalClient(root);
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()));
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leaf])));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.certificateVerify(leaf)));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()));
+    expect(c.handshakes()).toBe(1);
+    const keys = c.client.getKeys() as { serverSecret: Uint8Array };
+    // Post-handshake records are under s_ap_0.
+    return { ...c, post: new FakeServer(keys.serverSecret, new Uint8Array()) };
+  }
+
+  it("refuses application data sealed under the handshake traffic secret", async () => {
+    const { client, server, ended, appData, handshakes } = await externalClient(root);
+    // The node's own record (inner type 0x17) under s_hs, right after the
+    // ServerHello and before the real server flight.
+    await expect(client.handleReceivedBytes(await server.seal(FORGED, 0, 0x17))).rejects.toThrow(
+      /application data before the handshake completed/,
+    );
+    expect(appData).toEqual([]);
+    expect(client.hasEnded()).toBe(true);
+    expect(ended.length).toBe(1);
+    // The real flight (re-sealed with the next sequence numbers) no longer
+    // completes anything: the client is ended.
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf)));
+    await client.handleReceivedBytes(await server.seal(await server.finished()));
+    expect(handshakes()).toBe(0);
+    expect(appData).toEqual([]);
+  });
+
+  it("refuses application data between the server flight's messages", async () => {
+    const { client, server, appData, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf)));
+    await expect(client.handleReceivedBytes(await server.seal(FORGED, 0, 0x17))).rejects.toThrow(
+      /application data before the handshake completed/,
+    );
+    expect(appData).toEqual([]);
+    expect(handshakes()).toBe(0);
+  });
+
+  it("delivers application data under the application traffic secret (positive control)", async () => {
+    const { client, post, appData } = await completed();
+    await client.handleReceivedBytes(await post.seal(FORGED, 0, 0x17));
+    expect(appData.length).toBe(1);
+    expect(Array.from(appData[0]!)).toEqual(Array.from(FORGED));
+    expect(client.hasEnded()).toBe(false);
+  });
+
+  it("refuses a plaintext handshake record once the handshake keys are installed", async () => {
+    // During the handshake: a plaintext EncryptedExtensions after the ServerHello.
+    const during = await externalClient(root);
+    await expect(
+      during.client.handleReceivedBytes(plain(0x16, during.server.encryptedExtensions())),
+    ).rejects.toThrow(/plaintext record/);
+    expect(during.client.hasEnded()).toBe(true);
+
+    // After it: a plaintext KeyUpdate would rotate the read key.
+    const { client, post, appData } = await completed();
+    const before = (client.getKeys() as { serverSecret: Uint8Array }).serverSecret;
+    await expect(client.handleReceivedBytes(plain(0x16, hsMsg(24, [0])))).rejects.toThrow(/plaintext record/);
+    expect(client.hasEnded()).toBe(true);
+    void before;
+    // Nothing after it is delivered.
+    await client.handleReceivedBytes(await post.seal(FORGED, 0, 0x17));
+    expect(appData).toEqual([]);
+  });
+
+  it("refuses a plaintext alert once the handshake keys are installed", async () => {
+    const { client, ended } = await completed();
+    // close_notify in plaintext: anyone on the path could write it.
+    await expect(client.handleReceivedBytes(plain(0x15, [0x01, 0x00]))).rejects.toThrow(/plaintext record/);
+    expect(ended.length).toBe(1);
+    expect(ended[0]).toBeInstanceOf(Error);
+  });
+
+  it("still accepts the compatibility ChangeCipherSpec and an encrypted KeyUpdate", async () => {
+    const c = await externalClient(root);
+    await c.client.handleReceivedBytes(plain(0x14, [0x01]));
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()));
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leaf])));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.certificateVerify(leaf)));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()));
+    expect(c.handshakes()).toBe(1);
+    const sAp0 = (c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret;
+    const post = new FakeServer(sAp0, new Uint8Array());
+    await c.client.handleReceivedBytes(await post.seal(hsMsg(24, [0])));
+    expect(c.client.hasEnded()).toBe(false);
+    expect(Array.from((c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret)).not.toEqual(
+      Array.from(sAp0),
+    );
+  });
+
+  it("a v2 session hands nothing to the caller from a record under s_hs", async () => {
+    // The session's own TLS client (as session.ts builds it), with the 2PC
+    // hooks answering as the two-party key schedule would.
+    const heads: unknown[] = [];
+    const bodies: Uint8Array[] = [];
+    const session = new ConfidentialSession({
+      baseUrl: "http://127.0.0.1:8010",
+      offer: {
+        v: 2,
+        notary_pubkey: "00".repeat(32),
+        upstream_host: HOST,
+        chat: VENICE_CHAT,
+        suffix_keys: chatSuffixKeys(VENICE_CHAT),
+      },
+      auth: "sk-x",
+      model: "m",
+      maxTokens: 10,
+      bodyLength: 100,
+      prover: new CuProverBackend({ binaryPath: process.execPath }),
+      proofChannel: false,
+      onResponseHead: (h: unknown) => heads.push(h),
+      onResponseBody: (b: Uint8Array) => bodies.push(b),
+    } as never);
+    const sHs = crypto.getRandomValues(new Uint8Array(32));
+    const internals = session as unknown as {
+      makeTls(external: unknown): void;
+      tls: { startHandshake(): Promise<void>; handleReceivedBytes(b: Uint8Array): Promise<void> };
+      outbox: Uint8Array[];
+    };
+    internals.makeTls({
+      keyShare: await p256Point(),
+      onServerHello: async () => ({ clientHs: crypto.getRandomValues(new Uint8Array(32)), serverHs: sHs }),
+      onServerFinished: async () => ({
+        serverAp0: crypto.getRandomValues(new Uint8Array(32)),
+        clientAp1: crypto.getRandomValues(new Uint8Array(32)),
+      }),
+    });
+    await internals.tls.startHandshake();
+    // The ClientHello record the session queued for the node, without its header.
+    const server = new FakeServer(sHs, internals.outbox[0]!.slice(5));
+    await internals.tls.handleReceivedBytes(await server.serverHello());
+    await expect(internals.tls.handleReceivedBytes(await server.seal(FORGED, 0, 0x17))).rejects.toThrow(
+      /application data before the handshake completed/,
+    );
+    expect(heads).toEqual([]);
+    expect(bodies).toEqual([]);
+    session.close();
   });
 });
