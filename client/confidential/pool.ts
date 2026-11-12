@@ -205,7 +205,7 @@ type ConnLike = Pick<
   | "h2"
   | "depositMsat"
   | "failureReason"
-> & { topUp?: () => void };
+>;
 
 interface Entry<C extends ConnLike> {
   key: string;
@@ -486,12 +486,6 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       if (entry.state === "idle") this.retire(entry, "idle");
     }, closeAt - now);
     (entry.timer as { unref?: () => void }).unref?.();
-    // While it waits: correlations for the next request's proofs (§9.2).
-    try {
-      conn.topUp?.();
-    } catch {
-      /* a top-up is an optimisation */
-    }
     this.wake();
   }
 
