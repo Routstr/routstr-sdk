@@ -66,6 +66,7 @@ import {
   canonicalSuffix,
   exposedProviderHeader,
   samePinValue,
+  type PadBucket,
 } from "./suffix";
 import { confidentialKind } from "./endpoints";
 import { encryptedNodeTransport } from "./hosts";
@@ -82,6 +83,15 @@ import {
 import { ConnectionPool, poolKey, type Http2Options, type PoolLease, type PrewarmOptions } from "./pool";
 
 export interface ConfidentialRequestOptions {
+  /**
+   * Optional body-size bucket (off by default): pad each request body with
+   * JSON whitespace before the pinned suffix to the next multiple of this
+   * many bytes, or to the next power of two (`"pow2"`). It hides the exact
+   * body size from observers of the client–node and node–provider
+   * connections (and from the provider), at the cost of upload bytes; the
+   * node still learns the prompt's token count at settlement.
+   */
+  padBucket?: PadBucket;
   /** Upstream TLS hostnames the client trusts (exact or wildcard). */
   trustedHosts: readonly string[];
   /** Node signing keys (hex or npub) whose offers are accepted. */
@@ -749,6 +759,7 @@ async function runOnPool(
         maxTokens: spec.maxTokens,
         image: spec.image,
         body: spec.body,
+        padBucket: options.padBucket,
         onResponseHead: (h) => {
           state.headSeen = true;
           spec.onResponseHead?.(h);
