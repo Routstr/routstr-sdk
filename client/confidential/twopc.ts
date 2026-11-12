@@ -15,13 +15,18 @@
 
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fromHex, hex } from "./advice";
-import { ProverError, ProverMissingError } from "./errors";
+import { ProverError, ProverMissingError, TwoPcVersionMismatchError } from "./errors";
 import { isExecutable, resolveProverPath, StdinBudget } from "./prover";
 
 export const CU_2PC_ENV_VARS = ["CU_2PC_BIN", "CU_2PC"] as const;
 
 /** Largest frame accepted from cu-2pc (matches its own stdin limit). */
 export const TWOPC_MAX_FRAME = 16 << 20;
+
+/** What a 2PC version mismatch means for the operator of this client. */
+const TWOPC_MISMATCH_TEXT =
+  "twopc_version_mismatch: cu-2pc and the node's sidecar run different versions of the two-party key schedule " +
+  "(this client speaks split-public-1); update the helper binaries or use another node";
 
 export const TWOPC_CHANNEL_NET = 0;
 export const TWOPC_CHANNEL_CONTROL = 1;
@@ -203,7 +208,10 @@ export class TwoPcSession {
     this.child = child;
     child.on("error", (e) => this.fail(new ProverMissingError(`cu-2pc at ${this.binary}: ${e.message}`)));
     child.on("close", (code) => {
-      if (code !== 0 && !this.closed) this.fail(new ProverError(`cu-2pc exited ${code}`));
+      if (this.closed) return;
+      // Exit status 3: the peer's first bytes were another version tag (PROTOCOL-V3 §12.2).
+      if (code === 3) this.fail(new TwoPcVersionMismatchError(TWOPC_MISMATCH_TEXT));
+      else if (code !== 0) this.fail(new ProverError(`cu-2pc exited ${code}`));
     });
     child.stdin.on("error", () => {
       /* EPIPE after exit: reported via 'close' */
@@ -286,7 +294,12 @@ export class TwoPcSession {
       return;
     }
     if (ev === "error") {
-      this.fail(new ProverError(`cu-2pc: ${String(m.msg ?? "unknown error")}`));
+      const msg = String(m.msg ?? "unknown error");
+      this.fail(
+        m.code === "twopc_version_mismatch" || msg.includes("twopc_version_mismatch")
+          ? new TwoPcVersionMismatchError(`${TWOPC_MISMATCH_TEXT} (${msg.slice(0, 200)})`)
+          : new ProverError(`cu-2pc: ${msg}`),
+      );
       return;
     }
     if (ev === "ap") this.done = true;
