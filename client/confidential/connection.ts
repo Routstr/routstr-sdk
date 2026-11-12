@@ -35,6 +35,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { concat, hex } from "./advice";
+import { padBody, type PadBucket } from "./suffix";
 import { verifySchnorrSignature } from "./canonical";
 import {
   ConfidentialError,
@@ -59,6 +60,7 @@ import {
   checkPiWinFinalRecord,
   checkPiWinParams,
   decodeBlock,
+  errorHeadPrefixProblem,
   frame,
   frameHeader,
   latin1,
@@ -220,6 +222,11 @@ export interface ConnectionRequestOptions {
   image?: { variant: string; count: number };
   /** The whole JSON body; it must end with the canonical suffix. */
   body: Uint8Array;
+  /**
+   * Optional body-size bucket (`paddedBodyLength`; off when absent): the body
+   * is padded with JSON whitespace before the suffix to the bucket.
+   */
+  padBucket?: PadBucket;
   onResponseHead?: (head: { status: number; statusText: string; headers: Record<string, string> }) => void;
   onResponseBody?: (chunk: Uint8Array) => void;
 }
@@ -1536,7 +1543,8 @@ export class ConfidentialConnection {
    * node refused the request: the connection is then as it was, and the next
    * request carries the same number.
    */
-  request(opts: ConnectionRequestOptions): ConnectionRequestHandle {
+  request(requestOpts: ConnectionRequestOptions): ConnectionRequestHandle {
+    let opts = requestOpts;
     if (!this.idle) {
       throw this.failure ?? new SessionRejectedError("the connection cannot take a request now");
     }
@@ -1550,10 +1558,11 @@ export class ConfidentialConnection {
         ? renderImageSuffix(opts.model, image.count, imageCountKey(offer.images!), offer.images!.fixed_pins, image.variant.pins)
         : canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens),
     );
-    const body = opts.body;
-    if (body.length <= suffix.length || !suffix.every((b, i) => body[body.length - suffix.length + i] === b)) {
+    const given = opts.body;
+    if (given.length <= suffix.length || !suffix.every((b, i) => given[given.length - suffix.length + i] === b)) {
       throw new SessionProtocolError("request body does not end with the pinned suffix");
     }
+    if (opts.padBucket !== undefined) opts = { ...opts, body: padBody(given, suffix.length, opts.padBucket) };
     const n = this.requests + 1;
     const cur: Cur = {
       n,
@@ -2255,11 +2264,15 @@ export class ConfidentialConnection {
       "our records to be proven",
       this.timeouts.proof,
     );
-    const head = cur.head!;
-    const rec = this.reader.recordAt(head.off);
-    if (rec.start !== head.off) {
-      throw new ResponseVerificationError("the error head does not start a server record: it cannot be disclosed");
-    }
+    // R runs from byte 0 of the record that holds the response HEADERS frame
+    // to that frame's end (§5.4); the frames before it in the record are
+    // disclosed too, so they may only be ones that carry nothing of ours.
+    const frameHead = cur.head!;
+    const rec = this.reader.recordAt(frameHead.off);
+    const prefix = this.reader.slice(rec.start, frameHead.off);
+    const problem = errorHeadPrefixProblem(prefix, cur.stream);
+    if (problem) throw new ResponseVerificationError(`the error head cannot be disclosed: ${problem}`);
+    const head = { off: rec.start, raw: concat(prefix, frameHead.raw) };
     const postIdx = rec.abs - this.hsCipher;
     let keyUpdates = 0;
     let epochStart = 0;
