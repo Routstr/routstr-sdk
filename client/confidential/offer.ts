@@ -19,6 +19,7 @@ import { TrustedHostMatcher } from "./hosts";
 import { checkH2Offer } from "./h2";
 import { headRouteProblem, headTemplateProblem } from "./params";
 import {
+  NodeProtocolOutdatedError,
   OfferBadSignatureError,
   OfferMalformedError,
   OfferPinMismatchError,
@@ -29,12 +30,15 @@ import {
 } from "./errors";
 import { type ChatSuffixSpec, pinKeyProblem, validateChatSuffix } from "./suffix";
 
-/**
- * Protocol versions this client speaks: only v2 (the two-party handshake).
- * Protocol v1 is retired; a node that offers only v1 is refused.
- */
-export const CONFIDENTIAL_VERSION_MIN = 2;
-export const CONFIDENTIAL_VERSION_MAX = 2;
+/** The one protocol version this client speaks (PROTOCOL-V3.md). */
+export const CONFIDENTIAL_VERSION = 3;
+export const CONFIDENTIAL_VERSION_MIN = CONFIDENTIAL_VERSION;
+export const CONFIDENTIAL_VERSION_MAX = CONFIDENTIAL_VERSION;
+/** The two-party key schedule this client implements (§4). */
+export const CONFIDENTIAL_TWOPC = "split-public-1";
+/** A connection's framing towards the provider. */
+export type ConfidentialFraming = "2" | "1.1";
+export const CONFIDENTIAL_FRAMINGS: readonly ConfidentialFraming[] = ["2", "1.1"];
 
 export interface ConfidentialPriceEntry {
   /** msats per 1k input tokens. */
@@ -127,14 +131,25 @@ export interface ConfidentialOffer {
   capabilities?: string[];
   /** Image generation terms, present with the `images` capability. */
   images?: ConfidentialImagesOffer;
-  /** HTTP versions the node's sessions speak to the provider; absent: `["1.1"]`. */
-  http?: string[];
   /**
-   * Terms of `http: 2` sessions (protocol v3, option A: one two-party
-   * handshake per HTTP/2 connection, sequential requests on it), present when
-   * `http` lists `"2"`.
+   * The framings the node serves towards the provider, in the operator's
+   * order of preference (`"2"`: HTTP/2, many sequential requests per
+   * connection; `"1.1"`: one request per connection). Absent: `["1.1"]`.
    */
+  http?: string[];
+  /** Terms of framing `"2"`, present when `http` lists it. */
   h2?: ConfidentialH2Offer;
+  /** The two-party key schedule (`split-public-1`). */
+  twopc?: string;
+  /**
+   * The deposit (msat) the node reserves at a connection's `setup`. It is
+   * released when the connection's first request reaches a settlement and
+   * charged when the connection ends without one (unless the node, its
+   * sidecar or the provider failed first). 0: none.
+   */
+  connection_deposit_msat?: number;
+  /** The node closes a connection that had no request in flight for this long (seconds). */
+  idle_timeout_s?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
@@ -142,28 +157,53 @@ export interface ConfidentialOffer {
   [key: string]: unknown;
 }
 
-/** The `h2` block of an offer that lists `"2"` in `http`. */
+/** The `h2` block of an offer that lists `"2"` in `http` (§12.1). */
 export interface ConfidentialH2Offer {
   /** Path of the node's one probe request in the connection head (API base + `/models`). */
   probe_path: string;
-  /** The sidecar's own idle limit (seconds); the node's is `idle_timeout_s`. */
+  /** The sidecar's own idle limit (seconds); the ceiling of the offer's `idle_timeout_s`. */
   idle_secs: number;
   /** Requests per connection. */
   max_requests: number;
-  /**
-   * The deposit (msat) the node reserves when a connection is opened. It is
-   * released when the connection's first request reaches settlement and
-   * charged when the connection ends without one (unless the node, its
-   * sidecar or the provider failed first). 0: none.
-   */
-  connection_deposit_msat: number;
-  /** The node closes a connection that had no request in flight for this long (seconds, at most `idle_secs`). */
-  idle_timeout_s: number;
+  /** A connection is closed at the first settlement after this long since `head_written` (seconds). */
+  max_lifetime_s: number;
   /**
    * The request kinds a connection serves: `["chat"]`, or `["chat", "images"]`
    * when image requests (the offer's `images` block) may run on it too.
    */
   kinds: string[];
+}
+
+/** The framings a verified offer serves, in the operator's order. */
+export function offerFramings(offer: ConfidentialOffer): ConfidentialFraming[] {
+  const list = Array.isArray(offer.http) ? offer.http : ["1.1"];
+  return list.filter((f): f is ConfidentialFraming => f === "2" || f === "1.1");
+}
+
+/** The offer's connection deposit (msat; 0 when it names none). */
+export function offerConnectionDepositMsat(offer: Pick<ConfidentialOffer, "connection_deposit_msat">): number {
+  const d = offer.connection_deposit_msat;
+  return typeof d === "number" && Number.isSafeInteger(d) && d > 0 ? d : 0;
+}
+
+/** How long the node keeps a connection with no request in flight (seconds). */
+export function offerIdleTimeoutS(offer: Pick<ConfidentialOffer, "idle_timeout_s" | "h2">): number {
+  const t = offer.idle_timeout_s;
+  if (typeof t === "number" && Number.isSafeInteger(t) && t >= 10) return t;
+  return Math.min(120, offer.h2?.idle_secs ?? 120);
+}
+
+/**
+ * The framings of `offer` that serve a request of `kind`: `"1.1"` serves chat
+ * always and images when the offer has an images block; `"2"` serves the
+ * kinds its `h2` block lists.
+ */
+export function offerFramingsFor(offer: ConfidentialOffer, kind: "chat" | "images"): ConfidentialFraming[] {
+  return offerFramings(offer).filter((f) => {
+    if (kind === "chat") return f === "1.1" || offer.h2 !== undefined;
+    if (!offerSupportsImages(offer)) return false;
+    return f === "1.1" || offerSupportsHttp2Images(offer);
+  });
 }
 
 /** True when the verified offer serves image requests on `http: 2` connections. */
@@ -205,13 +245,13 @@ export interface VerifiedOffer extends ConfidentialOffer {
    */
   imagesRefused?: string;
   /**
-   * Why the offer's `http: 2` terms were refused (`http` then no longer lists
-   * `"2"` and `h2` is dropped; the v2 flow is unaffected).
+   * Why the offer's framing-`"2"` terms were refused (`http` then no longer
+   * lists `"2"` and `h2` is dropped; framing `"1.1"` is unaffected).
    */
   http2Refused?: string;
 }
 
-/** True when the verified offer serves `http: 2` sessions. */
+/** True when the verified offer serves framing `"2"`. */
 export function offerSupportsHttp2(offer: ConfidentialOffer): boolean {
   return Array.isArray(offer.http) && offer.http.includes("2") && offer.h2 !== undefined;
 }
@@ -514,6 +554,21 @@ export function verifyOfferSignature(offer: ConfidentialOffer): boolean {
   return verifySchnorrSignature(payload, offer.sig, offer.notary_pubkey);
 }
 
+/** The version an offer names (in its signed bytes when it has them), when it is below this client's. */
+function offeredVersionBelow(raw: unknown): number | undefined {
+  if (!isObject(raw)) return undefined;
+  let v: unknown = raw.v;
+  if (typeof raw.sig_payload === "string" && raw.sig_payload.length > 0) {
+    try {
+      const signed: unknown = JSON.parse(raw.sig_payload);
+      if (isObject(signed)) v = signed.v;
+    } catch {
+      return undefined;
+    }
+  }
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v < CONFIDENTIAL_VERSION ? v : undefined;
+}
+
 /** Supported-version check against the offer's `min_v`/`max_v` and `v`. */
 export function supportedVersion(offer: ConfidentialOffer): boolean {
   const min = offer.min_v ?? offer.v;
@@ -536,6 +591,16 @@ export function verifyConfidentialOffer(
   raw: unknown,
   options: VerifyOfferOptions = {},
 ): VerifiedOffer {
+  // §11, before anything else: an older node's offer need not have the shape
+  // of ours, and the answer is the same whoever signed it (the node is not used).
+  const olderVersion = offeredVersionBelow(raw);
+  if (olderVersion !== undefined) {
+    throw new NodeProtocolOutdatedError(
+      `node_protocol_outdated: the node offers routstr-confidential v${olderVersion}, this client speaks v${CONFIDENTIAL_VERSION}; ` +
+        "the node must be updated before it can serve confidential requests",
+      olderVersion,
+    );
+  }
   validateOfferShape(raw);
   // The signed bytes are authoritative: when the node ships `sig_payload`, the
   // fields the client uses MUST come from it, not from the outer (mutable)
@@ -558,10 +623,30 @@ export function verifyConfidentialOffer(
 
   if (!supportedVersion(offer)) {
     throw new OfferUnsupportedVersionError(
-      `offer version v=${offer.v} min_v=${offer.min_v ?? offer.v} max_v=${offer.max_v ?? offer.v} ` +
-        `is not supported: this client speaks only protocol v${CONFIDENTIAL_VERSION_MIN}` +
-        (offer.v < CONFIDENTIAL_VERSION_MIN ? " (protocol v1 is retired; the node must offer v2)" : ""),
+      `offer version v=${offer.v} is not supported: this client speaks only protocol v${CONFIDENTIAL_VERSION} (update the client)`,
     );
+  }
+  if (offer.twopc !== CONFIDENTIAL_TWOPC) {
+    throw new OfferUnsupportedVersionError(
+      `offer names the two-party key schedule ${JSON.stringify(offer.twopc ?? null).slice(0, 64)}, this client implements ${CONFIDENTIAL_TWOPC}`,
+    );
+  }
+  const framings = offer.http === undefined ? ["1.1"] : offer.http;
+  if (
+    !Array.isArray(framings) ||
+    framings.length === 0 ||
+    framings.some((f) => f !== "2" && f !== "1.1") ||
+    new Set(framings).size !== framings.length
+  ) {
+    throw new OfferMalformedError('offer.http is not a non-empty list of distinct framings ("2", "1.1")');
+  }
+  const deposit = offer.connection_deposit_msat ?? 0;
+  if (typeof deposit !== "number" || !Number.isSafeInteger(deposit) || deposit < 0) {
+    throw new OfferMalformedError("offer.connection_deposit_msat is not a non-negative integer");
+  }
+  const idleS = offer.idle_timeout_s;
+  if (idleS !== undefined && (typeof idleS !== "number" || !Number.isSafeInteger(idleS) || idleS < 10)) {
+    throw new OfferMalformedError("offer.idle_timeout_s is not an integer of at least 10");
   }
 
   const pinsConfigured = Boolean(options.pinnedPubkey) || (options.pinnedPubkeys?.length ?? 0) > 0;
@@ -641,21 +726,26 @@ export function verifyConfidentialOffer(
     if (route) throw new TrustedHostError(`offer head_template: ${route}`);
   }
 
-  // `http: 2` (protocol v3): held to what the node's sidecar enforces. A
-  // refused block switches http 2 off for this offer; v2 sessions on the
-  // same signed terms still work.
+  // Framing "2": held to what the node's sidecar enforces. A refused block
+  // switches it off for this offer when "1.1" is offered too; an offer of
+  // nothing else is refused.
   let http2Refused: string | undefined;
-  if (offer.http !== undefined || offer.h2 !== undefined) {
-    const lists = Array.isArray(offer.http) && offer.http.includes("2");
+  {
     const { h2: _block, ...rest } = offer;
-    try {
-      offer = lists
-        ? { ...rest, http: ["1.1", "2"], h2: checkH2Offer(offer, apiBases) }
-        : { ...rest, http: ["1.1"] };
-    } catch (error) {
-      http2Refused = error instanceof Error ? error.message : String(error);
-      offer = { ...rest, http: ["1.1"] };
-    }
+    if (framings.includes("2")) {
+      try {
+        const h2 = checkH2Offer(offer, apiBases);
+        if (idleS !== undefined && idleS > h2.idle_secs) {
+          throw new OfferMalformedError("offer.idle_timeout_s exceeds h2.idle_secs");
+        }
+        offer = { ...rest, http: [...framings], h2 };
+      } catch (error) {
+        http2Refused = error instanceof Error ? error.message : String(error);
+        if (!framings.includes("1.1")) throw new OfferMalformedError(`offer serves only framing "2" and its terms are refused: ${http2Refused}`);
+        offer = { ...rest, http: ["1.1"] };
+      }
+    } else offer = { ...rest, http: [...framings] };
+    offer.connection_deposit_msat = deposit;
   }
 
   if (offer.images !== undefined) {
@@ -681,7 +771,8 @@ export async function fetchConfidentialOffer(
   options: VerifyOfferOptions & { fetchImpl?: typeof fetch } = {},
 ): Promise<VerifiedOffer> {
   const base = baseUrl.replace(/\/$/, "");
-  const url = `${base}/v1/confidential/offer`;
+  // The query tells an older node's access log that v3 clients are asking (§11).
+  const url = `${base}/v1/confidential/offer?v=${CONFIDENTIAL_VERSION}`;
   const doFetch = options.fetchImpl ?? fetch;
   let resp: Response;
   try {

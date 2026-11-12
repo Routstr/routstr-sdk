@@ -13,6 +13,10 @@ export type ConfidentialErrorCode =
   | "offer_unpinned"
   | "offer_pin_mismatch"
   | "offer_unsupported_version"
+  | "node_protocol_outdated"
+  | "upgrade_required"
+  | "twopc_version_mismatch"
+  | "request_refused"
   | "trusted_host_rejected"
   | "session_protocol"
   | "session_rejected"
@@ -87,6 +91,20 @@ export class OfferUnsupportedVersionError extends ConfidentialError {
   }
 }
 
+/**
+ * The node's offer names a protocol version below this client's (PROTOCOL-V3
+ * §11): the node is not used for confidential requests until it is updated.
+ */
+export class NodeProtocolOutdatedError extends ConfidentialError {
+  /** The version the node offers. */
+  readonly nodeVersion: number;
+  constructor(message: string, nodeVersion: number) {
+    super("node_protocol_outdated", message);
+    this.name = "NodeProtocolOutdatedError";
+    this.nodeVersion = nodeVersion;
+  }
+}
+
 /** The offer's `upstream_host` matched no trusted hostname. */
 export class TrustedHostError extends ConfidentialError {
   constructor(message: string, detail?: string) {
@@ -110,6 +128,10 @@ export class SessionRejectedError extends ConfidentialError {
   readonly status?: number;
   /** The node's FastAPI-style error detail, if any. */
   readonly nodeDetail?: unknown;
+  /** The `code` of the node's `error` frame (`h2_withdrawn`, `upstream_unreachable`, …), if any. */
+  nodeCode?: string;
+  /** The `fault` of the node's `error` frame (`upstream` or `node`), if any. */
+  fault?: string;
   constructor(message: string, detail?: string, status?: number, nodeDetail?: unknown) {
     super("session_rejected", message, detail);
     this.name = "SessionRejectedError";
@@ -118,9 +140,52 @@ export class SessionRejectedError extends ConfidentialError {
   }
 }
 
+/**
+ * The node refused one `request` (`request_refused`, PROTOCOL-V3 §12.4):
+ * nothing is held for it and the connection stays as it was. `reason` is the
+ * node's (`offer_expired`, `offer_changed`, `session_fee_not_accepted`, or its
+ * usual error text); `nodeDetail` its usual error body.
+ */
+export class RequestRefusedError extends SessionRejectedError {
+  readonly reason: string;
+  constructor(status: number, reason: string, nodeDetail?: unknown) {
+    super(`node refused the request: ${reason.slice(0, 300)} (status ${status})`, undefined, status, nodeDetail);
+    this.name = "RequestRefusedError";
+    (this as { code: ConfidentialErrorCode }).code = "request_refused";
+    this.reason = reason;
+  }
+}
+
+/**
+ * The node speaks a newer protocol than this client (`error` 426
+ * `upgrade_required`, §11): update the client.
+ */
+export class UpgradeRequiredError extends SessionRejectedError {
+  /** The lowest version the node accepts. */
+  readonly minVersion?: number;
+  constructor(message: string, minVersion?: number, nodeDetail?: unknown) {
+    super(message, undefined, 426, nodeDetail);
+    this.name = "UpgradeRequiredError";
+    (this as { code: ConfidentialErrorCode }).code = "upgrade_required";
+    this.minVersion = minVersion;
+  }
+}
+
+/**
+ * The two parties run different versions of the two-party key schedule
+ * (`cu-2pc` exit status 3, or the node's `error` with this code; §4, §12.2):
+ * the helper binary and the node's sidecar must be of the same release.
+ */
+export class TwoPcVersionMismatchError extends ConfidentialError {
+  constructor(message: string) {
+    super("twopc_version_mismatch", message);
+    this.name = "TwoPcVersionMismatchError";
+  }
+}
+
 /** The spawned `cu-prover` failed to run or exited non-zero. */
 /**
- * An `http: 2` connection was not opened because of its deposit: the node's
+ * A connection was not opened because of its deposit: the node's
  * deposit exceeds the client's maximum (nothing was sent), or the balance
  * does not cover it (the node refused the setup with 402 before any 2PC).
  */
