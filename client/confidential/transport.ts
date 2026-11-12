@@ -805,8 +805,12 @@ async function runOnPool(
       return r;
     } catch (error) {
       const refused = error instanceof RequestRefusedError;
-      // A refused request leaves its connection usable: it goes back to the pool.
+      // A refused request leaves its connection usable: it goes back to the
+      // pool. Except `offer_changed`: the node takes no further request on a
+      // connection whose terms it no longer serves (§3.3), so the retry with
+      // the refetched offer opens a new one.
       if (oneOff) conn.close("one-off bearer");
+      else if (refused && offerChangedRefusal(error)) conn.close("offer_changed");
       lease.release();
       traffic.done();
       if (refused || handle.bodyReleased || state.headSeen || params.signal?.aborted || attempt >= 3) throw error;
@@ -946,6 +950,12 @@ async function fetchConfidentialImageOnce(
 }
 
 class OfferExpired extends Error {}
+
+/** A request the node refused because the connection's terms are no longer served (`offer_changed`). */
+function offerChangedRefusal(error: RequestRefusedError): boolean {
+  const detail = error.nodeDetail as { error?: { type?: string } } | undefined;
+  return error.reason === "offer_changed" || detail?.error?.type === "offer_changed";
+}
 
 /** The node no longer holds the offer the setup or the request named, or its connection-level terms changed. */
 function isOfferExpired(error: SessionRejectedError): boolean {
