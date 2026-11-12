@@ -9,7 +9,8 @@
  * stdin/stdout carry the same `[channel u8][len u32 BE][payload]` frames as
  * cu-2pc: channel 0 is the proof protocol (relayed to and from the websocket),
  * channel 1 is control JSON (`ready`, `done`, `error` events; `prove`,
- * `verify` and `close` commands). Witnesses travel to the process on stdin
+ * `verify`, `topup` and `close` commands). On a kept connection the chain is
+ * topped up between requests (`topup`), so later proofs only consume. Witnesses travel to the process on stdin
  * only and are never logged.
  *
  * If the channel fails before any proof started on it, the session falls back
@@ -51,6 +52,18 @@ export interface ProofChannelResult {
   err?: string;
 }
 
+/** What one top-up did (PROTOCOL-V3.md §9.2). */
+export interface ProofChannelTopup {
+  /** The node granted a step and the chain was extended. */
+  granted: boolean;
+  /** Correlations on the proof chain before and after. */
+  before: number;
+  after: number;
+  /** Bytes the top-up moved (both ways). */
+  bytes: number;
+  ms: number;
+}
+
 type Pending = { res: (m: ProofChannelResult) => void; rej: (e: Error) => void };
 
 export class ProofChannel {
@@ -67,6 +80,8 @@ export class ProofChannel {
   /** Bytes on the proof-channel websocket, each way. */
   bytesSent = 0;
   bytesRecv = 0;
+  /** Top-ups the node granted, in order. */
+  readonly topups: ProofChannelTopup[] = [];
   private child?: ChildProcessWithoutNullStreams;
   private ws?: WebSocket;
   private wsOpen = false;
@@ -294,6 +309,53 @@ export class ProofChannel {
       throw new ProverError(`proof channel: ${proof} checks failed or none were reported`);
     }
     return m;
+  }
+
+  /**
+   * Between requests on a kept connection: ask the node to top the proof
+   * chain up to one more request's worth (PROTOCOL-V3.md §9.2). cu-prover runs
+   * its commands in order, so a proof sent meanwhile waits for it. Resolves
+   * undefined when there is nothing to do (no proof ran on the channel yet,
+   * or it is closed); throws, and fails the channel, when the top-up fails.
+   */
+  async topup(ms = 60_000): Promise<ProofChannelTopup | undefined> {
+    if (this.failureErr || this.closed || !this.used) return undefined;
+    const id = this.nextId++;
+    const m = await new Promise<ProofChannelResult & Partial<ProofChannelTopup>>((res, rej) => {
+      const t = setTimeout(() => {
+        this.pending.delete(id);
+        rej(new ProverError(`proof channel: top-up timed out (${ms}ms)`));
+      }, ms);
+      this.pending.set(id, {
+        res: (r) => {
+          clearTimeout(t);
+          res(r);
+        },
+        rej: (e) => {
+          clearTimeout(t);
+          rej(e);
+        },
+      });
+      this.writeChild(TWOPC_CHANNEL_CONTROL, new TextEncoder().encode(JSON.stringify({ cmd: "topup", id })));
+    }).catch((e: unknown) => {
+      const err = e instanceof Error ? e : new ProverError(String(e));
+      this.fail(err);
+      throw err;
+    });
+    if (!m.ok) {
+      const err = new ProverError(`proof channel: top-up failed: ${m.err ?? "unknown"}`);
+      this.fail(err);
+      throw err;
+    }
+    const done: ProofChannelTopup = {
+      granted: m.granted === true,
+      before: Number(m.before ?? 0),
+      after: Number(m.after ?? 0),
+      bytes: Number(m.bytes ?? 0),
+      ms: Number(m.ms ?? 0),
+    };
+    if (done.granted) this.topups.push(done);
+    return done;
   }
 
   close(): void {
