@@ -81,6 +81,7 @@ import {
   offerIdleTimeoutS,
   offerSessionFeeMsat,
   offerSupportsImages,
+  pinnedModelId,
   renderImageSuffix,
   type ConfidentialFraming,
   type ConfidentialH2Offer,
@@ -1589,7 +1590,7 @@ export class ConfidentialConnection {
     const suffix = new TextEncoder().encode(
       image
         ? renderImageSuffix(opts.model, image.count, imageCountKey(offer.images!), offer.images!.fixed_pins, image.variant.pins)
-        : canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens),
+        : canonicalSuffix(this.offer.chat, pinnedModelId(offer, opts.model), opts.maxTokens),
     );
     const given = opts.body;
     if (given.length <= suffix.length || !suffix.every((b, i) => given[given.length - suffix.length + i] === b)) {
@@ -1856,8 +1857,9 @@ export class ConfidentialConnection {
     const effectiveModel =
       status < 300 && !cur.image ? effectiveModelFromText(new TextDecoder().decode(body)) : undefined;
     let warnings: string[] | undefined;
-    if (effectiveModel !== undefined && effectiveModel !== cur.model) {
-      warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${cur.model}`];
+    const pinned = cur.image ? cur.model : pinnedModelId(cur.offer, cur.model);
+    if (effectiveModel !== undefined && effectiveModel !== pinned) {
+      warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${pinned}`];
     }
     const bytes1 = this.byteCounts();
     const delta = {} as ConnectionBytes;
@@ -2451,6 +2453,7 @@ export class ConfidentialConnection {
     ownUsage: UpstreamUsageEvent,
   ): void {
     const fee = this.feeDue(cur);
+    this.checkPinnedModel(cur, got.receipt);
     const checked = verifyReceipt({
       receipt: got.receipt,
       receiptJson: got.receiptJson,
@@ -2483,7 +2486,22 @@ export class ConfidentialConnection {
     });
   }
 
+  /**
+   * A chat receipt names the public id (`model`) and, where it differs, the
+   * provider's id the suffix pinned (`upstream_model`, the offer's
+   * `upstream_models`).
+   */
+  private checkPinnedModel(cur: Cur, receipt: ConfidentialReceipt): void {
+    if (cur.image) return;
+    if (receipt.model !== cur.model) throw new ReceiptVerificationError(`receipt names model ${String(receipt.model)}, not ${cur.model}`);
+    const want = pinnedModelId(cur.offer, cur.model);
+    if ((receipt.upstream_model ?? receipt.model) !== want) {
+      throw new ReceiptVerificationError(`receipt names the pinned model ${String(receipt.upstream_model)}, not ${want}`);
+    }
+  }
+
   private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
+    this.checkPinnedModel(cur, receipt);
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
       image: cur.image

@@ -23,6 +23,8 @@ export interface ConfidentialReceipt {
   v?: number;
   sid: string;
   model: string;
+  /** Chat: the provider's id the suffix pinned, when it differs from `model` (the offer's `upstream_models`). */
+  upstream_model?: string;
   usage: UpstreamUsageEvent;
   /** Charged to the client's key from the verified usage. */
   cost_msats?: number;
