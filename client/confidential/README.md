@@ -38,9 +38,7 @@ A stream's final `data: [DONE]` line is delivered only after the settlement
 checks passed; a failed check ends the stream with an error instead.
 Confidential requests skip the client's raw request/response log sink unless
 `logPlaintext` is set, and `runsDir` (development evidence) writes the
-decrypted response to disk. `ConfidentialSession`'s `allowUnsignedSettlement`
-is a test hook, refused unless the process sets
-`ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
+decrypted response to disk (unused since v3).
 
 ## Images
 
@@ -52,13 +50,15 @@ template, `count_key`, `fixed_pins`, `param_space`, `max_count` and a
 (`n`/`variants`) and the variant (from `resolution`, `quality`, `size` or
 `format`; WebP only; no match is an error, never a substitute) are pinned in
 the suffix (`renderImageSuffix`), everything else (prompt, `aspect_ratio`,
-`seed`, ...) stays private. The session sets up with `kind: "images"`, never
-armed; after the attestation it sends `accept` for a 2xx (no usage proof) or
-discloses the error head for a 4xx/5xx as for chat. `verifyFlatReceipt`
+`seed`, ...) stays private. The `request` names `kind: "images"`, the variant
+and the count; after the response it sends `accept` for a 2xx (no usage
+proof; `accept_retry` when the node holds more records) or discloses the
+error head for a 4xx/5xx as for chat. Images run on framing "2" when
+`h2.kinds` lists them, else on "1.1"; the image body is handed on in the
+pieces it arrived in and decoded once (it was held about three times). `verifyFlatReceipt`
 requires `cost_msats == ceil(msat_per_image × count + session fee)`. The
 response is OpenAI-shaped (`{created, data: [{b64_json}]}`); a node without the
-capability is refused with `offer_no_images`. Image requests never use the
-pre-warm pool. `confidentialImageRequiredSats` sizes the deposit (also on a
+capability is refused with `offer_no_images`. An armed connection serves an image request too (it is bound to the credential only). `confidentialImageRequiredSats` sizes the deposit (also on a
 failover node) and throws for a request the offer cannot serve. The offer's
 `count_key` must be the key its route reads (`n` for `/images/generations`,
 `variants` for `/image/generate`): the charge is the price × count, so a
@@ -84,191 +84,135 @@ change and the verified receipt's cost, which `finalize()` accounts (a chat
 stream's headers left before the receipt existed). A stream ends when the
 session's settlement checks passed; it does not wait for the change.
 
-## Protocol version
+## Protocol version (v3)
 
-The client speaks protocol **v2** (two-party handshake) only: an offer must
-run `v = 2` (within its own `min_v..max_v`), and a node that offers only the
-retired protocol v1 is refused with `OfferUnsupportedVersionError`. The client
-and the node run the key schedule jointly with `cu-2pc` (spawned next to
-`cu-prover`, bridged to the node's `twopc` websocket), over a joint P-256 key
-share. The client gets c_hs/s_hs, s_ap_0 and c_ap_1 and never the node's
-epoch-0 key K_0; the node never gets the client's secrets. The node writes
-epoch 0 (credential + KeyUpdate) after π_NK, which the client verifies against
-the signed template and the hk anchor from its own 2PC output; π_C2S/π_C3S
-anchor on h1/h2.
+The client speaks routstr-confidential **protocol v3** only
+(`PROTOCOL-V3.md` in routstr-confidential is normative). Offers are fetched
+as `/v1/confidential/offer?v=3` and must name `v: 3` and
+`twopc: "split-public-1"`. An offer with `v < 3` is refused with
+`NodeProtocolOutdatedError` (`code: "node_protocol_outdated"`): the node is
+not used for confidential requests (`onNodeProtocolOutdated` tells the
+caller, routstrd logs it once per node per day). A node that speaks a newer
+protocol answers the setup with 426 `upgrade_required`, raised as
+`UpgradeRequiredError` (update the client). A `cu-2pc` that reads another
+2PC version tag exits with status 3, raised as `TwoPcVersionMismatchError`
+(`twopc_version_mismatch`: the helper binaries and the node's sidecar are of
+different releases). There is no v2 fallback.
 
-## Pre-warming
+## Connections and framings
 
-Most of a cold request is the 2PC preprocessing (about 22 MB from the node
-and 1.2 MB to it; about 7 s on a home link with a 2 Mbit/s uplink). Everything after the joint key share takes
-about 2 s: the online 2PC, the handshake, π_NK, the body and π_C2S. A session
-can be **armed** ahead of a request: `arm()` connects, sends the setup (the
-node reserves funds), runs the 2PC preprocessing and the key share, and stops
-before the ClientHello. `claim(body)` runs the rest. The sidecar dials the
-provider only when the ClientHello arrives. The node ends a session 600 s
-after accepting its websocket (the sidecar's own 600 s limit for an armed
-session starts at setup, a little later), so an armed session must be claimed
-before then. `run()` is `arm()` followed by `claim()`.
+The unit is a **connection** (`connection.ts`, `ConfidentialConnection`)
+that carries requests `(sid, n)`. One object serves both framings towards
+the provider:
 
-Pass `confidential.prewarm` (`{}` = the defaults) to let `fetchConfidential`
-keep a process-wide pool (`prewarm.ts`). It only reacts to traffic:
-
-| Rule | Behaviour | Default |
+| | framing `"2"` (HTTP/2) | framing `"1.1"` (HTTP/1.1) |
 |---|---|---|
-| Pool key | (node, model, `max_tokens`, credential). `max_tokens` must match exactly because the suffix pins it | |
-| No traffic, no arming | Nothing is armed at startup; a key with no request within `activityWindowMs` keeps no armed sessions | 10 min |
-| `target(K)` | 1 while K is active; 2 after ≥ `burstCount` requests within `burstWindowMs`; at least the peak number of overlapping requests in the window; capped at `maxPerKey` | 3 in 5 min; max 6 |
-| Global cap | `maxTotal` armed sessions, most recently active keys first (keep below the node's unused-sessions-per-address limit, default 12) | 6 |
-| Arms | one in flight at a time (`maxConcurrentArms`). None starts while a cold request is still in its own preprocessing. Replenishing runs off the request path: after a warm claim, at a response head, at completion, and on a 15 s tick that runs only while some key has state | 1 |
-| Body length | an armed session with length L serves any body ≤ L. The body is padded with spaces before the pinned suffix (valid JSON, and the suffix is still its own final record). L = max of the last `historySize` pinned bodies × `headroom`, rounded up to a power of two, between `minBucket` and `maxBucket`. A larger body goes cold and raises L, and smaller armed sessions are replaced | 20, ×1.25, 4 KiB to 8 MiB |
-| Retire | close at `maxAgeMs` from setup (the node ends a session 600 s after its websocket accept); when K goes idle, close its sessions at once (the node releases each reservation; nothing is charged unless it has an abandon fee) | 480 s |
-| Claim | the oldest healthy armed session that fits. If none is ready, an arm in progress is taken rather than starting a second preprocessing. If it fails before the credential record is released, the request runs on a fresh cold session. It is never retried after that point | |
-| Failures | a failed arm backs the key off, `backoffBaseMs` doubling up to `backoffMaxMs` | 30 s to 10 min |
-| Funds | each armed session holds a reservation on the credential: a full-context prompt plus `max_tokens` at the offer rates. A key arms only after one of its requests has settled (the receipt's `reserved_msats` is the estimate R), and only while `/v1/balance/info` shows an available balance ≥ `fundsHeadroom` × R: the new arm plus one cold request. While pre-warming is on, `RoutstrClient`'s automatic API-key top-up keeps (`fundsHeadroom` + 1.4) × R available instead of 1.4 × R (`prewarmFunds.ts`), so a claimed session is replaced while its request still runs. The available balance excludes the armed sessions' reservations, so the key's balance at the node grows to about (armed sessions + `fundsHeadroom` + 1.4) × R, bounded by `maxPerKey` and `maxTotal`. Too little balance is not a failure: the key retries when one of its requests settles (at a warm claim the claimed session still holds its reservation), or after `backoffBaseMs`, without escalating the backoff | ×2 |
-| Abandon fee | a node may charge a fee for a session that ends without a request reaching the provider (`abandon_fee_msat` in its signed offer, at least `session_fee_msat`), so every armed session that is never used costs that fee. A key whose abandon fee (from the receipt, rechecked against the fresh offer before each arm) exceeds `maxSessionFeeMsat` is never armed (0 = never arm a node that charges one); otherwise such keys hold at most `maxArmedWithFee` armed sessions in total. Abandon fees paid for sessions retired unused are logged (`… abandon fee N msats paid`) and summed in `pool.unusedFeeMsats` | 5000 msats; 6 |
+| setup | `{type:"setup", v:3, http, nonce_c, armed, auth, offer_sig}`: no request terms | same |
+| ARMED | 2PC preprocessing, key share, proof channel; deposit held; no provider connection | same |
+| connection head (epoch 0, by the node) | preface, SETTINGS, the probe putting the credential in the HPACK table | the request head of request 1 |
+| order | handshake, π_NK, `release_head`, `settings_seen`, then `request` k | `request` 1, then the ClientHello, handshake, π_NK, `release_head` |
+| a request | HEADERS + DATA, one frame per record, π_WIN over them, `release` by the provider's windows | the body, the suffix alone in the final record, π_WIN over that record |
+| end of a request | `disclose` (π_C3S) / `accept` / `disclose_head` (π_WIN under `s_ap_0`); READY again after a 2xx | the attestation when the provider closes, then `disclose` / `accept` / `disclose_head` (π_C3S); `closed` |
+| requests | up to `h2.max_requests`, one at a time | exactly 1 |
 
-Pooling is skipped for one-off Cashu bearers (`returnChange`, xcashu mode).
-The response carries `x-routstr-confidential-prewarmed:
-1|0`. Pool events are logged at info level (`[confidential-prewarm]` arming,
-armed, claim, retire, backoff) through `prewarm.log` (default
-`console.info`). Logs never contain credentials. `closeConfidentialPrewarm()`
-closes every armed session, for example on shutdown.
+`request_refused` (402 for the balance, 409 `offer_expired` /
+`offer_changed` / `session_fee_not_accepted`, 400 for terms) leaves the
+connection as it was and does not use up the request number: the call gets
+the node's HTTP error (`RequestRefusedError`), the connection goes back to
+the pool. `offer_expired` and `offer_changed` refetch the offer and run the
+request once more (`offer_changed` on a new connection: the pool key includes
+the offer's connection-level fields, `connectionTerms`). π_C2S and the v2
+one-request session are gone.
 
-Available-balance accounting: while sessions are armed, the node's
-`balance/info` reports the balance minus their reservations, so a client
-that tops up to cover one request may top up earlier than without
-pre-warming. Closing the pool releases the reservations.
+**Choosing the framing** (§2.3; `confidential.http`, default `auto`):
+the first entry of the signed offer's `http` that serves the request (images
+on `"2"` only when `h2.kinds` lists them) and is not marked bad for the node.
+When a framing-`"2"` connection fails before the body of its first request
+was released (handshake, ALPN, connection head, the provider closing, the
+sidecar's `h2_withdrawn`), the node's `"2"` is marked bad for 10 minutes and
+the request is served on `"1.1"` on the same node. A refusal with a status
+(credential, balance), the upgrade and 2PC-version errors and local faults do
+not fall back. After a body was released nothing is retried. `"2"` or
+`"1.1"` uses only that framing; a node that does not offer it is not used.
 
+## Money
 
-**Proof channel.** Each session (armed or cold) also opens one long-lived proof channel
-(`/zk?proof=zkchan`, `cu-prover --channel`) that pre-generates the OT/VOLE correlations of all three
-proofs while the session is being armed, so on the request path π_NK, π_C2S and π_C3S take tens to a few
-hundred milliseconds instead of seconds. Correlations are fresh per session and used once; a failed proof
-closes the channel. If the channel is unavailable (older node or prover), the session falls back to one
-connection per proof. Options: `proofChannel` (default true), `proofChannelFactory`; timings in
-`timings.proofs` and `timings.proofChannelReadyMs`. Measured against a production node: warm
-requests reach the first token in about 2–3 s (mostly the provider; about 1 s for a session armed through
-the handshake). Cold ones are dominated by receiving the ~22 MB of 2PC data: seconds on a fast connection,
-about 14–16 s from a good home connection (100 Mbit/s down), about 45–70 s on a slow,
-download-limited link.
+- The node reserves the offer's `connection_deposit_msat` at the setup, for
+  both framings, and releases it with the connection's first settled request
+  (`deposit_released_msat` in that receipt, required, and only there). A
+  connection that ends without a settled request loses it, unless the node,
+  its sidecar or the provider failed (the signed `deposit` of the last frame
+  says which; `conn.deposit`).
+- A node whose deposit exceeds `maxConnectionDepositMsat` (default 100 000
+  msat; also read from `http2.maxConnectionDepositMsat`) is not used: the
+  check runs when the node is qualified, before any token is spent.
+- Each request is reserved at its `request`: a full-context prompt plus
+  `max_tokens` (images: price × count), plus max(session fee if still due,
+  abandon fee). `confidentialRequiredSats` / `confidentialImageRequiredSats`
+  size the deposit as that reservation **plus the connection deposit**, the
+  balance needed before a connection is opened.
+- The session fee falls due once per connection, at its first settlement: the
+  receipt checks bound request 1 by usage + fee and later requests by usage
+  alone (`maxChargeMsats`, `verifyFlatReceipt`, `checkUpstreamErrorReceipt`).
 
-## HTTP/2 connections (`http: 2`, protocol v3 option A)
+## Pool, reuse scope and pre-warming
 
-Prototype. A node whose signed offer lists `"2"` in `http` (with an `h2`
-block: `probe_path`, `idle_secs`, `max_requests`, and the node's
-`connection_deposit_msat` and `idle_timeout_s`) serves **`http: 2`
-sessions**: one two-party handshake per HTTP/2 connection to the provider,
-and then many chat requests on it, one at a time. The node writes the
-connection head in epoch 0 (its SETTINGS and one probe request, which puts the
-credential into the provider's HPACK table); every later request names the
-credential by table index, so the client still never holds it. The design and
-the wire format are in routstr-confidential `PROTOCOL-V3-DESIGN.md` (A, A.11).
+`pool.ts` (`ConnectionPool`, process-wide) keys connections by (node,
+credential, `reuseScope`, the offer's connection terms). Requests of one
+connection are linkable for the provider; `reuseScope` (in the confidential
+options, per request; routstrd derives it from its local client) separates
+what must not be linked: a scope never shares a connection with another.
 
-`fetchConfidential` uses it automatically for chat requests when the verified
-offer lists it (`confidential.http2`, on unless `enabled: false`). The first
-request to a node opens a connection (the cost of a cold v2 session: the 2PC
-preprocessing, π_NK); it stays open, and later requests skip the handshake:
-they cost one π_WIN (the client's records), the usage proof π_C3S and the
-relayed records. Nothing is opened speculatively: "pre-warming" for `http: 2`
-is the connection the previous request left. A node that does not offer it and
-a one-off Cashu bearer (`returnChange`, a `cashu…` bearer) run the v2 flow
-exactly as before, with `prewarm` if set.
+- A framing-`"2"` request takes an idle open connection of its key, else an
+  armed one, else opens one (up to `http2.maxConnectionsPerKey`, 4, and
+  `http2.maxConnections`, 8, then it waits). Overlapping requests use separate
+  connections. A connection is kept after a settled 2xx and after a refused
+  request, and closed `idleMarginMs` (20 s, at most a quarter) before the
+  node's `idle_timeout_s`, at `h2.max_requests`, before `h2.max_lifetime_s`,
+  and on any failure. `http2.reuse: "none"` closes it after its request.
+- One-off Cashu bearers (`returnChange`, `cashu…`): framing `"1.1"` when
+  offered (a connection per token), else `"2"` with a connection of their own;
+  never pooled, never pre-warmed. The xcashu change handling is unchanged.
+- **Pre-warm** (`prewarm: {}`; off unless set): an *armed connection* (deposit
+  held, 2PC preprocessing, key share and the proof channel's correlations
+  done, no provider connection), bound to the credential only. Framing
+  `"1.1"`: one per key while the key has traffic. Framing `"2"`: one per key
+  while the key has traffic and every open connection of it is busy, so a
+  burst does not wait for a 2PC. A key is armed only after one of its requests
+  settled, only for nodes whose deposit is at most `prewarm.maxDepositMsat`
+  (5000), at most `prewarm.maxTotal` (4) in all, one arm at a time; a spare
+  is retired when its key had no request for `activityWindowMs` (10 min) or
+  it is `maxAgeMs` (480 s) old, and that costs its deposit
+  (`unusedDepositMsats`). A failed arm backs the key off (`backoffBaseMs`
+  doubling to `backoffMaxMs`); a deposit the balance does not cover waits
+  `backoffBaseMs` without escalating.
+- The proof channel (`cu-prover --channel`) holds correlations for π_NK and
+  the first π_WIN and π_C3S; later proofs on a kept connection extend the
+  chain online (one Ferret step, no new base OT). The SDK has no top-up of its
+  own: the channel protocol of the sidecar has no command for one (see the
+  measurements in the routstr-confidential gate notes).
 
-**Images.** When the offer's `h2.kinds` lists `images` (and the offer has an
-`images` block this client accepts), an image request is one more request on
-a pooled connection, in any order with chat requests: the same records and
-π_WIN, with the images route in the request's header block and the image
-suffix of the signed offer as the body's tail. A 2xx is settled by `accept`
-(no disclosure, no π_C3S) at the signed price per image × count plus the
-session fee, checked for equality in the receipt; an error status discloses
-its head as for chat. The response is one JSON body over DATA frames; its end
-is the stream's END_STREAM, and the client waits `images.response_idle_s` for
-it. Without `images` in `h2.kinds`, image requests keep the v2 flow (one
-session per image, never pre-warmed).
+`x-routstr-confidential-http` names the framing, and
+`x-routstr-confidential-connection` what the request found (`new`, `armed`,
+`reused`) and its number (`request=n`). `http2.onRequest` reports per request
+the framing, `warm` (`cold` | `armed` | `open`), time to first token and the
+bytes each way (the arming bytes separately).
 
-| `confidential.http2` | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` | `false`: never use `http: 2` |
-| `reuse` | `credential` | which requests may share a connection: `credential` (one node, one credential), `model` (and the same model), `none` (a connection per request: no linking, and slower than pre-warmed v2) |
-| `maxConnectionsPerKey` | 4 | open connections per reuse key. Requests on a connection are sequential, so a request that finds every connection busy opens another; at the limit it waits (`acquireTimeoutMs`, 120 s) |
-| `maxConnections` | 8 | open connections in total (an idle one of another key is closed to make room) |
-| `idleMarginMs` | 20 000 | an idle connection is closed this long before the node's idle timeout (`h2.idle_timeout_s` after the last settlement); at most a quarter of that timeout |
-| `maxIdleMs` | none | a shorter idle limit of your own (a longer one is clamped below the node's timeout) |
-| `maxConnectionDepositMsat` | 100 000 | the largest connection deposit (`h2.connection_deposit_msat`) accepted; a node asking for more is served by the v2 flow |
-| `maxRequestsPerConnection` | the offer's `h2.max_requests` | rotate the connection after this many requests |
-| `log`, `onRequest` | `console.info`, none | pool events; per-request statistics (connection, reuse, times, bytes to and from the node) |
+## Measured (loopback, Venice, 2026-11-12)
 
-**Deposit.** The node reserves `h2.connection_deposit_msat` from the
-credential when a connection is opened and releases it with the connection's
-first settled request (that request's signed receipt carries
-`deposit_released_msat`). A connection that ends without a settled request
-loses it, unless the node, its sidecar or the provider failed first; the
-node's last frame (`closed` or `error`) then carries the signed outcome
-(`ConfidentialH2Connection.deposit`). A balance that does not cover the
-deposit is refused at the setup with 402 (`ConnectionDepositError`), before
-any 2PC. The pool opens a connection only for a request, so the deposit is
-normally back within that request; it is lost when the connection's first
-request is refused by the node (a 402 on the reservation, an expired offer,
-a model the node does not serve) or abandoned before the provider had it.
+Time to first token at the API, bytes between client and node per request
+(`scripts/confidential-v3-e2e.ts`; arming = 2PC preprocessing, key share,
+proof-channel setup, paid before the request when armed):
 
-**Linkability.** Requests on one connection share a TLS connection to the
-provider, so the provider can tell that they come from the same client (it
-still sees only the node's key, and on the v2 flow every request is its own
-connection). The node sees the credential on every request in either flow.
-`reuse` narrows what shares a connection, `maxRequestsPerConnection` and
-`maxIdleMs` bound how long one lives, and `ConfidentialFetchParams.reuseScope`
-partitions the pool by a caller-chosen string (a daemon serving several users
-passes one per user). `enabled: false` gives the v2 behaviour.
+| framing | found | ttft | sent | received | arming sent / received |
+|---|---|---|---|---|---|
+| "2" | cold | 1.7–1.9 s | 82 kB | 12 kB | 2.55 MB / 17.9 MB |
+| "2" | open | 0.5–1.0 s | 81 kB | 12 kB–1.45 MB | – |
+| "1.1" | cold | 1.3–1.6 s | 77 kB | 93 kB | 2.55 MB / 17.9 MB |
 
-**Lifecycle and failures.** A connection is closed when it has been idle (see
-above), reached its request limit or the node's lifetime (one hour), after a
-GOAWAY, and after any error, abort, or non-2xx response (the node closes it
-then anyway; the next request opens a new one). A pooled connection is a
-cache, never a promise: if it turns out dead when a request arrives, or fails
-before the request was released towards the provider (no `release` frame was
-sent; the client sends it only after the node's `request_ok`), the request
-runs again on a fresh connection, at most twice. A refusal by the node itself
-(a status: 402 no funds, 409 expired offer) is returned as that HTTP error
-and not retried on another connection. After the release nothing is ever run
-again, on any connection or node, as for v2. A caller abort before the
-release closes the connection; after it the request settles in the
-background and the connection returns to the pool.
-
-**What the client checks** (ported from the reference client, with the
-sidecar's vectors in `tests/unit/fixtures/h2-vectors.json`): the π_NK
-statement against the connection head rebuilt from the signed offer (host,
-probe path, key length: SETTINGS with no response table and no push, the one
-probe request); every π_WIN window the node asks for against the client's own
-records (the ciphertext is ours, the compared bytes are ours and lie in a
-public range: a frame header, the pinned HEADERS block, the pinned suffix, the
-final content-type byte, the disclosed error head), since the node chooses
-the windows and the proof would otherwise be a decryption oracle; the π_C3S
-parameters against the disclosed tail; the per-request attestation (session,
-request number and stream, an interval that starts at this request, the
-hashes of the records received and sent); and the receipt (signature, `sid`,
-`n`, attestation hash, usage and cost against the signed rates).
-
-Responses carry `x-routstr-confidential-http: 2` and
-`x-routstr-confidential-connection: new|reused; request=<n>`.
-`closeConfidentialHttp2()` closes every pooled connection;
-`confidentialHttp2Snapshot()` lists them.
-
-Measured on loopback against a local node and the real provider (2026-11-11,
-`mistral-small-3-2-24b-instruct`, 20 tokens; no bandwidth limit, so the 2PC
-download costs almost nothing here): opening a connection moves 23.7 MB to
-the client and 2.6 MB to the node (about 1.0 s); a request on an open
-connection moves 0.5-1.0 MB to the client and 85 kB to the node (the proof
-channel extends its correlations online) and reached the first token in
-0.5-0.7 s, against 0.9-1.0 s for a pre-warmed v2 session and 1.6-1.8 s cold.
-Every v2 request, pre-warmed or not, moves the full 23.7 MB / 2.7 MB.
-`scripts/confidential-h2-e2e.ts` runs the live checks (sequential reuse,
-overlap, a provider error, an idle close).
-
-Not implemented: parallel streams on one connection, client KeyUpdates, a
-fallback to the v2 flow when an `http: 2` connection cannot be opened. An
-image response is held about three times in memory while its request runs
-(the decrypted body, the received records for the attestation's hash, and
-the result).
+The received bytes of an open-connection request jump to about 1.45 MB when
+its π_C3S runs out of the preprocessed correlations and the chain extends
+online (on the third request of a connection in these runs).
 
 ## What is checked
 
@@ -276,13 +220,17 @@ the result).
   trusted upstream host, under the caller's policy on every request.
 - The provider: TLS 1.3 with full certificate-path and hostname validation in
   the vendored TLS stack.
-- The proofs: π_NK against the published template, and every parameter the
-  node sends for π_C2S/π_C3S against the client's own records (`params.ts`),
+- The proofs: π_NK against the connection head rebuilt from the signed offer
+  (framing "2": §5.2; "1.1": the head template with the body length), and
+  every parameter the node sends for π_WIN and π_C3S against the client's own
+  records (`h2.ts` `checkPiWinParams` / `checkPiWinFinalRecord`, `params.ts`),
   so the client only proves statements about data it chose to disclose.
   π_C3S must cover exactly the tail records the client named in its
-  disclosure (no earlier records that only add proof work).
-  π_C2S/π_C3S reveal one bit to the node, never plaintext.
-- The attestation: the sidecar's record of the session (sid, certificate-chain
+  disclosure. Both reveal one bit to the node, never plaintext.
+- The attestation (per request): `sid`, `http`, `n`, and in framing "2"
+  `stream` and an interval `s_k` that starts at the request and ends at the
+  disclosure, with the hash of exactly those records (an accepted image
+  response is hashed as it arrives and not kept); the sidecar's record of the session (sid, certificate-chain
   hash, both handshake transcript hashes, record counts and the SHA-256 of all
   bytes in each direction, the credential-record commitment, the time), signed
   by the sidecar's per-process Ed25519 key and re-signed by the node's Nostr
@@ -290,7 +238,8 @@ the result).
   both transcript hashes and the credential-record commitment (the one π_NK
   proved) are its own (`checkAttestationBinding`).
 - The receipt: required Schnorr signature over the exact signed bytes, this
-  session's sid and attestation hash, the usage equal to the client's own
+  connection's sid, its framing and request number, the attestation hash, the
+  deposit released once (on the first settled request, the offer's amount), the usage equal to the client's own
   plaintext, and a cost no higher than that usage at the signed offer's rates
   plus the offer's session fee (`maxChargeMsats`); a receipt naming larger
   fees than the signed ones is refused. For an upstream HTTP error the
@@ -333,12 +282,16 @@ client with only the environment it needs, and use only prover and 2PC binaries 
 
 | File | What |
 |---|---|
-| `transport.ts` | the transport: offer check, pinned body, session, streamed `Response`, SSE→JSON for non-stream callers |
-| `session.ts` | one session: 2PC, handshake through the relay, π_NK/π_C2S/π_C3S, receipt check |
-| `twopc.ts` | `cu-2pc` runner: stdio frame codec, websocket bridge |
+| `transport.ts` | the transport: offer check, framing choice and fallback, pinned body, the pooled request, streamed `Response`, SSE→JSON for non-stream callers |
+| `connection.ts` | one connection, both framings: setup, arm, handshake, π_NK, requests, π_WIN, disclosures, attestation, receipt and deposit checks |
+| `pool.ts` | the connection pool: reuse keys and scopes, idle and lifetime limits, armed spares, bad marks |
+| `wire.ts` | shared types and helpers (TLS handle, receipt shape, waits, image response) |
+| `twopc.ts` | `cu-2pc` runner: stdio frame codec, websocket bridge, version mismatch |
 | `zkchan.ts` | the pre-warmed proof channel (`cu-prover --channel`) |
-| `prewarm.ts` | traffic-driven pool of armed sessions, body-length buckets and padding |
-| `h2conn.ts`, `h2pool.ts`, `h2.ts`, `hpack-tables.ts` | `http: 2` sessions: one connection (handshake, request loop, disclosures, receipt), the connection pool, HTTP/2 framing + HPACK decoding + the π_NK/π_WIN parameter checks |
-| `offer.ts`, `hosts.ts`, `canonical.ts` | signed offer verification, trusted-host wildcards, Schnorr/canonical JSON |
-| `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned chat suffix (rendered from the offer's `chat` block and held to the pin policy, routstr-confidential `docs/CHAT-SUFFIX.md`) and response parsing, receipt checks, proof-parameter checks, byte helpers, `cu-prover` runner |
+| `h2.ts`, `hpack-tables.ts` | HTTP/2 framing and HPACK decoding, the π_NK (framing "2") and π_WIN parameter checks |
+| `offer.ts`, `hosts.ts`, `canonical.ts` | signed offer verification (v3, framings, connection terms), trusted-host wildcards, Schnorr/canonical JSON |
+| `suffix.ts`, `receipt.ts`, `params.ts`, `advice.ts`, `prover.ts` | pinned chat suffix (rendered from the offer's `chat` block and held to the pin policy, routstr-confidential `docs/CHAT-SUFFIX.md`) and response parsing, receipt checks, π_NK ("1.1") / π_C3S parameter checks, byte helpers, `cu-prover` runner |
 | `tls-fork/` | vendored `@reclaimprotocol/tls@0.1.4` (MIT) with the patches in `FORK-NOTES.md` |
+
+Gate: `bun scripts/confidential-v3-e2e.ts <node> <sk-key> <model> [cases]`
+(header of the script).
