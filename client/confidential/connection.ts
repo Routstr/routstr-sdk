@@ -106,6 +106,7 @@ import {
   extractUsageDisclosure,
   IncrementalHttpResponse,
   usageEventFromDisclosure,
+  usageEventProblem,
   validateChatSuffix,
   type UpstreamUsageEvent,
 } from "./suffix";
@@ -2164,16 +2165,8 @@ export class ConfidentialConnection {
     } catch {
       return bad("the last event before data: [DONE] is not JSON");
     }
-    const u = ownUsage?.usage;
-    const choices = (ownUsage as { choices?: unknown } | null)?.choices;
-    if (
-      !Array.isArray(choices) ||
-      choices.length !== 0 ||
-      !Number.isSafeInteger(u?.prompt_tokens) ||
-      !Number.isSafeInteger(u?.completion_tokens)
-    ) {
-      bad("the last event before data: [DONE] is not a usage event");
-    }
+    const notUsage = usageEventProblem(ownUsage);
+    if (notUsage) bad(`the last event before data: [DONE] is not a usage event (${notUsage})`);
     // Where the event starts in the received stream.
     let acc = 0;
     let start = -1;
