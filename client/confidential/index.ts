@@ -85,6 +85,8 @@ export {
   verifyOfferSignature,
   supportedVersion,
   offerSupportsImages,
+  pinnedModelId,
+  upstreamModelsProblem,
   offerSupportsHttp2,
   imageCountKey,
   imageCountKeyForRoute,

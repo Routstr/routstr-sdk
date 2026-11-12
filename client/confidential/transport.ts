@@ -50,6 +50,7 @@ import {
   offerConnectionDepositMsat,
   offerFramingsFor,
   offerSupportsImages,
+  pinnedModelId,
   renderImageSuffix,
   verifyConfidentialOffer,
   type ConfidentialFraming,
@@ -385,7 +386,7 @@ export async function qualifyConfidentialNode(
   if (request !== null && typeof request === "object" && !Array.isArray(request)) {
     const body = { ...(request as Record<string, unknown>), model };
     if (kind === "images") planImageRequest(body, offer.images!);
-    else buildPinnedBody(body, model, maxTokensFor(body, Number(offer.max_tokens_cap ?? 4096)).maxTokens, offer.chat);
+    else buildPinnedBody(body, pinnedModelId(offer, model), maxTokensFor(body, Number(offer.max_tokens_cap ?? 4096)).maxTokens, offer.chat);
   }
   return offer;
 }
@@ -976,7 +977,8 @@ async function fetchConfidentialOnce(
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer);
   throwIfAborted(params.signal);
   const { maxTokens, clampedFrom } = maxTokensFor(request, Number(offer.max_tokens_cap ?? 4096));
-  const body = buildPinnedBody(request, model, maxTokens, offer.chat);
+  // The suffix pins the provider's id (`upstream_models`); the request names the public one.
+  const body = buildPinnedBody(request, pinnedModelId(offer, model), maxTokens, offer.chat);
   const wantStream = request.stream === true;
   // The request's start: it may first wait for a connection, and that wait
   // belongs in its timings.
