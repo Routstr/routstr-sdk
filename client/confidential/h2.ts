@@ -324,7 +324,7 @@ export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
   const max = b.max_requests ?? 100
   if (!(Number.isSafeInteger(idle) && idle >= 10 && idle <= 3600)) fail('offer_malformed: h2 idle_secs')
   if (!(Number.isSafeInteger(max) && max >= 1 && max <= 1000)) fail('offer_malformed: h2 max_requests')
-  const life = b.max_lifetime_s ?? 3600
+  const life = b.max_lifetime_s === undefined ? 3600 : b.max_lifetime_s
   if (!(Number.isSafeInteger(life) && life >= 60 && life <= 86400)) fail('offer_malformed: h2 max_lifetime_s')
   const host = offer.upstream_host
   if (typeof host !== 'string' || host.length >= 127 || !/^[A-Za-z0-9.-]+$/.test(host)) fail('offer_malformed: upstream_host')

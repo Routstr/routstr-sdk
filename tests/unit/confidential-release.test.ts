@@ -15,8 +15,8 @@ import { chatSuffixKeys } from "../../client/confidential/suffix";
 import { verifyConfidentialOffer } from "../../client/confidential/offer";
 import { verifyReceipt } from "../../client/confidential/receipt";
 import {
-  closeConfidentialPrewarm,
-  confidentialPrewarmSnapshot,
+  closeConfidentialConnections,
+  confidentialConnectionsSnapshot,
   fetchConfidential,
   headerSafeText,
 } from "../../client/confidential/transport";
@@ -25,16 +25,15 @@ import {
   ReceiptVerificationError,
   SessionRejectedError,
 } from "../../client/confidential/errors";
-import { ConfidentialSession } from "../../client/confidential/session";
+import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 
 const priv = new Uint8Array(32).fill(7);
 const pubHex = bytesToHex(schnorr.getPublicKey(priv));
 
 function offer(signed = true): Record<string, unknown> {
   const o: Record<string, unknown> = {
-    v: 2,
-    min_v: 2,
-    max_v: 2,
+    v: 3,
+    twopc: "split-public-1",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
@@ -84,10 +83,76 @@ function call(extra: Record<string, unknown> = {}, body: Record<string, unknown>
   });
 }
 
-/** Stand-in for a session: `steps` runs with the session as `this`. */
+/**
+ * Stand-in for a connection's one request: `steps` runs with a state object
+ * (`authSent`: the credential went out; `released`: the body was released;
+ * the response handlers), and returns the request's outcome.
+ */
 function fakeRun(steps: (s: any) => Promise<unknown>) {
-  return vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: any) {
-    return steps(this) as never;
+  let sids = 0;
+  const open = async function (this: any) {
+    if (this.failure) throw this.failure;
+    if (this.phaseNow === "new") {
+      this.sid = (++sids).toString(16).padStart(8, "0").padEnd(64, "0");
+      this.phaseNow = this.framing === "2" ? "ready" : "armed";
+      this.opened = true;
+      this.tOpen = this.tLastSettled = Date.now();
+    }
+  };
+  vi.spyOn(ConfidentialConnection.prototype, "arm").mockImplementation(open);
+  vi.spyOn(ConfidentialConnection.prototype, "connect").mockImplementation(open);
+  return vi.spyOn(ConfidentialConnection.prototype, "request").mockImplementation(function (
+    this: any,
+    opts: ConnectionRequestOptions,
+  ) {
+    const conn = this;
+    const s: any = { authSent: false, released: false, sid: "", onResponseHead: opts.onResponseHead, onResponseBody: opts.onResponseBody };
+    conn.cur = { n: 1 };
+    let over = false;
+    const done = (async () => {
+      try {
+        const r: any = await steps(s);
+        conn.cur = undefined;
+        conn.requests = 1;
+        conn.settled = 1;
+        conn.goaway = true;
+        over = true;
+        return {
+          sid: s.sid || conn.sid,
+          http: conn.framing,
+          n: 1,
+          model: opts.model,
+          status: r.http.status,
+          headers: r.http.headers ?? {},
+          body: r.http.body ?? new Uint8Array(0),
+          receipt: r.receipt ?? {},
+          attestation: {},
+          warnings: r.warnings,
+          timings: { startedAt: Date.now(), totalMs: 1, proofs: [] },
+          bytes: { relaySent: 0, relayRecv: 0, controlSent: 0, controlRecv: 0, twoPcSent: 0, twoPcRecv: 0, zkSent: 0, zkRecv: 0 },
+        };
+      } catch (e) {
+        conn.fail(e);
+        throw e;
+      }
+    })();
+    done.catch(() => {});
+    return {
+      n: 1,
+      get sid() {
+        return s.sid || conn.sid;
+      },
+      get bodyReleased() {
+        return s.released === true;
+      },
+      get credentialSent() {
+        return s.authSent === true;
+      },
+      done,
+      close() {
+        if (!over) conn.close("request aborted");
+      },
+    } as never;
   });
 }
 
@@ -100,7 +165,7 @@ function released(s: any) {
 afterEach(() => {
   vi.restoreAllMocks();
   globalThis.fetch = realFetch;
-  closeConfidentialPrewarm();
+  closeConfidentialConnections();
 });
 
 describe("node errors around the release", () => {
@@ -347,7 +412,7 @@ describe("caller abort", () => {
 
   it("before the release closes the session at once", async () => {
     mockNode();
-    const close = vi.spyOn(ConfidentialSession.prototype, "close");
+    const close = vi.spyOn(ConfidentialConnection.prototype, "close");
     fakeRun(() => new Promise(() => {}));
     const ac = new AbortController();
     const p = call({ signal: ac.signal });
@@ -359,7 +424,7 @@ describe("caller abort", () => {
 
   it("after the release detaches the caller and lets the session settle", async () => {
     mockNode();
-    const close = vi.spyOn(ConfidentialSession.prototype, "close");
+    const close = vi.spyOn(ConfidentialConnection.prototype, "close");
     let finish!: () => void;
     const gate = new Promise<void>((r) => (finish = r));
     fakeRun(async (s) => {
@@ -385,7 +450,7 @@ describe("caller abort", () => {
 
   it("after the release, a non-streamed call rejects at once and the session settles on its own", async () => {
     mockNode();
-    const close = vi.spyOn(ConfidentialSession.prototype, "close");
+    const close = vi.spyOn(ConfidentialConnection.prototype, "close");
     let finish!: () => void;
     const gate = new Promise<void>((r) => (finish = r));
     let ended = false;
@@ -420,23 +485,21 @@ describe("pre-warm", () => {
       options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex], prewarm: {} },
     });
     expect(run).toHaveBeenCalledTimes(1);
-    expect(confidentialPrewarmSnapshot()).toEqual([]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(confidentialConnectionsSnapshot()).toEqual([]);
   });
 });
 
-describe("session release guards", () => {
+describe("connection release guards", () => {
   const opts = () =>
     ({
       baseUrl: "http://127.0.0.1:8010",
-      offer: { v: 2, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
+      offer: { v: 3, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
       auth: "sk-x",
-      model: "m",
-      maxTokens: 10,
-      bodyLength: 100,
       prover: {},
     }) as never;
 
-  it("a closed session never opens or arms", async () => {
+  it("a closed connection never dials, arms or takes a request", async () => {
     const realWs = (globalThis as any).WebSocket;
     let dialed = 0;
     (globalThis as any).WebSocket = class {
@@ -446,25 +509,26 @@ describe("session release guards", () => {
       close() {}
     };
     try {
-      const s = new ConfidentialSession(opts());
-      s.close();
-      await expect(s.open()).rejects.toThrow(/closed/);
-      await expect(s.arm()).rejects.toThrow(/closed/);
+      const c = new ConfidentialConnection(opts());
+      c.close();
+      await expect(c.arm()).rejects.toThrow(/closed/);
+      await expect(c.connect()).rejects.toThrow(/closed/);
+      expect(() => c.request({ model: "m", maxTokens: 10, body: new Uint8Array(10) })).toThrow(/closed/);
       expect(dialed).toBe(0);
     } finally {
       (globalThis as any).WebSocket = realWs;
     }
   });
 
-  it("checks the pinned suffix before it releases the credential record", async () => {
-    const s = new ConfidentialSession(opts()) as any;
-    s.prepared = true;
-    s.ready = {};
+  it("checks the pinned suffix before anything of the request is sent", () => {
+    const c = new ConfidentialConnection(opts()) as any;
+    c.phaseNow = "armed";
     const sent: unknown[] = [];
-    s.sendText = (m: unknown) => sent.push(m);
-    await expect(s.finish(new Uint8Array(100).fill(0x78))).rejects.toThrow(/pinned suffix/);
-    expect(s.bodyReleased).toBe(false);
+    c.sendText = (m: unknown) => sent.push(m);
+    expect(() => c.request({ model: "m", maxTokens: 10, body: new Uint8Array(100).fill(0x78) })).toThrow(/pinned suffix/);
     expect(sent).toEqual([]);
+    // The connection can still take a request.
+    expect(c.idle).toBe(true);
   });
 });
 

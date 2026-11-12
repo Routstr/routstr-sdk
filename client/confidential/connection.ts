@@ -1012,6 +1012,8 @@ export class ConfidentialConnection {
    * everything ready. Idempotent.
    */
   arm(prewarm = false): Promise<void> {
+    // A connection the caller closed never dials.
+    if (!this.armP && this.failure) return Promise.reject(this.failure);
     if (!this.armP) {
       this.connectStarted = true;
       this.prewarmed = prewarm;
