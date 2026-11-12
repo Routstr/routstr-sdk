@@ -102,6 +102,13 @@ export interface ConfidentialOffer {
   /** How the pinned chat suffix is built (`validateChatSuffix`). */
   chat: ChatSuffixSpec;
   price_list: Record<string, ConfidentialPriceEntry>;
+  /**
+   * Public id -> the provider's own id, for the models whose two ids differ
+   * (an `org/` prefix): the chat suffix pins the provider's id, the request
+   * and the price list name the public one (PROTOCOL-V3.md §12.1). Absent
+   * when every id is the provider's own.
+   */
+  upstream_models?: Record<string, string>;
   mints?: string[];
   prewarm?: boolean;
   /**
@@ -256,6 +263,31 @@ export function offerSupportsHttp2(offer: ConfidentialOffer): boolean {
   return Array.isArray(offer.http) && offer.http.includes("2") && offer.h2 !== undefined;
 }
 
+/**
+ * The id the chat suffix pins for `model` (a public id of `price_list`): the
+ * offer's `upstream_models` entry where the provider's own id differs, else
+ * the id itself.
+ */
+export function pinnedModelId(offer: { upstream_models?: Record<string, string> }, model: string): string {
+  const m = offer.upstream_models;
+  return m && Object.hasOwn(m, model) ? m[model]! : model;
+}
+
+/** Why an offer's `upstream_models` is refused, or undefined (absent is fine). */
+export function upstreamModelsProblem(offer: { price_list: Record<string, unknown>; upstream_models?: unknown }): string | undefined {
+  const m = offer.upstream_models;
+  if (m === undefined) return undefined;
+  if (m === null || typeof m !== "object" || Array.isArray(m)) return "upstream_models is not an object";
+  for (const [pub, id] of Object.entries(m as Record<string, unknown>)) {
+    if (!Object.hasOwn(offer.price_list, pub)) return `upstream_models names ${JSON.stringify(pub)}, which price_list does not`;
+    // Rendered into the suffix as a JSON string: printable ASCII without a quote or backslash.
+    if (typeof id !== "string" || !/^[\x21-\x7e]{1,256}$/.test(id) || /["\\]/.test(id) || id === pub) {
+      return `upstream_models[${JSON.stringify(pub)}] is not a provider model id`;
+    }
+  }
+  return undefined;
+}
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -318,6 +350,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
       throw new OfferMalformedError(`offer.price_list[${JSON.stringify(model)}] is not a set of non-negative rates`);
     }
   }
+  const upstreamProblem = upstreamModelsProblem(offer as { price_list: Record<string, unknown>; upstream_models?: unknown });
+  if (upstreamProblem) throw new OfferMalformedError(`offer.${upstreamProblem}`);
   if (
     typeof offer.max_tokens_cap !== "number" ||
     !Number.isSafeInteger(offer.max_tokens_cap) ||
