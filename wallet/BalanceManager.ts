@@ -232,7 +232,9 @@ export class BalanceManager {
     baseUrl: string,
     type: "topup" | "refund"
   ): { allowed: boolean; reason?: string } {
-    const existing = this.providerWalletOps.get(baseUrl);
+    // Coordination identity only: leave transport and storage URLs unchanged.
+    const key = baseUrl.replace(/\/+$/, "");
+    const existing = this.providerWalletOps.get(key);
     if (!existing) {
       return { allowed: true };
     }
@@ -254,7 +256,7 @@ export class BalanceManager {
       };
     }
     // Cooldown expired — clean up stale entry
-    this.providerWalletOps.delete(baseUrl);
+    this.providerWalletOps.delete(key);
     return { allowed: true };
   }
 
@@ -263,13 +265,15 @@ export class BalanceManager {
     type: "topup" | "refund"
   ): number {
     const id = ++nextProviderWalletOperationId;
-    const existing = this.providerWalletOps.get(baseUrl);
+    // Coordination identity only: leave transport and storage URLs unchanged.
+    const key = baseUrl.replace(/\/+$/, "");
+    const existing = this.providerWalletOps.get(key);
     if (existing?.type === type) {
       // Keep earlier live callers and any real completion timestamp. A later
       // no-op must not erase either one's protection.
       existing.activeIds.add(id);
     } else {
-      this.providerWalletOps.set(baseUrl, {
+      this.providerWalletOps.set(key, {
         type, startTime: Date.now(), activeIds: new Set([id]),
       });
     }
@@ -282,14 +286,16 @@ export class BalanceManager {
     id: number,
     skipped = false
   ): void {
-    const existing = this.providerWalletOps.get(baseUrl);
+    // Coordination identity only: leave transport and storage URLs unchanged.
+    const key = baseUrl.replace(/\/+$/, "");
+    const existing = this.providerWalletOps.get(key);
     if (!existing || existing.type !== type || !existing.activeIds.delete(id)) return;
     // Live siblings always block the opposite operation, regardless of this
     // timestamp. The final real completion starts the full cooldown; a skip
     // neither creates nor extends it. Unknown (throwing) outcomes are real.
     if (!skipped) existing.endTime = Date.now();
     if (existing.activeIds.size === 0 && existing.endTime === undefined) {
-      this.providerWalletOps.delete(baseUrl);
+      this.providerWalletOps.delete(key);
     }
   }
 
