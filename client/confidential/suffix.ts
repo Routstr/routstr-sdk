@@ -603,3 +603,45 @@ export class ChunkedDecoder {
     return out;
   }
 }
+
+
+/** The largest request body a node takes (`body_len`, PROTOCOL-V3.md §12.4). */
+export const MAX_BODY_LEN = 8 << 20;
+
+/** A body-size bucket: a multiple of this many bytes (at least 16), or the next power of two. */
+export type PadBucket = number | "pow2";
+
+/**
+ * The optional body-size bucket (off by default): the body's length rounded
+ * up to the next multiple of `bucket` bytes, or with `"pow2"` to the next
+ * power of two (at least 1 KiB), never above `MAX_BODY_LEN`. The padding is
+ * JSON whitespace between the private part and the canonical suffix, so the
+ * provider parses the same object while `body_len`, the record sizes and the
+ * ciphertext show the bucket. The node still learns the prompt's token
+ * count at settlement: this hides the size from observers of the
+ * connections, not from the node.
+ */
+export function paddedBodyLength(len: number, bucket: PadBucket | undefined): number {
+  if (bucket === undefined || len >= MAX_BODY_LEN) return len;
+  let want: number;
+  if (bucket === "pow2") {
+    want = 1024;
+    while (want < len) want *= 2;
+  } else {
+    if (!Number.isSafeInteger(bucket) || bucket < 16) throw new Error("a padding bucket is an integer of at least 16 bytes, or pow2");
+    want = Math.ceil(len / bucket) * bucket;
+  }
+  return Math.min(want, MAX_BODY_LEN);
+}
+
+/** `body` (which ends with a suffix of `suffixLen` bytes) padded to its bucket with spaces before the suffix. */
+export function padBody(body: Uint8Array, suffixLen: number, bucket: PadBucket | undefined): Uint8Array {
+  const len = paddedBodyLength(body.length, bucket);
+  if (len === body.length) return body;
+  const out = new Uint8Array(len);
+  const cut = body.length - suffixLen;
+  out.set(body.subarray(0, cut), 0);
+  out.fill(0x20, cut, len - suffixLen);
+  out.set(body.subarray(cut), len - suffixLen);
+  return out;
+}

@@ -263,6 +263,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     this.http2 = http2;
     this.prewarm = prewarm;
     if (!this.prewarmOn) this.closeSpares("pre-warming is off");
+    // Reuse turned off: no connection kept under the old policy is handed out again.
+    if (http2.reuse === "none") {
+      for (const e of [...this.entries]) if (e.state === "idle") this.retire(e, "reuse is off");
+    }
   }
 
   private get prewarmOn(): boolean {
@@ -351,7 +355,9 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         if ((e.state === "idle" && !e.conn.idle) || (e.state === "armed" && !e.conn.armed)) this.remove(e);
       }
       const mineOf = (e: Entry<C>) => e.key === key && e.conn.framing === framing;
-      if (framing === "2") {
+      // `reuse: none` is enforced here too, not only when a request ends: an
+      // open connection that served a request is never taken by another.
+      if (framing === "2" && this.http2.reuse !== "none") {
         const idle = this.entries.find((e) => mineOf(e) && e.state === "idle");
         if (idle) {
           if (idle.timer) clearTimeout(idle.timer);

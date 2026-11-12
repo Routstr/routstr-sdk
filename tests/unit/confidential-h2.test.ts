@@ -24,6 +24,7 @@ import {
   checkPiNKParamsH2,
   checkPiWinParams,
   decodeBlock,
+  errorHeadPrefixProblem,
   frame,
   h2Head,
   huffmanDecode,
@@ -32,6 +33,7 @@ import {
   splitBody,
   type WinSource,
 } from "../../client/confidential/h2";
+import { MAX_BODY_LEN, padBody, paddedBodyLength } from "../../client/confidential/suffix";
 import { ConnectionPool, poolIdleMs, poolKey } from "../../client/confidential/pool";
 import { ConnectionDepositError } from "../../client/confidential/errors";
 import { offerSupportsHttp2, verifyConfidentialOffer } from "../../client/confidential/offer";
@@ -762,6 +764,23 @@ describe("http 2: the connection pool", () => {
     expect(none.snapshot()).toHaveLength(0);
   });
 
+  it("never hands out a kept connection once reuse is none (acquisition, not only release)", async () => {
+    const pool = new ConnectionPool<FakeConn>(quiet);
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
+    l1.conn.start();
+    l1.conn.finish();
+    l1.release(true);
+    expect(pool.snapshot()).toHaveLength(1); // kept idle under "shared"
+    const kept = l1.conn;
+    pool.configure({ ...quiet, reuse: "none" });
+    expect(kept.dead).toBeDefined();
+    const l2 = await pool.acquire("k", "2", () => new FakeConn());
+    expect(l2.reused).toBe(false);
+    expect(l2.conn).not.toBe(kept);
+    l2.release();
+    pool.close();
+  });
+
   it("closes an idle connection before the node's idle limit, and after maxRequestsPerConnection", async () => {
     const pool = new ConnectionPool<FakeConn>({ ...quiet, maxIdleMs: 30, maxRequestsPerConnection: 2 });
     const l1 = await pool.acquire("k", "2", () => new FakeConn());
@@ -966,5 +985,35 @@ describe("http 2: the connection pool", () => {
       busy.finish();
       pool.close();
     });
+  });
+});
+
+
+describe("http 2: the error head's record prefix and the body-size bucket", () => {
+  it("discloses only frames that carry nothing of ours before a response head", () => {
+    const wu = (st: number) => frame(FRAME.WINDOW_UPDATE, 0, st, new Uint8Array([0, 0, 1, 0]));
+    const ping = frame(FRAME.PING, FLAG.ACK, 0, new Uint8Array(8));
+    const probe = frame(FRAME.DATA, FLAG.END_STREAM, 1, new TextEncoder().encode('{"data":[]}'));
+    const cat = (...xs: Uint8Array[]) => Uint8Array.from(xs.flatMap((x) => [...x]));
+    expect(errorHeadPrefixProblem(new Uint8Array(0), 3)).toBeUndefined();
+    expect(errorHeadPrefixProblem(cat(wu(0), wu(3), ping, probe, frame(FRAME.SETTINGS, FLAG.ACK, 0)), 3)).toBeUndefined();
+    expect(errorHeadPrefixProblem(frame(FRAME.DATA, 0, 3, new Uint8Array([1])), 3)).toMatch(/type 0 on stream 3/);
+    expect(errorHeadPrefixProblem(wu(5), 3)).toBeDefined();
+    expect(errorHeadPrefixProblem(ping.subarray(0, 12), 3)).toMatch(/runs into/);
+  });
+
+  it("pads to the bucket with whitespace before the suffix (off by default)", () => {
+    const enc = new TextEncoder();
+    const body = enc.encode('{"messages":[],"model":"m"}');
+    const sfx = ',"model":"m"}'.length;
+    expect(padBody(body, sfx, undefined)).toBe(body);
+    const p = padBody(body, sfx, 64);
+    expect(p.length).toBe(64);
+    expect(JSON.parse(new TextDecoder().decode(p))).toEqual({ messages: [], model: "m" });
+    expect(new TextDecoder().decode(p).endsWith(' ,"model":"m"}')).toBe(true);
+    expect(paddedBodyLength(5000, "pow2")).toBe(8192);
+    expect(paddedBodyLength(100, "pow2")).toBe(1024);
+    expect(paddedBodyLength(MAX_BODY_LEN - 1, "pow2")).toBe(MAX_BODY_LEN);
+    expect(() => paddedBodyLength(10, 3)).toThrow(/bucket/);
   });
 });
