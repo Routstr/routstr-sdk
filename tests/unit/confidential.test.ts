@@ -61,7 +61,8 @@ import {
   SessionRejectedError,
 } from "../../client/confidential/errors";
 import { CuProverBackend } from "../../client/confidential/prover";
-import { ConfidentialSession } from "../../client/confidential/session";
+import { ConfidentialConnection } from "../../client/confidential/connection";
+import { fakeConnections } from "./fixtures/v3";
 import {
   TrustedHostMatcher,
   matchHostname,
@@ -75,6 +76,7 @@ import {
   OfferPinMismatchError,
   OfferUnpinnedError,
   OfferUnsupportedVersionError,
+  NodeProtocolOutdatedError,
   TrustedHostError,
 } from "../../client/confidential/errors";
 
@@ -95,9 +97,8 @@ function makeKey() {
 function signedOffer(overrides: Record<string, unknown> = {}) {
   const { priv, pubHex } = makeKey();
   const offer: Record<string, unknown> = {
-    v: 2,
-    min_v: 2,
-    max_v: 2,
+    v: 3,
+    twopc: "split-public-1",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
@@ -176,13 +177,14 @@ describe("npub decoding", () => {
 });
 
 describe("offer verification + pinning", () => {
-  it("accepts the real node offer with the pin from its own key", () => {
-    const verified = verifyConfidentialOffer(OFFER, {
-      pinnedPubkey: OFFER.notary_pubkey as string,
-      trustedHosts: ["*.venice.ai"],
-    });
+  it("accepts a v3 offer with the pin from its own key", () => {
+    const { offer, pubHex } = signedOffer();
+    const verified = verifyConfidentialOffer(offer, { pinnedPubkey: pubHex, trustedHosts: ["*.venice.ai"] });
     expect(verified.upstream_host).toBe("api.venice.ai");
     expect(verified.signedPayload.length).toBeGreaterThan(0);
+    // Absent `http`: framing "1.1" only; absent deposit: none.
+    expect(verified.http).toEqual(["1.1"]);
+    expect(verified.connection_deposit_msat).toBe(0);
   });
 
   it("rejects an offer signed by a different key than the pin (npub pin mismatch)", () => {
@@ -203,7 +205,7 @@ describe("offer verification + pinning", () => {
       allowUnpinned: true,
       trustedHosts: ["*.venice.ai"],
     });
-    expect(verified.v).toBe(2);
+    expect(verified.v).toBe(3);
   });
 
   it("rejects a bad signature even when pinned", () => {
@@ -216,58 +218,58 @@ describe("offer verification + pinning", () => {
     ).toThrow(OfferBadSignatureError);
   });
 
-  it("rejects an unsupported protocol version", () => {
-    const { offer } = signedOffer({ v: 3, min_v: 3, max_v: 3 });
+  it("rejects a protocol version above its own", () => {
+    const { offer } = signedOffer({ v: 4, min_v: 4, max_v: 4 });
     expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(
       OfferUnsupportedVersionError,
     );
-    expect(supportedVersion({ v: 3, min_v: 3, max_v: 3 } as never)).toBe(false);
-    // Only v2 (two-party handshake) is supported; an offer must run v2.
-    expect(supportedVersion({ v: 2, min_v: 2, max_v: 2 } as never)).toBe(true);
-    expect(supportedVersion({ v: 2, min_v: 1, max_v: 2 } as never)).toBe(true);
-    expect(supportedVersion({ v: 1, min_v: 1, max_v: 2 } as never)).toBe(false);
+    expect(supportedVersion({ v: 4, min_v: 4, max_v: 4 } as never)).toBe(false);
+    // Only v3 is supported; an offer must run v3.
+    expect(supportedVersion({ v: 3 } as never)).toBe(true);
+    expect(supportedVersion({ v: 3, min_v: 2, max_v: 3 } as never)).toBe(true);
+    expect(supportedVersion({ v: 2, min_v: 2, max_v: 3 } as never)).toBe(false);
   });
 
-  it("refuses a node that offers only the retired protocol v1", () => {
-    const { offer } = signedOffer({ v: 1, min_v: 1, max_v: 1 });
-    expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(/v1 is retired/);
-    expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(
-      OfferUnsupportedVersionError,
-    );
-    // A real (correctly signed) offer recorded from a v1 node.
-    expect(() =>
-      verifyConfidentialOffer(OFFER_V1, {
-        pinnedPubkey: OFFER_V1.notary_pubkey as string,
-        trustedHosts: ["*.venice.ai"],
-      }),
-    ).toThrow(OfferUnsupportedVersionError);
+  it("a node that offers an older protocol is outdated (v2, and the retired v1)", () => {
+    for (const v of [1, 2]) {
+      const { offer } = signedOffer({ v, min_v: v, max_v: v });
+      expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(/node_protocol_outdated/);
+      expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(NodeProtocolOutdatedError);
+    }
+    // Real (correctly signed) offers recorded from a v1 node and from a v2 node.
+    for (const recorded of [OFFER_V1, OFFER]) {
+      expect(() =>
+        verifyConfidentialOffer(recorded, {
+          pinnedPubkey: recorded.notary_pubkey as string,
+          trustedHosts: ["*.venice.ai"],
+        }),
+      ).toThrow(NodeProtocolOutdatedError);
+    }
   });
 
-  it("refuses to build a session for a v1 offer", () => {
-    expect(
-      () =>
-        new ConfidentialSession({
-          baseUrl: "http://127.0.0.1:8010",
-          offer: { v: 1, notary_pubkey: "00".repeat(32) },
-          auth: "sk-x",
-          model: "m",
-          maxTokens: 10,
-          bodyLength: 100,
-          prover: {},
-        } as never),
-    ).toThrow(/only v2/);
+  it("refuses to build a connection for an offer of another version", () => {
+    for (const v of [1, 2, 4]) {
+      expect(
+        () =>
+          new ConfidentialConnection({
+            baseUrl: "http://127.0.0.1:8010",
+            offer: { v, notary_pubkey: "00".repeat(32) },
+            auth: "sk-x",
+            prover: {},
+          } as never),
+      ).toThrow(/unsupported protocol version/);
+    }
   });
 
   it("rejects an offer whose version lies outside its own min_v..max_v", () => {
-    // v=1 inside the client's range, but the node says it speaks only v2
-    expect(supportedVersion({ v: 1, min_v: 2, max_v: 2 } as never)).toBe(false);
-    expect(supportedVersion({ v: 2, min_v: 1, max_v: 1 } as never)).toBe(false);
+    expect(supportedVersion({ v: 3, min_v: 4, max_v: 4 } as never)).toBe(false);
+    expect(supportedVersion({ v: 3, min_v: 2, max_v: 2 } as never)).toBe(false);
     for (const bad of [
-      { v: 1, min_v: 2, max_v: 2 },
-      { v: 2, min_v: 1, max_v: 1 },
-      { v: 2, min_v: 3 },
-      { v: 1.5, min_v: 1, max_v: 2 },
-      { v: 2, min_v: "1", max_v: 2 },
+      { v: 3, min_v: 4, max_v: 4 },
+      { v: 3, min_v: 2, max_v: 2 },
+      { v: 3, min_v: 4 },
+      { v: 3.5, min_v: 3, max_v: 4 },
+      { v: 3, min_v: "1", max_v: 3 },
     ]) {
       const { offer } = signedOffer(bad as never);
       expect(() => verifyConfidentialOffer(offer, { allowUnpinned: true })).toThrow(OfferMalformedError);
@@ -967,23 +969,18 @@ describe("security regressions", () => {
       new SessionRejectedError("offer expired", undefined, 409, { error: { type: "offer_expired" } });
     try {
       for (const released of [false, true]) {
-        let runs = 0;
-        const run = vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: any) {
-          runs++;
-          if (released) this.released = true;
-          throw expired();
-        });
+        const { request } = fakeConnections(() => ({ released, fail: expired() }));
         const call = fetchConfidential({
           baseUrl: `https://expired-${released}.example`,
-          body: { model: "cheap", messages: [] },
+          body: { model: "cheap", messages: [{ role: "user", content: "x" }] },
           bearer: "sk-x",
           options: { trustedHosts: ["*.venice.ai"], nodePubkeys: [pubHex] },
         });
-        // Released: never a second session, and no refusal Response to fail
+        // Released: never a second request, and no refusal Response to fail
         // over on (the provider may have the request).
         await expect(call).rejects.toThrow(/offer expired/);
-        expect(runs).toBe(released ? 1 : 2);
-        run.mockRestore();
+        expect(request).toHaveBeenCalledTimes(released ? 1 : 2);
+        vi.restoreAllMocks();
       }
     } finally {
       globalThis.fetch = realFetch;
@@ -1106,7 +1103,7 @@ describe("security regressions", () => {
 
 describe("confidential session fee and surcharge in the offer", () => {
   const shape = {
-    v: 2,
+    v: 3,
     upstream_host: "api.venice.ai",
     notary_pubkey: "ab".repeat(32),
     max_tokens_cap: 4096,
@@ -1363,32 +1360,15 @@ describe("stream end held until settlement", () => {
   });
 });
 
-describe("session construction guards", () => {
+describe("connection construction guards", () => {
   const opts = (extra: Record<string, unknown> = {}) =>
     ({
       baseUrl: "http://127.0.0.1:8010",
-      offer: { v: 2, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
+      offer: { v: 3, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
       auth: "sk-x",
-      model: "m",
-      maxTokens: 10,
-      bodyLength: 100,
       prover: {},
       ...extra,
     }) as never;
-
-  it("refuses the insecure test hooks unless the process opts in", () => {
-    const prev = process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
-    delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
-    try {
-      expect(() => new ConfidentialSession(opts())).not.toThrow();
-      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).toThrow(/test hook/);
-      process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = "1";
-      expect(() => new ConfidentialSession(opts({ allowUnsignedSettlement: true }))).not.toThrow();
-    } finally {
-      if (prev === undefined) delete process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING;
-      else process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING = prev;
-    }
-  });
 
   it("refuses to send the setup when cu-prover or cu-2pc is missing", async () => {
     const realWs = (globalThis as any).WebSocket;
@@ -1401,11 +1381,11 @@ describe("session construction guards", () => {
     };
     try {
       const missing = new CuProverBackend({ binaryPath: "/nonexistent/cu-prover" });
-      await expect(new ConfidentialSession(opts({ prover: missing })).arm()).rejects.toThrow(ProverMissingError);
+      await expect(new ConfidentialConnection(opts({ prover: missing })).arm()).rejects.toThrow(ProverMissingError);
       // The prover exists, cu-2pc does not.
       const present = new CuProverBackend({ binaryPath: process.execPath });
       await expect(
-        new ConfidentialSession(opts({ prover: present, twoPcPath: "/nonexistent/cu-2pc" })).arm(),
+        new ConfidentialConnection(opts({ prover: present, twoPcPath: "/nonexistent/cu-2pc" })).arm(),
       ).rejects.toThrow(/cu-2pc/);
       expect(dialed).toBe(0);
     } finally {
@@ -1424,13 +1404,13 @@ describe("session construction guards", () => {
         setTimeout(() => this.onopen?.(), 0);
       }
       send() {
-        setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: "ready", v: 2, sid: "ab".repeat(32), pubkey: "11".repeat(32) }) }), 0);
+        setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: "ready", v: 3, http: "1.1", sid: "ab".repeat(32), pubkey: "11".repeat(32) }) }), 0);
       }
       close() {}
     };
     let twoPcStarted = 0;
     try {
-      const session = new ConfidentialSession(
+      const session = new ConfidentialConnection(
         opts({
           prover: new CuProverBackend({ binaryPath: process.execPath }),
           twoPcFactory: () => {
@@ -1447,9 +1427,9 @@ describe("session construction guards", () => {
   });
 
   it("refuses a plain-http remote node", () => {
-    expect(() => new ConfidentialSession(opts({ baseUrl: "http://node.example" }))).toThrow(/plain http/);
+    expect(() => new ConfidentialConnection(opts({ baseUrl: "http://node.example" }))).toThrow(/plain http/);
     expect(() =>
-      new ConfidentialSession(opts({ baseUrl: "http://node.example", allowInsecureTransport: true })),
+      new ConfidentialConnection(opts({ baseUrl: "http://node.example", allowInsecureTransport: true })),
     ).not.toThrow();
   });
 });

@@ -640,7 +640,7 @@ export function verifyConfidentialOffer(
   ) {
     throw new OfferMalformedError('offer.http is not a non-empty list of distinct framings ("2", "1.1")');
   }
-  const deposit = offer.connection_deposit_msat ?? 0;
+  const deposit = offer.connection_deposit_msat === undefined ? 0 : offer.connection_deposit_msat;
   if (typeof deposit !== "number" || !Number.isSafeInteger(deposit) || deposit < 0) {
     throw new OfferMalformedError("offer.connection_deposit_msat is not a non-negative integer");
   }

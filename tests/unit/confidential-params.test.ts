@@ -1,6 +1,5 @@
 /**
- * Confidential-upstream protocol v2 (two-party handshake) unit tests:
- * the client-side checks of the π_NK / π_C2S / π_C3S parameters the node
+ * The client-side checks of the π_NK / π_WIN (framing "1.1") / π_C3S parameters the node
  * sends, the cu-2pc stdio frame codec, binary resolution, and the 2PC bridge
  * against a fake cu-2pc process.
  */
@@ -10,7 +9,6 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 import {
-  checkPiC2SParams,
   checkPiC3SParams,
   checkPiNKParams,
   firstTailOffset,
@@ -23,11 +21,12 @@ import {
   TwoPcSession,
   TWOPC_MAX_FRAME,
 } from "../../client/confidential/twopc";
-import { ProverError, SessionProtocolError } from "../../client/confidential/errors";
+import { checkPiWinFinalRecord } from "../../client/confidential/h2";
+import { ProverError, SessionProtocolError, TwoPcVersionMismatchError } from "../../client/confidential/errors";
 
 const bytes = (n: number, fill: number) => new Uint8Array(n).fill(fill);
 
-describe("π_NK statement rebuild (v2)", () => {
+describe("π_NK statement rebuild (framing 1.1)", () => {
   const keyLen = 4;
   const alphabet = "[A-Za-z0-9_-]";
   const tpl =
@@ -126,7 +125,7 @@ describe("π_NK statement rebuild (v2)", () => {
   });
 });
 
-describe("π_C2S / π_C3S parameter checks (v2)", () => {
+describe("π_WIN / π_C3S parameter checks", () => {
   const suffix = new TextEncoder().encode(',"model":"m","max_tokens":8}');
   const payloadLen = 50 + suffix.length + 1 + 16; // header + (body + suffix + type byte + tag)
   const record = new Uint8Array(5 + payloadLen);
@@ -137,54 +136,64 @@ describe("π_C2S / π_C3S parameter checks (v2)", () => {
   const off = ctLen - w;
   const h1 = bytes(32, 0x11);
   const h2 = bytes(32, 0x22);
-  const honestC2 = () => ({
-    PiC2S: {
-      h1: Array.from(h1),
-      seq: 3,
-      ct_window: Array.from(record.subarray(5 + off, 5 + off + w)),
-      off,
-      w,
-      sel_start: w - 1 - suffix.length,
-      sel_len: suffix.length + 1,
-      expected: [...Array.from(suffix), 0x17],
+  // Framing "1.1": the final record is the suffix alone (suffix ‖ 0x17 ‖ tag).
+  const finalRecord = new Uint8Array(5 + suffix.length + 1 + 16);
+  finalRecord.set([0x17, 0x03, 0x03, 0, suffix.length + 17]);
+  for (let i = 5; i < finalRecord.length; i++) finalRecord[i] = (i * 17) & 0xff;
+  const finalCt = finalRecord.subarray(5, finalRecord.length - 16);
+  const honestWin = () => ({
+    first_seq: 3,
+    count: 1,
+    params: {
+      PiWin: {
+        anchor: Array.from(h1),
+        windows: [{ seq: 3, ct: Array.from(finalCt), expected: [...Array.from(suffix), 0x17] }] as Record<string, any>[],
+      },
     },
   });
-  const ownC2 = { h1, seq: 3, record, suffix };
+  const ownWin = { anchor: h1, seq: 3, wire: finalRecord, suffix };
 
-  it("accepts a window over our own final epoch-1 record anchored on our h1", () => {
-    expect(() => checkPiC2SParams(honestC2(), ownC2)).not.toThrow();
+  it("π_WIN (framing 1.1): one window, the whole of our own final record, anchored on our h1", () => {
+    expect(checkPiWinFinalRecord(honestWin(), ownWin)).toEqual({ windows: 1, ctBytes: suffix.length + 1 });
   });
 
-  it("rejects another anchor, another record or a moved window", () => {
-    const otherAnchor = honestC2();
-    otherAnchor.PiC2S.h1 = Array.from(h2);
-    expect(() => checkPiC2SParams(otherAnchor, ownC2)).toThrow(SessionProtocolError);
-    const earlier = honestC2();
-    earlier.PiC2S.seq = 2;
-    expect(() => checkPiC2SParams(earlier, ownC2)).toThrow(SessionProtocolError);
-    const moved = honestC2();
-    moved.PiC2S.off = 0;
-    moved.PiC2S.ct_window = Array.from(record.subarray(5, 5 + w));
-    expect(() => checkPiC2SParams(moved, ownC2)).toThrow(SessionProtocolError);
-    const otherSuffix = honestC2();
-    otherSuffix.PiC2S.expected[0] = 0x20;
-    expect(() => checkPiC2SParams(otherSuffix, ownC2)).toThrow(SessionProtocolError);
-    // A v1-shaped statement is not a v2 one.
-    expect(() => checkPiC2SParams({ PiC2: honestC2().PiC2S }, ownC2)).toThrow(SessionProtocolError);
+  it("π_WIN (framing 1.1): rejects another anchor, another record, a moved or partial window", () => {
+    const otherAnchor = honestWin();
+    otherAnchor.params.PiWin.anchor = Array.from(h2);
+    expect(() => checkPiWinFinalRecord(otherAnchor, ownWin)).toThrow(SessionProtocolError);
+    const earlier = honestWin();
+    earlier.first_seq = 2;
+    expect(() => checkPiWinFinalRecord(earlier, ownWin)).toThrow(SessionProtocolError);
+    const otherSeq = honestWin();
+    otherSeq.params.PiWin.windows[0]!.seq = 2;
+    expect(() => checkPiWinFinalRecord(otherSeq, ownWin)).toThrow(SessionProtocolError);
+    const two = honestWin();
+    two.count = 2;
+    expect(() => checkPiWinFinalRecord(two, ownWin)).toThrow(SessionProtocolError);
+    const otherCt = honestWin();
+    otherCt.params.PiWin.windows[0]!.ct[0] ^= 1;
+    expect(() => checkPiWinFinalRecord(otherCt, ownWin)).toThrow(SessionProtocolError);
+    const otherSuffix = honestWin();
+    otherSuffix.params.PiWin.windows[0]!.expected[0] = 0x20;
+    expect(() => checkPiWinFinalRecord(otherSuffix, ownWin)).toThrow(SessionProtocolError);
+    const partial = honestWin();
+    partial.params.PiWin.windows[0]!.expected = partial.params.PiWin.windows[0]!.expected.slice(0, -1);
+    expect(() => checkPiWinFinalRecord(partial, ownWin)).toThrow(SessionProtocolError);
+    const shifted = honestWin();
+    shifted.params.PiWin.windows[0]!.sel_start = 1;
+    expect(() => checkPiWinFinalRecord(shifted, ownWin)).toThrow(SessionProtocolError);
+    const extra = honestWin();
+    extra.params.PiWin.windows.push({ seq: 3, ct: Array.from(finalCt), expected: [0x17], sel_start: suffix.length });
+    expect(() => checkPiWinFinalRecord(extra, ownWin)).toThrow(SessionProtocolError);
+    // A π_C2S-shaped statement (protocol v2) is not a π_WIN one.
+    expect(() => checkPiWinFinalRecord({ first_seq: 3, count: 1, params: { PiC2S: {} } }, ownWin)).toThrow(SessionProtocolError);
   });
 
-  it("requires the suffix followed by the content type byte 0x17", () => {
-    const bare = honestC2();
-    bare.PiC2S.expected = bare.PiC2S.expected.slice(0, -1);
-    bare.PiC2S.sel_len -= 1;
-    expect(() => checkPiC2SParams(bare, ownC2)).toThrow(SessionProtocolError);
-    const otherType = honestC2();
-    otherType.PiC2S.expected[otherType.PiC2S.expected.length - 1] = 0x16;
-    expect(() => checkPiC2SParams(otherType, ownC2)).toThrow(SessionProtocolError);
-    const longer = honestC2();
-    longer.PiC2S.expected = [...longer.PiC2S.expected, 0x00];
-    longer.PiC2S.sel_len += 1;
-    expect(() => checkPiC2SParams(longer, ownC2)).toThrow(SessionProtocolError);
+  it("π_WIN (framing 1.1): our final record must be the suffix alone", () => {
+    // A record that also carries private bytes cannot be proven as a whole.
+    const longer = new Uint8Array(finalRecord.length + 8);
+    longer.set(finalRecord);
+    expect(() => checkPiWinFinalRecord(honestWin(), { ...ownWin, wire: longer })).toThrow(/not the suffix alone/);
   });
 
   it("π_C3S must cover exactly the final records we received, anchored on our h2", () => {
@@ -501,6 +510,35 @@ describe("cu-2pc bridge", () => {
     const ks2 = u.session.keyShare(1000);
     u.child.emit("close", 1);
     await expect(ks2).rejects.toThrow(/exited 1/);
+  });
+
+  it("a version mismatch of the two-party key schedule is its own error (exit status 3, or the event's code)", async () => {
+    const t = fakeBridge();
+    t.session.start("ws://x");
+    const ks = t.session.keyShare(1000);
+    t.child.emit("close", 3);
+    const exit = await ks.catch((e) => e);
+    expect(exit).toBeInstanceOf(TwoPcVersionMismatchError);
+    expect(exit.code).toBe("twopc_version_mismatch");
+    expect(exit.message).toMatch(/twopc_version_mismatch.*split-public-1/);
+
+    const u = fakeBridge();
+    u.session.start("ws://x");
+    const ks2 = u.session.keyShare(1000);
+    u.emit(1, JSON.stringify({ ev: "error", code: "twopc_version_mismatch", msg: "the peer speaks routstr-2pc/split-proven-1" }));
+    await expect(ks2).rejects.toBeInstanceOf(TwoPcVersionMismatchError);
+
+    const w = fakeBridge();
+    w.session.start("ws://x");
+    const ks3 = w.session.keyShare(1000);
+    w.emit(1, JSON.stringify({ ev: "error", msg: "twopc_version_mismatch: peer tag" }));
+    await expect(ks3).rejects.toBeInstanceOf(TwoPcVersionMismatchError);
+    // Any other error stays a prover error.
+    const x = fakeBridge();
+    x.session.start("ws://x");
+    const ks4 = x.session.keyShare(1000);
+    x.emit(1, JSON.stringify({ ev: "error", code: "other", msg: "equality check failed" }));
+    await expect(ks4).rejects.toBeInstanceOf(ProverError);
   });
 
   it("rejects malformed secrets from cu-2pc", async () => {

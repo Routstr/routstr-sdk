@@ -435,6 +435,8 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
 
   private lease(entry: Entry<C>, warm: "open" | "armed" | "cold"): PoolLease<C> {
     let released = false;
+    // A connection just became busy: a spare may be due (off the request's path).
+    queueMicrotask(() => this.replenish());
     return {
       conn: entry.conn,
       reused: warm === "open",
