@@ -10,7 +10,7 @@
 import { hex, sha256 } from "./advice";
 import { verifySchnorrSignature } from "./canonical";
 import { ReceiptVerificationError } from "./errors";
-import type { ConfidentialReceipt } from "./session";
+import type { ConfidentialReceipt } from "./wire";
 import type { UpstreamUsageEvent } from "./suffix";
 
 export interface ReceiptVerificationInput {
@@ -24,7 +24,7 @@ export interface ReceiptVerificationInput {
   /** Our own usage event parsed from the π_C3 disclosure. */
   ownUsage: UpstreamUsageEvent;
   /**
-   * The model the request pinned (π_C2S proves it). The node settles at this
+   * The model the request pinned (π_WIN over the suffix proves it). The node settles at this
    * model's rates and names it in the receipt even when the provider's usage
    * event spells the model differently (an alias, a canonical id, a case
    * change); a receipt naming either is accepted.

@@ -1,7 +1,7 @@
 /**
- * Protocol v2 proof channel: one long-lived `cu-prover --channel` process per
+ * The proof channel: one long-lived `cu-prover --channel` process per
  * session, bridged to the node's `zkchan` websocket
- * (`/v1/confidential/zk?proof=zkchan`). The OT/VOLE setup of π_NK, π_C2S and
+ * (`/v1/confidential/zk?proof=zkchan`). The OT/VOLE setup of π_NK, π_WIN and
  * π_C3S (base OT → KOS → Ferret, ~1 MB and several round trips per proof on
  * the per-proof path) runs once, while the session is armed; each proof at
  * claim time then only runs QuickSilver over correlations that already exist.
@@ -34,12 +34,6 @@ export interface ProofChannelOptions {
   binaryPath?: string;
   /** Override the preallocated correlation counts (the smaller of the two sides' values is used). */
   prealloc?: { nk?: number; cp?: number };
-  /**
-   * An `http: 2` session (protocol v3): π_WIN and π_C3S run once per request,
-   * so the channel repeats them and extends its correlations online
-   * (`cu-prover --channel --multi`).
-   */
-  multi?: boolean;
   /** Injectable spawn (tests). */
   spawnImpl?: typeof nodeSpawn;
   /** Injectable WebSocket constructor (tests). */
@@ -70,7 +64,6 @@ export class ProofChannel {
   private readonly spawnImpl: typeof nodeSpawn;
   private readonly WS: typeof WebSocket;
   private readonly prealloc?: { nk?: number; cp?: number };
-  private readonly multi: boolean;
   /** Bytes on the proof-channel websocket, each way. */
   bytesSent = 0;
   bytesRecv = 0;
@@ -93,7 +86,6 @@ export class ProofChannel {
     this.spawnImpl = options.spawnImpl ?? nodeSpawn;
     this.WS = options.webSocketImpl ?? WebSocket;
     this.prealloc = options.prealloc;
-    this.multi = options.multi === true;
     this.readyP = new Promise<void>((res, rej) => {
       this.readyRes = res;
       this.readyRej = rej;
@@ -106,7 +98,6 @@ export class ProofChannel {
   /** Spawn `cu-prover --channel` and connect it to the node's zkchan websocket. */
   start(url: string): void {
     const args = ["--channel"];
-    if (this.multi) args.push("--multi");
     if (this.prealloc?.nk) args.push("--prealloc-nk", String(this.prealloc.nk));
     if (this.prealloc?.cp) args.push("--prealloc-cp", String(this.prealloc.cp));
     let child: ChildProcessWithoutNullStreams;
@@ -264,7 +255,7 @@ export class ProofChannel {
 
   /**
    * Run one proof on the channel: `verify` for π_NK (the node proves),
-   * `prove` for π_C2S/π_C3S with the witness. Throws if it fails.
+   * `prove` for π_WIN/π_C3S with the witness. Throws if it fails.
    */
   async run(
     cmd: "prove" | "verify",

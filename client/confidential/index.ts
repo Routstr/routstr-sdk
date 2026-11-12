@@ -16,6 +16,10 @@ export {
   OfferUnpinnedError,
   OfferPinMismatchError,
   OfferUnsupportedVersionError,
+  NodeProtocolOutdatedError,
+  UpgradeRequiredError,
+  TwoPcVersionMismatchError,
+  RequestRefusedError,
   TrustedHostError,
   SessionProtocolError,
   SessionRejectedError,
@@ -49,7 +53,6 @@ export {
 
 export {
   checkPiNKParams,
-  checkPiC2SParams,
   checkPiC3SParams,
   checkHeadTemplate,
   headTemplateProblem,
@@ -58,8 +61,17 @@ export {
 } from "./params";
 
 export {
+  CONFIDENTIAL_VERSION,
   CONFIDENTIAL_VERSION_MIN,
   CONFIDENTIAL_VERSION_MAX,
+  CONFIDENTIAL_TWOPC,
+  CONFIDENTIAL_FRAMINGS,
+  offerFramings,
+  offerFramingsFor,
+  offerConnectionDepositMsat,
+  offerIdleTimeoutS,
+  type ConfidentialFraming,
+  type ConfidentialH2Offer,
   fetchConfidentialOffer,
   verifyConfidentialOffer,
   validateOfferShape,
@@ -147,38 +159,16 @@ export {
   type ReceiptVerificationResult,
 } from "./receipt";
 
-export {
-  ConfidentialSession,
-  checkImageResponse,
-  type ConfidentialSessionOptions,
-  type ConfidentialSessionResult,
-  type ConfidentialSessionTimings,
-  type ConfidentialReceipt,
-} from "./session";
-
-
-export {
-  PrewarmPool,
-  PREWARM_DEFAULTS,
-  chooseBucket,
-  padPinnedBody,
-  poolKey,
-  type PrewarmOptions,
-  type PrewarmDeps,
-  type PoolKeyInfo,
-  type ArmHandle,
-  type ArmedSessionLike,
-  type Lease,
-  type RequestTicket,
-} from "./prewarm";
+export { checkImageResponse, imageOutcome, type ConfidentialReceipt } from "./wire";
 
 export {
   fetchConfidential,
   qualifyConfidentialNode,
-  closeConfidentialPrewarm,
-  confidentialPrewarmSnapshot,
-  closeConfidentialHttp2,
-  confidentialHttp2Snapshot,
+  closeConfidentialConnections,
+  confidentialConnectionsSnapshot,
+  chooseFraming,
+  http2OpenFailure,
+  maxConnectionDepositMsat,
   buildPinnedBody,
   planImageRequest,
   isConfidentialImageEndpoint,
@@ -188,31 +178,34 @@ export {
   type ConfidentialSettlement,
 } from "./transport";
 
-// Protocol v3, option A: `http: 2` sessions (one two-party handshake per
-// HTTP/2 connection, sequential requests on it).
+// The connection (both framings) and its pool.
 export {
-  ConfidentialH2Connection,
+  ConfidentialConnection,
   DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT,
-  h2ConnectionTerms,
-  type ConfidentialH2ConnectionOptions,
-  type H2DepositOutcome,
-  type H2RequestOptions,
-  type H2RequestResult,
-  type H2RequestHandle,
-  type H2ProofTiming,
-  type H2Bytes,
-} from "./h2conn";
+  connectionTerms,
+  type ConfidentialConnectionOptions,
+  type ConnectionPhase,
+  type DepositOutcome,
+  type ConnectionRequestOptions,
+  type ConnectionRequestResult,
+  type ConnectionRequestHandle,
+  type ProofTiming,
+  type ConnectionBytes,
+} from "./connection";
 
 export {
-  Http2Pool,
+  ConnectionPool,
   HTTP2_DEFAULTS,
-  http2IdleMs,
-  http2PoolKey,
+  PREWARM_DEFAULTS,
+  FRAMING_BAD_MS,
+  poolIdleMs,
+  poolKey,
   type Http2Options,
-  type Http2RequestStats,
-  type Http2KeyInfo,
-  type Http2Lease,
-} from "./h2pool";
+  type PrewarmOptions,
+  type ConfidentialRequestStats,
+  type PoolKeyInfo,
+  type PoolLease,
+} from "./pool";
 export { offerSupportsHttp2Images } from "./offer";
 
 export {
@@ -220,6 +213,7 @@ export {
   checkH2Offer,
   checkPiNKParamsH2,
   checkPiWinParams,
+  checkPiWinFinalRecord,
   decodeBlock,
   h2Head,
   requestBlock,

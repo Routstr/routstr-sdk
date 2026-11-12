@@ -1,28 +1,36 @@
 /**
- * An `http: 2` confidential connection (protocol v3, option A;
- * PROTOCOL-V3-DESIGN.md A, wire format in A.11). C side.
+ * A confidential connection (PROTOCOL-V3.md), client side.
  *
- * One two-party TLS handshake, then the node writes the HTTP/2 connection
- * head (its SETTINGS, one probe request that puts the credential into the
- * HPACK table) in epoch 0. This client then sends chat requests on the same
- * TLS connection, one at a time, naming the credential by HPACK index. Per
- * request: `request` (the node reserves), one HTTP/2 frame per TLS record,
- * π_WIN over those records, `release`, the response, then the usage
- * disclosure (π_C3S) or the error head (π_WIN under `s_ap_0`), a per-request
- * attestation and a signed receipt.
+ * One object for both framings. `setup` → the two-party preprocessing and the
+ * joint key share (ARMED: the node holds the connection deposit, no provider
+ * connection exists) → the handshake, π_NK over the connection head the node
+ * writes in epoch 0, `head_written` (READY) → requests `(sid, n)`.
  *
- * Ported from the reference client (`crypto/client/src/driver-h2.ts`). What
- * it verifies is verified here: the π_NK statement against the connection
- * head rebuilt from the signed offer, every π_WIN window against our own
- * records (the node chooses the windows; without this check the equality bit
- * would be an oracle on private plaintext), the π_C3S parameters, the
- * attestation's interval and hashes, and the receipt's signature, binding,
- * usage and cost.
+ * - Framing `"2"` (HTTP/2): the head names no request (the node's SETTINGS
+ *   and one probe that puts the credential into the HPACK table); requests
+ *   follow one at a time, naming the credential by index. One HTTP/2 frame per
+ *   TLS record, π_WIN over the records, `release` as the provider's windows
+ *   open, the response, then the usage disclosure (π_C3S), `accept` (images)
+ *   or the error head (π_WIN under `s_ap_0`).
+ * - Framing `"1.1"`: the head is the request head of request 1, so `request`
+ *   1 goes before the ClientHello; the body follows under `c_ap_1` with the
+ *   canonical suffix alone in the final record, which the node holds until
+ *   π_WIN (one window, the whole record) verifies. The provider closes after
+ *   its response, the node attests, and the client discloses the usage event
+ *   or the error head (π_C3S), or accepts an image response.
+ *
+ * Ported from the reference client (`crypto/client/src/driver*.ts`). What it
+ * verifies is verified here: the π_NK statement against the head rebuilt from
+ * the signed offer, every π_WIN window against our own records (the node
+ * chooses the windows; without this check the equality bit would be an oracle
+ * on private plaintext), the π_C3S parameters, the attestation, and the
+ * receipt's signature, binding (`sid`, `http`, `n`), usage, cost and deposit.
  *
  * A connection is a cache, never a promise: it can die at any time (idle
  * limit, GOAWAY, the node, the network). `bodyReleased` of a request says
  * whether anything of it can have reached the provider; before that a caller
- * may run the request again on another connection.
+ * may run the request again on another connection. A refused request
+ * (`request_refused`) leaves the connection as it was.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -33,9 +41,12 @@ import {
   ConfidentialTimeoutError,
   ConnectionDepositError,
   ReceiptVerificationError,
+  RequestRefusedError,
   ResponseVerificationError,
   SessionProtocolError,
   SessionRejectedError,
+  TwoPcVersionMismatchError,
+  UpgradeRequiredError,
 } from "./errors";
 import {
   FLAG,
@@ -45,6 +56,7 @@ import {
   chatPath,
   checkH2Offer,
   checkPiNKParamsH2,
+  checkPiWinFinalRecord,
   checkPiWinParams,
   decodeBlock,
   frame,
@@ -58,35 +70,51 @@ import {
 } from "./h2";
 import { encryptedNodeTransport } from "./hosts";
 import {
+  CONFIDENTIAL_VERSION,
   imageCountKey,
   imagesOfferProblem,
   offerAbandonFeeMsat,
+  offerConnectionDepositMsat,
+  offerFramings,
+  offerIdleTimeoutS,
   offerSessionFeeMsat,
   offerSupportsImages,
   renderImageSuffix,
+  type ConfidentialFraming,
   type ConfidentialH2Offer,
   type ConfidentialImageVariant,
   type VerifiedOffer,
 } from "./offer";
-import { checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from "./params";
+import { checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params";
 import { CuProverBackend } from "./prover";
 import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
 import {
   countKeyUpdates,
   cryptoRandom,
+  KEPT_SERVER_RECORDS,
   MAX_PENDING_TLS_BYTES,
   SID_RE,
   type ConfidentialReceipt,
   type TlsHandle,
-} from "./session";
-import { canonicalSuffix, effectiveModelFromText, validateChatSuffix, type UpstreamUsageEvent } from "./suffix";
+} from "./wire";
+import {
+  canonicalSuffix,
+  disclosureTailLens,
+  effectiveModelFromText,
+  extractUsageDisclosure,
+  IncrementalHttpResponse,
+  usageEventFromDisclosure,
+  validateChatSuffix,
+  type UpstreamUsageEvent,
+} from "./suffix";
 import { makeTLSClient } from "./tls-fork/lib/index.js";
 import { requireHelperBinaries, TwoPcSession, type TwoPcApplicationSecrets } from "./twopc";
 import { ProofChannel } from "./zkchan";
 
-const H2_TIMEOUTS = {
+const TIMEOUTS = {
   ready: 30_000,
-  twoPcKeyShare: 120_000,
+  /** The sidecar allows 180 s of preprocessing. */
+  twoPcKeyShare: 175_000,
   handshake: 45_000,
   hsVerified: 30_000,
   cCommit: 60_000,
@@ -105,6 +133,14 @@ const H2_TIMEOUTS = {
   zkParams: 30_000,
   attestation: 60_000,
   receipt: 60_000,
+  /** The connection's `closed` frame after its last settlement (framing "1.1"; it carries nothing we need). */
+  closed: 2_000,
+  /**
+   * Framing "2", before the first request: how long to wait for the
+   * provider's answer to the node's probe (stream 1), so that its frames lie
+   * before the first request's interval (§5.4).
+   */
+  probe: 2_000,
 };
 
 /** Control frames of one kind the node may send ahead of the wait for them. */
@@ -113,12 +149,14 @@ const INBOX_MAX = 256;
 /** Response DATA bytes after which a connection is retired (its receive window is 2^31-1). */
 const MAX_CONNECTION_DATA = 1 << 30;
 
-export interface ConfidentialH2ConnectionOptions {
+export interface ConfidentialConnectionOptions {
   /** Node HTTP(S) base. */
   baseUrl: string;
-  /** A verified offer that lists `"2"` in `http`. */
+  /** A verified offer that lists `framing` in `http`. */
   offer: VerifiedOffer;
-  /** The client's bearer for this node: checked at setup, reserved on per request. */
+  /** The framing towards the provider (default: the offer's first). */
+  framing?: ConfidentialFraming;
+  /** The client's bearer for this node: the setup's credential (the deposit); each request names its own. */
   auth: string;
   prover: CuProverBackend;
   twoPcPath?: string;
@@ -127,14 +165,14 @@ export interface ConfidentialH2ConnectionOptions {
   proofChannelFactory?: () => ProofChannel;
   /** Node pubkey the ready frame must announce (default: the offer's). */
   expectedPubkey?: string;
-  timeouts?: Partial<typeof H2_TIMEOUTS>;
+  timeouts?: Partial<typeof TIMEOUTS>;
   /** Largest DATA payload per record (default: the largest that fits one record). */
   chunk?: number;
   /** Dev only: a plain-http node that is neither loopback nor an onion service. */
   allowInsecureTransport?: boolean;
   /**
    * The largest connection deposit (msat) accepted from the offer
-   * (`h2.connection_deposit_msat`); a larger one is refused before anything
+   * (`connection_deposit_msat`); a larger one is refused before anything
    * is sent. Default `DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT`.
    */
   maxDepositMsat?: number;
@@ -146,7 +184,7 @@ export interface ConfidentialH2ConnectionOptions {
 export const DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT = 100_000;
 
 /** What became of a connection's deposit, as the node reported it. */
-export interface H2DepositOutcome {
+export interface DepositOutcome {
   msat: number;
   outcome: "released" | "charged";
   /** `request_settled`, or why a connection without a settled request kept or lost it. */
@@ -155,20 +193,22 @@ export interface H2DepositOutcome {
   signed: boolean;
 }
 
-export interface H2RequestOptions {
+export interface ConnectionRequestOptions {
   /**
    * The verified offer this request is priced by (default: the one the
    * connection was opened on). The node remembers a signed offer for a
    * limited time and re-signs it when its rates move, so a request on a kept
    * connection names the offer the caller verified last. Its connection-level
-   * terms must be the connection's (`h2ConnectionTerms`).
+   * terms must be the connection's (`connectionTerms`).
    */
   offer?: VerifiedOffer;
+  /** The credential the request is reserved and settled on (default: the connection's). */
+  auth?: string;
   model: string;
   /** The pinned completion cap of a chat request (unused for an image request). */
   maxTokens: number;
   /**
-   * An image request (PROTOCOL-V3-DESIGN.md A.13): the offered variant id and
+   * An image request (PROTOCOL-V3.md §3.5, §12.4): the offered variant id and
    * the image count. The body then ends with the image suffix of the signed
    * offer, a 2xx is settled by `accept` at the signed price per image, and
    * the result's body is the provider's JSON as received.
@@ -181,7 +221,7 @@ export interface H2RequestOptions {
 }
 
 /** Bytes between this client and the node, by channel. */
-export interface H2Bytes {
+export interface ConnectionBytes {
   relaySent: number;
   relayRecv: number;
   controlSent: number;
@@ -192,28 +232,34 @@ export interface H2Bytes {
   zkRecv: number;
 }
 
-export interface H2RequestResult {
+export interface ConnectionRequestResult {
   sid: string;
-  /** The request's number on its connection (1, 2, …) and its stream. */
+  http: ConfidentialFraming;
+  /** The request's number on its connection (1, 2, …) and, in framing "2", its stream. */
   n: number;
-  stream: number;
+  stream?: number;
   model: string;
   effectiveModel?: string;
   status: number;
   headers: Record<string, string>;
-  /** The decrypted response body. */
+  /** The decrypted response body (empty for an accepted image response: see `bodyChunks`). */
   body: Uint8Array;
+  /**
+   * An accepted image response: its body in the pieces it arrived in, held
+   * once. The caller takes them out as it decodes them (megabytes).
+   */
+  bodyChunks?: Uint8Array[];
   receipt: ConfidentialReceipt;
   attestation: unknown;
   costMsats?: number;
   warnings?: string[];
   /** Milliseconds from the start of the request on this connection (`startedAt`, wall clock). */
-  timings: { startedAt: number; releasedMs?: number; ttftMs?: number; totalMs: number; proofs: H2ProofTiming[] };
+  timings: { startedAt: number; releasedMs?: number; ttftMs?: number; totalMs: number; proofs: ProofTiming[] };
   /** Bytes between client and node spent on this request (the connection's setup is not included). */
-  bytes: H2Bytes;
+  bytes: ConnectionBytes;
 }
 
-export interface H2ProofTiming {
+export interface ProofTiming {
   proof: string;
   purpose?: string;
   ms: number;
@@ -225,27 +271,32 @@ export interface H2ProofTiming {
 }
 
 /** One request on a connection. */
-export interface H2RequestHandle {
+export interface ConnectionRequestHandle {
+  /** The request's number on the connection (the last accepted request + 1). */
   readonly n: number;
   readonly sid: string;
   /** True once the request may have reached the provider: never run it again elsewhere. */
   readonly bodyReleased: boolean;
   /** True once the `request` frame (with the credential) went out. */
   readonly credentialSent: boolean;
-  readonly done: Promise<H2RequestResult>;
-  /** Abort an unfinished request (this ends the connection); a no-op once it settled. */
+  readonly done: Promise<ConnectionRequestResult>;
+  /** Abort an unfinished request (this ends the connection); a no-op once it settled or was refused. */
   close(): void;
 }
 
 /**
- * What of a signed offer an open connection depends on: the provider, the
- * node's key, the credential's shape, the request route, the chat suffix
- * rules and the `h2` block. Requests priced by another offer may use a
- * connection only when this is the same (rates and fees may differ).
+ * The connection-level fields of a signed offer (§12.1): a request that names
+ * an offer in which one of them differs from the offer of the `setup` is
+ * refused by the node with `offer_changed`. Rates and fees may differ. The
+ * client adds what it holds the node's frames to (its key, the key's shape).
  */
-export function h2ConnectionTerms(offer: VerifiedOffer): string {
+export function connectionTerms(offer: VerifiedOffer): string {
+  const images = offer.images
+    ? Object.fromEntries(Object.entries(offer.images).filter(([k]) => k !== "price_list"))
+    : null;
   return JSON.stringify([
     offer.v,
+    offer.twopc ?? null,
     offer.upstream_host,
     offer.notary_pubkey,
     offer.key_length,
@@ -253,8 +304,14 @@ export function h2ConnectionTerms(offer: VerifiedOffer): string {
     offer.head_template,
     offer.chat,
     offer.h2 ?? null,
+    offerConnectionDepositMsat(offer),
+    offer.idle_timeout_s ?? null,
+    images,
   ]);
 }
+
+/** Where a connection is in its life (§3). */
+export type ConnectionPhase = "new" | "opening" | "armed" | "connecting" | "ready" | "closed";
 
 /** One record this client sent after the handshake. */
 interface OutRec {
@@ -266,14 +323,23 @@ interface OutRec {
 /** The request in flight. */
 interface Cur {
   n: number;
+  /** Framing "2": the request's stream (0 in framing "1.1"). */
   stream: number;
+  /** The credential the request is reserved on. */
+  auth: string;
+  /** True for the connection's first settlement: the session fee is due and the deposit comes back. */
+  first: boolean;
   model: string;
-  opts: H2RequestOptions;
+  opts: ConnectionRequestOptions;
   /** The offer the request is priced by. */
   offer: VerifiedOffer;
   /** An image request's terms from that offer. */
   image?: { variant: ConfidentialImageVariant; count: number };
   tStart: number;
+  /** When the connection was ready for the request (after a claim's handshake). */
+  tOpened?: number;
+  /** An accepted image response: running hashes of its records, one per candidate interval start. */
+  roll?: { from: number; next: number; h: ReturnType<typeof createHash> }[];
   /** Server application-data records decrypted when the request was sent. */
   recvAtSend: number;
   /** Stream offset of the first frame on the request's stream, and the server record that holds it. */
@@ -298,7 +364,7 @@ interface Cur {
   parts: { off: number; data: Uint8Array }[];
   ended: boolean;
   reset?: number;
-  proofs: H2ProofTiming[];
+  proofs: ProofTiming[];
   settled: boolean;
 }
 
@@ -355,22 +421,38 @@ class Inbox {
 
 const u32 = (b: Uint8Array, i = 0) => ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0;
 
-export class ConfidentialH2Connection {
+export class ConfidentialConnection {
   readonly uuid = randomUUID();
   readonly baseUrl: string;
   readonly offer: VerifiedOffer;
-  readonly h2: ConfidentialH2Offer;
-  /** The connection-level terms of the offer it was opened on (`h2ConnectionTerms`). */
+  readonly framing: ConfidentialFraming;
+  /** The offer's checked `h2` block (framing "2"). */
+  readonly h2?: ConfidentialH2Offer;
+  /** Requests this connection may carry (framing "1.1": one). */
+  readonly maxRequests: number;
+  /** How long the node keeps the connection with no request in flight (ms). */
+  readonly nodeIdleMs: number;
+  /** The connection-level terms of the offer it was opened on (`connectionTerms`). */
   readonly terms: string;
   sid = "";
-  /** When the connection was created, opened (`head_written` + SETTINGS) and last settled a request. */
+  /**
+   * When the connection was created, armed (key share done), opened (framing
+   * "2": `head_written` + SETTINGS; "1.1": armed) and last settled a request.
+   */
   readonly tCreated = Date.now();
+  tArmed = 0;
   tOpen = 0;
   tLastSettled = 0;
-  /** Requests started on this connection. */
+  /** Requests the node accepted on this connection (`request_ok`): the next one is `requests + 1`. */
   requests = 0;
-  /** Bytes spent to open the connection (2PC, proof channel setup, π_NK, handshake relay). */
-  setupBytes?: H2Bytes;
+  /** Requests settled on this connection. */
+  settled = 0;
+  /** True when the setup asked for an armed connection (pre-warm). */
+  prewarmed = false;
+  /** Bytes spent to arm the connection (2PC preprocessing, key share, proof channel setup). */
+  armBytes?: ConnectionBytes;
+  /** Framing "2": bytes spent to open the connection (arming, handshake relay, π_NK). */
+  setupBytes?: ConnectionBytes;
   /** Phase times of the connection's setup (ms). */
   setupTimings: Record<string, number> = {};
   /**
@@ -379,7 +461,7 @@ export class ConfidentialH2Connection {
    * receipt, or released/charged in the connection's last frame).
    */
   readonly depositMsat: number;
-  deposit?: H2DepositOutcome;
+  deposit?: DepositOutcome;
 
   private readonly auth: string;
   private readonly prover: CuProverBackend;
@@ -387,7 +469,7 @@ export class ConfidentialH2Connection {
   private readonly twoPcFactory?: () => TwoPcSession;
   private readonly proofChannelFactory?: () => ProofChannel;
   private readonly expectedPubkey: string;
-  private readonly timeouts: typeof H2_TIMEOUTS;
+  private readonly timeouts: typeof TIMEOUTS;
   private readonly chunk: number;
   private readonly onEvent?: (event: Record<string, unknown>) => void;
 
@@ -407,6 +489,12 @@ export class ConfidentialH2Connection {
   private connectStarted = false;
   private opened = false;
   private ready: any = null;
+  private phaseNow: ConnectionPhase = "new";
+  private armP?: Promise<void>;
+  private connectP?: Promise<void>;
+  private keyShare?: Uint8Array;
+  private tSetup = 0;
+  private tReady = 0;
 
   private tls!: TlsHandle;
   private twoPc?: TwoPcSession;
@@ -419,6 +507,8 @@ export class ConfidentialH2Connection {
   private handshakeDone?: () => void;
   private flushChain: Promise<void> = Promise.resolve();
   private pendingTls = 0;
+  /** When the last upstream bytes arrived (a response that streams resets the silence timers). */
+  private tLastWire = 0;
 
   // --- received records -----------------------------------------------------
   private serverPending: Uint8Array = new Uint8Array(0);
@@ -446,7 +536,30 @@ export class ConfidentialH2Connection {
   private proofChain: Promise<unknown> = Promise.resolve();
   private unproven = new Set<number>();
 
+  // --- framing "1.1" ----------------------------------------------------------
+  /** True while the request body is written: those records are the body records. */
+  private bodyEpoch = false;
+  private bodyRecords: Uint8Array[] = [];
+  /** Every upstream byte and record received (the attestation hashes and counts them). */
+  private readonly recvHash = createHash("sha256");
+  private recvRecords = 0;
+  /** Type-23 records let go (only the last ones are needed for π_C3S). */
+  private serverRecordsDropped = 0;
+  private incremental = new IncrementalHttpResponse();
+  private headEmitted = false;
+  /** The decrypted response as it arrived (not kept for an accepted image response), and each record's length. */
+  private rawChunks: Uint8Array[] = [];
+  private rawLens: number[] = [];
+  private rawTotal = 0;
+  private tlsEnded = false;
+
   // --- HTTP/2 state -----------------------------------------------------------
+  /** `SETTINGS_HEADER_TABLE_SIZE` of the provider's SETTINGS so far (null: never sent). */
+  private tableSize: number | null = null;
+  private settingsSeenSent = false;
+  /** The provider answered the node's probe (a frame on stream 1). */
+  private probeAnswered = false;
+  private tHeadWritten = 0;
   private gotSettings = false;
   private initialWindow = 65535;
   private connCredit = 65535;
@@ -458,16 +571,27 @@ export class ConfidentialH2Connection {
 
   private bytes = { relaySent: 0, relayRecv: 0, controlSent: 0, controlRecv: 0 };
 
-  constructor(options: ConfidentialH2ConnectionOptions) {
+  constructor(options: ConfidentialConnectionOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.offer = options.offer;
-    if (options.offer.v !== 2) throw new SessionProtocolError(`unsupported protocol version v=${options.offer.v}`);
-    if (!options.offer.h2) throw new SessionProtocolError("the signed offer serves no http: 2 sessions");
-    // Held to the same limits as at verification (a caller may pass an offer
-    // that did not go through verifyConfidentialOffer); the probe's API base
-    // was checked there against the caller's trusted hosts.
-    const probe = options.offer.h2.probe_path;
-    this.h2 = checkH2Offer(options.offer, [probe.slice(0, Math.max(0, probe.length - "/models".length))]);
+    if (options.offer.v !== CONFIDENTIAL_VERSION) {
+      throw new SessionProtocolError(`unsupported protocol version v=${options.offer.v}`);
+    }
+    const offered = offerFramings(options.offer);
+    this.framing = options.framing ?? offered[0] ?? "1.1";
+    if (!offered.includes(this.framing)) {
+      throw new SessionProtocolError(`the signed offer does not serve framing "${this.framing}"`);
+    }
+    if (this.framing === "2") {
+      if (!options.offer.h2) throw new SessionProtocolError('the signed offer has no h2 block for framing "2"');
+      // Held to the same limits as at verification (a caller may pass an offer
+      // that did not go through verifyConfidentialOffer); the probe's API base
+      // was checked there against the caller's trusted hosts.
+      const probe = options.offer.h2.probe_path;
+      this.h2 = checkH2Offer(options.offer, [probe.slice(0, Math.max(0, probe.length - "/models".length))]);
+    }
+    this.maxRequests = this.h2 ? this.h2.max_requests : 1;
+    this.nodeIdleMs = offerIdleTimeoutS(options.offer) * 1000;
     try {
       validateChatSuffix(options.offer.chat, options.offer.suffix_keys);
     } catch (e) {
@@ -478,7 +602,7 @@ export class ConfidentialH2Connection {
         `refusing plain http to ${this.baseUrl}: the node credential would travel unencrypted`,
       );
     }
-    this.depositMsat = this.h2.connection_deposit_msat;
+    this.depositMsat = offerConnectionDepositMsat(options.offer);
     const maxDeposit = options.maxDepositMsat ?? DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT;
     if (this.depositMsat > maxDeposit) {
       throw new ConnectionDepositError(
@@ -486,14 +610,14 @@ export class ConfidentialH2Connection {
         this.depositMsat,
       );
     }
-    this.terms = h2ConnectionTerms(options.offer);
+    this.terms = connectionTerms(options.offer);
     this.auth = options.auth;
     this.prover = options.prover;
     this.twoPcPath = options.twoPcPath;
     this.twoPcFactory = options.twoPcFactory;
     this.proofChannelFactory = options.proofChannelFactory;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
-    this.timeouts = { ...H2_TIMEOUTS, ...(options.timeouts ?? {}) };
+    this.timeouts = { ...TIMEOUTS, ...(options.timeouts ?? {}) };
     this.chunk = Math.max(1, Math.min(options.chunk ?? MAX_DATA_IN_RECORD, MAX_DATA_IN_RECORD));
     this.onEvent = options.onEvent;
     this.errP = new Promise<never>((_, rej) => (this.errRej = rej));
@@ -502,18 +626,28 @@ export class ConfidentialH2Connection {
 
   // --- state ------------------------------------------------------------------
 
-  /** Open, healthy and able to take another request (none is in flight). */
+  /** Where the connection is in its life. */
+  get phase(): ConnectionPhase {
+    return this.failure ? "closed" : this.phaseNow;
+  }
+
+  /** Able to take a request now: armed or open, healthy, none in flight. */
   get idle(): boolean {
     return this.usable && !this.cur;
   }
 
-  /** Open and healthy, with requests left. */
+  /** Armed (the key share is done, no provider connection yet) and healthy. */
+  get armed(): boolean {
+    return this.phase === "armed" && this.usable;
+  }
+
+  /** Armed or open, healthy, with requests left. */
   get usable(): boolean {
     return (
-      this.opened &&
+      (this.phaseNow === "armed" || this.phaseNow === "ready") &&
       !this.failure &&
       !this.goaway &&
-      this.requests < this.h2.max_requests &&
+      this.requests < this.maxRequests &&
       this.dataBytes < MAX_CONNECTION_DATA &&
       !(this.twoPc?.failed ?? false) &&
       !(this.zkChan?.failed ?? false)
@@ -535,7 +669,7 @@ export class ConfidentialH2Connection {
   }
 
   /** Bytes between client and node so far, by channel. */
-  byteCounts(): H2Bytes {
+  byteCounts(): ConnectionBytes {
     return {
       ...this.bytes,
       twoPcSent: this.twoPc?.bytesSent ?? 0,
@@ -559,6 +693,7 @@ export class ConfidentialH2Connection {
   private fail(e: Error): void {
     if (this.failure) return;
     this.failure = e;
+    this.phaseNow = "closed";
     this.errRej(e);
     this.endedRes(e);
     this.teardown();
@@ -575,7 +710,11 @@ export class ConfidentialH2Connection {
     }
   }
 
-  /** Close the connection (the node releases what an unfinished request reserved, by its abort rules). */
+  /**
+   * Close the connection. The node releases what an unfinished request
+   * reserved by its abort rules (§12.10); a connection that never settled a
+   * request loses its deposit.
+   */
   close(reason = "closed by the client"): void {
     this.fail(new SessionRejectedError(`connection closed: ${reason}`));
   }
@@ -588,7 +727,8 @@ export class ConfidentialH2Connection {
 
   private zkUrl(proof: string): string {
     const token = typeof this.ready?.zk_token === "string" ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : "";
-    return `${this.wsBase()}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&session_id=${encodeURIComponent(this.sid)}${token}`;
+    const sid = encodeURIComponent(this.sid);
+    return `${this.wsBase()}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&sid=${sid}&session_id=${sid}${token}`;
   }
 
   private sendText(obj: unknown): void {
@@ -612,7 +752,7 @@ export class ConfidentialH2Connection {
   }
 
   private openSocket(): Promise<void> {
-    const ws = new WebSocket(`${this.wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=2`);
+    const ws = new WebSocket(`${this.wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=${CONFIDENTIAL_VERSION}`);
     this.ws = ws;
     ws.binaryType = "arraybuffer";
     const opened = new Promise<void>((res) => {
@@ -650,6 +790,7 @@ export class ConfidentialH2Connection {
         return;
       }
       this.pendingTls += bytes.length;
+      this.tLastWire = Date.now();
       this.trackServerRecords(bytes);
       this.flushChain = this.flushChain
         .then(() => this.tls.handleReceivedBytes(bytes))
@@ -683,17 +824,7 @@ export class ConfidentialH2Connection {
     switch (m.type) {
       case "error": {
         this.noteDeposit(m);
-        const type = (m.detail as { error?: { type?: unknown } } | undefined)?.error?.type;
-        this.fail(
-          type === "connection_deposit_unfunded"
-            ? new ConnectionDepositError(
-                `node rejected: ${String(m.reason ?? "the balance does not cover the connection deposit")}`,
-                this.depositMsat,
-                m.status,
-                m.detail,
-              )
-            : new SessionRejectedError(`node rejected: ${String(m.reason ?? "unknown")}`, undefined, m.status, m.detail),
-        );
+        this.fail(this.nodeError(m));
         return;
       }
       case "closed":
@@ -710,10 +841,14 @@ export class ConfidentialH2Connection {
           this.kick();
         }
         return;
+      case "upstream_closed_early":
+        // The provider closed before the request was fully written; the `error` follows.
+        this.event({ ev: "upstream_closed_early", n: m.n, response_bytes: m.response_bytes });
+        return;
       case "zk_params": {
         const key = `zk_params:${String(m.proof)}:${String(m.purpose ?? "")}`;
         // Our own records: proven as the node asks, in order, whenever it asks.
-        if (key === "zk_params:pi_win:records") {
+        if (key === "zk_params:pi_win:records" && this.framing === "2") {
           void this.proveRecords(m).catch((e) => this.fail(e instanceof Error ? e : new SessionProtocolError(String(e))));
           return;
         }
@@ -723,6 +858,38 @@ export class ConfidentialH2Connection {
       default:
         this.inbox.push(m.type, m);
     }
+  }
+
+  /** The node's `error` frame as a typed error (§12.9: `status`, `code`, `fault`). */
+  private nodeError(m: any): Error {
+    const reason = typeof m.reason === "string" ? m.reason : JSON.stringify(m.reason ?? "unknown");
+    const code = typeof m.code === "string" ? m.code.slice(0, 64) : undefined;
+    const type = (m.detail as { error?: { type?: unknown } } | undefined)?.error?.type;
+    if (m.status === 426 || code === "upgrade_required" || reason === "upgrade_required") {
+      return new UpgradeRequiredError(
+        `upgrade_required: the node speaks a newer routstr-confidential protocol` +
+          `${Number.isSafeInteger(m.min_v) ? ` (v${m.min_v} or later)` : ""} than this client (v${CONFIDENTIAL_VERSION}); update the client`,
+        Number.isSafeInteger(m.min_v) ? m.min_v : undefined,
+        m.detail,
+      );
+    }
+    if (code === "twopc_version_mismatch") {
+      return new TwoPcVersionMismatchError(
+        `twopc_version_mismatch: the node's sidecar runs another version of the two-party key schedule than cu-2pc (${reason.slice(0, 200)})`,
+      );
+    }
+    if (type === "connection_deposit_unfunded") {
+      return new ConnectionDepositError(`node rejected: ${reason.slice(0, 300)}`, this.depositMsat, m.status, m.detail);
+    }
+    const e = new SessionRejectedError(
+      `node rejected: ${reason.slice(0, 300)}`,
+      undefined,
+      Number.isSafeInteger(m.status) ? m.status : undefined,
+      m.detail,
+    );
+    e.nodeCode = code;
+    if (m.fault === "upstream" || m.fault === "node") e.fault = m.fault;
+    return e;
   }
 
   /**
@@ -746,7 +913,7 @@ export class ConfidentialH2Connection {
       verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
       (d.sid === this.sid || (d.sid === null && !this.sid));
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
-    this.event({ ev: "h2_deposit", ...this.deposit });
+    this.event({ ev: "deposit", ...this.deposit });
   }
 
   /** The next control frame of one of `keys`, or the connection's failure, or a timeout. */
@@ -798,11 +965,23 @@ export class ConfidentialH2Connection {
   }
 
   private trackServerRecords(bytes: Uint8Array): void {
+    if (this.framing === "1.1") this.recvHash.update(bytes);
     let buf = this.serverPending.length ? concat(this.serverPending, bytes) : bytes;
     while (buf.length >= 5) {
       const len = (buf[3]! << 8) | buf[4]!;
       if (buf.length < 5 + len) break;
-      if (buf[0] === 0x17) this.serverRecords.set(this.wireRecords++, buf.slice(5, 5 + len));
+      this.recvRecords++;
+      if (buf[0] === 0x17) {
+        this.serverRecords.set(this.wireRecords++, buf.slice(5, 5 + len));
+        // Framing "1.1": π_C3S covers only records at the end of the response.
+        if (this.framing === "1.1" && this.serverRecords.size > 2 * KEPT_SERVER_RECORDS) {
+          for (const abs of this.serverRecords.keys()) {
+            if (this.serverRecords.size <= KEPT_SERVER_RECORDS) break;
+            this.serverRecords.delete(abs);
+            this.serverRecordsDropped++;
+          }
+        }
+      }
       buf = buf.subarray(5 + len);
     }
     this.serverPending = buf.slice();
@@ -825,28 +1004,40 @@ export class ConfidentialH2Connection {
   }
 
   /**
-   * setup → ready → 2PC → handshake (ALPN h2) → π_NK on the connection head →
-   * release_head → head_written → the provider's SETTINGS. The node checks
-   * the credential and reserves the offer's connection deposit (released
-   * with the first settled request); no request is reserved yet.
+   * `setup` → `ready` → the two-party preprocessing and the joint key share
+   * (§3.1, §12.3). The node checks the credential and reserves the offer's
+   * connection deposit; nothing names a request, and the sidecar has no
+   * provider connection. With `prewarm` the setup says `armed: true` and the
+   * proof channel's correlations are awaited too, so a later request finds
+   * everything ready. Idempotent.
    */
-  async connect(): Promise<void> {
-    if (this.connectStarted) throw new SessionProtocolError("connect() called twice");
-    this.connectStarted = true;
-    try {
-      await this.connectInner();
-    } catch (e) {
-      const err = e instanceof Error ? e : new SessionProtocolError(String(e));
-      this.fail(err);
-      throw this.failure ?? err;
+  arm(prewarm = false): Promise<void> {
+    if (!this.armP) {
+      this.connectStarted = true;
+      this.prewarmed = prewarm;
+      this.phaseNow = "opening";
+      this.armP = this.armInner(prewarm).catch((e) => {
+        const err = e instanceof Error ? e : new SessionProtocolError(String(e));
+        this.fail(err);
+        throw this.failure ?? err;
+      });
+      this.armP.catch(() => {});
     }
+    return this.armP;
   }
 
-  private async connectInner(): Promise<void> {
+  private async armInner(prewarm: boolean): Promise<void> {
     const t0 = Date.now();
+    this.tSetup = t0;
     this.checkBinaries();
     await this.openSocket();
-    const setup: Record<string, unknown> = { type: "setup", http: 2, nonce_c: hex(cryptoRandom(32)), armed: false };
+    const setup: Record<string, unknown> = {
+      type: "setup",
+      v: CONFIDENTIAL_VERSION,
+      http: this.framing,
+      nonce_c: hex(cryptoRandom(32)),
+      armed: prewarm,
+    };
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     setup.auth = this.auth;
     this.sendText(setup);
@@ -854,38 +1045,90 @@ export class ConfidentialH2Connection {
     this.ready = (await this.wait(["ready"], this.timeouts.ready)).msg;
     if (this.expectedPubkey && this.ready.pubkey !== this.expectedPubkey) {
       throw new SessionProtocolError(
-        `session pubkey ${String(this.ready.pubkey)} differs from the signed offer key ${this.expectedPubkey}`,
+        `connection pubkey ${String(this.ready.pubkey).slice(0, 80)} differs from the signed offer key ${this.expectedPubkey}`,
       );
     }
     if (typeof this.ready?.sid !== "string" || !SID_RE.test(this.ready.sid)) {
-      throw new SessionProtocolError("node announced a malformed session id");
+      throw new SessionProtocolError("node announced a malformed connection id");
     }
-    if (this.ready.v !== 2 || this.ready.http !== 2) {
-      throw new SessionProtocolError("node did not start an http: 2 session");
+    if (this.ready.v !== CONFIDENTIAL_VERSION || this.ready.http !== this.framing) {
+      throw new SessionProtocolError(`node did not open a v${CONFIDENTIAL_VERSION} connection with framing "${this.framing}"`);
+    }
+    if (this.ready.armed !== undefined && this.ready.armed !== prewarm) {
+      throw new SessionProtocolError("ready names another armed state than the setup");
     }
     // What the setup reserved must be the signed offer's deposit (a sidecar
     // without a node names none).
     if (this.ready.deposit_msat !== undefined && this.ready.deposit_msat !== this.depositMsat) {
       throw new SessionProtocolError(
-        `node reserved a connection deposit of ${String(this.ready.deposit_msat)} msat, the signed offer's is ${this.depositMsat}`,
+        `node reserved a connection deposit of ${String(this.ready.deposit_msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat}`,
       );
     }
     this.sid = this.ready.sid;
-    const tReady = Date.now();
-    this.event({ ev: "h2_ready" });
+    this.tReady = Date.now();
+    this.event({ ev: "ready", http: this.framing, armed: prewarm });
 
     const twoPc = this.twoPcFactory?.() ?? new TwoPcSession({ binaryPath: this.twoPcPath, proverPath: this.prover.path });
     this.twoPc = twoPc;
     twoPc.start(this.zkUrl("twopc"));
-    // π_WIN and π_C3S run once per request: the channel must repeat them.
-    this.zkChan = this.proofChannelFactory?.() ?? new ProofChannel({ binaryPath: this.prover.path, multi: true });
+    // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
+    this.zkChan = this.proofChannelFactory?.() ?? new ProofChannel({ binaryPath: this.prover.path });
     this.zkChan.start(this.zkUrl("zkchan"));
-    const keyShare = await Promise.race([twoPc.keyShare(this.timeouts.twoPcKeyShare), this.errP]);
+    this.keyShare = await Promise.race([twoPc.keyShare(this.timeouts.twoPcKeyShare), this.errP]);
     const tKeyShare = Date.now();
+    this.setupTimings.readyMs = this.tReady - t0;
+    this.setupTimings.twoPcKeyShareMs = tKeyShare - this.tReady;
+    if (prewarm) {
+      // Pre-warm: the proof channel's correlations are part of it. A channel
+      // that does not come up is not fatal (the proofs then run one by one).
+      await Promise.race([this.zkChan.ready(this.timeouts.proofChannelReady), this.errP]);
+    }
+    this.tArmed = Date.now();
+    this.setupTimings.armMs = this.tArmed - t0;
+    this.armBytes = this.byteCounts();
+    this.phaseNow = "armed";
+    if (this.framing === "1.1") {
+      this.opened = true;
+      this.tOpen = this.tLastSettled = this.tArmed;
+    }
+    this.event({ ev: "armed", http: this.framing, arm_ms: this.tArmed - t0 });
+  }
 
+  /**
+   * Open the connection as far as it goes without a request. Framing `"2"`:
+   * arm (unless it is armed), the handshake (ALPN `h2`), π_NK on the
+   * connection head, `release_head`, `head_written`, the provider's SETTINGS
+   * and `settings_seen`: READY. Framing `"1.1"`: armed is as far as it goes
+   * (its head names request 1). Idempotent.
+   */
+  connect(): Promise<void> {
+    if (!this.connectP) {
+      this.connectP = (async () => {
+        await this.arm(false);
+        if (this.framing !== "2") return;
+        try {
+          await this.connectInner();
+        } catch (e) {
+          const err = e instanceof Error ? e : new SessionProtocolError(String(e));
+          this.fail(err);
+          throw this.failure ?? err;
+        }
+      })();
+      this.connectP.catch(() => {});
+    }
+    return this.connectP;
+  }
+
+  /**
+   * The handshake to `hs_verified` (§12.5): the ClientHello with exactly the
+   * joint share; the key schedule runs on the 2PC channel; the node verifies
+   * chain, hostname, CertificateVerify and both Finished.
+   */
+  private async handshake(): Promise<void> {
+    const twoPc = this.twoPc!;
     const handshakeP = new Promise<void>((res) => (this.handshakeDone = res));
     this.makeTls({
-      keyShare,
+      keyShare: this.keyShare!,
       onServerHello: async (serverShare, thSH) => {
         this.thSH = thSH;
         return twoPc.handshake(serverShare, thSH);
@@ -900,30 +1143,57 @@ export class ConfidentialH2Connection {
     await Promise.race([handshakeP, this.errP, rejectAfter(this.timeouts.handshake, "handshake")]);
     if (!this.ap) throw new SessionProtocolError("handshake finished without 2PC application secrets");
     await this.wait(["hs_verified"], this.timeouts.hsVerified);
-    const tHs = Date.now();
+  }
 
-    // π_NK: the node's one epoch-0 record is the connection head of the
-    // signed offer (its SETTINGS, its probe, the credential as the one table
-    // entry), under the K_0 our 2PC anchored.
+  /**
+   * `c_commit` and π_NK: the node's one epoch-0 record is the head of the
+   * framing (rebuilt here from the signed offer) with a key of the offer's
+   * alphabet, under the K_0 our 2PC anchored. Framing `"1.1"`: the head of
+   * our request 1.
+   */
+  private async proveHead(req?: { kind: "chat" | "images"; bodyLen: number; headLen: number; headTemplate: string }): Promise<void> {
+    const ap = this.ap!;
     const commit = (await this.wait(["c_commit"], this.timeouts.cCommit)).msg;
     for (const k of ["h1", "h2", "hk"] as const) {
-      if (commit[k] !== undefined && commit[k] !== hex(this.ap[k])) {
+      if (commit[k] !== undefined && commit[k] !== hex(ap[k])) {
         throw new SessionProtocolError(`c_commit: ${k} differs from our 2PC output`);
       }
     }
-    checkPiNKParamsH2(commit.params, {
-      host: this.offer.upstream_host,
-      probePath: this.h2.probe_path,
-      keyLength: this.offer.key_length,
-      keyAlphabet: this.offer.key_alphabet,
-      hk: this.ap.hk,
-    });
+    const headLen = (commit.params as { PiNK?: { head_len?: unknown } } | null)?.PiNK?.head_len;
+    if (this.framing === "2") {
+      checkPiNKParamsH2(commit.params, {
+        host: this.offer.upstream_host,
+        probePath: this.h2!.probe_path,
+        keyLength: this.offer.key_length,
+        keyAlphabet: this.offer.key_alphabet,
+        hk: ap.hk,
+      });
+      if (this.ready.head_len !== undefined && this.ready.head_len !== headLen) {
+        throw new SessionProtocolError("ready names another head length than π_NK proves");
+      }
+    } else {
+      checkPiNKParams(commit.params, {
+        offer: { ...this.offer, head_template: req!.headTemplate },
+        hk: ap.hk,
+        bodyLen: req!.bodyLen,
+        kind: req!.kind,
+      });
+      if (req!.headLen !== headLen) throw new SessionProtocolError("request_ok names another head length than π_NK proves");
+    }
     const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
     if (commit.c_commit !== pinkCommit) {
       throw new SessionProtocolError("c_commit: the frame's commitment is not the one π_NK proves");
     }
     this.cCommitHex = pinkCommit;
     await this.proof("pi_nk", "verify", commit.params);
+  }
+
+  private async connectInner(): Promise<void> {
+    const t0 = Date.now();
+    this.phaseNow = "connecting";
+    await this.handshake();
+    const tHs = Date.now();
+    await this.proveHead();
     const tNk = Date.now();
 
     // The node writes the head (epoch 0) and its KeyUpdate; we are keyed for
@@ -931,22 +1201,29 @@ export class ConfidentialH2Connection {
     // request of ours, nothing reserved.
     this.sendText({ type: "release_head" });
     await this.wait(["head_written"], this.timeouts.headWritten);
-    const tHead = Date.now();
+    const tHead = (this.tHeadWritten = Date.now());
     await this.until(() => this.gotSettings, "the provider's SETTINGS", this.timeouts.settings);
+    // §12.6: required before the first request; sent again when a later SETTINGS carries the parameter.
+    this.sendSettingsSeen();
     this.opened = true;
+    this.phaseNow = "ready";
     this.tOpen = Date.now();
     this.tLastSettled = this.tOpen;
     this.setupBytes = this.byteCounts();
-    this.setupTimings = {
-      readyMs: tReady - t0,
-      twoPcKeyShareMs: tKeyShare - tReady,
-      handshakeMs: tHs - tKeyShare,
+    Object.assign(this.setupTimings, {
+      handshakeMs: tHs - t0,
       piNkMs: tNk - tHs,
       headMs: tHead - tNk,
       settingsMs: this.tOpen - tHead,
-      connectMs: this.tOpen - t0,
-    };
-    this.event({ ev: "h2_open", ...this.setupTimings });
+      connectMs: this.tOpen - this.tSetup,
+      claimMs: this.tOpen - t0,
+    });
+    this.event({ ev: "open", http: "2", ...this.setupTimings });
+  }
+
+  private sendSettingsSeen(): void {
+    this.settingsSeenSent = true;
+    this.sendOrdered({ type: "settings_seen", header_table_size: this.tableSize });
   }
 
   private makeTls(external: {
@@ -961,7 +1238,7 @@ export class ConfidentialH2Connection {
       cipherSuites: ["TLS_AES_128_GCM_SHA256"],
       supportedProtocolVersions: ["TLS1_3"],
       namedCurves: ["SECP256R1"],
-      applicationLayerProtocols: ["h2"],
+      applicationLayerProtocols: [this.framing === "2" ? "h2" : "http/1.1"],
       write: (packet: { header: Uint8Array; content: Uint8Array }) => {
         const record = concat(packet.header, packet.content);
         const d = this.pendingDesc;
@@ -973,7 +1250,7 @@ export class ConfidentialH2Connection {
           this.out.set(seq, { wire: record, plain: d.plain, pub: d.pub });
           this.unproven.add(seq);
           this.lastSeq = seq;
-        }
+        } else if (this.bodyEpoch) this.bodyRecords.push(record);
         this.sendBytes(record);
       },
       onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string; plaintext?: Uint8Array }) => {
@@ -986,7 +1263,7 @@ export class ConfidentialH2Connection {
         // Only a record that may hold the response head is kept in plaintext
         // (an error head is disclosed from it).
         const cur = this.cur;
-        if (ctx.plaintext && cur && (cur.status === undefined || cur.status >= 400)) {
+        if (this.framing === "2" && ctx.plaintext && cur && (cur.status === undefined || cur.status >= 400)) {
           this.plain.set(this.curAbs, ctx.plaintext);
         }
         this.serverPost.push({
@@ -1000,6 +1277,11 @@ export class ConfidentialH2Connection {
         this.certChainHash = new Uint8Array(h.digest());
       },
       onApplicationData: (rec: Uint8Array) => {
+        if (this.framing === "1.1") {
+          this.onResponseBytes(rec);
+          this.kick();
+          return;
+        }
         try {
           for (const f of this.reader.push(rec, this.curAbs)) this.onFrame(f);
         } catch (e) {
@@ -1013,6 +1295,7 @@ export class ConfidentialH2Connection {
       },
       onTlsEnd: () => {
         // The provider closed (or the node did): nothing more can be sent.
+        this.tlsEnded = true;
         this.goaway = true;
         this.kick();
       },
@@ -1034,8 +1317,8 @@ export class ConfidentialH2Connection {
     cmd: "prove" | "verify",
     params: unknown,
     witness?: unknown,
-  ): Promise<H2ProofTiming> {
-    const run = async (): Promise<H2ProofTiming> => {
+  ): Promise<ProofTiming> {
+    const run = async (): Promise<ProofTiming> => {
       if (this.failure) throw this.failure;
       const t = Date.now();
       const ch = this.zkChan;
@@ -1060,19 +1343,29 @@ export class ConfidentialH2Connection {
       cur.firstFrameOff = f.off;
       cur.firstFrameAbs = this.reader.recordAt(f.off).abs;
     }
+    // The only other stream is the node's probe (stream 1, reset in the head).
+    if (f.stream === 1) this.probeAnswered = true;
     switch (f.type) {
-      case FRAME.SETTINGS:
+      case FRAME.SETTINGS: {
         if (f.flags & FLAG.ACK) break;
+        let carried = false;
         for (let i = 0; i + 6 <= f.payload.length; i += 6) {
           const id = (f.payload[i]! << 8) | f.payload[i + 1]!;
-          if (id === 4) this.initialWindow = u32(f.payload, i + 2);
+          const v = u32(f.payload, i + 2);
+          if (id === 4) this.initialWindow = v;
+          if (id === 1) {
+            this.tableSize = v;
+            carried = true;
+          }
         }
         this.gotSettings = true;
+        if (carried && this.settingsSeenSent) this.sendSettingsSeen();
         // Acknowledged with the next request's records (one π_WIN for both)
         // when none is open, else at once.
         if (this.requestOpen) void this.sendCtl("settings_ack", new Uint8Array(0));
         else this.unackedSettings++;
         break;
+      }
       case FRAME.PING:
         if (!(f.flags & FLAG.ACK)) void this.sendCtl("ping_ack", f.payload);
         break;
@@ -1086,7 +1379,7 @@ export class ConfidentialH2Connection {
       }
       case FRAME.GOAWAY:
         this.goaway = true;
-        this.event({ ev: "h2_goaway" });
+        this.event({ ev: "goaway" });
         break;
       case FRAME.RST_STREAM:
         if (cur && f.stream === cur.stream && f.payload.length >= 4) cur.reset = u32(f.payload);
@@ -1123,8 +1416,12 @@ export class ConfidentialH2Connection {
         this.dataBytes += f.payload.length;
         cur.parts.push({ off: f.off + 9, data: f.payload });
         // A successful image response is megabytes and is never disclosed:
-        // its records need not be kept beyond the frame being read.
-        if (cur.image && (cur.status ?? 0) < 300 && cur.parts.length % 64 === 0) this.reader.dropBefore(f.off);
+        // neither its plaintext records nor its ciphertext need be kept beyond
+        // the frame being read (the attestation's hash is computed as it arrives).
+        if (cur.image && (cur.status ?? 0) >= 200 && (cur.status ?? 0) < 300 && cur.parts.length % 32 === 0) {
+          this.reader.dropBefore(f.off);
+          this.rollImageRecords(cur, this.reader.recordAt(f.off).abs);
+        }
         if (f.payload.length) cur.opts.onResponseBody?.(f.payload);
         if (f.flags & FLAG.END_STREAM) this.streamEnded(cur);
         break;
@@ -1227,15 +1524,18 @@ export class ConfidentialH2Connection {
   // --- one request ----------------------------------------------------------------
 
   /**
-   * Start a request on this idle connection. Throws synchronously when the
-   * connection cannot take one (nothing was sent then).
+   * Start a request on this idle (armed or open) connection. Throws
+   * synchronously when the connection cannot take one (nothing was sent
+   * then). The handle's `done` rejects with `RequestRefusedError` when the
+   * node refused the request: the connection is then as it was, and the next
+   * request carries the same number.
    */
-  request(opts: H2RequestOptions): H2RequestHandle {
+  request(opts: ConnectionRequestOptions): ConnectionRequestHandle {
     if (!this.idle) {
-      throw this.failure ?? new SessionRejectedError("the http: 2 connection is not idle");
+      throw this.failure ?? new SessionRejectedError("the connection cannot take a request now");
     }
     const offer = opts.offer ?? this.offer;
-    if (offer !== this.offer && h2ConnectionTerms(offer) !== this.terms) {
+    if (offer !== this.offer && connectionTerms(offer) !== this.terms) {
       throw new SessionProtocolError("the request's offer has other connection terms than this connection was opened on");
     }
     const image = opts.image ? this.imageTerms(offer, opts.model, opts.image) : undefined;
@@ -1245,13 +1545,15 @@ export class ConfidentialH2Connection {
         : canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens),
     );
     const body = opts.body;
-    if (body.length < suffix.length || !suffix.every((b, i) => body[body.length - suffix.length + i] === b)) {
+    if (body.length <= suffix.length || !suffix.every((b, i) => body[body.length - suffix.length + i] === b)) {
       throw new SessionProtocolError("request body does not end with the pinned suffix");
     }
-    const n = ++this.requests;
+    const n = this.requests + 1;
     const cur: Cur = {
       n,
-      stream: requestStream(n),
+      stream: this.framing === "2" ? requestStream(n) : 0,
+      auth: opts.auth ?? this.auth,
+      first: this.settled === 0,
       model: opts.model,
       opts,
       offer,
@@ -1271,22 +1573,27 @@ export class ConfidentialH2Connection {
       proofs: [],
       settled: false,
     };
-    // An earlier request's records are no longer needed.
-    for (const abs of this.serverRecords.keys()) {
-      if (abs < cur.recvAtSend) this.serverRecords.delete(abs);
-      else break;
-    }
-    this.plain.clear();
     this.cur = cur;
     let credentialSent = false;
-    const done = this.runRequest(cur, suffix, () => (credentialSent = true)).then(
+    let over = false;
+    const run = this.framing === "2" ? this.runRequest(cur, suffix, () => (credentialSent = true)) : this.runRequest11(cur, suffix, () => (credentialSent = true));
+    const done = run.then(
       (r) => {
         cur.settled = true;
+        over = true;
         return r;
       },
       (e) => {
-        // The prototype rule: any failure ends the connection.
         const err = e instanceof Error ? e : new SessionProtocolError(String(e));
+        // A refused request leaves the connection as it was (§12.4).
+        if (err instanceof RequestRefusedError && !this.failure && this.cur === cur && !cur.accepted) {
+          this.cur = undefined;
+          over = true;
+          this.tLastSettled = Math.max(this.tLastSettled, this.tOpen);
+          this.event({ ev: "request_refused", n, status: err.status });
+          this.kick();
+          throw err;
+        }
         this.fail(err);
         throw this.failure ?? err;
       },
@@ -1300,11 +1607,11 @@ export class ConfidentialH2Connection {
         return cur.releaseSent;
       },
       get credentialSent() {
-        return credentialSent;
+        return credentialSent || conn.credentialSent;
       },
       done,
       close() {
-        if (!cur.settled) conn.close("request aborted");
+        if (!over) conn.close("request aborted");
       },
     };
   }
@@ -1320,8 +1627,8 @@ export class ConfidentialH2Connection {
     want: { variant: string; count: number },
   ): { variant: ConfidentialImageVariant; count: number } {
     const images = offer.images;
-    if (!this.h2.kinds.includes("images") || !offerSupportsImages(offer) || !images) {
-      throw new SessionProtocolError("the signed offer serves no image requests over http: 2");
+    if ((this.h2 && !this.h2.kinds.includes("images")) || !offerSupportsImages(offer) || !images) {
+      throw new SessionProtocolError(`the signed offer serves no image requests on framing "${this.framing}"`);
     }
     const problem = imagesOfferProblem(images, offer.upstream_host);
     if (problem) throw new SessionProtocolError(`the signed offer's images block is refused: ${problem}`);
@@ -1334,8 +1641,68 @@ export class ConfidentialH2Connection {
     return { variant, count: want.count };
   }
 
-  private async runRequest(cur: Cur, suffix: Uint8Array, onSent: () => void): Promise<H2RequestResult> {
+  /** The `request` message of §12.4 for `cur`. */
+  private requestMessage(cur: Cur, bodyLen: number): Record<string, unknown> {
+    const { opts, n } = cur;
+    // An image request names the variant and the count: the node renders
+    // the suffix from its own signed offer and echoes it in `request_ok`.
+    const req: Record<string, unknown> = cur.image
+      ? { type: "request", n, kind: "images", model: opts.model, variant: cur.image.variant.id, count: cur.image.count, body_len: bodyLen }
+      : { type: "request", n, kind: "chat", model: opts.model, max_tokens: opts.maxTokens, body_len: bodyLen };
+    if (cur.offer.sig) req.offer_sig = cur.offer.sig;
+    // The fee fields echo the named offer's fees (409 `session_fee_not_accepted` otherwise).
+    req.session_fee_msat = offerSessionFeeMsat(cur.offer);
+    req.abandon_fee_msat = offerAbandonFeeMsat(cur.offer);
+    req.auth = cur.auth;
+    return req;
+  }
+
+  /**
+   * Send `request` n and wait for its answer (§12.4). No record of the
+   * request may be sent before this returns (framing "1.1": not even the
+   * ClientHello). A refusal throws `RequestRefusedError`.
+   */
+  private async openRequest(cur: Cur, bodyLen: number, suffix: Uint8Array, onSent: () => void): Promise<any> {
+    this.sendOrdered(this.requestMessage(cur, bodyLen));
+    onSent();
+    const { key, msg } = await this.wait(["request_ok", "request_refused"], this.timeouts.requestOk);
+    if (key === "request_refused") {
+      if (msg.n !== cur.n) throw new SessionProtocolError("request_refused names another request");
+      const status = Number.isSafeInteger(msg.status) && msg.status >= 400 && msg.status <= 599 ? msg.status : 400;
+      const reason = typeof msg.reason === "string" ? msg.reason : JSON.stringify(msg.reason ?? "refused");
+      throw new RequestRefusedError(status, reason, msg.detail);
+    }
+    if (msg.n !== cur.n || (msg.sid !== undefined && msg.sid !== this.sid)) {
+      throw new SessionProtocolError("request_ok names another connection or request");
+    }
+    if (msg.suffix !== new TextDecoder().decode(suffix)) {
+      throw new SessionProtocolError("node expects a different pinned suffix than ours");
+    }
+    this.requests = cur.n;
+    cur.accepted = true;
+    return msg;
+  }
+
+  private async runRequest(cur: Cur, suffix: Uint8Array, onSent: () => void): Promise<ConnectionRequestResult> {
     const { opts, n, stream } = cur;
+    // An armed connection is opened by its first request.
+    await this.connect();
+    cur.tOpened = Date.now();
+    cur.recvAtSend = this.recvCount();
+    cur.streamCredit = this.initialWindow;
+    // An earlier request's records are no longer needed.
+    for (const abs of this.serverRecords.keys()) {
+      if (abs < cur.recvAtSend) this.serverRecords.delete(abs);
+      else break;
+    }
+    this.plain.clear();
+    if (this.requests === 0 && !this.probeAnswered) {
+      // §5.4: the provider may still answer the node's probe; its frames must
+      // lie before the first request's interval, or they may land in a tail.
+      const until = this.tHeadWritten + this.timeouts.probe;
+      await this.until(() => this.probeAnswered || Date.now() >= until, "the probe's answer", this.timeouts.probe + 1000);
+      cur.recvAtSend = this.recvCount();
+    }
     const bytes0 = this.byteCounts();
     const host = this.offer.upstream_host;
     // The route: the chat template's, or the images template's (both `POST <path> HTTP/1.1`).
@@ -1355,39 +1722,19 @@ export class ConfidentialH2Connection {
     });
     const bodyLen = opts.body.length;
 
-    // `request` first, then the records: the node opens the request (and
-    // reserves), and takes any SETTINGS acknowledgement and the records as
-    // one π_WIN batch. The same rates and fees as a v2 setup accepts.
+    // `request`, then its answer; only then the records (§12.4). A refused
+    // request leaves the connection READY and its number unused.
+    const ok = await this.openRequest(cur, bodyLen, suffix, onSent);
+    if (ok.stream !== stream) throw new SessionProtocolError("request_ok names another stream");
+    // Any SETTINGS acknowledgement and the records go as one π_WIN batch.
     this.requestOpen = true;
-    // An image request names the variant and the count: the node renders
-    // the suffix from its own signed offer and echoes it in `request_ok`.
-    const req: Record<string, unknown> = cur.image
-      ? { type: "request", n, kind: "images", model: opts.model, variant: cur.image.variant.id, count: cur.image.count, body_len: bodyLen }
-      : { type: "request", n, kind: "chat", model: opts.model, max_tokens: opts.maxTokens, body_len: bodyLen };
-    if (cur.offer.sig) req.offer_sig = cur.offer.sig;
-    const fee = offerSessionFeeMsat(cur.offer);
-    const abandonFee = offerAbandonFeeMsat(cur.offer);
-    if (fee > 0) req.session_fee_msat = fee;
-    if (abandonFee > 0) req.abandon_fee_msat = abandonFee;
-    req.auth = this.auth;
-    this.sendOrdered(req);
-    onSent();
     while (this.unackedSettings > 0) {
       this.unackedSettings--;
       void this.sendCtl("settings_ack", new Uint8Array(0));
     }
     for (const p of plan) cur.seqs.push(await Promise.race([this.sendRecord(p.content, p.pub), this.errP]));
     cur.dataLens = plan.slice(1).map((p) => p.data);
-    this.event({ ev: "h2_request_sent", n, records: plan.length, body_len: bodyLen });
-
-    // Nothing is released before the node accepted the request: until then a
-    // refusal (no funds, an expired offer) costs nothing and may be retried.
-    const ok = (await this.wait(["request_ok"], this.timeouts.requestOk)).msg;
-    if (ok.n !== n || ok.stream !== stream) throw new SessionProtocolError("request_ok names another request or stream");
-    if (ok.suffix !== new TextDecoder().decode(suffix)) {
-      throw new SessionProtocolError("node expects a different pinned suffix than ours");
-    }
-    cur.accepted = true;
+    this.event({ ev: "request_sent", n, records: plan.length, body_len: bodyLen });
     this.updateRelease();
 
     // Released (in steps, as the provider's window opens) or refused early.
@@ -1435,27 +1782,49 @@ export class ConfidentialH2Connection {
     this.cur = undefined;
     this.requestOpen = false;
     this.tLastSettled = tEnd;
+    this.settled++;
+    this.kick();
 
-    const responseBody = concat(...cur.parts.map((p) => p.data));
+    // An accepted image response is handed on in the pieces it arrived in (held once).
+    const accepted = cur.image !== undefined && status < 300;
+    const responseBody = accepted ? new Uint8Array(0) : concat(...cur.parts.map((p) => p.data));
+    const bodyChunks = accepted ? cur.parts.map((p) => p.data) : undefined;
+    cur.parts = [];
+    return this.result(cur, status, cur.headers ?? {}, responseBody, bodyChunks, receipt, attestation, bytes0, tEnd);
+  }
+
+  private result(
+    cur: Cur,
+    status: number,
+    headers: Record<string, string>,
+    body: Uint8Array,
+    bodyChunks: Uint8Array[] | undefined,
+    receipt: ConfidentialReceipt,
+    attestation: unknown,
+    bytes0: ConnectionBytes,
+    tEnd: number,
+  ): ConnectionRequestResult {
     const effectiveModel =
-      status < 300 && !cur.image ? effectiveModelFromText(new TextDecoder().decode(responseBody)) : undefined;
+      status < 300 && !cur.image ? effectiveModelFromText(new TextDecoder().decode(body)) : undefined;
     let warnings: string[] | undefined;
-    if (effectiveModel !== undefined && effectiveModel !== opts.model) {
-      warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${opts.model}`];
+    if (effectiveModel !== undefined && effectiveModel !== cur.model) {
+      warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${cur.model}`];
     }
     const bytes1 = this.byteCounts();
-    const delta = {} as H2Bytes;
-    for (const k of Object.keys(bytes1) as (keyof H2Bytes)[]) delta[k] = bytes1[k] - bytes0[k];
-    this.event({ ev: "h2_request_settled", n, status, total_ms: tEnd - cur.tStart });
+    const delta = {} as ConnectionBytes;
+    for (const k of Object.keys(bytes1) as (keyof ConnectionBytes)[]) delta[k] = bytes1[k] - bytes0[k];
+    this.event({ ev: "request_settled", http: this.framing, n: cur.n, status, total_ms: tEnd - cur.tStart });
     return {
       sid: this.sid,
-      n,
-      stream,
-      model: opts.model,
+      http: this.framing,
+      n: cur.n,
+      stream: this.framing === "2" ? cur.stream : undefined,
+      model: cur.model,
       effectiveModel,
       status,
-      headers: cur.headers ?? {},
-      body: responseBody,
+      headers,
+      body,
+      bodyChunks,
       receipt,
       attestation,
       costMsats: receipt.cost_msats,
@@ -1471,10 +1840,254 @@ export class ConfidentialH2Connection {
     };
   }
 
+  // --- framing "1.1": the connection's one request ------------------------------------
+
+  /** Decrypted response bytes (framing "1.1"): parsed as they arrive, kept only while a disclosure may need them. */
+  private onResponseBytes(rec: Uint8Array): void {
+    const cur = this.cur;
+    if (!cur) return;
+    cur.tLastData = Date.now();
+    if (!cur.tFirstData) cur.tFirstData = cur.tLastData;
+    this.rawLens.push(rec.length);
+    this.rawTotal += rec.length;
+    try {
+      const parts = this.incremental.push(rec);
+      const head = this.incremental.head;
+      if (head && !this.headEmitted) {
+        this.headEmitted = true;
+        cur.status = head.status;
+        cur.headers = head.headers;
+        cur.opts.onResponseHead?.(head);
+      }
+      // An accepted image response is megabytes and is never disclosed: only
+      // its decoded body is kept, once. Anything else is kept as it arrived
+      // (the usage tail, or the error head, is disclosed from it).
+      const accepted = cur.image !== undefined && head !== undefined && head.status >= 200 && head.status < 300;
+      if (accepted) this.rawChunks = [];
+      else this.rawChunks.push(rec);
+      for (const p of parts) {
+        if (!p.length) continue;
+        cur.parts.push({ off: 0, data: p });
+        cur.opts.onResponseBody?.(p);
+      }
+      if (this.incremental.complete) this.streamEnded(cur);
+    } catch (e) {
+      this.fail(new ResponseVerificationError(`malformed upstream HTTP: ${e instanceof Error ? e.message : String(e)}`));
+    }
+  }
+
+  /**
+   * Framing "1.1" (§6, §12.4 to §12.8): `request` 1 before the ClientHello,
+   * the handshake, π_NK over the request head, the body with the suffix alone
+   * in the final record, π_WIN over that record, the response, the node's
+   * attestation when the provider closes, then the disclosure or `accept`.
+   */
+  private async runRequest11(cur: Cur, suffix: Uint8Array, onSent: () => void): Promise<ConnectionRequestResult> {
+    const { opts } = cur;
+    await this.arm(false);
+    cur.tOpened = Date.now();
+    const bytes0 = this.armBytes ?? this.byteCounts();
+    const body = opts.body;
+    const ok = await this.openRequest(cur, body.length, suffix, onSent);
+    if (!Number.isSafeInteger(ok.head_len) || ok.head_len <= 0) {
+      throw new SessionProtocolError("request_ok names no head length");
+    }
+    this.phaseNow = "connecting";
+    const t0 = Date.now();
+    await this.handshake();
+    const tHs = Date.now();
+    await this.proveHead({
+      kind: cur.image ? "images" : "chat",
+      bodyLen: body.length,
+      headLen: ok.head_len,
+      headTemplate: cur.image ? cur.offer.images!.head_template : this.offer.head_template,
+    });
+    const tNk = Date.now();
+    // The node writes epoch 0 (the request head with the credential, then a
+    // KeyUpdate under K_0); we are keyed for epoch 1 (c_ap_1, seq 0).
+    this.sendText({ type: "release_head" });
+    await this.wait(["head_written"], this.timeouts.headWritten);
+    this.tHeadWritten = Date.now();
+    Object.assign(this.setupTimings, {
+      handshakeMs: tHs - t0,
+      piNkMs: tNk - tHs,
+      headMs: this.tHeadWritten - tNk,
+      connectMs: this.tHeadWritten - this.tSetup,
+      claimMs: this.tHeadWritten - t0,
+    });
+    this.setupBytes = this.byteCounts();
+    this.phaseNow = "ready";
+
+    // The body under c_ap_1: the private part, then the suffix alone in the
+    // final record, which the node holds until π_WIN verifies.
+    this.bodyEpoch = true;
+    await this.tls.write(body.subarray(0, body.length - suffix.length));
+    await this.tls.write(suffix);
+    this.bodyEpoch = false;
+    const finalSeq = this.bodyRecords.length - 1;
+    const finalRecord = this.bodyRecords[finalSeq];
+    if (!finalRecord) throw new SessionProtocolError("no body record was written");
+    this.event({ ev: "body_sent", len: body.length, records: this.bodyRecords.length });
+
+    const zp = (await this.wait(["zk_params:pi_win:records"], this.timeouts.zkParams)).msg;
+    const shape = checkPiWinFinalRecord(zp, { anchor: this.ap!.h1, seq: finalSeq, wire: finalRecord, suffix });
+    // From here the request may reach the provider: never run it again elsewhere.
+    cur.releaseSent = true;
+    const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.ap!.clientAp1) });
+    cur.proofs.push({ ...tw, purpose: "records", ...shape });
+    await this.until(() => cur.released, "body_released", this.timeouts.released);
+
+    // The provider closes after its response; the node then attests on its
+    // own. The wait lasts as long as the answer streams: only silence ends it.
+    const idleMs = cur.image
+      ? Math.max(this.timeouts.responseIdle, Math.max(1, cur.offer.images?.response_idle_s ?? 300) * 1000)
+      : this.timeouts.responseIdle;
+    let attMsg: any;
+    for (;;) {
+      const last = Math.max(cur.tLastData, cur.tReleased ?? 0, this.tLastWire);
+      const left = last + idleMs + this.timeouts.attestation - Date.now();
+      if (left <= 0) throw new ConfidentialTimeoutError("timeout waiting for the response and its attestation");
+      try {
+        attMsg = (await this.wait(["attestation"], Math.min(left, 5_000))).msg;
+        break;
+      } catch (e) {
+        if (!(e instanceof ConfidentialTimeoutError)) throw e;
+      }
+    }
+    const att = await this.checkAttestation11(attMsg);
+    await this.drained();
+    if (this.failure) throw this.failure;
+
+    const status = cur.status ?? 0;
+    let receipt: ConfidentialReceipt;
+    if (status >= 200 && status < 300 && cur.image) {
+      this.sendText({ type: "accept", n: 1 });
+      ({ receipt } = await this.takeReceipt(cur, att.json));
+      this.checkFlatReceipt(cur, receipt);
+    } else if (status >= 200 && status < 300) {
+      const raw = concat(...this.rawChunks);
+      const r = extractUsageDisclosure(raw);
+      if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
+      const ownUsage = usageEventFromDisclosure(r);
+      if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
+      await this.disclose11(cur, "disclose", r, 0);
+      const got = await this.takeReceipt(cur, att.json);
+      receipt = got.receipt;
+      this.checkUsageReceipt(cur, got, ownUsage);
+    } else if (status >= 400) {
+      // No usage event: disclose only the head (status line and headers); the body stays private.
+      const raw = concat(...this.rawChunks);
+      const headEnd = indexOfCrlfCrlf(raw);
+      if (headEnd < 0) throw new ResponseVerificationError("upstream error response has no head");
+      if (!/^HTTP\/1\.[01] [45]\d\d/.test(latin1(raw.subarray(0, 16)))) {
+        throw new ResponseVerificationError("an interim head precedes the error head: it cannot be disclosed");
+      }
+      const r = raw.slice(0, headEnd + 4);
+      await this.disclose11(cur, "disclose_head", r, raw.length - r.length);
+      ({ receipt } = await this.takeReceipt(cur, att.json));
+      this.checkErrorReceipt(cur, receipt, status);
+    } else {
+      throw new ResponseVerificationError(`status ${status} is neither a success nor a disclosable error`);
+    }
+    const tEnd = Date.now();
+    this.settled++;
+    this.tLastSettled = tEnd;
+    this.goaway = true;
+    this.cur = undefined;
+    // The connection's orderly end (`done`, or `error_settled`): it carries nothing we need.
+    await this.until(() => this.closedReason !== undefined, "closed", this.timeouts.closed).catch(() => {});
+    this.twoPc?.close();
+    this.zkChan?.close();
+
+    const accepted = cur.image !== undefined && status < 300;
+    const chunks = cur.parts.map((p) => p.data);
+    cur.parts = [];
+    this.rawChunks = [];
+    const responseBody = accepted ? new Uint8Array(0) : concat(...chunks);
+    return this.result(cur, status, cur.headers ?? {}, responseBody, accepted ? chunks : undefined, receipt, att.a, bytes0, tEnd);
+  }
+
+  /** `disclose` (the usage tail) or `disclose_head` (the response head), then π_C3S over the last server records. */
+  private async disclose11(cur: Cur, type: "disclose" | "disclose_head", r: Uint8Array, skip: number): Promise<void> {
+    const ap = this.ap!;
+    const tailLens = disclosureTailLens(this.rawLens, r.length + skip);
+    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
+    const msg: Record<string, unknown> = { type, n: 1, r: hex(r), tail_lens: tailLens, skip, trailing: epoch.trailing };
+    if (epoch.keyUpdates > 0) {
+      msg.key_updates = epoch.keyUpdates;
+      msg.epoch_start = epoch.epochStart;
+    }
+    this.sendText(msg);
+    const purpose = type === "disclose_head" ? "error_head" : "";
+    const c3 = (await this.wait([`zk_params:pi_c3s:${purpose}`], this.timeouts.zkParams)).msg;
+    if (c3.n !== undefined && c3.n !== 1) throw new SessionProtocolError("π_C3S parameters name another request");
+    // Indices are into the kept records, so the dropped ones are subtracted.
+    const kept = [...this.serverRecords.values()];
+    const handshakeRecords = this.wireRecords - this.serverPost.length;
+    checkPiC3SParams(c3.params, {
+      h2: ap.h2,
+      serverRecords: kept,
+      r,
+      skip,
+      keyUpdates: epoch.keyUpdates,
+      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart - this.serverRecordsDropped : undefined,
+      trailing: epoch.trailing,
+      tailLens,
+    });
+    const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(ap.serverAp0) });
+    cur.proofs.push(purpose ? { ...t, purpose } : t);
+  }
+
+  /**
+   * The attestation of a framing-"1.1" connection's one request: signed by
+   * the node's key, naming this connection, framing, request and handshake,
+   * the head-record commitment π_NK proved, and counts and a hash we can
+   * recompute from our own records. Returns the signed bytes.
+   */
+  private async checkAttestation11(m: any): Promise<{ json: string; a: any }> {
+    const json: string = typeof m.a_json === "string" ? m.a_json : JSON.stringify(m.a);
+    if (!verifySchnorrSignature(json, m.sig, this.ready.pubkey)) {
+      throw new ReceiptVerificationError("attestation signature invalid");
+    }
+    const bad = (what: string): never => {
+      throw new ReceiptVerificationError(`attestation ${what}`);
+    };
+    let a: any;
+    try {
+      a = JSON.parse(json);
+    } catch {
+      return bad("is not valid JSON");
+    }
+    if (a === null || typeof a !== "object") bad("is not an object");
+    if (a.sid !== this.sid || a.http !== "1.1" || a.n !== 1 || (m.n !== undefined && m.n !== 1)) {
+      bad("names another connection, framing or request");
+    }
+    if (!this.thSH || !this.thSF || a.th_sh !== hex(this.thSH) || a.th_sf !== hex(this.thSF)) {
+      bad("names a different TLS handshake");
+    }
+    if (!this.cCommitHex || a.c_commit !== this.cCommitHex) bad("names a different head-record commitment");
+    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) bad("names a different certificate chain");
+    // Records may still be on their way to us when the attestation arrives.
+    if (Number.isSafeInteger(a.server_records)) {
+      await this.until(() => this.recvRecords >= a.server_records, "the records the attestation counts", 15_000).catch((e) => {
+        if (!(e instanceof ConfidentialTimeoutError)) throw e;
+      });
+    }
+    if (a.server_records !== this.recvRecords) {
+      bad(`counts ${String(a.server_records).slice(0, 16)} upstream records, we received ${this.recvRecords}`);
+    }
+    if (a.sha256_recv !== this.recvHash.copy().digest("hex")) bad("hashes different upstream bytes than we received");
+    if (a.client_records !== this.bodyRecords.length) {
+      bad(`counts ${String(a.client_records).slice(0, 16)} body records, we sent ${this.bodyRecords.length}`);
+    }
+    this.event({ ev: "attestation", n: 1, server_records: a.server_records });
+    return { json, a };
+  }
+
   // --- disclosures ----------------------------------------------------------------
 
   /**
-   * The usage disclosure of a finished stream (A.6, A.11): R runs from the
+   * The usage disclosure of a finished stream (§5.4, §12.8): R runs from the
    * usage event (its DATA frame header, or the line feed before it inside a
    * frame) to the last server byte received.
    */
@@ -1589,31 +2202,15 @@ export class ConfidentialH2Connection {
       });
       const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(ap.serverAp0) });
       cur.proofs.push(t);
-      const { receipt, receiptJson, sig } = await this.takeReceipt(cur, att.json);
-      const checked = verifyReceipt({
-        receipt,
-        receiptJson,
-        sig,
-        pubkey: this.ready.pubkey,
-        ownUsage: d.ownUsage,
-        pinnedModel: cur.model,
-        priceEntry: cur.offer.price_list[cur.model],
-        sessionFeeMsat: offerSessionFeeMsat(cur.offer),
-        abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
-      });
-      if (!checked.usageMatch) throw new ReceiptVerificationError("receipt usage does not match our own plaintext");
-      if (!checked.costWithinOffer) {
-        throw new ReceiptVerificationError(
-          `receipt cost ${receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates` +
-            ` plus its session fee (${offerSessionFeeMsat(cur.offer)} msats)`,
-        );
-      }
+      const got = await this.takeReceipt(cur, att.json);
+      this.checkUsageReceipt(cur, got, d.ownUsage);
+      const receipt = got.receipt;
       return { receipt, attestation: att.a };
     }
   }
 
   /**
-   * A successful image response (A.13): the price was fixed by the request,
+   * A successful image response (§5.4): the price was fixed by the request,
    * so nothing is disclosed and nothing proven. `accept` names the server
    * records received; the node closes the request's interval there, attests
    * it (checked as for chat: every record of the response is hashed) and
@@ -1637,19 +2234,12 @@ export class ConfidentialH2Connection {
       }
       const att = await this.checkAttestation(next.msg, cur, serverRecords);
       const { receipt } = await this.takeReceipt(cur, att.json);
-      verifyFlatReceipt(receipt, {
-        model: cur.model,
-        variant: terms.variant.id,
-        count: terms.count,
-        msatPerImage: terms.variant.msat_per_image,
-        sessionFeeMsat: offerSessionFeeMsat(cur.offer),
-        abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
-      });
+      this.checkFlatReceipt(cur, receipt);
       return { receipt, attestation: att.a };
     }
   }
 
-  /** The error head (A.7): the response HEADERS frame, which must start a record. */
+  /** The error head (§5.4): the response HEADERS frame, which must start a record. */
   private async settleErrorHead(cur: Cur, status: number): Promise<{ receipt: ConfidentialReceipt; attestation: unknown }> {
     const ap = this.ap!;
     await this.drained();
@@ -1706,18 +2296,7 @@ export class ConfidentialH2Connection {
     const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(ap.serverAp0) });
     cur.proofs.push({ ...t, purpose: "error_head", ...shape });
     const { receipt } = await this.takeReceipt(cur, att.json);
-    const usageMatch = checkUpstreamErrorReceipt(receipt, status, offerSessionFeeMsat(cur.offer), {
-      abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
-      image: cur.image
-        ? {
-            model: cur.model,
-            variant: cur.image.variant.id,
-            count: cur.image.count,
-            msatPerImage: cur.image.variant.msat_per_image,
-          }
-        : undefined,
-    });
-    if (!usageMatch) throw new ReceiptVerificationError("error receipt does not match the disclosed status");
+    this.checkErrorReceipt(cur, receipt, status);
     return { receipt, attestation: att.a };
   }
 
@@ -1742,8 +2321,8 @@ export class ConfidentialH2Connection {
       return bad("is not valid JSON");
     }
     if (a === null || typeof a !== "object") bad("is not an object");
-    if (a.sid !== this.sid || a.http !== 2 || a.n !== cur.n || a.stream !== cur.stream) {
-      bad("names another session or request");
+    if (a.sid !== this.sid || a.http !== "2" || a.n !== cur.n || a.stream !== cur.stream || (m.n !== undefined && m.n !== cur.n)) {
+      bad("names another connection, framing or request");
     }
     if (!this.thSH || !this.thSF || a.th_sh !== hex(this.thSH) || a.th_sf !== hex(this.thSF)) {
       bad("names a different TLS handshake");
@@ -1758,12 +2337,20 @@ export class ConfidentialH2Connection {
     const end = sK + count;
     if (upto !== undefined && end !== upto) bad("interval does not end at our disclosure");
     await this.until(() => this.wireRecords >= end, "the records the attestation counts", 15_000);
-    const h = createHash("sha256");
-    for (let i = sK; i < end; i++) {
+    // An accepted image response was hashed as it arrived, from each start
+    // the interval may have; anything else is hashed from the records held.
+    const rolled = cur.roll?.find((r) => r.from === sK);
+    let h = createHash("sha256");
+    let from = sK;
+    if (cur.roll) {
+      if (!rolled) return bad("interval starts where we kept no hash");
+      h = rolled.h;
+      from = rolled.next;
+    }
+    for (let i = from; i < end; i++) {
       const p = this.serverRecords.get(i);
       if (!p) return bad("covers records we no longer hold");
-      h.update(Uint8Array.from([0x17, 0x03, 0x03, p.length >> 8, p.length & 0xff]));
-      h.update(p);
+      hashRecord(h, p);
     }
     if (a.sha256_recv !== h.digest("hex")) bad("hashes different upstream records than we received");
     const sent = a.client_records;
@@ -1775,6 +2362,95 @@ export class ConfidentialH2Connection {
     if (a.sha256_sent !== hs.digest("hex")) bad("hashes different request records than we sent");
     this.event({ ev: "attestation", n: cur.n, s_k: sK, server_records: count });
     return { json, a };
+  }
+
+  /**
+   * An accepted image response in framing "2": hash the ciphertext records
+   * below `upto` (all processed) into one running hash per start the
+   * request's interval may have, and let them go. The interval starts between
+   * the records received when the request was sent and the response's first
+   * frame; with more candidates than a few the records are kept instead.
+   */
+  private rollImageRecords(cur: Cur, upto: number): void {
+    if (cur.firstFrameAbs === undefined) return;
+    if (!cur.roll) {
+      const starts = cur.firstFrameAbs - cur.recvAtSend + 1;
+      if (starts < 1 || starts > 4) return;
+      cur.roll = [];
+      for (let from = cur.recvAtSend; from <= cur.firstFrameAbs; from++) {
+        cur.roll.push({ from, next: from, h: createHash("sha256") });
+      }
+    }
+    for (const r of cur.roll) {
+      for (; r.next < upto; r.next++) {
+        const p = this.serverRecords.get(r.next);
+        if (!p) return;
+        hashRecord(r.h, p);
+      }
+    }
+    for (const abs of this.serverRecords.keys()) {
+      if (abs < upto) this.serverRecords.delete(abs);
+      else break;
+    }
+  }
+
+  /** The session fee still due on this connection for `cur` (§8.3: once, at the first settlement). */
+  private feeDue(cur: Cur): number {
+    return cur.first ? offerSessionFeeMsat(cur.offer) : 0;
+  }
+
+  /** A usage receipt: our own usage, the pinned model, a cost within the signed rates plus the fee still due. */
+  private checkUsageReceipt(
+    cur: Cur,
+    got: { receipt: ConfidentialReceipt; receiptJson: string; sig?: string },
+    ownUsage: UpstreamUsageEvent,
+  ): void {
+    const fee = this.feeDue(cur);
+    const checked = verifyReceipt({
+      receipt: got.receipt,
+      receiptJson: got.receiptJson,
+      sig: got.sig,
+      pubkey: this.ready.pubkey,
+      ownUsage,
+      pinnedModel: cur.model,
+      priceEntry: cur.offer.price_list[cur.model],
+      sessionFeeMsat: fee,
+      abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+    });
+    if (!checked.usageMatch) throw new ReceiptVerificationError("receipt usage does not match our own plaintext");
+    if (!checked.costWithinOffer) {
+      throw new ReceiptVerificationError(
+        `receipt cost ${got.receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates` +
+          ` plus the session fee due on this connection (${fee} msats)`,
+      );
+    }
+  }
+
+  private checkFlatReceipt(cur: Cur, receipt: ConfidentialReceipt): void {
+    const terms = cur.image!;
+    verifyFlatReceipt(receipt, {
+      model: cur.model,
+      variant: terms.variant.id,
+      count: terms.count,
+      msatPerImage: terms.variant.msat_per_image,
+      sessionFeeMsat: this.feeDue(cur),
+      abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+    });
+  }
+
+  private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
+    const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
+      abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+      image: cur.image
+        ? {
+            model: cur.model,
+            variant: cur.image.variant.id,
+            count: cur.image.count,
+            msatPerImage: cur.image.variant.msat_per_image,
+          }
+        : undefined,
+    });
+    if (!usageMatch) throw new ReceiptVerificationError("error receipt does not match the disclosed status");
   }
 
   /** The request's node-signed receipt: bound to this connection, request and attestation. */
@@ -1796,23 +2472,45 @@ export class ConfidentialH2Connection {
       sid: this.sid,
       attestationJson: attJson,
     });
-    if (receipt.http !== 2 || receipt.n !== cur.n) {
-      throw new ReceiptVerificationError(`receipt is for request ${String(receipt.n)}, not http 2 request ${cur.n}`);
+    if (receipt.http !== this.framing || receipt.n !== cur.n) {
+      throw new ReceiptVerificationError(
+        `receipt is for http ${JSON.stringify(receipt.http ?? null).slice(0, 16)} request ${String(receipt.n).slice(0, 16)}, not "${this.framing}" request ${cur.n}`,
+      );
     }
     // The connection's first settled request returns the deposit: its
-    // (signed) receipt says so, once, with the offer's amount.
+    // (signed) receipt says so, once, with the offer's amount (§12.8, §12.10).
     const back = receipt.deposit_released_msat;
-    if (back !== undefined) {
-      if (back !== this.depositMsat || this.depositMsat === 0 || this.deposit !== undefined) {
+    if (back === undefined) {
+      if (cur.first && this.depositMsat > 0) {
         throw new ReceiptVerificationError(
-          `receipt ${cur.n} releases a connection deposit of ${String(back)} msat (the offer's is ${this.depositMsat})`,
+          `receipt ${cur.n} settles the connection's first request and does not release the deposit of ${this.depositMsat} msat`,
+        );
+      }
+    } else {
+      if (!cur.first || back !== this.depositMsat || this.deposit !== undefined) {
+        throw new ReceiptVerificationError(
+          `receipt ${cur.n} releases a connection deposit of ${String(back).slice(0, 32)} msat (the offer's is ${this.depositMsat}` +
+            `${cur.first ? "" : "; it was released before"})`,
         );
       }
       this.deposit = { msat: this.depositMsat, outcome: "released", reason: "request_settled", signed: true };
-      this.event({ ev: "h2_deposit", ...this.deposit, n: cur.n });
+      this.event({ ev: "deposit", ...this.deposit, n: cur.n });
     }
     return { receipt, receiptJson, sig: m.sig };
   }
+}
+
+/** One type-23 record into the attestation's hash: header ‖ payload. */
+function hashRecord(h: ReturnType<typeof createHash>, payload: Uint8Array): void {
+  h.update(Uint8Array.from([0x17, 0x03, 0x03, payload.length >> 8, payload.length & 0xff]));
+  h.update(payload);
+}
+
+function indexOfCrlfCrlf(b: Uint8Array): number {
+  for (let i = 0; i + 3 < b.length; i++) {
+    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
+  }
+  return -1;
 }
 
 function rejectAfter(ms: number, what: string): Promise<never> {

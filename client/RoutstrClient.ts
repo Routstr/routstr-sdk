@@ -90,7 +90,6 @@ import type {
 } from "./confidential/transport";
 import type { ConfidentialOffer } from "./confidential/offer";
 import { chooseImageVariant } from "./confidential/imagePlan";
-import { prewarmTopupFactor } from "./confidential/prewarmFunds";
 import { confidentialKind } from "./confidential/endpoints";
 import {
   isTinfoilModel,
@@ -443,7 +442,8 @@ export function confidentialImageRequiredSats(
   const count = chosen.count;
   const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
   const msats = Math.ceil(price * count) + Math.max(fee(offer!.session_fee_msat), fee(offer!.abandon_fee_msat));
-  return Math.ceil(msats / 1000);
+  // The connection deposit is held beside the reservation until the request settles.
+  return Math.ceil((msats + confidentialDepositMsats(offer)) / 1000);
 }
 
 /** Reserve margin assumed when the node's signed offer is not at hand. */
@@ -459,7 +459,19 @@ type ConfidentialDepositOffer = Pick<
   | "rate_surcharge_pct"
   | "reserve_margin_tokens"
   | "images"
+  | "connection_deposit_msat"
 >;
+
+/**
+ * The connection deposit (msats) of a node's signed offer: held from a
+ * connection's setup until its first request settles, so the balance a
+ * request needs before a connection is opened is the deposit plus the
+ * request's reservation (PROTOCOL-V3 §8).
+ */
+export function confidentialDepositMsats(offer?: ConfidentialDepositOffer): number {
+  const d = offer?.connection_deposit_msat;
+  return typeof d === "number" && Number.isSafeInteger(d) && d > 0 ? d : 0;
+}
 
 /**
  * The reservation (msats) a confidential node holds for this request, by the
@@ -551,8 +563,9 @@ function callerMaxTokens(body: Record<string, unknown>): number | undefined {
 }
 
 /**
- * The deposit (sats) a confidential request needs: the node's reservation
- * for it (see `confidentialReservationMsats`), rounded up.
+ * The balance (sats) a confidential request needs before its connection is
+ * opened: the node's reservation for it (see `confidentialReservationMsats`)
+ * plus the offer's connection deposit, rounded up.
  */
 export function confidentialRequiredSats(
   model: Model,
@@ -560,7 +573,7 @@ export function confidentialRequiredSats(
   offer?: ConfidentialDepositOffer
 ): number | undefined {
   const msats = confidentialReservationMsats(model, maxTokens, offer);
-  return msats === undefined ? undefined : Math.ceil(msats / 1000);
+  return msats === undefined ? undefined : Math.ceil((msats + confidentialDepositMsats(offer)) / 1000);
 }
 
 export interface RouteRequestParams {
@@ -603,7 +616,9 @@ export interface RouteRequestParams {
   /**
    * Run the request as a confidential-upstream session (the node relays TLS
    * to the provider and never sees the prompt or response) instead of a
-   * plain HTTP request. Node-only (Bun/Node entrypoints).
+   * plain HTTP request. Node-only (Bun/Node entrypoints). The options are
+   * per request: `reuseScope` in them names what this request may share a
+   * connection with (failover and retries keep it).
    */
   confidential?: ConfidentialRequestOptions;
 }
@@ -1469,13 +1484,7 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       requiredSats,
-      // A pre-warmed confidential chat key arms only above fundsHeadroom × R
-      // (after the armed sessions' reservations); keep it there, or it never
-      // arms. Image sessions are never armed.
-      topupFactor:
-        params.confidential && !confidentialImages
-          ? prewarmTopupFactor(params.confidential.prewarm, TOPUP_MARGIN)
-          : TOPUP_MARGIN,
+      topupFactor: TOPUP_MARGIN,
       tokenBalance,
       tokenReserved,
       tokenBalanceUnit,
@@ -1793,6 +1802,8 @@ export class RoutstrClient {
             body,
             bearer: token,
             options: params.confidential,
+            // Requests of different scopes never share a connection to the provider.
+            reuseScope: params.confidential.reuseScope,
             method,
             path,
             returnChange: this.mode === "xcashu",
