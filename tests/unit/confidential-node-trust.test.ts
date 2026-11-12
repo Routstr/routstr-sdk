@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { checkUpstreamErrorReceipt, errorStatusCharge } from "../../client/confidential/receipt";
 import { exposedProviderHeader, parseHttpResponse } from "../../client/confidential/suffix";
-import { checkImageResponse } from "../../client/confidential/session";
+import { checkImageResponse } from "../../client/confidential/wire";
 import { chooseImageVariant } from "../../client/confidential/imagePlan";
 import { ConfidentialError, ReceiptVerificationError } from "../../client/confidential/errors";
 

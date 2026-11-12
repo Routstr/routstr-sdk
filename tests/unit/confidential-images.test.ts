@@ -4,7 +4,7 @@
  * the flat receipt check, and the image session's setup frame.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { VENICE_CHAT } from "./fixtures/chat";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
@@ -28,7 +28,8 @@ import {
   isConfidentialImageEndpoint,
   planImageRequest,
 } from "../../client/confidential/transport";
-import { ConfidentialSession, imageOutcome } from "../../client/confidential/session";
+import { ConfidentialConnection } from "../../client/confidential/connection";
+import { imageOutcome } from "../../client/confidential/wire";
 import { CuProverBackend } from "../../client/confidential/prover";
 import { ConfidentialError, ReceiptVerificationError, SessionProtocolError } from "../../client/confidential/errors";
 import { confidentialImageRequiredSats } from "../../client/RoutstrClient";
@@ -62,9 +63,8 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
   const priv = new Uint8Array(32).fill(7);
   const pubHex = bytesToHex(schnorr.getPublicKey(priv));
   const offer: Record<string, unknown> = {
-    v: 2,
-    min_v: 2,
-    max_v: 2,
+    v: 3,
+    twopc: "split-public-1",
     upstream_host: "api.venice.ai",
     notary_pubkey: pubHex,
     max_tokens_cap: 4096,
@@ -368,45 +368,62 @@ describe("image session", () => {
     ({
       baseUrl: "http://127.0.0.1:8010",
       offer: signedOffer().offer,
+      framing: "1.1",
       auth: "sk-x",
-      model: "nano-banana-pro",
-      maxTokens: 0,
-      kind: "images",
-      image: { variant: "2K-webp", count: 3 },
-      bodyLength: 100,
       prover: {},
       ...extra,
     }) as never;
+  const enc = (t: string) => new TextEncoder().encode(t);
+  /** An armed connection whose network side never runs. */
+  const armed = (extra: Record<string, unknown> = {}) => {
+    const c = new ConfidentialConnection(opts(extra)) as any;
+    c.phaseNow = "armed";
+    const run = vi.spyOn(c, "runRequest11").mockReturnValue(new Promise(() => {}));
+    return { c, run };
+  };
+  const suffixOf = (variant: [string, unknown][], count: number) =>
+    renderImageSuffix("nano-banana-pro", count, "variants", FIXED, variant);
+  const ask = (c: any, image: { variant: string; count: number }, suffix: string) =>
+    c.request({ model: "nano-banana-pro", maxTokens: 0, image, body: enc(`{"prompt":"x"${suffix}`) });
 
-  it("renders its suffix from the signed offer and checks the terms", () => {
-    const s = new ConfidentialSession(opts());
-    expect(s.suffix).toBe(renderImageSuffix("nano-banana-pro", 3, "variants", FIXED, [["resolution", "2K"], ["format", "webp"]]));
-    expect(() => new ConfidentialSession(opts({ image: { variant: "4K-webp", count: 1 } }))).toThrow(SessionProtocolError);
-    expect(() => new ConfidentialSession(opts({ image: { variant: "1K-webp", count: 5 } }))).toThrow(/outside 1..4/);
-    expect(() => new ConfidentialSession(opts({ offer: signedOffer({ capabilities: ["chat"] }).offer }))).toThrow(
-      /no confidential image generation/,
-    );
+  it("a request's image terms are checked against the signed offer, and its body must end with the offer's suffix", () => {
+    const K2: [string, unknown][] = [["resolution", "2K"], ["format", "webp"]];
+    const good = armed();
+    expect(() => ask(good.c, { variant: "2K-webp", count: 3 }, suffixOf(K2, 3))).not.toThrow();
+    // The suffix handed to the request's run is the offer's rendering.
+    expect(new TextDecoder().decode(good.run.mock.calls[0]![1] as Uint8Array)).toBe(suffixOf(K2, 3));
+    // Another count in the body than the request names: refused before anything is sent.
+    expect(() => ask(armed().c, { variant: "2K-webp", count: 2 }, suffixOf(K2, 3))).toThrow(/does not end with the pinned suffix/);
+    expect(() => ask(armed().c, { variant: "4K-webp", count: 1 }, suffixOf(K2, 1))).toThrow(SessionProtocolError);
+    expect(() => ask(armed().c, { variant: "1K-webp", count: 5 }, suffixOf(K2, 5))).toThrow(/outside 1..4/);
+    expect(() =>
+      ask(armed({ offer: signedOffer({ capabilities: ["chat"] }).offer }).c, { variant: "2K-webp", count: 1 }, suffixOf(K2, 1)),
+    ).toThrow(/serves no image requests/);
     // A variant's own count cap is below the offer's.
+    const K4: [string, unknown][] = [["resolution", "4K"], ["format", "webp"]];
     const capped = {
       ...IMAGES,
-      price_list: { ...IMAGES.price_list, "nano-banana-pro": [{ id: "4K-webp", pins: [["resolution", "4K"], ["format", "webp"]], msat_per_image: 400000, max_count: 1 }] },
+      price_list: { ...IMAGES.price_list, "nano-banana-pro": [{ id: "4K-webp", pins: K4, msat_per_image: 400000, max_count: 1 }] },
     };
     const cappedOffer = signedOffer({ images: capped }).offer;
-    expect(() => new ConfidentialSession(opts({ offer: cappedOffer, image: { variant: "4K-webp", count: 2 } }))).toThrow(/outside 1..1/);
-    expect(new ConfidentialSession(opts({ offer: cappedOffer, image: { variant: "4K-webp", count: 1 } })).suffix).toContain('"variants":1');
+    expect(() => ask(armed({ offer: cappedOffer }).c, { variant: "4K-webp", count: 2 }, suffixOf(K4, 2))).toThrow(/outside 1..1/);
+    expect(() => ask(armed({ offer: cappedOffer }).c, { variant: "4K-webp", count: 1 }, suffixOf(K4, 1))).not.toThrow();
     // An offer that did not go through verification is held to the same shape.
     const hostile = signedOffer({ images: { ...IMAGES, fixed_pins: [["enable_web_search", true]] } }).offer;
-    expect(() => new ConfidentialSession(opts({ offer: hostile }))).toThrow(/switched off/);
+    expect(() => ask(armed({ offer: hostile }).c, { variant: "2K-webp", count: 3 }, suffixOf(K2, 3))).toThrow(/switched off/);
   });
 
-  it("requires the relay to name the image suffix it pins", async () => {
-    const s = new ConfidentialSession(opts()) as any;
-    s.prepared = true;
-    s.ready = { pubkey: "00" };
-    await expect(s.finish(new Uint8Array(100))).rejects.toThrow(/did not name the image suffix/);
+  it("framing 2 serves images only when the offer's h2.kinds lists them", () => {
+    const h2 = { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 100 };
+    const chatOnly = signedOffer({ http: ["2", "1.1"], h2 }).offer;
+    const c = new ConfidentialConnection(opts({ offer: chatOnly, framing: "2" })) as any;
+    c.phaseNow = "ready";
+    expect(() => ask(c, { variant: "2K-webp", count: 1 }, suffixOf([["resolution", "2K"], ["format", "webp"]], 1))).toThrow(
+      /no image requests on framing "2"/,
+    );
   });
 
-  it("sends an image setup: kind, variant and count, never armed, no token cap", async () => {
+  it("the setup names the framing and the credential, never a request's terms (§12.3)", async () => {
     const realWs = (globalThis as any).WebSocket;
     const sent: Record<string, unknown>[] = [];
     (globalThis as any).WebSocket = class {
@@ -414,24 +431,30 @@ describe("image session", () => {
       onmessage?: (ev: { data: string }) => void;
       onclose?: () => void;
       onerror?: () => void;
-      constructor() {
+      constructor(readonly url: string) {
+        sent.push({ url });
         setTimeout(() => this.onopen?.(), 0);
       }
       send(d: string) {
         sent.push(JSON.parse(d));
-        // A node error ends the session after the setup was seen.
+        // A node error ends the connection after the setup was seen.
         setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: "error", reason: "test" }) }), 0);
       }
       close() {}
     };
     try {
-      const session = new ConfidentialSession(
-        opts({ prover: new CuProverBackend({ binaryPath: process.execPath }), twoPcFactory: () => ({}) as never }),
-      );
-      await expect(session.arm()).rejects.toThrow(/node rejected/);
-      expect(sent[0]).toMatchObject({ type: "setup", kind: "images", model: "nano-banana-pro", variant: "2K-webp", count: 3, len: 100 });
-      expect(sent[0]).not.toHaveProperty("max_tokens");
-      expect(sent[0]).not.toHaveProperty("armed");
+      for (const prewarm of [false, true]) {
+        sent.length = 0;
+        const conn = new ConfidentialConnection(
+          opts({ prover: new CuProverBackend({ binaryPath: process.execPath }), twoPcFactory: () => ({}) as never }),
+        );
+        await expect(conn.arm(prewarm)).rejects.toThrow(/node rejected/);
+        expect(String(sent[0]!.url)).toMatch(/\/v1\/confidential\/ws\?session_id=[0-9a-f-]{36}&v=3$/);
+        const setup = sent[1]!;
+        expect(Object.keys(setup).sort()).toEqual(["armed", "auth", "http", "nonce_c", "offer_sig", "type", "v"]);
+        expect(setup).toMatchObject({ type: "setup", v: 3, http: "1.1", armed: prewarm, auth: "sk-x" });
+        expect(setup.nonce_c).toMatch(/^[0-9a-f]{64}$/);
+      }
     } finally {
       (globalThis as any).WebSocket = realWs;
     }

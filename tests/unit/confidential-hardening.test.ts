@@ -24,13 +24,28 @@ import {
 } from "../../client/confidential/offer";
 import { headTemplateProblem } from "../../client/confidential/params";
 import { CuProverBackend, MAX_UNFLUSHED_STDIN, StdinBudget } from "../../client/confidential/prover";
-import { ConfidentialSession, timeout } from "../../client/confidential/session";
+import { NodeProtocolOutdatedError } from "../../client/confidential/errors";
+import { offerSupportsHttp2Images } from "../../client/confidential/offer";
+import { ConfidentialConnection } from "../../client/confidential/connection";
+import { timeout } from "../../client/confidential/wire";
 import { chatSuffixKeys, pinKeyProblem, validateChatSuffix } from "../../client/confidential/suffix";
 import { TwoPcSession } from "../../client/confidential/twopc";
 import { ProofChannel } from "../../client/confidential/zkchan";
 
+/** The production node's offer (captured while it still ran protocol v2). */
 const OFFER = offerFixture as unknown as Record<string, unknown>;
-const SIGNED = JSON.parse(OFFER.sig_payload as string) as Record<string, unknown>;
+const SIGNED_V2 = JSON.parse(OFFER.sig_payload as string) as Record<string, unknown>;
+/** Its terms as a v3 node offers them (§2.2): the same blocks, `v: 3` and the connection-level fields. */
+const { min_v: _minV, max_v: _maxV, ...V2_TERMS } = SIGNED_V2;
+const SIGNED: Record<string, unknown> = {
+  ...V2_TERMS,
+  v: 3,
+  twopc: "split-public-1",
+  http: ["2", "1.1"],
+  h2: { probe_path: "/api/v1/models", max_requests: 100, max_lifetime_s: 3600, idle_secs: 300, kinds: ["chat", "images"] },
+  connection_deposit_msat: 2000,
+  idle_timeout_s: 120,
+};
 const IMAGES = SIGNED.images as ConfidentialImagesOffer;
 const CHAT_TPL = SIGNED.head_template as string;
 const IMAGE_TPL = IMAGES.head_template;
@@ -40,8 +55,20 @@ const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
 
 describe("the production offer passes every client check", () => {
   it("verifies, with its chat block, both head templates and its images block", () => {
-    const v = verifyConfidentialOffer(OFFER, { pinnedPubkey: OFFER.notary_pubkey as string, trustedHosts: [HOST] });
+    // As captured it is a v2 offer: a v3 client does not use that node (§11).
+    expect(() =>
+      verifyConfidentialOffer(OFFER, { pinnedPubkey: OFFER.notary_pubkey as string, trustedHosts: [HOST] }),
+    ).toThrow(NodeProtocolOutdatedError);
+    const priv = new Uint8Array(32).fill(9);
+    const pub = bytesToHex(schnorr.getPublicKey(priv));
+    const offer = { ...SIGNED, notary_pubkey: pub };
+    const payload = canonicalJson(offer);
+    const signed = { ...offer, sig: bytesToHex(schnorr.sign(sha256(utf8ToBytes(payload)), priv)), sig_payload: payload };
+    const v = verifyConfidentialOffer(signed, { pinnedPubkey: pub, trustedHosts: [HOST] });
     expect(v.imagesRefused).toBeUndefined();
+    expect(v.http2Refused).toBeUndefined();
+    expect(v.http).toEqual(["2", "1.1"]);
+    expect(offerSupportsHttp2Images(v)).toBe(true);
     expect(offerSupportsImages(v)).toBe(true);
     expect(() => validateChatSuffix(SIGNED.chat, SIGNED.suffix_keys)).not.toThrow();
     expect(headTemplateProblem(CHAT_TPL, HOST, "chat")).toBeUndefined();
@@ -167,20 +194,17 @@ function fakeControlSocket(ready: Record<string, unknown>) {
   return Ws;
 }
 
-describe("session id and node frames", () => {
+describe("connection id and node frames", () => {
   const opts = (extra: Record<string, unknown> = {}) =>
     ({
       baseUrl: "http://127.0.0.1:8010",
-      offer: { v: 2, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
+      offer: { v: 3, notary_pubkey: "00".repeat(32), chat: VENICE_CHAT, suffix_keys: chatSuffixKeys(VENICE_CHAT) },
       auth: "sk-x",
-      model: "m",
-      maxTokens: 10,
-      bodyLength: 100,
       prover: new CuProverBackend({ binaryPath: process.execPath }),
-      proofChannel: false,
+      proofChannelFactory: () => ({ start() {}, ready: async () => false, failed: false, used: false, close() {} }) as never,
       ...extra,
     }) as never;
-  const ready = (sid: unknown) => ({ type: "ready", v: 2, sid, pubkey: "00".repeat(32), zk_token: "t/k" });
+  const ready = (sid: unknown) => ({ type: "ready", v: 3, http: "1.1", sid, pubkey: "00".repeat(32), zk_token: "t/k" });
 
   async function withSocket<T>(Ws: unknown, f: () => Promise<T>): Promise<T> {
     const real = (globalThis as { WebSocket: unknown }).WebSocket;
@@ -196,7 +220,7 @@ describe("session id and node frames", () => {
     for (const sid of ["ab".repeat(31), "AB".repeat(32), `${"ab".repeat(31)}&x`, "../../v1/x", 7, undefined]) {
       let started = 0;
       await withSocket(fakeControlSocket(ready(sid)), async () => {
-        const session = new ConfidentialSession(
+        const session = new ConfidentialConnection(
           opts({
             twoPcFactory: () => {
               started++;
@@ -204,7 +228,7 @@ describe("session id and node frames", () => {
             },
           }),
         );
-        await expect(session.arm()).rejects.toThrow(/malformed session id/);
+        await expect(session.arm()).rejects.toThrow(/malformed connection id/);
       });
       expect(started).toBe(0);
     }
@@ -214,7 +238,7 @@ describe("session id and node frames", () => {
     const sid = "ab".repeat(32);
     const urls: string[] = [];
     await withSocket(fakeControlSocket(ready(sid)), async () => {
-      const session = new ConfidentialSession(
+      const session = new ConfidentialConnection(
         opts({
           twoPcFactory: () =>
             ({
@@ -228,13 +252,13 @@ describe("session id and node frames", () => {
       await expect(session.arm()).rejects.toThrow(/stop here/);
       expect(session.sid).toBe(sid);
     });
-    expect(urls).toEqual([`ws://127.0.0.1:8010/v1/confidential/zk?proof=twopc&session_id=${sid}&zk_token=t%2Fk`]);
+    expect(urls).toEqual([`ws://127.0.0.1:8010/v1/confidential/zk?proof=twopc&sid=${sid}&session_id=${sid}&zk_token=t%2Fk`]);
   });
 
   it("fails the session on the 17th unanswered frame of one type", async () => {
     const Ws = fakeControlSocket(ready("cd".repeat(32)));
     await withSocket(Ws, async () => {
-      const session = new ConfidentialSession(
+      const session = new ConfidentialConnection(
         opts({
           twoPcFactory: () =>
             ({ start() {}, keyShare: () => new Promise(() => {}), failed: false, close() {} }) as never,
@@ -255,7 +279,7 @@ describe("session id and node frames", () => {
   it("fails the session when the node queues more than 32 MiB of TLS bytes", async () => {
     const Ws = fakeControlSocket(ready("ab".repeat(32)));
     await withSocket(Ws, async () => {
-      const session = new ConfidentialSession(
+      const session = new ConfidentialConnection(
         opts({
           twoPcFactory: () =>
             ({ start() {}, keyShare: () => new Promise(() => {}), failed: false, close() {} }) as never,
@@ -271,10 +295,10 @@ describe("session id and node frames", () => {
     });
   });
 
-  it("fails the session on a frame without a type, and caps the event log", async () => {
+  it("fails the connection on a frame without a type", async () => {
     const Ws = fakeControlSocket(ready("ef".repeat(32)));
     await withSocket(Ws, async () => {
-      const session = new ConfidentialSession(
+      const session = new ConfidentialConnection(
         opts({
           twoPcFactory: () =>
             ({ start() {}, keyShare: () => new Promise(() => {}), failed: false, close() {} }) as never,
@@ -283,9 +307,6 @@ describe("session id and node frames", () => {
       const armed = session.arm();
       armed.catch(() => {});
       await tick(20);
-      const log = session as unknown as { event(e: Record<string, unknown>): void; events: string[] };
-      for (let i = 0; i < 10_050; i++) log.event({ ev: "x" });
-      expect(log.events.length).toBe(10_000);
       Ws.last.frame(null);
       await expect(armed).rejects.toThrow(/without a type/);
     });

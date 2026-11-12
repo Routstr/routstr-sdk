@@ -32,7 +32,7 @@ import { encryptWrappedRecord } from "../../client/confidential/tls-fork/lib/uti
 import { packFinishMessagePacket } from "../../client/confidential/tls-fork/lib/utils/finish-messages.js";
 import { getSignatureDataTls13 } from "../../client/confidential/tls-fork/lib/utils/parse-certificate.js";
 import { CuProverBackend } from "../../client/confidential/prover";
-import { ConfidentialSession } from "../../client/confidential/session";
+import { ConfidentialConnection } from "../../client/confidential/connection";
 import { chatSuffixKeys } from "../../client/confidential/suffix";
 import { VENICE_CHAT } from "./fixtures/chat";
 
@@ -831,29 +831,29 @@ describe("tls-fork application data and plaintext records (TLS-15, TLS-16)", () 
     );
   });
 
-  it("a v2 session hands nothing to the caller from a record under s_hs", async () => {
-    // The session's own TLS client (as session.ts builds it), with the 2PC
-    // hooks answering as the two-party key schedule would.
+  it("a framing-1.1 connection hands nothing to the caller from a record under s_hs", async () => {
+    // The connection's own TLS client (as connection.ts builds it), with the
+    // 2PC hooks answering as the two-party key schedule would.
     const heads: unknown[] = [];
     const bodies: Uint8Array[] = [];
-    const session = new ConfidentialSession({
+    const session = new ConfidentialConnection({
       baseUrl: "http://127.0.0.1:8010",
       offer: {
-        v: 2,
+        v: 3,
         notary_pubkey: "00".repeat(32),
         upstream_host: HOST,
         chat: VENICE_CHAT,
         suffix_keys: chatSuffixKeys(VENICE_CHAT),
       },
+      framing: "1.1",
       auth: "sk-x",
-      model: "m",
-      maxTokens: 10,
-      bodyLength: 100,
       prover: new CuProverBackend({ binaryPath: process.execPath }),
-      proofChannel: false,
-      onResponseHead: (h: unknown) => heads.push(h),
-      onResponseBody: (b: Uint8Array) => bodies.push(b),
     } as never);
+    // A request in flight, as when the response would be delivered.
+    (session as unknown as { cur: unknown }).cur = {
+      parts: [],
+      opts: { onResponseHead: (h: unknown) => heads.push(h), onResponseBody: (b: Uint8Array) => bodies.push(b) },
+    };
     const sHs = crypto.getRandomValues(new Uint8Array(32));
     const internals = session as unknown as {
       makeTls(external: unknown): void;

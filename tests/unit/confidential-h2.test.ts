@@ -6,7 +6,7 @@
  * and the connection pool.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
@@ -32,10 +32,10 @@ import {
   splitBody,
   type WinSource,
 } from "../../client/confidential/h2";
-import { Http2Pool, http2IdleMs, http2PoolKey } from "../../client/confidential/h2pool";
+import { ConnectionPool, poolIdleMs, poolKey } from "../../client/confidential/pool";
 import { ConnectionDepositError } from "../../client/confidential/errors";
 import { offerSupportsHttp2, verifyConfidentialOffer } from "../../client/confidential/offer";
-import { ConfidentialH2Connection, h2ConnectionTerms } from "../../client/confidential/h2conn";
+import { ConfidentialConnection, connectionTerms } from "../../client/confidential/connection";
 import { CuProverBackend } from "../../client/confidential/prover";
 import { deriveTrafficKeysForSide } from "../../client/confidential/tls-fork/lib/utils/decryption-utils.js";
 import { encryptWrappedRecord } from "../../client/confidential/tls-fork/lib/utils/wrapped-record.js";
@@ -120,7 +120,7 @@ describe("http 2: framing and HPACK (sidecar vectors)", () => {
 
 describe("http 2: the offer's h2 block", () => {
   const offer = {
-    http: ["1.1", "2"],
+    http: ["2", "1.1"],
     upstream_host: "api.venice.ai",
     h2: { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 100 },
   };
@@ -139,27 +139,38 @@ describe("http 2: the offer's h2 block", () => {
     expect(() => checkH2Offer(offer, ["/v1"])).toThrow();
   });
 
-  it("reads the node's connection deposit and idle timeout, and holds them to their ranges", () => {
-    // A sidecar's own block names neither: no deposit, the sidecar's idle limit.
+  it("fills the block's defaults and holds the connection lifetime to its range", () => {
     expect(checkH2Offer(offer, bases)).toEqual({
       probe_path: "/api/v1/models",
       idle_secs: 300,
       max_requests: 100,
-      connection_deposit_msat: 0,
-      idle_timeout_s: 300,
+      max_lifetime_s: 3600,
       kinds: ["chat"],
     });
-    const node = { ...offer, h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 } };
-    const block = checkH2Offer(node, bases);
-    expect(block.connection_deposit_msat).toBe(7000);
-    expect(block.idle_timeout_s).toBe(120);
+    expect(checkH2Offer({ ...offer, h2: { ...offer.h2, max_lifetime_s: 60 } }, bases).max_lifetime_s).toBe(60);
+    for (const max_lifetime_s of [59, 86401, 12.5, "3600", null]) {
+      expect(() => checkH2Offer({ ...offer, h2: { ...offer.h2, max_lifetime_s } }, bases)).toThrow(/max_lifetime_s/);
+    }
+  });
+
+  it("the deposit and the idle timeout are the offer's own fields (§12.1), held to their ranges", () => {
+    const node = (extra: Record<string, unknown>) => {
+      const o = signedOffer({ http: ["2", "1.1"], h2: offer.h2, ...extra });
+      return verifyConfidentialOffer(o.offer, policy(o.pubHex));
+    };
+    const v3 = node({ connection_deposit_msat: 7000, idle_timeout_s: 120 });
+    expect(v3.connection_deposit_msat).toBe(7000);
+    expect(v3.idle_timeout_s).toBe(120);
+    // Absent: no deposit.
+    expect(node({}).connection_deposit_msat).toBe(0);
     for (const connection_deposit_msat of [-1, 1.5, "7000", null, 2 ** 60]) {
-      expect(() => checkH2Offer({ ...node, h2: { ...node.h2, connection_deposit_msat } }, bases)).toThrow(/connection_deposit_msat/);
+      expect(() => node({ connection_deposit_msat })).toThrow(/connection_deposit_msat/);
     }
-    // Never longer than the sidecar's own limit, never under 10 s.
-    for (const idle_timeout_s of [9, 301, 12.5, "120", null]) {
-      expect(() => checkH2Offer({ ...node, h2: { ...node.h2, idle_timeout_s } }, bases)).toThrow(/idle_timeout_s/);
+    for (const idle_timeout_s of [9, 12.5, "120", null]) {
+      expect(() => node({ idle_timeout_s })).toThrow(/idle_timeout_s/);
     }
+    // Longer than the sidecar's own limit: framing "2" is not used with that offer.
+    expect(node({ idle_timeout_s: 301 }).http).toEqual(["1.1"]);
   });
 
   it("reads the request kinds: chat, or chat and images", () => {
@@ -186,22 +197,23 @@ describe("http 2: the offer's h2 block", () => {
       price_list: { img: [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 12100 }] },
     };
     const open = (h2: Record<string, unknown>) => {
-      const good = signedOffer({ http: ["1.1", "2"], h2, capabilities: ["chat", "images"], images });
-      const conn = new ConfidentialH2Connection({
+      const good = signedOffer({ http: ["2", "1.1"], h2, capabilities: ["chat", "images"], images });
+      const conn = new ConfidentialConnection({
         baseUrl: "https://node.example",
         offer: verifyConfidentialOffer(good.offer, policy(good.pubHex)),
+        framing: "2",
         auth: "sk-x",
         prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
       });
-      (conn as unknown as { opened: boolean }).opened = true;
+      (conn as unknown as { phaseNow: string }).phaseNow = "ready";
       return conn;
     };
     const body = (suffix: string) => new TextEncoder().encode(`{"prompt":"x"${suffix}`);
     const sfx = ',"model":"img","variants":1,"return_binary":false,"format":"webp"}';
-    const req = (conn: ConfidentialH2Connection, image: { variant: string; count: number }, b = body(sfx)) => () =>
+    const req = (conn: ConfidentialConnection, image: { variant: string; count: number }, b = body(sfx)) => () =>
       conn.request({ model: "img", maxTokens: 0, image, body: b });
-    // A connection whose offer keeps images on the v2 flow.
-    expect(req(open({ ...offer.h2 }), { variant: "webp", count: 1 })).toThrow(/no image requests over http: 2/);
+    // A connection whose offer serves images only with framing "1.1".
+    expect(req(open({ ...offer.h2 }), { variant: "webp", count: 1 })).toThrow(/no image requests on framing "2"/);
     const conn = open({ ...offer.h2, kinds: ["chat", "images"] });
     expect(req(conn, { variant: "png", count: 1 })).toThrow(/no variant png/);
     expect(req(conn, { variant: "webp", count: 3 })).toThrow(/outside 1\.\.2/);
@@ -212,56 +224,52 @@ describe("http 2: the offer's h2 block", () => {
   });
 
   it("the pool's idle time stays below the node's idle timeout", () => {
-    const h2 = { idle_secs: 300, idle_timeout_s: 120 };
     // The default margin (20 s) below the node's timeout.
-    expect(http2IdleMs(h2)).toBe(100_000);
+    expect(poolIdleMs(120_000)).toBe(100_000);
     // A caller's shorter idle time is kept; a longer one is clamped.
-    expect(http2IdleMs(h2, { maxIdleMs: 30_000 })).toBe(30_000);
-    expect(http2IdleMs(h2, { maxIdleMs: 600_000 })).toBe(100_000);
-    expect(http2IdleMs(h2, { idleMarginMs: 0, maxIdleMs: 600_000 })).toBe(120_000);
+    expect(poolIdleMs(120_000, { maxIdleMs: 30_000 })).toBe(30_000);
+    expect(poolIdleMs(120_000, { maxIdleMs: 600_000 })).toBe(100_000);
+    expect(poolIdleMs(120_000, { idleMarginMs: 0, maxIdleMs: 600_000 })).toBe(120_000);
     // A short node timeout: the margin shrinks to a quarter of it.
-    expect(http2IdleMs({ idle_secs: 300, idle_timeout_s: 12 })).toBe(9_000);
-    // Without the node's term (a sidecar's own offer): the sidecar's limit.
-    expect(http2IdleMs({ idle_secs: 300 })).toBe(280_000);
-    // A block that names a longer timeout than the sidecar's is not believed.
-    expect(http2IdleMs({ idle_secs: 60, idle_timeout_s: 600 })).toBe(45_000);
+    expect(poolIdleMs(12_000)).toBe(9_000);
   });
 
-  it("refuses to open a connection whose deposit exceeds the client's maximum", () => {
-    const good = signedOffer({
-      http: ["1.1", "2"],
-      h2: { ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 },
-    });
+  it("refuses to open a connection whose deposit exceeds the client's maximum (both framings)", () => {
+    const good = signedOffer({ http: ["2", "1.1"], h2: offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120 });
     const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
-    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 7000, idle_timeout_s: 120, kinds: ["chat"] });
-    const open = (maxDepositMsat?: number) =>
-      new ConfidentialH2Connection({
-        baseUrl: "https://node.example",
-        offer: verified,
-        auth: "sk-x",
-        prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
-        maxDepositMsat,
-      });
-    expect(open().depositMsat).toBe(7000);
-    expect(open(7000).depositMsat).toBe(7000);
-    let refused: unknown;
-    try {
-      open(6999);
-    } catch (e) {
-      refused = e;
+    expect(verified.h2).toEqual({ ...offer.h2, max_lifetime_s: 3600, kinds: ["chat"] });
+    for (const framing of ["2", "1.1"] as const) {
+      const open = (maxDepositMsat?: number) =>
+        new ConfidentialConnection({
+          baseUrl: "https://node.example",
+          offer: verified,
+          framing,
+          auth: "sk-x",
+          prover: new CuProverBackend({ binaryPath: "/nonexistent" }),
+          maxDepositMsat,
+        });
+      expect(open().depositMsat).toBe(7000);
+      expect(open().nodeIdleMs).toBe(120_000);
+      expect(open().maxRequests).toBe(framing === "2" ? 100 : 1);
+      expect(open(7000).depositMsat).toBe(7000);
+      let refused: unknown;
+      try {
+        open(6999);
+      } catch (e) {
+        refused = e;
+      }
+      expect(refused).toBeInstanceOf(ConnectionDepositError);
+      expect((refused as ConnectionDepositError).depositMsat).toBe(7000);
+      expect((refused as Error).message).toMatch(/7000 msat exceeds the client's maximum of 6999/);
     }
-    expect(refused).toBeInstanceOf(ConnectionDepositError);
-    expect((refused as ConnectionDepositError).depositMsat).toBe(7000);
-    expect((refused as Error).message).toMatch(/7000 msat exceeds the client's maximum of 6999/);
   });
 
   function signedOffer(overrides: Record<string, unknown> = {}) {
     const priv = new Uint8Array(32).fill(7);
     const pubHex = bytesToHex(schnorr.getPublicKey(priv));
     const o: Record<string, unknown> = {
-      v: 2,
-      min_v: 2,
-      max_v: 2,
+      v: 3,
+      twopc: "split-public-1",
       upstream_host: "api.venice.ai",
       notary_pubkey: pubHex,
       max_tokens_cap: 4096,
@@ -285,8 +293,8 @@ describe("http 2: the offer's h2 block", () => {
     // Application data is not in the handshake transcript: a node could put
     // its own HTTP/2 frames (a SETTINGS shrinking our window, a HEADERS)
     // between the ServerHello and the real server flight.
-    const good = signedOffer({ http: ["1.1", "2"], h2: offer.h2 });
-    const conn = new ConfidentialH2Connection({
+    const good = signedOffer({ http: ["2", "1.1"], h2: offer.h2 });
+    const conn = new ConfidentialConnection({
       baseUrl: "https://node.example",
       offer: verifyConfidentialOffer(good.offer, policy(good.pubHex)),
       auth: "sk-x",
@@ -343,11 +351,12 @@ describe("http 2: the offer's h2 block", () => {
     const plain = signedOffer();
     expect(offerSupportsHttp2(verifyConfidentialOffer(plain.offer, policy(plain.pubHex)))).toBe(false);
 
-    const good = signedOffer({ http: ["1.1", "2"], h2: offer.h2 });
+    const good = signedOffer({ http: ["2", "1.1"], h2: offer.h2 });
     const verified = verifyConfidentialOffer(good.offer, policy(good.pubHex));
     expect(offerSupportsHttp2(verified)).toBe(true);
     // The node's two terms default to "no deposit" and the sidecar's idle limit.
-    expect(verified.h2).toEqual({ ...offer.h2, connection_deposit_msat: 0, idle_timeout_s: 300, kinds: ["chat"] });
+    expect(verified.h2).toEqual({ ...offer.h2, max_lifetime_s: 3600, kinds: ["chat"] });
+    expect(verified.http).toEqual(["2", "1.1"]);
     expect(verified.http2Refused).toBeUndefined();
     // Verifying a verified offer again (the transport's cache) keeps it.
     expect(offerSupportsHttp2(verifyConfidentialOffer(verified, policy(good.pubHex)))).toBe(true);
@@ -356,13 +365,13 @@ describe("http 2: the offer's h2 block", () => {
     expect(offerSupportsHttp2(verifyConfidentialOffer(only11.offer, policy(only11.pubHex)))).toBe(false);
   });
 
-  it("a bad h2 block switches http 2 off and leaves the v2 offer usable", () => {
+  it("a bad h2 block switches framing 2 off and leaves the offer usable with 1.1", () => {
     for (const h2 of [
       { ...offer.h2, probe_path: "/api/v1/api_keys" },
       { ...offer.h2, idle_secs: 5 },
       undefined,
     ]) {
-      const bad = signedOffer(h2 ? { http: ["1.1", "2"], h2 } : { http: ["1.1", "2"] });
+      const bad = signedOffer(h2 ? { http: ["2", "1.1"], h2 } : { http: ["2", "1.1"] });
       const verified = verifyConfidentialOffer(bad.offer, policy(bad.pubHex));
       expect(offerSupportsHttp2(verified)).toBe(false);
       expect(verified.http).toEqual(["1.1"]);
@@ -370,7 +379,7 @@ describe("http 2: the offer's h2 block", () => {
       expect(verified.price_list.cheap).toBeDefined();
     }
     // A probe under another API base than the trusted host entry allows.
-    const other = signedOffer({ http: ["1.1", "2"], h2: { ...offer.h2, probe_path: "/v1/models" } });
+    const other = signedOffer({ http: ["2", "1.1"], h2: { ...offer.h2, probe_path: "/v1/models" } });
     const verified = verifyConfidentialOffer(other.offer, {
       pinnedPubkey: other.pubHex,
       trustedHosts: ["api.venice.ai/api/v1"],
@@ -380,39 +389,56 @@ describe("http 2: the offer's h2 block", () => {
 
   it("a re-signed offer with other rates keeps the connection terms; another route or h2 block does not", () => {
     const h2 = offer.h2;
-    const first = signedOffer({ http: ["1.1", "2"], h2 });
+    const first = signedOffer({ http: ["2", "1.1"], h2 });
     const a = verifyConfidentialOffer(first.offer, policy(first.pubHex));
-    const repriced = signedOffer({ http: ["1.1", "2"], h2, price_list: { cheap: { in: 1100, cached_in: 1100, out: 1200 } }, session_fee_msat: 5 });
+    const repriced = signedOffer({ http: ["2", "1.1"], h2, price_list: { cheap: { in: 1100, cached_in: 1100, out: 1200 } }, session_fee_msat: 5 });
     const b = verifyConfidentialOffer(repriced.offer, policy(repriced.pubHex));
     expect(a.sig).not.toBe(b.sig);
-    expect(h2ConnectionTerms(b)).toBe(h2ConnectionTerms(a));
-    const key = (o: typeof a) => http2PoolKey({ baseUrl: "https://n", bearer: "sk", model: "cheap", terms: h2ConnectionTerms(o) }, "credential");
+    expect(connectionTerms(b)).toBe(connectionTerms(a));
+    const key = (o: typeof a) => poolKey({ baseUrl: "https://n", bearer: "sk", scope: connectionTerms(o) });
     expect(key(b)).toBe(key(a));
-    const otherIdle = signedOffer({ http: ["1.1", "2"], h2: { ...h2, idle_secs: 60 } });
-    expect(h2ConnectionTerms(verifyConfidentialOffer(otherIdle.offer, policy(otherIdle.pubHex)))).not.toBe(h2ConnectionTerms(a));
+    const otherIdle = signedOffer({ http: ["2", "1.1"], h2: { ...h2, idle_secs: 60 } });
+    expect(connectionTerms(verifyConfidentialOffer(otherIdle.offer, policy(otherIdle.pubHex)))).not.toBe(connectionTerms(a));
+    // The other connection-level fields of §12.1: the deposit, the idle timeout, the chat block.
+    for (const extra of [{ connection_deposit_msat: 5 }, { idle_timeout_s: 60 }]) {
+      const o = signedOffer({ http: ["2", "1.1"], h2, ...extra });
+      expect(connectionTerms(verifyConfidentialOffer(o.offer, policy(o.pubHex)))).not.toBe(connectionTerms(a));
+    }
     const otherKeyLen = signedOffer({
-      http: ["1.1", "2"],
+      http: ["2", "1.1"],
       h2,
       key_length: 40,
       head_template: (first.offer.head_template as string).replace("{KEY:42}", "{KEY:40}"),
     });
     const c = verifyConfidentialOffer(otherKeyLen.offer, policy(otherKeyLen.pubHex));
-    expect(h2ConnectionTerms(c)).not.toBe(h2ConnectionTerms(a));
+    expect(connectionTerms(c)).not.toBe(connectionTerms(a));
     expect(key(c)).not.toBe(key(a));
   });
 
-  it("a connection refuses an offer without the block, before anything is sent", () => {
+  it("a connection refuses a framing the offer does not list, before anything is sent", () => {
     const plain = signedOffer();
     const verified = verifyConfidentialOffer(plain.offer, policy(plain.pubHex));
-    expect(
-      () =>
-        new ConfidentialH2Connection({
-          baseUrl: "http://127.0.0.1:1",
-          offer: verified,
-          auth: "sk-test",
-          prover: new CuProverBackend({ binaryPath: "/nonexistent/cu-prover" }),
-        }),
-    ).toThrow(/no http: 2/);
+    const open = (framing?: "2" | "1.1") =>
+      new ConfidentialConnection({
+        baseUrl: "http://127.0.0.1:1",
+        offer: verified,
+        framing,
+        auth: "sk-test",
+        prover: new CuProverBackend({ binaryPath: "/nonexistent/cu-prover" }),
+      });
+    expect(() => open("2")).toThrow(/does not serve framing "2"/);
+    // Without a choice: the offer's first framing.
+    expect(open().framing).toBe("1.1");
+    const both = signedOffer({ http: ["2", "1.1"], h2: offer.h2 });
+    const conn = new ConfidentialConnection({
+      baseUrl: "http://127.0.0.1:1",
+      offer: verifyConfidentialOffer(both.offer, policy(both.pubHex)),
+      auth: "sk-test",
+      prover: new CuProverBackend({ binaryPath: "/nonexistent/cu-prover" }),
+    });
+    expect(conn.framing).toBe("2");
+    expect(conn.phase).toBe("new");
+    expect(conn.idle).toBe(false);
   });
 });
 
@@ -544,31 +570,56 @@ describe("http 2: π_WIN windows may compare only public bytes of our own record
 class FakeConn {
   static opened = 0;
   sid = `${(++FakeConn.opened).toString(16).padStart(8, "0")}`;
-  h2 = { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 3 };
+  framing: "2" | "1.1";
+  h2 = { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 3, max_lifetime_s: 3600, kinds: ["chat"] };
+  maxRequests: number;
+  nodeIdleMs = 120_000;
+  depositMsat = 1000;
   requests = 0;
+  settled = 0;
+  tCreated = Date.now();
   tOpen = 0;
   tLastSettled = 0;
   busy = false;
+  isArmed = false;
   dead?: Error;
   failConnect = false;
+  failArm = false;
   private endedRes!: (e: Error) => void;
   ended = new Promise<Error>((r) => (this.endedRes = r));
+  constructor(framing: "2" | "1.1" = "2") {
+    this.framing = framing;
+    this.maxRequests = framing === "2" ? 3 : 1;
+  }
   get failureReason() {
     return this.dead;
   }
   get usable() {
-    return !this.dead && this.tOpen > 0 && this.requests < this.h2.max_requests;
+    return !this.dead && (this.tOpen > 0 || this.isArmed) && this.requests < this.maxRequests;
   }
   get idle() {
     return this.usable && !this.busy;
   }
+  get armed() {
+    return this.isArmed && this.tOpen === 0 && this.usable;
+  }
+  async arm(_prewarm = false) {
+    await new Promise((r) => setTimeout(r, 5));
+    if (this.dead) throw this.dead;
+    if (this.failArm) {
+      this.close("arm failed");
+      throw new Error("arm failed");
+    }
+    this.isArmed = true;
+  }
   async connect() {
+    if (!this.isArmed) await this.arm();
     await new Promise((r) => setTimeout(r, 5));
     if (this.failConnect) {
       this.close("connect failed");
       throw new Error("connect failed");
     }
-    this.tOpen = this.tLastSettled = Date.now();
+    if (this.framing === "2") this.tOpen = this.tLastSettled = Date.now();
   }
   close(why = "closed") {
     if (this.dead) return;
@@ -582,6 +633,7 @@ class FakeConn {
   }
   finish() {
     this.busy = false;
+    this.settled++;
     this.tLastSettled = Date.now();
   }
 }
@@ -589,23 +641,22 @@ class FakeConn {
 describe("http 2: the connection pool", () => {
   const quiet = { log: () => {} };
 
-  it("keys by node, credential and offer; by model only when asked", () => {
-    const a = { baseUrl: "https://n1/", bearer: "sk-a", model: "m1", terms: "s" };
-    expect(http2PoolKey(a, "credential")).toBe(http2PoolKey({ ...a, baseUrl: "https://n1", model: "m2" }, "credential"));
-    expect(http2PoolKey(a, "credential")).not.toBe(http2PoolKey({ ...a, bearer: "sk-b" }, "credential"));
-    expect(http2PoolKey(a, "credential")).not.toBe(http2PoolKey({ ...a, baseUrl: "https://n2" }, "credential"));
-    expect(http2PoolKey(a, "credential")).not.toBe(http2PoolKey({ ...a, terms: "t" }, "credential"));
-    expect(http2PoolKey(a, "credential")).not.toBe(http2PoolKey({ ...a, scope: "user-1" }, "credential"));
-    expect(http2PoolKey(a, "model")).not.toBe(http2PoolKey({ ...a, model: "m2" }, "model"));
-    expect(http2PoolKey(a, "credential")).not.toContain("sk-a");
+  it("keys by node, credential and scope (§9.1)", () => {
+    const a = { baseUrl: "https://n1/", bearer: "sk-a" };
+    expect(poolKey(a)).toBe(poolKey({ ...a, baseUrl: "https://n1" }));
+    expect(poolKey(a)).not.toBe(poolKey({ ...a, bearer: "sk-b" }));
+    expect(poolKey(a)).not.toBe(poolKey({ ...a, baseUrl: "https://n2" }));
+    expect(poolKey(a)).not.toBe(poolKey({ ...a, scope: "user-1" }));
+    expect(poolKey({ ...a, scope: "user-1" })).not.toBe(poolKey({ ...a, scope: "user-2" }));
+    expect(poolKey(a)).not.toContain("sk-a");
   });
 
   it("reuses an idle connection for sequential requests", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
+    const pool = new ConnectionPool<FakeConn>(quiet);
     const conns: FakeConn[] = [];
     const open = () => (conns.push(new FakeConn()), conns[conns.length - 1]!);
     for (let i = 0; i < 3; i++) {
-      const lease = await pool.acquire("k", open);
+      const lease = await pool.acquire("k", "2", open);
       expect(lease.reused).toBe(i > 0);
       lease.conn.start();
       lease.conn.finish();
@@ -615,26 +666,26 @@ describe("http 2: the connection pool", () => {
     // The connection reached the offer's request limit (3): it was closed.
     expect(conns[0]!.dead).toBeDefined();
     expect(pool.snapshot()).toHaveLength(0);
-    const again = await pool.acquire("k", open);
+    const again = await pool.acquire("k", "2", open);
     expect(again.reused).toBe(false);
     expect(conns).toHaveLength(2);
     pool.close();
   });
 
   it("opens another connection for an overlapping request, and one per key", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
+    const pool = new ConnectionPool<FakeConn>(quiet);
     const conns: FakeConn[] = [];
     const open = () => (conns.push(new FakeConn()), conns[conns.length - 1]!);
-    const [l1, l2] = await Promise.all([pool.acquire("k", open), pool.acquire("k", open)]);
+    const [l1, l2] = await Promise.all([pool.acquire("k", "2", open), pool.acquire("k", "2", open)]);
     expect(l1.conn).not.toBe(l2.conn);
     expect(l1.reused || l2.reused).toBe(false);
     l1.conn.start();
     l2.conn.start();
-    const other = await pool.acquire("other", open);
+    const other = await pool.acquire("other", "2", open);
     expect(conns).toHaveLength(3);
     l1.conn.finish();
     l1.release();
-    const l3 = await pool.acquire("k", open);
+    const l3 = await pool.acquire("k", "2", open);
     expect(l3.conn).toBe(l1.conn);
     expect(l3.reused).toBe(true);
     expect(pool.snapshot().map((s) => s.state).sort()).toEqual(["busy", "busy", "busy"]);
@@ -644,13 +695,13 @@ describe("http 2: the connection pool", () => {
   });
 
   it("waits at the per-key limit until a connection is free", async () => {
-    const pool = new Http2Pool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1 });
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1 });
     const conns: FakeConn[] = [];
     const open = () => (conns.push(new FakeConn()), conns[conns.length - 1]!);
-    const l1 = await pool.acquire("k", open);
+    const l1 = await pool.acquire("k", "2", open);
     l1.conn.start();
     let got = false;
-    const second = pool.acquire("k", open).then((l) => ((got = true), l));
+    const second = pool.acquire("k", "2", open).then((l) => ((got = true), l));
     await new Promise((r) => setTimeout(r, 30));
     expect(got).toBe(false);
     l1.conn.finish();
@@ -662,48 +713,48 @@ describe("http 2: the connection pool", () => {
   });
 
   it("times out when no connection becomes free", async () => {
-    const pool = new Http2Pool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1, acquireTimeoutMs: 40 });
-    const l1 = await pool.acquire("k", () => new FakeConn());
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1, acquireTimeoutMs: 40 });
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
     l1.conn.start();
-    await expect(pool.acquire("k", () => new FakeConn())).rejects.toThrow(/timeout/);
+    await expect(pool.acquire("k", "2", () => new FakeConn())).rejects.toThrow(/timeout/);
     pool.close();
   });
 
   it("makes room at the total limit by closing another key's idle connection", async () => {
-    const pool = new Http2Pool<FakeConn>({ ...quiet, maxConnections: 1 });
-    const a = await pool.acquire("a", () => new FakeConn());
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnections: 1 });
+    const a = await pool.acquire("a", "2", () => new FakeConn());
     a.conn.start();
     a.conn.finish();
     a.release();
-    const b = await pool.acquire("b", () => new FakeConn());
+    const b = await pool.acquire("b", "2", () => new FakeConn());
     expect(a.conn.dead).toBeDefined();
     expect(b.reused).toBe(false);
     pool.close();
   });
 
   it("never hands out a connection that died while idle", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
-    const l1 = await pool.acquire("k", () => new FakeConn());
+    const pool = new ConnectionPool<FakeConn>(quiet);
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
     l1.conn.start();
     l1.conn.finish();
     l1.release();
     l1.conn.close("the node's idle limit");
-    const l2 = await pool.acquire("k", () => new FakeConn());
+    const l2 = await pool.acquire("k", "2", () => new FakeConn());
     expect(l2.conn).not.toBe(l1.conn);
     expect(l2.reused).toBe(false);
     pool.close();
   });
 
   it("does not keep a connection whose request failed, or with reuse off", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
-    const l1 = await pool.acquire("k", () => new FakeConn());
+    const pool = new ConnectionPool<FakeConn>(quiet);
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
     l1.conn.start();
     l1.conn.close("request failed");
     l1.release();
     expect(pool.snapshot()).toHaveLength(0);
 
-    const none = new Http2Pool<FakeConn>({ ...quiet, reuse: "none" });
-    const l2 = await none.acquire("k", () => new FakeConn());
+    const none = new ConnectionPool<FakeConn>({ ...quiet, reuse: "none" });
+    const l2 = await none.acquire("k", "2", () => new FakeConn());
     l2.conn.start();
     l2.conn.finish();
     l2.release();
@@ -712,8 +763,8 @@ describe("http 2: the connection pool", () => {
   });
 
   it("closes an idle connection before the node's idle limit, and after maxRequestsPerConnection", async () => {
-    const pool = new Http2Pool<FakeConn>({ ...quiet, maxIdleMs: 30, maxRequestsPerConnection: 2 });
-    const l1 = await pool.acquire("k", () => new FakeConn());
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxIdleMs: 30, maxRequestsPerConnection: 2 });
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
     l1.conn.start();
     l1.conn.finish();
     l1.release();
@@ -722,11 +773,11 @@ describe("http 2: the connection pool", () => {
     expect(l1.conn.dead).toBeDefined();
     expect(pool.snapshot()).toHaveLength(0);
 
-    const l2 = await pool.acquire("k", () => new FakeConn());
+    const l2 = await pool.acquire("k", "2", () => new FakeConn());
     l2.conn.start();
     l2.conn.finish();
     l2.release();
-    const l3 = await pool.acquire("k", () => new FakeConn());
+    const l3 = await pool.acquire("k", "2", () => new FakeConn());
     expect(l3.conn).toBe(l2.conn);
     l3.conn.start();
     l3.conn.finish();
@@ -736,9 +787,9 @@ describe("http 2: the connection pool", () => {
   });
 
   it("surfaces a failed connect and forgets the connection", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
+    const pool = new ConnectionPool<FakeConn>(quiet);
     await expect(
-      pool.acquire("k", () => {
+      pool.acquire("k", "2", () => {
         const c = new FakeConn();
         c.failConnect = true;
         return c;
@@ -748,9 +799,172 @@ describe("http 2: the connection pool", () => {
   });
 
   it("respects an aborted caller", async () => {
-    const pool = new Http2Pool<FakeConn>(quiet);
+    const pool = new ConnectionPool<FakeConn>(quiet);
     const ac = new AbortController();
     ac.abort(new Error("gone"));
-    await expect(pool.acquire("k", () => new FakeConn(), ac.signal)).rejects.toThrow(/gone/);
+    await expect(pool.acquire("k", "2", () => new FakeConn(), ac.signal)).rejects.toThrow(/gone/);
+  });
+
+  describe("armed spares (§9.2)", () => {
+    const prewarm = { log: () => {}, backoffBaseMs: 20 };
+    const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
+    /** One settled request of `key` on `framing`, announced to the pool as the transport does. */
+    async function request(pool: ConnectionPool<FakeConn>, key: string, framing: "2" | "1.1", conns: FakeConn[], o: { deposit?: number; prewarmable?: boolean; hold?: boolean } = {}) {
+      const open = (f: "2" | "1.1") => (conns.push(new FakeConn(f)), conns[conns.length - 1]!);
+      const traffic = pool.noteRequest(key, { baseUrl: "https://n", framing, depositMsat: o.deposit ?? 1000, prewarmable: o.prewarmable ?? true }, open);
+      const lease = await pool.acquire(key, framing, open);
+      lease.conn.start();
+      const finish = () => {
+        lease.conn.finish();
+        lease.release(true);
+        traffic.done();
+      };
+      if (!o.hold) finish();
+      return { lease, finish };
+    }
+
+    it("framing 1.1: one spare per key after a settled request; the next request claims it and it is replaced", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      const first = await request(pool, "k", "1.1", conns);
+      expect(first.lease.warm).toBe("cold");
+      await tick();
+      expect(pool.snapshot().map((s) => [s.http, s.state])).toEqual([["1.1", "armed"]]);
+      const second = await request(pool, "k", "1.1", conns);
+      expect(second.lease.warm).toBe("armed");
+      expect(second.lease.reused).toBe(false);
+      expect(second.lease.conn).toBe(conns[1]);
+      await tick();
+      // Never more than one spare for the key.
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      expect(conns).toHaveLength(3);
+      pool.close();
+    });
+
+    it("a request that arrives while the spare is still arming waits for it", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      // The arm has started (5 ms) and not finished.
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["arming"]);
+      const second = await request(pool, "k", "1.1", conns);
+      expect(second.lease.conn).toBe(conns[1]);
+      expect(second.lease.warm).toBe("cold");
+      pool.close();
+    });
+
+    it("framing 2: no spare while a connection of the key is idle; one while all are busy", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "2", conns);
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["idle"]);
+      const busy = await request(pool, "k", "2", conns, { hold: true });
+      expect(busy.lease.warm).toBe("open");
+      await tick();
+      expect(pool.snapshot().map((s) => s.state).sort()).toEqual(["armed", "busy"]);
+      // The burst's second request does not wait for a 2PC.
+      const burst = await request(pool, "k", "2", conns, { hold: true });
+      expect(burst.lease.warm).toBe("armed");
+      expect(burst.lease.conn.tOpen).toBeGreaterThan(0);
+      busy.finish();
+      burst.finish();
+      pool.close();
+    });
+
+    it("no spare without pre-warming, for a key that is not prewarmable, before a settled request, or above maxDepositMsat", async () => {
+      const off = new ConnectionPool<FakeConn>(quiet);
+      const conns: FakeConn[] = [];
+      await request(off, "k", "1.1", conns);
+      await tick();
+      expect(off.snapshot()).toEqual([]);
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      await request(pool, "one-off", "1.1", conns, { prewarmable: false });
+      await request(pool, "dear", "1.1", conns, { deposit: 5001 });
+      const held = await request(pool, "unsettled", "1.1", conns, { hold: true });
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["busy"]);
+      held.finish();
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      pool.close();
+    });
+
+    it("a failed arm backs the key off; a deposit the balance does not cover retries without escalating", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      let fail = true;
+      const open = (f: "2" | "1.1") => {
+        const c = new FakeConn(f);
+        c.failArm = fail && conns.length > 0;
+        conns.push(c);
+        return c;
+      };
+      const traffic = pool.noteRequest("k", { baseUrl: "https://n", framing: "1.1", depositMsat: 1000, prewarmable: true }, open);
+      const lease = await pool.acquire("k", "1.1", open);
+      lease.conn.start();
+      lease.conn.finish();
+      lease.release(true);
+      traffic.done();
+      await tick(12);
+      // The arm failed: nothing armed, and no new attempt during the backoff.
+      expect(pool.snapshot()).toEqual([]);
+      const attempts = conns.length;
+      fail = false;
+      pool.noteRequest("k", { baseUrl: "https://n", framing: "1.1", depositMsat: 1000, prewarmable: true }, open).done();
+      expect(conns.length).toBe(attempts);
+      await tick(30);
+      pool.noteRequest("k", { baseUrl: "https://n", framing: "1.1", depositMsat: 1000, prewarmable: true }, open).done();
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      pool.close();
+    });
+
+    it("retires a spare whose key went quiet or that is too old, and counts its deposit", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, { ...prewarm, activityWindowMs: 30, tickMs: 10 } as never);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      await tick(15);
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      await tick(60);
+      expect(pool.snapshot()).toEqual([]);
+      expect(conns[1]!.dead?.message).toMatch(/armed and unused: its key has no traffic/);
+      expect(pool.unusedDepositMsats).toBe(1000);
+      pool.close();
+    });
+
+    it("a spare that died is not handed out, and a claimed 1.1 spare that fails to arm is replaced by a fresh connection", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      await tick();
+      conns[1]!.close("the node ended it");
+      const next = await request(pool, "k", "1.1", conns);
+      expect(next.lease.conn).not.toBe(conns[1]);
+      expect(next.lease.warm).toBe("cold");
+      pool.close();
+    });
+
+    it("marking framing 2 bad for a node closes its framing-2 spares and holds for 10 minutes", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "2", conns);
+      const busy = await request(pool, "k", "2", conns, { hold: true });
+      await tick();
+      expect(pool.snapshot().map((s) => s.state).sort()).toEqual(["armed", "busy"]);
+      expect(pool.isBad("https://n/")).toBe(false);
+      pool.markBad("https://n", "h2 not selected");
+      expect(pool.isBad("https://n/")).toBe(true);
+      expect(pool.isBad("https://other")).toBe(false);
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["busy"]);
+      vi.useFakeTimers({ now: Date.now() + 10 * 60_000 + 1, toFake: ["Date"] });
+      try {
+        expect(pool.isBad("https://n")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+      busy.finish();
+      pool.close();
+    });
   });
 });
