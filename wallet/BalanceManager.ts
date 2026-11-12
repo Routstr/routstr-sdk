@@ -171,12 +171,11 @@ type ProviderWalletOperation = {
   type: "topup" | "refund";
   startTime: number;
   endTime?: number;
-  /** Identifies this specific call, so a finishing caller cannot stamp or
-   *  clear tracking that belongs to a different in-flight operation. */
-  id: number;
+  /** Every live same-type caller, shared across managers of this wallet. */
+  activeIds: Set<number>;
 };
 
-/** Monotonic source of {@link ProviderWalletOperation.id} values. */
+/** Monotonic source of provider-wallet call IDs. */
 let nextProviderWalletOperationId = 0;
 
 /** Per-provider wallet mutations (topup / refund) of each wallet */
@@ -241,13 +240,13 @@ export class BalanceManager {
       return { allowed: true };
     }
     // Opposite type in progress or recently completed
-    if (!existing.endTime) {
+    if (existing.activeIds.size > 0) {
       return {
         allowed: false,
         reason: `Provider wallet operation locked; ${existing.type} in progress`,
       };
     }
-    const elapsed = Date.now() - existing.endTime;
+    const elapsed = Date.now() - existing.endTime!;
     if (elapsed < BalanceManager.PROVIDER_WALLET_COOLDOWN_MS) {
       return {
         allowed: false,
@@ -264,33 +263,32 @@ export class BalanceManager {
     type: "topup" | "refund"
   ): number {
     const id = ++nextProviderWalletOperationId;
-    this.providerWalletOps.set(baseUrl, { type, startTime: Date.now(), id });
+    const existing = this.providerWalletOps.get(baseUrl);
+    if (existing?.type === type) {
+      // Keep earlier live callers and any real completion timestamp. A later
+      // no-op must not erase either one's protection.
+      existing.activeIds.add(id);
+    } else {
+      this.providerWalletOps.set(baseUrl, {
+        type, startTime: Date.now(), activeIds: new Set([id]),
+      });
+    }
     return id;
   }
 
   private _endProviderWalletOperation(
     baseUrl: string,
     type: "topup" | "refund",
-    id: number
+    id: number,
+    skipped = false
   ): void {
     const existing = this.providerWalletOps.get(baseUrl);
-    if (existing && existing.type === type && existing.id === id) {
-      existing.endTime = Date.now();
-    }
-  }
-
-  /**
-   * Drop a tracked operation that never touched the provider wallet, leaving
-   * no cooldown behind. Scoped to this operation's id so an overlapping
-   * same-type call keeps its own tracking.
-   */
-  private _discardProviderWalletOperation(
-    baseUrl: string,
-    type: "topup" | "refund",
-    id: number
-  ): void {
-    const existing = this.providerWalletOps.get(baseUrl);
-    if (existing && existing.type === type && existing.id === id) {
+    if (!existing || existing.type !== type || !existing.activeIds.delete(id)) return;
+    // Live siblings always block the opposite operation, regardless of this
+    // timestamp. The final real completion starts the full cooldown; a skip
+    // neither creates nor extends it. Unknown (throwing) outcomes are real.
+    if (!skipped) existing.endTime = Date.now();
+    if (existing.activeIds.size === 0 && existing.endTime === undefined) {
       this.providerWalletOps.delete(baseUrl);
     }
   }
@@ -344,25 +342,14 @@ export class BalanceManager {
 
     const operationId = this._beginProviderWalletOperation(baseUrl, "refund");
 
-    let result: RefundResult;
+    let result: RefundResult | undefined;
     try {
       result = await this._refundApiKeyImpl({ mintUrl, baseUrl, apiKey, forceRefund });
+      return result;
     } finally {
-      // Throwing (unknown outcome) keeps the cooldown armed, which is the
-      // safe default. Skips clear it right below.
-      this._endProviderWalletOperation(baseUrl, "refund", operationId);
+      // An exception has an unknown outcome and retains the cooldown.
+      this._endProviderWalletOperation(baseUrl, "refund", operationId, result?.skipped);
     }
-
-    // A skip bailed out before touching the provider wallet, so it must not
-    // leave a completed-operation timestamp behind: that would block the
-    // top-up a 402 recovery needs, for a refund that moved nothing. The guard
-    // exists to keep concurrent fund movements apart, not to serialize
-    // no-ops.
-    if (result.skipped) {
-      this._discardProviderWalletOperation(baseUrl, "refund", operationId);
-    }
-
-    return result;
   }
 
   private async _refundApiKeyImpl(options: RefundApiKeyOptions): Promise<RefundResult> {
