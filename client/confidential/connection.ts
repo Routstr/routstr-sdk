@@ -182,6 +182,12 @@ export interface ConfidentialConnectionOptions {
    * is sent. Default `DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT`.
    */
   maxDepositMsat?: number;
+  /**
+   * Framing "2": top the proof channel up after the head and after each
+   * settled request (PROTOCOL-V3.md §9.2), so later requests' proofs do not
+   * extend their correlations on the request path. Default true.
+   */
+  topUp?: boolean;
   /** Structured event sink (never receives secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
 }
@@ -479,6 +485,7 @@ export class ConfidentialConnection {
   private readonly twoPcPath?: string;
   private readonly twoPcFactory?: () => TwoPcSession;
   private readonly proofChannelFactory?: () => ProofChannel;
+  private readonly topUpOn: boolean;
   private readonly expectedPubkey: string;
   private readonly timeouts: typeof TIMEOUTS;
   private readonly chunk: number;
@@ -627,6 +634,7 @@ export class ConfidentialConnection {
     this.twoPcPath = options.twoPcPath;
     this.twoPcFactory = options.twoPcFactory;
     this.proofChannelFactory = options.proofChannelFactory;
+    this.topUpOn = options.topUp ?? true;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
     this.timeouts = { ...TIMEOUTS, ...(options.timeouts ?? {}) };
     this.chunk = Math.max(1, Math.min(options.chunk ?? MAX_DATA_IN_RECORD, MAX_DATA_IN_RECORD));
@@ -1232,6 +1240,7 @@ export class ConfidentialConnection {
       claimMs: this.tOpen - t0,
     });
     this.event({ ev: "open", http: "2", ...this.setupTimings });
+    this.topUp();
   }
 
   private sendSettingsSeen(): void {
@@ -1346,6 +1355,29 @@ export class ConfidentialConnection {
     const p = this.proofChain.then(run, run);
     this.proofChain = p.catch(() => {});
     return p;
+  }
+
+  /**
+   * Framing "2", idle (after the head, after a settled request): top the
+   * proof channel up for the next request (§9.2). Queued with the proofs, so
+   * the next request's first proof waits for it (it is not cancelled: the
+   * extension runs in lockstep with the node). A failed top-up fails the
+   * channel and so the connection, as a failed proof would.
+   */
+  private topUp(): void {
+    const ch = this.zkChan;
+    if (!this.topUpOn || this.framing !== "2" || !ch?.used || ch.failed || this.failure || !this.usable) return;
+    const run = async (): Promise<void> => {
+      if (this.failure || ch.failed) return;
+      try {
+        const t = await ch.topup(this.timeouts.proof);
+        if (t?.granted) this.event({ ev: "topup", before: t.before, after: t.after, bytes: t.bytes, ms: t.ms });
+      } catch (e) {
+        this.fail(e instanceof ConfidentialError ? e : new SessionProtocolError(`proof channel top-up: ${e instanceof Error ? e.message : String(e)}`));
+      }
+    };
+    const p = this.proofChain.then(run, run);
+    this.proofChain = p.catch(() => {});
   }
 
   // --- frames -------------------------------------------------------------------
@@ -1799,6 +1831,7 @@ export class ConfidentialConnection {
     this.tLastSettled = tEnd;
     this.settled++;
     this.kick();
+    if (status < 300) this.topUp();
 
     // An accepted image response is handed on in the pieces it arrived in (held once).
     const accepted = cur.image !== undefined && status < 300;

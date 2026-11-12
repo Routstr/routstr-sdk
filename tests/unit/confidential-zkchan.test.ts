@@ -133,6 +133,34 @@ describe("proof channel bridge (v2)", () => {
     await expect(p).rejects.toThrow(/exited 1/);
   });
 
+  it("top-up (§9.2): only after a proof ran, a granted one is recorded, a failed one fails the channel", async () => {
+    const t = fakeChannel();
+    t.chan.start("ws://x");
+    t.emit(1, JSON.stringify({ ev: "ready" }));
+    await t.chan.ready(1000);
+    // Nothing ran on the channel yet: nothing to top up, nothing sent.
+    expect(await t.chan.topup(1000)).toBeUndefined();
+    expect(t.controlIn).toHaveLength(0);
+    const v = t.chan.run("verify", "pi_nk", {}, undefined, 1000);
+    t.emit(1, JSON.stringify({ ev: "done", id: 1, proof: "pi_nk", ok: true, checks: [{ label: "c", ok: true }] }));
+    await v;
+    const a = t.chan.topup(1000);
+    await tick();
+    expect(t.controlIn[1]).toEqual({ cmd: "topup", id: 2 });
+    t.emit(1, JSON.stringify({ ev: "done", id: 2, proof: "topup", ok: true, granted: true, before: 10, after: 900010, bytes: 610487, ms: 170 }));
+    expect(await a).toEqual({ granted: true, before: 10, after: 900010, bytes: 610487, ms: 170 });
+    const b = t.chan.topup(1000);
+    await tick();
+    t.emit(1, JSON.stringify({ ev: "done", id: 3, proof: "topup", ok: true, granted: false, before: 900010, after: 900010, bytes: 0, ms: 0 }));
+    expect((await b)?.granted).toBe(false);
+    expect(t.chan.topups).toHaveLength(1);
+    const c = t.chan.topup(1000);
+    await tick();
+    t.emit(1, JSON.stringify({ ev: "done", id: 4, proof: "topup", ok: false, err: "top-up: the node granted 5 correlations" }));
+    await expect(c).rejects.toThrow(/top-up failed/);
+    expect(t.chan.failed).toBe(true);
+  });
+
   it("not ready in time counts as a failure", async () => {
     const t = fakeChannel();
     t.chan.start("ws://x");
