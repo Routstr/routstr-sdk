@@ -23,6 +23,8 @@
 //   money     the key's balance at the node fell by exactly the receipts' costs plus the
 //             deposits of the connections that ended unused
 //
+// Another provider: E2E_TRUSTED_HOSTS=<its host> and E2E_NO_IMAGES=1 for a chat-only node.
+//
 // The script prints one row per request (framing, what it found, time to first token,
 // bytes each way) and a summary by (framing, cold | armed | open).
 import { execSync } from "node:child_process";
@@ -69,7 +71,8 @@ let spent = 0;
 let depositsLost = 0;
 
 const options = (extra: Record<string, unknown> = {}, http2: Record<string, unknown> = {}) => ({
-  trustedHosts: ["api.venice.ai"],
+  // The provider hosts accepted (E2E_TRUSTED_HOSTS, comma-separated; default Venice).
+  trustedHosts: (process.env.E2E_TRUSTED_HOSTS ?? "api.venice.ai").split(",").filter(Boolean),
   nodePubkeys: [offer.notary_pubkey],
   proverPath: process.env.CU_PROVER,
   twoPcPath: process.env.CU_2PC,
