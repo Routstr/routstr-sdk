@@ -171,7 +171,13 @@ type ProviderWalletOperation = {
   type: "topup" | "refund";
   startTime: number;
   endTime?: number;
+  /** Identifies this specific call, so a finishing caller cannot stamp or
+   *  clear tracking that belongs to a different in-flight operation. */
+  id: number;
 };
+
+/** Monotonic source of {@link ProviderWalletOperation.id} values. */
+let nextProviderWalletOperationId = 0;
 
 /** Per-provider wallet mutations (topup / refund) of each wallet */
 const providerWalletOperations = new WeakMap<
@@ -256,17 +262,36 @@ export class BalanceManager {
   private _beginProviderWalletOperation(
     baseUrl: string,
     type: "topup" | "refund"
-  ): void {
-    this.providerWalletOps.set(baseUrl, { type, startTime: Date.now() });
+  ): number {
+    const id = ++nextProviderWalletOperationId;
+    this.providerWalletOps.set(baseUrl, { type, startTime: Date.now(), id });
+    return id;
   }
 
   private _endProviderWalletOperation(
     baseUrl: string,
-    type: "topup" | "refund"
+    type: "topup" | "refund",
+    id: number
   ): void {
     const existing = this.providerWalletOps.get(baseUrl);
-    if (existing && existing.type === type) {
+    if (existing && existing.type === type && existing.id === id) {
       existing.endTime = Date.now();
+    }
+  }
+
+  /**
+   * Drop a tracked operation that never touched the provider wallet, leaving
+   * no cooldown behind. Scoped to this operation's id so an overlapping
+   * same-type call keeps its own tracking.
+   */
+  private _discardProviderWalletOperation(
+    baseUrl: string,
+    type: "topup" | "refund",
+    id: number
+  ): void {
+    const existing = this.providerWalletOps.get(baseUrl);
+    if (existing && existing.type === type && existing.id === id) {
+      this.providerWalletOps.delete(baseUrl);
     }
   }
 
@@ -314,16 +339,30 @@ export class BalanceManager {
     const guard = this._canRunProviderWalletOperation(baseUrl, "refund");
     if (!guard.allowed) {
       this.logger.log(`Skipping refund for ${baseUrl} - ${guard.reason}`);
-      return { success: false, message: guard.reason };
+      return { success: false, skipped: true, message: guard.reason };
     }
 
-    this._beginProviderWalletOperation(baseUrl, "refund");
+    const operationId = this._beginProviderWalletOperation(baseUrl, "refund");
 
+    let result: RefundResult;
     try {
-      return await this._refundApiKeyImpl({ mintUrl, baseUrl, apiKey, forceRefund });
+      result = await this._refundApiKeyImpl({ mintUrl, baseUrl, apiKey, forceRefund });
     } finally {
-      this._endProviderWalletOperation(baseUrl, "refund");
+      // Throwing (unknown outcome) keeps the cooldown armed, which is the
+      // safe default. Skips clear it right below.
+      this._endProviderWalletOperation(baseUrl, "refund", operationId);
     }
+
+    // A skip bailed out before touching the provider wallet, so it must not
+    // leave a completed-operation timestamp behind: that would block the
+    // top-up a 402 recovery needs, for a refund that moved nothing. The guard
+    // exists to keep concurrent fund movements apart, not to serialize
+    // no-ops.
+    if (result.skipped) {
+      this._discardProviderWalletOperation(baseUrl, "refund", operationId);
+    }
+
+    return result;
   }
 
   private async _refundApiKeyImpl(options: RefundApiKeyOptions): Promise<RefundResult> {
@@ -331,7 +370,7 @@ export class BalanceManager {
 
     if (!apiKey) {
       this.logger.warn(`refundApiKey: aborting for ${baseUrl} - no API key`);
-      return { success: false, message: "No API key to refund" };
+      return { success: false, skipped: true, message: "No API key to refund" };
     }
 
     // If forceRefund is not true, skip refund if the API key was used in the last 5 minutes
@@ -345,6 +384,7 @@ export class BalanceManager {
           );
           return {
             success: false,
+            skipped: true,
             message: "API key was used recently, skipping refund",
           };
         }
@@ -722,12 +762,12 @@ export class BalanceManager {
       return { success: false, message: "No API key available for top up" };
     }
 
-    this._beginProviderWalletOperation(baseUrl, "topup");
+    const operationId = this._beginProviderWalletOperation(baseUrl, "topup");
 
     try {
       return await this._queueTopUp({ ...options, token: apiKey });
     } finally {
-      this._endProviderWalletOperation(baseUrl, "topup");
+      this._endProviderWalletOperation(baseUrl, "topup", operationId);
     }
   }
 
