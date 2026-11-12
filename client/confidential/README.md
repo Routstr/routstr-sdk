@@ -187,10 +187,15 @@ what must not be linked: a scope never shares a connection with another.
   doubling to `backoffMaxMs`); a deposit the balance does not cover waits
   `backoffBaseMs` without escalating.
 - The proof channel (`cu-prover --channel`) holds correlations for π_NK and
-  the first π_WIN and π_C3S; later proofs on a kept connection extend the
-  chain online (one Ferret step, no new base OT). The SDK has no top-up of its
-  own: the channel protocol of the sidecar has no command for one (see the
-  measurements in the routstr-confidential gate notes).
+  the first π_WIN and π_C3S. On a kept framing-"2" connection it is **topped
+  up while idle** (after the head and after each settled 2xx; PROTOCOL-V3.md
+  §9.2): the node grants one Ferret step (about 0.6 MB from the node) while
+  the chain holds less than one request's worth, so later requests prove from
+  preprocessed correlations. The top-up is queued with the proofs: a request
+  that starts during one waits for it (about 0.2 s on loopback). A proof that
+  still runs short extends the chain online. `ConfidentialConnectionOptions.topUp:
+  false` turns it off. A request refused with `offer_changed` closes its
+  connection (the node takes no further request on it).
 
 `x-routstr-confidential-http` names the framing, and
 `x-routstr-confidential-connection` what the request found (`new`, `armed`,
@@ -206,13 +211,17 @@ proof-channel setup, paid before the request when armed):
 
 | framing | found | ttft | sent | received | arming sent / received |
 |---|---|---|---|---|---|
-| "2" | cold | 1.7–1.9 s | 82 kB | 12 kB | 2.55 MB / 17.9 MB |
-| "2" | open | 0.5–1.0 s | 81 kB | 12 kB–1.45 MB | – |
-| "1.1" | cold | 1.3–1.6 s | 77 kB | 93 kB | 2.55 MB / 17.9 MB |
+| "2" | cold | 1.7–2.1 s | 82 kB | 12 kB | 2.55 MB / 17.9 MB |
+| "2" | open | 0.6–1.1 s | 81 kB | 12 kB (620 kB¹) | – |
+| "1.1" | cold | 1.3–1.8 s | 77 kB | 93 kB | 2.55 MB / 17.9 MB |
 
-The received bytes of an open-connection request jump to about 1.45 MB when
-its π_C3S runs out of the preprocessed correlations and the chain extends
-online (on the third request of a connection in these runs).
+¹ The script sends its requests back to back, so the proof channel's top-up
+after one settlement runs while the next request starts and its 0.6 MB count
+in that request's bytes (every second request or so); with a pause between
+requests the top-up is done before the next one and the request downloads
+about 12 kB. Before the top-up existed, an open-connection request downloaded
+up to 1.45 MB on its path when its proofs ran out of correlations and the
+chain extended online (from the third request of a connection on).
 
 ## What is checked
 
