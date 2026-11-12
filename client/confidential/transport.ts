@@ -144,6 +144,12 @@ export interface ConfidentialRequestOptions {
    */
   reuseScope?: string;
   /**
+   * Called when a node's offer names an older protocol than this client
+   * speaks (`node_protocol_outdated`, §11): the node is not used. For the
+   * caller's log (routstrd: once per node per day).
+   */
+  onNodeProtocolOutdated?: (baseUrl: string, nodeVersion: number) => void;
+  /**
    * Pre-warming (§9.2, `pool.ts`): armed connections bound to the credential
    * only, for both framings. Off unless set; `{}` enables it with the
    * defaults. Not used for one-off Cashu bearers (`returnChange`).
@@ -287,7 +293,18 @@ async function verifiedOffer(
     // call: a cached offer accepted under a looser policy must not leak.
     offer = verifyConfidentialOffer(hit.offer, policy);
   } else {
-    offer = await fetchConfidentialOffer(key, policy);
+    try {
+      offer = await fetchConfidentialOffer(key, policy);
+    } catch (error) {
+      if (error instanceof NodeProtocolOutdatedError) {
+        try {
+          options.onNodeProtocolOutdated?.(key, error.nodeVersion);
+        } catch {
+          /* the caller's log */
+        }
+      }
+      throw error;
+    }
     offerCache.set(key, { offer, at: Date.now() });
   }
   // Pinned keys authenticate the offer, not the connection: the session
@@ -870,7 +887,7 @@ async function fetchConfidentialImageOnce(
     const change = await failureChange(params, state, runP);
     // After release the provider has the request: a node error is not a
     // refusal, and failing over would run (and pay for) it again.
-    if (error instanceof SessionRejectedError && error.status && !released) {
+    if (isNodeRefusal(error) && !released) {
       return refusalResponse(error, change);
     }
     throw withChange(error, change);
@@ -1000,7 +1017,7 @@ async function fetchConfidentialOnce(
     // top-up / failover handling applies. After release the provider has the
     // request: a node error is not a refusal, and failing over would run (and
     // pay for) it again.
-    if (error instanceof SessionRejectedError && error.status && !released) {
+    if (isNodeRefusal(error) && !released) {
       return refusalResponse(error, change);
     }
     throw withChange(error, change);
@@ -1173,6 +1190,15 @@ function setProviderHeader(headers: Headers, name: string, value: string, replac
   } catch {
     /* not a valid header for this runtime: dropped */
   }
+}
+
+/**
+ * A refusal the node gave with an HTTP status (the credential, the balance, a
+ * bad request): presented as that HTTP error. Not the upgrade error (§11):
+ * that is about this client, and is thrown as itself.
+ */
+function isNodeRefusal(error: unknown): error is SessionRejectedError & { status: number } {
+  return error instanceof SessionRejectedError && !(error instanceof UpgradeRequiredError) && Boolean(error.status);
 }
 
 /** A node refusal as the HTTP error a normal request would get. */

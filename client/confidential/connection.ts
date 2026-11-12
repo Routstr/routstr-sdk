@@ -136,11 +136,15 @@ const TIMEOUTS = {
   /** The connection's `closed` frame after its last settlement (framing "1.1"; it carries nothing we need). */
   closed: 2_000,
   /**
-   * Framing "2", before the first request: how long to wait for the
-   * provider's answer to the node's probe (stream 1), so that its frames lie
-   * before the first request's interval (§5.4).
+   * Framing "2", before the first request: how long after `head_written` to
+   * wait for the provider's answer to the node's probe (stream 1), so that
+   * its frames lie before the first request's interval (§5.4 suggests up to
+   * 2 s). The probe is reset in the same record that carries it, and the
+   * provider this was measured with (Venice, 2026-11) never answers it, so
+   * the default only covers a provider that answers at once; the time since
+   * `head_written` (the wait for SETTINGS) counts towards it.
    */
-  probe: 2_000,
+  probe: 300,
 };
 
 /** Control frames of one kind the node may send ahead of the wait for them. */
