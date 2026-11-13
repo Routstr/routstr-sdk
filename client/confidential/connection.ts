@@ -152,6 +152,18 @@ const TIMEOUTS = {
   probe: 300,
 };
 
+/** The reasons of §12.10 under which the node releases a connection's deposit. */
+const DEPOSIT_RELEASED_REASONS = new Set([
+  "request_settled",
+  "not_started",
+  "provider_unreachable",
+  "sidecar_failure",
+  "provider_closed",
+  "node_failure",
+  "request_received",
+  "provider_refused",
+]);
+
 /** Control frames of one kind the node may send ahead of the wait for them. */
 const INBOX_MAX_PER_KEY = 16;
 const INBOX_MAX = 256;
@@ -193,6 +205,8 @@ export interface ConfidentialConnectionOptions {
   topUp?: boolean;
   /** Structured event sink (never receives secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
+  /** Where to report what the node did against its own terms (default: console.warn). */
+  onWarning?: (message: string) => void;
 }
 
 /** The largest connection deposit a client accepts unless told otherwise (100 sat). */
@@ -493,6 +507,7 @@ export class ConfidentialConnection {
   private readonly timeouts: typeof TIMEOUTS;
   private readonly chunk: number;
   private readonly onEvent?: (event: Record<string, unknown>) => void;
+  private readonly onWarning: (message: string) => void;
 
   private ws?: WebSocket;
   private wsOpen = false;
@@ -644,6 +659,7 @@ export class ConfidentialConnection {
     this.timeouts = { ...TIMEOUTS, ...(options.timeouts ?? {}) };
     this.chunk = Math.max(1, Math.min(options.chunk ?? MAX_DATA_IN_RECORD, MAX_DATA_IN_RECORD));
     this.onEvent = options.onEvent;
+    this.onWarning = options.onWarning ?? ((m) => console.warn(`[confidential] ${m}`));
     this.errP = new Promise<never>((_, rej) => (this.errRej = rej));
     this.errP.catch(() => {});
   }
@@ -936,8 +952,28 @@ export class ConfidentialConnection {
       typeof pubkey === "string" &&
       verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
       (d.sid === this.sid || (d.sid === null && !this.sid));
+    const released = this.deposit?.outcome === "released";
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
     this.event({ ev: "deposit", ...this.deposit });
+    // Detection only: the node's own word against its signed terms (§12.10).
+    const problems: string[] = [];
+    if (this.deposit.msat !== this.depositMsat) {
+      problems.push(`a deposit of ${String(d.msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat} msat`);
+    }
+    if (this.deposit.outcome === "charged") {
+      if (released) problems.push("charged, though a receipt of this connection released it");
+      if (m.type === "error" && (m.fault === "node" || m.fault === "upstream")) {
+        problems.push(`charged after a fault of the ${m.fault === "node" ? "node" : "provider"} (released by §12.10 rows 3 and 4)`);
+      }
+      if (DEPOSIT_RELEASED_REASONS.has(this.deposit.reason)) {
+        problems.push(`charged with reason ${JSON.stringify(this.deposit.reason)}, which releases it`);
+      }
+    }
+    if (problems.length) {
+      this.onWarning(
+        `connection ${this.sid.slice(0, 8)}: the node's ${signed ? "signed " : "unsigned "}deposit outcome names ${problems.join("; ")}`,
+      );
+    }
   }
 
   /** The next control frame of one of `keys`, or the connection's failure, or a timeout. */

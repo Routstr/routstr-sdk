@@ -699,3 +699,44 @@ describe("framing 1.1: the connection's one request", () => {
     await expect(conn.request(chatRequest()).done).rejects.toBeInstanceOf(ReceiptVerificationError);
   });
 });
+
+describe("the deposit outcome in the connection's last frame", () => {
+  const lastFrame = (type: "closed" | "error", deposit: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
+    const json = JSON.stringify({ sid: SID, ...deposit });
+    return JSON.stringify({ type, reason: "x", ...extra, deposit: JSON.parse(json), deposit_json: json, deposit_sig: sign(json) });
+  };
+  const fresh = (warnings: string[]) => {
+    const conn = newConnection("2") as any;
+    conn.sid = SID;
+    conn.onWarning = (m: string) => warnings.push(m);
+    return conn;
+  };
+
+  it("an outcome that agrees with the offer and the end is recorded quietly", () => {
+    const warnings: string[] = [];
+    const conn = fresh(warnings);
+    conn.onText(lastFrame("closed", { msat: DEPOSIT, outcome: "charged", reason: "idle" }));
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "idle", signed: true });
+    expect(warnings).toEqual([]);
+  });
+
+  it("is logged when it names another amount than the offer's deposit", () => {
+    const warnings: string[] = [];
+    fresh(warnings).onText(lastFrame("closed", { msat: DEPOSIT * 2, outcome: "charged", reason: "unused" }));
+    expect(warnings.join("\n")).toMatch(/deposit of 2000 msat.*the signed offer's is 1000/);
+  });
+
+  it("is logged when the deposit is charged after a fault of the node or the provider", () => {
+    for (const fault of ["node", "upstream"]) {
+      const warnings: string[] = [];
+      fresh(warnings).onText(lastFrame("error", { msat: DEPOSIT, outcome: "charged", reason: "unused" }, { fault }));
+      expect(warnings.join("\n")).toMatch(new RegExp(`charged after a fault of the ${fault === "node" ? "node" : "provider"}`));
+    }
+  });
+
+  it("is logged when a reason that releases the deposit comes with a charge", () => {
+    const warnings: string[] = [];
+    fresh(warnings).onText(lastFrame("closed", { msat: DEPOSIT, outcome: "charged", reason: "provider_closed" }));
+    expect(warnings.join("\n")).toMatch(/provider_closed/);
+  });
+});
