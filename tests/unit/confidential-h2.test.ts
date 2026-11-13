@@ -35,8 +35,9 @@ import {
   type WinSource,
 } from "../../client/confidential/h2";
 import { MAX_BODY_LEN, padBody, paddedBodyLength } from "../../client/confidential/suffix";
-import { ConnectionPool, poolIdleMs, poolKey } from "../../client/confidential/pool";
-import { ConnectionDepositError } from "../../client/confidential/errors";
+import { ConnectionPool, PoolBusyError, poolIdleMs, poolKey } from "../../client/confidential/pool";
+import { ConfidentialTimeoutError, ConnectionDepositError } from "../../client/confidential/errors";
+import { http2OpenFailure } from "../../client/confidential/transport";
 import { offerSupportsHttp2, verifyConfidentialOffer } from "../../client/confidential/offer";
 import { ConfidentialConnection, connectionTerms } from "../../client/confidential/connection";
 import { CuProverBackend } from "../../client/confidential/prover";
@@ -734,6 +735,33 @@ describe("http 2: the connection pool", () => {
     pool.close();
   });
 
+  it("a busy pool is not a failure of framing 2 (finding 19)", async () => {
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1, acquireTimeoutMs: 40 });
+    const l1 = await pool.acquire("k", "2", () => new FakeConn());
+    l1.conn.start();
+    const error = await pool.acquire("k", "2", () => new FakeConn()).catch((e) => e);
+    expect(error).toBeInstanceOf(PoolBusyError);
+    expect(error).toBeInstanceOf(ConfidentialTimeoutError);
+    // No §2.3 fallback, no bad mark.
+    expect(http2OpenFailure(error)).toBe(false);
+    pool.close();
+  });
+
+  it("an idle connection of the key's other framing makes room at the per-key limit (finding 19)", async () => {
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnectionsPerKey: 1, acquireTimeoutMs: 40 });
+    const l1 = await pool.acquire("k", "2", () => new FakeConn("2"));
+    l1.conn.start();
+    l1.conn.finish();
+    l1.release(true);
+    expect(pool.snapshot().map((e) => e.state)).toEqual(["idle"]);
+    // Framing "2" is marked bad meanwhile: the key's next request runs on "1.1".
+    const l2 = await pool.acquire("k", "1.1", () => new FakeConn("1.1"));
+    expect(l2.conn.framing).toBe("1.1");
+    expect(l1.conn.dead?.message).toMatch(/framing-"1.1" request/);
+    l2.release();
+    pool.close();
+  });
+
   it("makes room at the total limit by closing another key's idle connection", async () => {
     const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnections: 1 });
     const a = await pool.acquire("a", "2", () => new FakeConn());
@@ -974,6 +1002,70 @@ describe("http 2: the connection pool", () => {
       expect(next.lease.conn).not.toBe(conns[1]);
       expect(next.lease.warm).toBe("cold");
       pool.close();
+    });
+
+    it("keeps an armed connection whose request was refused, also with pre-warming off (finding 23)", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet);
+      const conns: FakeConn[] = [];
+      const open = (f: "2" | "1.1") => (conns.push(new FakeConn(f)), conns[conns.length - 1]!);
+      const traffic = pool.noteRequest("k", { baseUrl: "https://n", framing: "1.1", depositMsat: 1000, prewarmable: true }, open);
+      const refused = await pool.acquire("k", "1.1", open);
+      // The node refused request 1 (402): nothing was released, the connection is still armed.
+      refused.release();
+      traffic.done();
+      expect(conns[0]!.dead).toBeUndefined();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      // The retry (after a top-up) runs on it: no second 2PC, no second deposit.
+      const retry = await pool.acquire("k", "1.1", open);
+      expect(retry.conn).toBe(conns[0]);
+      expect(retry.warm).toBe("armed");
+      expect(conns).toHaveLength(1);
+      pool.close();
+    });
+
+    it("another caller's request without prewarm does not close the spares (finding 23)", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      pool.configure(quiet, undefined);
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      expect(conns[1]!.dead).toBeUndefined();
+      pool.close();
+    });
+
+    it("a spare that aged out is not replaced until the key has a request again (finding 24)", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      // The spare reaches maxAgeMs while the key is still within its activity window.
+      conns[1]!.tCreated -= 500_000;
+      (pool as any).housekeeping();
+      await tick();
+      expect(pool.snapshot()).toEqual([]);
+      expect(conns).toHaveLength(2);
+      expect(pool.unusedDepositMsats).toBe(1000);
+      // The key's next request settles: a spare is armed again.
+      await request(pool, "k", "1.1", conns);
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      pool.close();
+    });
+
+    it("forgets the state of one-off keys and of keys it never pre-warms (finding 25)", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      for (let i = 0; i < 50; i++) await request(pool, `one-off-${i}`, "1.1", conns, { prewarmable: false });
+      expect((pool as any).keys.size).toBe(0);
+      const off = new ConnectionPool<FakeConn>(quiet);
+      await request(off, "k", "2", conns);
+      expect((off as any).keys.size).toBe(0);
+      expect(off.snapshot().map((s) => s.state)).toEqual(["idle"]);
+      pool.close();
+      off.close();
     });
 
     it("marking framing 2 bad for a node closes its framing-2 spares and holds for 10 minutes", async () => {

@@ -82,7 +82,7 @@ import {
   type ConnectionRequestOptions,
   type ConnectionRequestResult,
 } from "./connection";
-import { ConnectionPool, poolKey, type Http2Options, type PoolLease, type PrewarmOptions } from "./pool";
+import { ConnectionPool, PoolBusyError, poolKey, type Http2Options, type PoolLease, type PrewarmOptions } from "./pool";
 
 export interface ConfidentialRequestOptions {
   /**
@@ -248,6 +248,8 @@ export function http2OpenFailure(error: unknown): boolean {
   if (error instanceof ProverMissingError) return false;
   // The provider refused one stream or went away: the framing worked.
   if (error instanceof StreamNotProcessedError) return false;
+  // Waiting for a free connection of the pool says nothing about the framing.
+  if (error instanceof PoolBusyError) return false;
   if (error instanceof SessionRejectedError) {
     if (error.nodeCode?.startsWith("h2_") || error.nodeCode === "upstream_unreachable" || error.fault === "upstream") return true;
     return error.status === undefined || error.status >= 500 || error.status === 408;
@@ -667,6 +669,32 @@ const sumSent = (b: ConnectionBytes) => b.relaySent + b.controlSent + b.twoPcSen
 const sumRecv = (b: ConnectionBytes) => b.relayRecv + b.controlRecv + b.twoPcRecv + b.zkRecv;
 
 /**
+ * How to open a connection for a pool key. Built outside `runOnPool`: the pool
+ * keeps it for pre-warming, and a closure there would keep the request (its
+ * body) reachable for the key's life.
+ */
+function connectionOpener(
+  baseUrl: string,
+  offer: VerifiedOffer,
+  bearer: string,
+  options: ConfidentialFetchParams["options"],
+  maxDepositMsat: number,
+): (framing: ConfidentialFraming) => ConfidentialConnection {
+  const { proverPath, twoPcPath, allowInsecureTransport } = options;
+  return (framing) =>
+    new ConfidentialConnection({
+      baseUrl,
+      offer,
+      framing,
+      auth: bearer,
+      prover: new CuProverBackend({ binaryPath: proverPath }),
+      twoPcPath,
+      allowInsecureTransport,
+      maxDepositMsat,
+    });
+}
+
+/**
  * One request on a pooled connection: an idle open one, else an armed one,
  * else a new one. A pooled connection may have died since its last request;
  * while nothing of this request was released towards the provider it runs
@@ -692,19 +720,7 @@ async function runOnPool(
     bearer: params.bearer,
     scope: `${params.reuseScope ?? options.reuseScope ?? ""}\0${connectionTerms(offer)}${oneOff ? `\0${crypto.randomUUID()}` : ""}`,
   });
-  const open = (framing: ConfidentialFraming) => {
-    const conn = new ConfidentialConnection({
-      baseUrl,
-      offer,
-      framing,
-      auth: params.bearer,
-      prover: new CuProverBackend({ binaryPath: options.proverPath }),
-      twoPcPath: options.twoPcPath,
-      allowInsecureTransport: options.allowInsecureTransport,
-      maxDepositMsat,
-    });
-    return conn;
-  };
+  const open = connectionOpener(baseUrl, offer, params.bearer, options, maxDepositMsat);
   let forced: ConfidentialFraming | undefined;
   for (let attempt = 0; ; attempt++) {
     throwIfAborted(params.signal);

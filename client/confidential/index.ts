@@ -198,6 +198,7 @@ export {
 
 export {
   ConnectionPool,
+  PoolBusyError,
   HTTP2_DEFAULTS,
   PREWARM_DEFAULTS,
   FRAMING_BAD_MS,
