@@ -45,6 +45,17 @@ import { ConfidentialTimeoutError, ConnectionDepositError } from "./errors";
 import type { ConfidentialConnection } from "./connection";
 import type { ConfidentialFraming } from "./offer";
 
+/**
+ * No connection became free within `acquireTimeoutMs`: the pool's own limits,
+ * never a failure of the node or of a framing (no §2.3 fallback, no bad mark).
+ */
+export class PoolBusyError extends ConfidentialTimeoutError {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolBusyError";
+  }
+}
+
 export interface Http2Options {
   /**
    * Which requests may share a framing-`"2"` connection (and so be linked to
@@ -229,6 +240,10 @@ interface KeyState {
   failures: number;
   /** How to open a spare for the key (from its latest request). */
   open?: (framing: ConfidentialFraming) => ConnLike;
+  /** Requests of the key so far, and that count when its latest spare was armed. */
+  requests: number;
+  /** A key is armed again only after a request since (an unused spare costs its deposit). */
+  armedAt?: number;
   framing?: ConfidentialFraming;
   depositMsat: number;
 }
@@ -262,7 +277,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
   configure(http2: Http2Options = {}, prewarm?: PrewarmOptions): void {
     this.http2 = http2;
     this.prewarm = prewarm;
-    if (!this.prewarmOn) this.closeSpares("pre-warming is off");
+    // Spares already hold their deposits (closing one charges it): with
+    // pre-warming off none is armed any more, and those left age out or are
+    // claimed. The pool is shared, so one caller's options must not close
+    // another caller's spares.
     // Reuse turned off: no connection kept under the old policy is handed out again.
     if (http2.reuse === "none") {
       for (const e of [...this.entries]) if (e.state === "idle") this.retire(e, "reuse is off");
@@ -389,6 +407,15 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         return this.lease(spare, wasArmed ? "armed" : "cold");
       }
       const mine = this.entries.filter((e) => e.key === key && !this.isSpare(e)).length;
+      if (mine >= this.opt("maxConnectionsPerKey")) {
+        // An idle connection of the key's other framing (e.g. "2" after a bad
+        // mark) cannot serve this request: it must not hold the key's slot.
+        const other = this.entries.find((e) => e.key === key && e.state === "idle" && e.conn.framing !== framing);
+        if (other) {
+          this.retire(other, `making room for a framing-"${framing}" request`);
+          continue;
+        }
+      }
       if (mine < this.opt("maxConnectionsPerKey")) {
         if (this.entries.length >= this.opt("maxConnections")) {
           // Make room: a spare of another key, else the idle connection that waited longest.
@@ -413,7 +440,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         }
       }
       const left = deadline - Date.now();
-      if (left <= 0) throw new ConfidentialTimeoutError("timeout waiting for a free confidential connection");
+      if (left <= 0) throw new PoolBusyError("timeout waiting for a free confidential connection");
       await new Promise<void>((res) => {
         const t = setTimeout(res, Math.min(left, 1000));
         this.waiters.push(() => {
@@ -471,8 +498,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     const now = Date.now();
     if (!conn.idle) return this.retireQuietly(entry);
     if (conn.armed) {
-      // Its request was refused before the handshake: still armed, still a spare.
-      if (!this.prewarmOn) return this.retire(entry, "the request was refused");
+      // Its request was refused before the handshake: still armed, still a
+      // spare. Kept even with pre-warming off: closing it now charges its
+      // deposit (only refused requests, §12.10 row 12), and the retry after a
+      // top-up can still use it. Unclaimed, it ages out like any spare.
       entry.state = "armed";
       this.startTick();
       this.wake();
@@ -514,10 +543,11 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
   ): { done(): void } {
     let k = this.keys.get(key);
     if (!k) {
-      k = { node: info.baseUrl.replace(/\/$/, ""), lastRequest: 0, settled: 0, inFlight: 0, backoffUntil: 0, failures: 0, depositMsat: 0 };
+      k = { node: info.baseUrl.replace(/\/$/, ""), lastRequest: 0, settled: 0, inFlight: 0, backoffUntil: 0, failures: 0, depositMsat: 0, requests: 0 };
       this.keys.set(key, k);
     }
     k.lastRequest = Date.now();
+    k.requests++;
     k.inFlight++;
     k.depositMsat = info.depositMsat;
     k.framing = info.framing;
@@ -530,6 +560,17 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         over = true;
         state.inFlight--;
         state.lastRequest = Date.now();
+        // A key the pool will never pre-warm (a one-off bearer, or pre-warming
+        // off) is forgotten once nothing of it is in flight or armed: its
+        // state (and its opener) would otherwise stay for the process's life.
+        if (
+          state.inFlight === 0 &&
+          (!state.open || !this.prewarmOn) &&
+          this.keys.get(key) === state &&
+          !this.entries.some((e) => e.key === key && this.isSpare(e))
+        ) {
+          this.keys.delete(key);
+        }
         this.replenish();
       },
     };
@@ -571,6 +612,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       return;
     }
     const entry: Entry<C> = { key, node: k.node, conn, state: "arming" };
+    k.armedAt = k.requests;
     this.track(entry);
     this.startTick();
     const t0 = Date.now();
@@ -588,6 +630,8 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         // Claimed meanwhile: the claimer sees the failure itself.
         if (entry.state === "arming") {
           this.remove(entry);
+          // Never armed: the backoff decides when to try again, not a new request.
+          if (k.armedAt === k.requests) k.armedAt = undefined;
           // Too little balance for the deposit is not a failure of the node: retry later, no escalation.
           if (error instanceof ConnectionDepositError) {
             k.backoffUntil = Date.now() + this.pre("backoffBaseMs");
@@ -603,6 +647,9 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     if (!k.open || !k.framing || k.settled < 1 || !this.active(k, now) || now < k.backoffUntil) return false;
     if (k.depositMsat > this.pre("maxDepositMsat")) return false;
     if (k.framing === "2" && this.isBad(k.node)) return false;
+    // A spare that aged out or died unused is not replaced until the key has
+    // a request again: each replacement that is never used costs a deposit.
+    if (k.armedAt === k.requests) return false;
     const mine = this.entries.filter((e) => e.key === key && e.conn.framing === k.framing);
     if (mine.some((e) => this.isSpare(e))) return false;
     if (k.framing === "2") {
@@ -649,10 +696,6 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     );
     this.remove(entry);
     entry.conn.close(`armed and unused: ${why}`);
-  }
-
-  private closeSpares(why: string): void {
-    for (const e of [...this.entries]) if (this.isSpare(e)) this.retire(e, why);
   }
 
   /** Close every connection. */
