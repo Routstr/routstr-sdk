@@ -273,7 +273,10 @@ export function pinnedModelId(offer: { upstream_models?: Record<string, string> 
   return m && Object.hasOwn(m, model) ? m[model]! : model;
 }
 
-/** Why an offer's `upstream_models` is refused, or undefined (absent is fine). */
+/**
+ * Why an offer's `upstream_models` is refused, or undefined (absent is fine).
+ * Each value must be `<provider prefix>/<public id>`.
+ */
 export function upstreamModelsProblem(offer: { price_list: Record<string, unknown>; upstream_models?: unknown }): string | undefined {
   const m = offer.upstream_models;
   if (m === undefined) return undefined;
@@ -283,6 +286,12 @@ export function upstreamModelsProblem(offer: { price_list: Record<string, unknow
     // Rendered into the suffix as a JSON string: printable ASCII without a quote or backslash.
     if (typeof id !== "string" || !/^[\x21-\x7e]{1,256}$/.test(id) || /["\\]/.test(id) || id === pub) {
       return `upstream_models[${JSON.stringify(pub)}] is not a provider model id`;
+    }
+    // Only the provider's prefix may differ (`moonshotai/kimi-k3.1-pro` for
+    // `kimi-k3.1-pro`): any other id would let the node pin another model than
+    // the one the client asked and pays for, and the receipt would verify it.
+    if (!id.endsWith(`/${pub}`)) {
+      return `upstream_models[${JSON.stringify(pub)}] names another model (${JSON.stringify(id)})`;
     }
   }
   return undefined;
