@@ -27,10 +27,13 @@ test("a control frame awaited on a live connection is released after the wait", 
       await p;
     })();
   }
-  for (let i = 0; i < 10 && refs.some((r) => r.deref()); i++) {
+  for (let i = 0; i < 10 && refs.filter((r) => r.deref()).length > 1; i++) {
     await new Promise((r) => setTimeout(r, 0));
     Bun.gc(true);
   }
-  expect(refs.filter((r) => r.deref()).length).toBe(0);
+  // JavaScriptCore scans the stack conservatively, so a stale word may keep
+  // one message alive (often so after other test files ran in the same
+  // process); the defect kept every one of them.
+  expect(refs.filter((r) => r.deref()).length).toBeLessThanOrEqual(1);
   conn.close();
 });
