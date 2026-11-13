@@ -361,6 +361,13 @@ export class ProofChannel {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // A proof, top-up or ready wait still open is answered now: its timer (up
+    // to 120 s, ref'd) would otherwise be the only thing to settle it, and it
+    // would hold the host process open after the connection is gone.
+    const closed = new ProverError("proof channel closed");
+    this.readyRej(closed);
+    for (const w of this.pending.values()) w.rej(closed);
+    this.pending.clear();
     try {
       this.writeChild(TWOPC_CHANNEL_CONTROL, new TextEncoder().encode('{"cmd":"close"}'));
       this.child?.stdin.end();

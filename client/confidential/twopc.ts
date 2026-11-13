@@ -395,6 +395,10 @@ export class TwoPcSession {
 
   close(): void {
     this.closed = true;
+    // A wait still open (the key share takes up to 175 s) ends now, with its ref'd timer.
+    const closed = new ProverError("2PC closed");
+    for (const w of this.waiters.values()) w.rej(closed);
+    this.waiters.clear();
     try {
       this.child?.stdin.end();
     } catch {

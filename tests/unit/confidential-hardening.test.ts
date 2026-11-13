@@ -497,3 +497,40 @@ describe("session wait timers", () => {
     }
   });
 });
+
+describe("closing ends the waits at once (finding 22)", () => {
+  it("cu-2pc: a key-share wait rejects when the session is closed", async () => {
+    const { child } = fakeChild(true);
+    const Ws = fakeSocketClass();
+    const s = new TwoPcSession({ binaryPath: "/fake/cu-2pc", spawnImpl: (() => child) as never, webSocketImpl: Ws as never });
+    s.start("ws://node/zk?proof=twopc");
+    const t0 = Date.now();
+    const ks = s.keyShare(175_000);
+    ks.catch(() => {});
+    await tick();
+    s.close();
+    await expect(ks).rejects.toThrow(/2PC closed/);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("proof channel: a top-up, a proof and the ready wait reject when the channel is closed", async () => {
+    const { child } = fakeChild(true);
+    const Ws = fakeSocketClass();
+    const c = new ProofChannel({ binaryPath: "/fake/cu-prover", spawnImpl: (() => child) as never, webSocketImpl: Ws as never });
+    c.start("ws://node/zk?proof=zkchan");
+    const ready = c.ready(120_000);
+    await tick();
+    c.used = true;
+    const t0 = Date.now();
+    const top = c.topup(60_000);
+    const proof = c.run("prove", "pi_win", {}, {}, 60_000);
+    top.catch(() => {});
+    proof.catch(() => {});
+    await tick();
+    c.close();
+    await expect(top).rejects.toThrow(/proof channel closed/);
+    await expect(proof).rejects.toThrow(/proof channel closed/);
+    expect(await ready).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+});
