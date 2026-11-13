@@ -574,6 +574,30 @@ describe("v3 transport: a pooled connection is a cache, never a promise", () => 
     expect(http2OpenFailure(new StreamNotProcessedError("x"))).toBe(false);
   });
 
+  // Run with NODE_OPTIONS=--expose-gc to include it.
+  it.runIf(typeof (globalThis as { gc?: unknown }).gc === "function")(
+    "keeps no request body reachable from a kept connection's key (finding 25)",
+    async () => {
+      mockNodeOffer();
+      const mocks = fakeConnections();
+      const url = freshNode();
+      const ref = await (async () => {
+        const body = { model: "cheap", messages: [{ role: "user", content: "x".repeat(1 << 16) }] };
+        // Pre-warming on: the pool keeps the key's state and its opener.
+        await fetchConfidential({ baseUrl: url, body, bearer: "sk-x", options: { ...base, prewarm: { log: () => {} } } });
+        return new WeakRef(body);
+      })();
+      // The kept connection is still pooled (the key's opener is remembered for pre-warming).
+      expect(confidentialConnectionsSnapshot()).toHaveLength(1);
+      for (const m of Object.values(mocks)) m.mockClear();
+      for (let i = 0; i < 10 && ref.deref(); i++) {
+        await new Promise((r) => setTimeout(r, 0));
+        (globalThis as unknown as { gc: () => void }).gc();
+      }
+      expect(ref.deref()).toBeUndefined();
+    },
+  );
+
   it("a setup the node refuses with a status is the HTTP error", async () => {
     mockNodeOffer(ONLY_11);
     fakeConnections(undefined, { connectFails: () => new SessionRejectedError("node rejected: no funds", undefined, 402) });
