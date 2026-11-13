@@ -48,9 +48,29 @@ describe("upstream_models", () => {
       expect(upstreamModelsProblem({ price_list: MAPPED.price_list, upstream_models: bad })).toBeDefined();
       expect(() => validateOfferShape({ ...fields, upstream_models: bad })).toThrow(/upstream_models/);
     }
-    for (const ok of ["@cf/meta/llama-3.2-1b-instruct", "liquid/lfm-2.5-2.6b:free"]) {
-      expect(upstreamModelsProblem({ price_list: { a: RATES }, upstream_models: { a: ok } })).toBeUndefined();
+    for (const [pub, ok] of [
+      ["meta/llama-3.2-1b-instruct", "@cf/meta/llama-3.2-1b-instruct"],
+      ["llama-3.2-1b-instruct", "@cf/meta/llama-3.2-1b-instruct"],
+      ["kimi-k3.1-pro", "moonshotai/kimi-k3.1-pro"],
+      ["lfm-2.5-2.6b:free", "liquid/lfm-2.5-2.6b:free"],
+    ]) {
+      expect(upstreamModelsProblem({ price_list: { [pub]: RATES }, upstream_models: { [pub]: ok } })).toBeUndefined();
     }
+  });
+
+  it("only the provider's prefix may differ: a node cannot pin another model (finding 17)", () => {
+    const swap = (pub: string, id: string) =>
+      upstreamModelsProblem({ price_list: { [pub]: RATES }, upstream_models: { [pub]: id } });
+    // A model swap under the id the client asked (and pays) for.
+    expect(swap("claude-opus-4.5", "qwen/qwen3.8-27b")).toMatch(/names another model/);
+    // A suffix or a partial name is not a prefix.
+    expect(swap("kimi-k3.1-pro", "moonshotai/kimi-k3.1-pro-lite")).toBeDefined();
+    expect(swap("kimi-k3.1-pro", "moonshotai/xkimi-k3.1-pro")).toBeDefined();
+    expect(swap("lfm-2.5-2.6b:free", "liquid/lfm-2.5-2.6b")).toBeDefined();
+    expect(swap("meta/llama-3.2-1b-instruct", "@cf/meta/llama-3.2-3b-instruct")).toBeDefined();
+    expect(() =>
+      validateOfferShape(v3OfferFields({ ...MAPPED, upstream_models: { [PUBLIC]: "qwen/qwen3.8-27b" } })),
+    ).toThrow(/names another model/);
   });
 
   it("the request names the public id; the body ends with the suffix pinning the provider's", async () => {
