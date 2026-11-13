@@ -1800,7 +1800,10 @@ export class ConfidentialConnection {
       idleMs,
       () => Math.max(cur.tLastData, cur.tReleased ?? 0),
     );
-    if (cur.reset !== undefined) {
+    // An error head the provider sent before it reset the stream (RFC 9113
+    // §8.1: a server that answers before the request is complete resets it,
+    // with NO_ERROR) is still disclosed and settled by its status.
+    if (cur.reset !== undefined && !errored()) {
       throw new ResponseVerificationError(`the provider reset stream ${stream} (code ${cur.reset})`);
     }
     const status = cur.status ?? 0;
@@ -1811,8 +1814,9 @@ export class ConfidentialConnection {
     } else if (status >= 200 && status < 300) {
       ({ receipt, attestation } = await this.settleUsage(cur));
     } else if (status >= 400) {
-      // The error body is short; give it a moment (it stays private), no more.
-      await this.until(() => cur.ended, "the error body", this.timeouts.errorBody).catch((e) => {
+      // The error body is short; give it a moment (it stays private), no
+      // more. A reset ends it too: nothing more comes on the stream.
+      await this.until(() => cur.ended || cur.reset !== undefined, "the error body", this.timeouts.errorBody).catch((e) => {
         if (!(e instanceof ConfidentialTimeoutError)) throw e;
       });
       ({ receipt, attestation } = await this.settleErrorHead(cur, status));
