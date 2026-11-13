@@ -18,6 +18,7 @@ import {
   ConfidentialError,
   ConnectionDepositError,
   NodeProtocolOutdatedError,
+  OfferUnavailableError,
   ProverMissingError,
   RequestRefusedError,
   SessionProtocolError,
@@ -26,7 +27,7 @@ import {
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
 } from "../../client/confidential/errors";
-import { verifyConfidentialOffer } from "../../client/confidential/offer";
+import { fetchConfidentialOffer, verifyConfidentialOffer } from "../../client/confidential/offer";
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import * as twopc from "../../client/confidential/twopc";
 import {
@@ -714,5 +715,32 @@ describe("v3 transport: pre-warm (§9.2)", () => {
     expect(arm.mock.calls.filter((c) => c[0] === true)).toHaveLength(0);
     // The connection its request left armed is kept for the next request.
     expect(confidentialConnectionsSnapshot()).toMatchObject([{ http: "1.1", state: "armed" }]);
+  });
+});
+
+describe("a node whose offer cannot be fetched (finding 21)", () => {
+  it("is not asked again while it cools down: later requests fail over without waiting for it", async () => {
+    vi.spyOn(twopc, "requireHelperBinaries").mockImplementation(() => {});
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches++;
+      throw new TypeError("connect ECONNREFUSED");
+    }) as typeof fetch;
+    const url = freshNode();
+    for (let i = 0; i < 3; i++) {
+      await expect(qualifyConfidentialNode(url, "cheap", base as never)).rejects.toBeInstanceOf(OfferUnavailableError);
+    }
+    expect(fetches).toBe(1);
+    // Another node is not affected.
+    await expect(qualifyConfidentialNode(freshNode(), "cheap", base as never)).rejects.toBeInstanceOf(OfferUnavailableError);
+    expect(fetches).toBe(2);
+  });
+
+  it("an offer fetch that hangs times out", async () => {
+    const t0 = Date.now();
+    const hang = ((_url: string, init?: RequestInit) =>
+      new Promise((_res, rej) => init?.signal?.addEventListener("abort", () => rej(init.signal!.reason)))) as typeof fetch;
+    await expect(fetchConfidentialOffer(freshNode(), { fetchImpl: hang, timeoutMs: 50 })).rejects.toThrow(OfferUnavailableError);
+    expect(Date.now() - t0).toBeLessThan(2_000);
   });
 });
