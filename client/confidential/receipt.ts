@@ -164,7 +164,14 @@ export function errorStatusCharge(status: number): "abandon_fee" | "session_fee"
  * what that status is billed (`errorStatusCharge`, at the signed fees). For an
  * image session the receipt must also carry the session's image terms, and
  * even the reservation is bounded by them: price × count plus the larger fee.
- * A charge outside these bounds throws.
+ *
+ * A status billed at the reservation is never bounded by the receipt's own
+ * `reserved_msats` alone (the node signs that number too): a charge above the
+ * fee needs a bound the client knew before the release, `reservationMsat`
+ * (the reservation the node announced in `request_ok`, or else the caller's
+ * ceiling), or the image terms. With `reservationAnnounced` the receipt must
+ * name exactly the announced reservation. Without any such bound only the fee
+ * is accepted. A charge outside these bounds throws.
  */
 export function checkUpstreamErrorReceipt(
   receipt: ConfidentialReceipt,
@@ -173,6 +180,10 @@ export function checkUpstreamErrorReceipt(
   options: {
     abandonFeeMsat?: number;
     image?: { model: string; variant: string; count: number; msatPerImage: number };
+    /** The most the request may have reserved (msat), known before its release. */
+    reservationMsat?: number;
+    /** `reservationMsat` is the node's own announcement (`request_ok.reserved_msats`). */
+    reservationAnnounced?: boolean;
   } = {},
 ): boolean {
   const ru = receipt.usage as unknown as { error_status?: unknown } | undefined;
@@ -194,6 +205,7 @@ export function checkUpstreamErrorReceipt(
     throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
   }
   const image = options.image;
+  let imageCeiling: number | undefined;
   if (image) {
     const fail = (what: string): never => {
       throw new ReceiptVerificationError(`image error receipt: ${what}`);
@@ -202,8 +214,12 @@ export function checkUpstreamErrorReceipt(
     if (receipt.model !== image.model) fail(`model ${String(receipt.model)} is not ${image.model}`);
     if (receipt.variant !== image.variant) fail(`variant ${String(receipt.variant)} is not ${image.variant}`);
     if (receipt.count !== image.count) fail(`count ${String(receipt.count)} is not ${image.count}`);
-    const ceiling = Math.ceil(image.msatPerImage * image.count + abandon);
-    if (cost > ceiling) fail(`cost ${cost} msats exceeds price × count plus the abandon fee (${ceiling} msats)`);
+    imageCeiling = Math.ceil(image.msatPerImage * image.count + abandon);
+    if (cost > imageCeiling) fail(`cost ${cost} msats exceeds price × count plus the abandon fee (${imageCeiling} msats)`);
+  }
+  const known = options.reservationMsat;
+  if (known !== undefined && !isMsatAmount(known)) {
+    throw new ReceiptVerificationError(`the request's reservation bound ${String(known)} is not a valid amount`);
   }
   const charge = errorStatusCharge(status);
   if (charge !== "reservation") {
@@ -220,9 +236,27 @@ export function checkUpstreamErrorReceipt(
         `node charged ${cost} msats for upstream error ${status} without naming its reservation`,
       );
     }
+    if (options.reservationAnnounced && known !== undefined && reserved !== known) {
+      throw new ReceiptVerificationError(
+        `receipt names a reservation of ${reserved} msats, the node announced ${known} msats`,
+      );
+    }
     if (cost > reserved) {
       throw new ReceiptVerificationError(
         `node charged ${cost} msats for upstream error ${status}, more than its reservation (${reserved} msats)`,
+      );
+    }
+    // The receipt's own number is the node's word: the charge must also be
+    // within a bound the client held before anything was released.
+    const bound = known ?? imageCeiling;
+    if (bound === undefined) {
+      throw new ReceiptVerificationError(
+        `node charged ${cost} msats for upstream error ${status}, and no reservation bound is known for the request`,
+      );
+    }
+    if (cost > bound) {
+      throw new ReceiptVerificationError(
+        `node charged ${cost} msats for upstream error ${status}, more than the request's reservation bound (${bound} msats)`,
       );
     }
   }

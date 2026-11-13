@@ -977,6 +977,33 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 });
             }
         },
+        // FORK PATCH (v3, SDK only): best-effort erasure when the connection
+        // ends. Zero the traffic secrets and IVs this client holds (the
+        // current keys and the handshake secrets), drop every key reference
+        // (the AES keys are CryptoKey objects, which cannot be zeroed), and end
+        // the client so no record is read or written with them afterwards.
+        // Copies made elsewhere (by the runtime, by the caller) are untouched.
+        destroySecrets() {
+            for (const set of [keys, handshakeSecrets]) {
+                if (!set) {
+                    continue;
+                }
+                for (const name of ['clientSecret', 'serverSecret', 'masterSecret', 'clientIv', 'serverIv']) {
+                    const v = set[name];
+                    if (v instanceof Uint8Array) {
+                        v.fill(0);
+                    }
+                }
+            }
+            if (earlySecret instanceof Uint8Array) {
+                earlySecret.fill(0);
+            }
+            keys = undefined;
+            handshakeSecrets = undefined;
+            earlySecret = undefined;
+            handshakeDone = false;
+            ended = true;
+        },
         end,
     };
 }

@@ -821,6 +821,47 @@ describe("http 2: the connection pool", () => {
     pool.close();
   });
 
+  it("keeps each acquisition's reuse policy, whatever a later call configures (shared, none, shared)", async () => {
+    const limits = { ...quiet, maxConnectionsPerKey: 1 };
+    const pool = new ConnectionPool<FakeConn>(limits);
+    const conns: FakeConn[] = [];
+    const open = () => (conns.push(new FakeConn()), conns[conns.length - 1]!);
+    // 1. A shared request holds the key's only connection.
+    const first = await pool.acquire("k", "2", open, undefined, "shared");
+    first.conn.start();
+    // 2. A request with reuse none arrives and waits for the per-key limit.
+    pool.configure({ ...limits, reuse: "none" });
+    let none: Awaited<ReturnType<typeof pool.acquire>> | undefined;
+    const waiting = pool.acquire("k", "2", open, undefined, "none").then((l) => (none = l));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(none).toBeUndefined();
+    // 3. A later shared call reconfigures the process-wide pool.
+    pool.configure({ ...limits, reuse: "shared" });
+    // The first request settles: its lease is shared, so its connection is kept.
+    first.conn.finish();
+    first.release(true);
+    await waiting;
+    // The none request never takes the connection another request used.
+    expect(none!.conn).not.toBe(first.conn);
+    expect(none!.reused).toBe(false);
+    expect(first.conn.dead).toBeDefined(); // made room at the per-key limit
+    none!.conn.start();
+    none!.conn.finish();
+    none!.release(true);
+    // ...and its own connection is closed after it, although the pool now says shared.
+    expect(none!.conn.dead).toBeDefined();
+    expect(pool.snapshot()).toHaveLength(0);
+    // A shared request after that opens a fresh one and keeps it.
+    const later = await pool.acquire("k", "2", open, undefined, "shared");
+    expect(later.reused).toBe(false);
+    later.conn.start();
+    later.conn.finish();
+    later.release(true);
+    expect(pool.snapshot().map((e) => e.state)).toEqual(["idle"]);
+    expect(conns).toHaveLength(3);
+    pool.close();
+  });
+
   it("closes an idle connection before the node's idle limit, and after maxRequestsPerConnection", async () => {
     const pool = new ConnectionPool<FakeConn>({ ...quiet, maxIdleMs: 30, maxRequestsPerConnection: 2 });
     const l1 = await pool.acquire("k", "2", () => new FakeConn());
