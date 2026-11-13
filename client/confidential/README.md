@@ -197,6 +197,14 @@ what must not be linked: a scope never shares a connection with another.
   false` turns it off. A request refused with `offer_changed` closes its
   connection (the node takes no further request on it).
 
+**Ending a process.** A kept connection holds its WebSocket and the helper
+processes (`cu-2pc`, `cu-prover --channel`) until the pool retires it, so a
+process that made confidential requests stays alive for up to the node's idle
+time (about 100 s by default; with a spare armed, up to `maxAgeMs`). A script
+or CLI calls `closeConfidentialConnections()` after its last request: every
+connection closes and every wait on it ends at once. A connection that never
+settled a request (an unused spare) loses its deposit.
+
 `x-routstr-confidential-http` names the framing, and
 `x-routstr-confidential-connection` what the request found (`new`, `armed`,
 `reused`) and its number (`request=n`). `http2.onRequest` reports per request
