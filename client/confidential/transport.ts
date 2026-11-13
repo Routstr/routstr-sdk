@@ -41,6 +41,7 @@ import {
   ProverMissingError,
   RequestRefusedError,
   SessionRejectedError,
+  StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
 } from "./errors";
@@ -245,6 +246,8 @@ export function http2OpenFailure(error: unknown): boolean {
   if (error instanceof RequestRefusedError || error instanceof ConnectionDepositError) return false;
   if (error instanceof UpgradeRequiredError || error instanceof TwoPcVersionMismatchError) return false;
   if (error instanceof ProverMissingError) return false;
+  // The provider refused one stream or went away: the framing worked.
+  if (error instanceof StreamNotProcessedError) return false;
   if (error instanceof SessionRejectedError) {
     if (error.nodeCode?.startsWith("h2_") || error.nodeCode === "upstream_unreachable" || error.fault === "upstream") return true;
     return error.status === undefined || error.status >= 500 || error.status === 408;
@@ -814,7 +817,20 @@ async function runOnPool(
       else if (refused && offerChangedRefusal(error)) conn.close("offer_changed");
       lease.release();
       traffic.done();
-      if (refused || handle.bodyReleased || state.headSeen || params.signal?.aborted || attempt >= 3) throw error;
+      if (refused || state.headSeen || params.signal?.aborted || attempt >= 3) throw error;
+      // A request the provider did not process (RFC 9113 §8.7: REFUSED_STREAM,
+      // or a stream above a GOAWAY's last one) may run again, even after its
+      // release. The node cannot see why nothing came: a released request's
+      // reservation may still be charged (PROTOCOL-V3.md §12.10).
+      if (error instanceof StreamNotProcessedError) {
+        log(
+          `sid=${handle.sid.slice(0, 8)} request ${handle.n} was not processed by the provider (${errorText(error)}); ` +
+            `running it on a new connection${handle.bodyReleased ? " (the node may charge the released request's reservation)" : ""}`,
+        );
+        state.handle = undefined;
+        continue;
+      }
+      if (handle.bodyReleased) throw error;
       const first = handle.n === 1 && lease.warm !== "open";
       if (first && fallbackTo11(error)) {
         // §2.3: the connection failed before the body of its first request was released.

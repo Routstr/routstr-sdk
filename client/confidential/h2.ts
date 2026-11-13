@@ -14,6 +14,9 @@ export const PREFACE = new TextEncoder().encode('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\
 export const FRAME = { DATA: 0, HEADERS: 1, RST_STREAM: 3, SETTINGS: 4, PING: 6, GOAWAY: 7, WINDOW_UPDATE: 8, CONTINUATION: 9 } as const
 export const FLAG = { END_STREAM: 0x1, ACK: 0x1, END_HEADERS: 0x4, PADDED: 0x8, PRIORITY: 0x20 } as const
 
+/** SETTINGS_MAX_FRAME_SIZE: the default, which the node's connection head keeps. */
+export const MAX_FRAME_SIZE = 1 << 14
+
 /** The largest DATA payload in one record: one frame per record, 2^14 bytes of content. */
 export const MAX_DATA_IN_RECORD = (1 << 14) - 9
 
@@ -226,6 +229,9 @@ export class FrameReader {
     while (this.pending.length >= 9) {
       const p = this.pending
       const len = (p[0]! << 16) | (p[1]! << 8) | p[2]!
+      // The node's head never raises SETTINGS_MAX_FRAME_SIZE above 2^14: a
+      // larger frame is the provider's error, refused before it is reassembled.
+      if (len > MAX_FRAME_SIZE) fail(`h2: a frame of ${len} bytes exceeds SETTINGS_MAX_FRAME_SIZE (FRAME_SIZE_ERROR)`)
       if (p.length < 9 + len) break
       out.push({
         type: p[3]!,

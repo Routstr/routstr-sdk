@@ -26,6 +26,7 @@ import {
   decodeBlock,
   errorHeadPrefixProblem,
   frame,
+  frameHeader,
   h2Head,
   huffmanDecode,
   requestBlock,
@@ -75,6 +76,17 @@ describe("http 2: framing and HPACK (sidecar vectors)", () => {
     expect(all.every((x, i) => x === i)).toBe(true);
     expect(() => huffmanDecode(Uint8Array.from([0x00]))).toThrow();
     expect(() => huffmanDecode(Uint8Array.from([0xff, 0xff, 0xff, 0xff]))).toThrow();
+  });
+
+  it("refuses a frame above 16 KiB (FRAME_SIZE_ERROR) as soon as its header arrives", () => {
+    // The node's head never raises SETTINGS_MAX_FRAME_SIZE above the default 2^14.
+    const ok = new FrameReader();
+    expect(ok.push(frame(FRAME.DATA, 0, 3, new Uint8Array(16384)), 0)).toHaveLength(1);
+    const rd = new FrameReader();
+    const big = frameHeader((1 << 24) - 1, FRAME.DATA, 0, 3);
+    const t0 = Date.now();
+    expect(() => rd.push(big, 0)).toThrow(/FRAME_SIZE_ERROR/);
+    expect(Date.now() - t0).toBeLessThan(100);
   });
 
   it("reassembles frames across record boundaries and maps offsets to records", () => {

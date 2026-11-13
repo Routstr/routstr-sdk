@@ -46,6 +46,7 @@ import {
   ResponseVerificationError,
   SessionProtocolError,
   SessionRejectedError,
+  StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
 } from "./errors";
@@ -586,6 +587,8 @@ export class ConfidentialConnection {
   private unackedSettings = 0;
   private requestOpen = false;
   private goaway = false;
+  /** The last-stream-id of the provider's GOAWAY: a stream above it is never processed (RFC 9113 §6.8). */
+  private goawayLast?: number;
   private cur?: Cur;
   private kicks: (() => void)[] = [];
 
@@ -1399,13 +1402,18 @@ export class ConfidentialConnection {
         for (let i = 0; i + 6 <= f.payload.length; i += 6) {
           const id = (f.payload[i]! << 8) | f.payload[i + 1]!;
           const v = u32(f.payload, i + 2);
-          if (id === 4) this.initialWindow = v;
+          if (id === 4) {
+            // RFC 9113 §6.9.2: the change applies to the open stream's window too.
+            if (cur) cur.streamCredit += v - this.initialWindow;
+            this.initialWindow = v;
+          }
           if (id === 1) {
             this.tableSize = v;
             carried = true;
           }
         }
         this.gotSettings = true;
+        this.updateRelease();
         if (carried && this.settingsSeenSent) this.sendSettingsSeen();
         // Acknowledged with the next request's records (one π_WIN for both)
         // when none is open, else at once.
@@ -1424,10 +1432,15 @@ export class ConfidentialConnection {
         this.updateRelease();
         break;
       }
-      case FRAME.GOAWAY:
+      case FRAME.GOAWAY: {
         this.goaway = true;
-        this.event({ ev: "goaway" });
+        if (f.payload.length >= 8) {
+          const last = u32(f.payload) & 0x7fffffff;
+          this.goawayLast = Math.min(last, this.goawayLast ?? last);
+        }
+        this.event({ ev: "goaway", last_stream: this.goawayLast });
         break;
+      }
       case FRAME.RST_STREAM:
         if (cur && f.stream === cur.stream && f.payload.length >= 4) cur.reset = u32(f.payload);
         break;
@@ -1516,6 +1529,8 @@ export class ConfidentialConnection {
   private updateRelease(): void {
     const cur = this.cur;
     if (!cur || !cur.accepted || cur.dataLens.length === 0) return;
+    // The provider is going away and will not process this stream: nothing more of it goes out.
+    if (this.notProcessed(cur)) return;
     const credit = Math.min(cur.streamCredit, this.connCredit);
     let upto = 1;
     let sum = 0;
@@ -1530,6 +1545,11 @@ export class ConfidentialConnection {
       cur.releaseSent = true;
       this.sendOrdered({ type: "release", n: cur.n, upto });
     }
+  }
+
+  /** The provider's GOAWAY names a last stream below the request's: it will not process it. */
+  private notProcessed(cur: Cur): boolean {
+    return this.goawayLast !== undefined && cur.stream > this.goawayLast;
   }
 
   // --- proofs of our own records --------------------------------------------------
@@ -1788,14 +1808,19 @@ export class ConfidentialConnection {
 
     // Released (in steps, as the provider's window opens) or refused early.
     const errored = () => (cur.status ?? 0) >= 400;
-    await this.until(() => cur.released || errored() || cur.reset !== undefined, `body_released for request ${n}`, this.timeouts.released);
+    const unprocessed = () => this.notProcessed(cur) && cur.status === undefined;
+    await this.until(
+      () => cur.released || errored() || cur.reset !== undefined || unprocessed(),
+      `body_released for request ${n}`,
+      this.timeouts.released,
+    );
     // An image response is silent until the image is done: wait as long as
     // the signed offer says the provider may take.
     const idleMs = cur.image
       ? Math.max(this.timeouts.responseIdle, Math.max(1, cur.offer.images?.response_idle_s ?? 300) * 1000)
       : this.timeouts.responseIdle;
     await this.until(
-      () => cur.ended || cur.reset !== undefined || errored(),
+      () => cur.ended || cur.reset !== undefined || errored() || unprocessed(),
       `the response to request ${n}`,
       idleMs,
       () => Math.max(cur.tLastData, cur.tReleased ?? 0),
@@ -1803,6 +1828,14 @@ export class ConfidentialConnection {
     // An error head the provider sent before it reset the stream (RFC 9113
     // §8.1: a server that answers before the request is complete resets it,
     // with NO_ERROR) is still disclosed and settled by its status.
+    // RFC 9113 §8.7: a refused stream, or one above a GOAWAY's last stream, was not processed.
+    if (!errored() && (cur.reset === 7 || unprocessed())) {
+      throw new StreamNotProcessedError(
+        cur.reset === 7
+          ? `the provider refused stream ${stream} (REFUSED_STREAM): request ${n} was not processed`
+          : `the provider is going away (GOAWAY, last stream ${this.goawayLast}): request ${n} on stream ${stream} was not processed`,
+      );
+    }
     if (cur.reset !== undefined && !errored()) {
       throw new ResponseVerificationError(`the provider reset stream ${stream} (code ${cur.reset})`);
     }

@@ -28,6 +28,7 @@ export {
   ProverMissingError,
   ReceiptVerificationError,
   ResponseVerificationError,
+  StreamNotProcessedError,
   ConfidentialTimeoutError,
   type ConfidentialErrorCode,
 } from "./errors";
