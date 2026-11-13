@@ -930,6 +930,58 @@ export class RoutstrClient {
     }
   }
 
+  /**
+   * The usage row (and, with an API key, the balance) of an upstream error a
+   * confidential session returned: the charge is the verified receipt's
+   * (`confidentialSettled`, also in `x-routstr-cost-msats`). A one-off
+   * bearer's change was taken where the error was returned.
+   */
+  private async _accountConfidentialUpstreamError(
+    params: RouteRequestParams,
+    prepared: Awaited<ReturnType<RoutstrClient["_prepareRoutedRequest"]>>
+  ): Promise<number> {
+    const source = prepared.response;
+    const settlement = (await (source as any).confidentialSettled?.catch(() => undefined)) as
+      | { costMsats?: unknown }
+      | undefined;
+    // Headers only: the body is the caller's to read.
+    const headers = new Headers(source.headers);
+    const cost = settlement?.costMsats;
+    if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+      headers.set("x-routstr-cost-msats", String(cost));
+    }
+    const response = new Response(null, { status: source.status, headers });
+    const requestId = params.lifecycle?.requestId;
+    let satsSpent: number;
+    if (this.mode === "xcashu") {
+      satsSpent = extractUsageFromResponseHeaders(headers)?.reportedSatsCost ?? 0;
+      await this._trackResponseUsage({
+        token: prepared.tokenUsed,
+        baseUrl: prepared.baseUrlUsed,
+        response,
+        responseBody: null,
+        modelId: prepared.modelId,
+        satsSpent,
+        requestId,
+        clientApiKey: prepared.clientApiKey,
+      });
+    } else {
+      satsSpent = await this._handlePostResponseBalanceUpdate({
+        token: prepared.tokenUsed,
+        baseUrl: prepared.baseUrlUsed,
+        initialTokenBalance: prepared.tokenBalanceInSats,
+        response,
+        responseBody: null,
+        modelId: prepared.modelId,
+        requestId,
+        clientApiKey: prepared.clientApiKey,
+      });
+    }
+    (source as any).satsSpent = satsSpent;
+    if ((response as any).usageEntryId !== undefined) (source as any).usageEntryId = (response as any).usageEntryId;
+    return satsSpent;
+  }
+
   private async _routeRequest(params: RouteRequestParams): Promise<Response> {
     // Refuse before any credential or deposit: the confidential transport
     // only speaks chat completions, and must never fall back to plaintext.
@@ -955,6 +1007,17 @@ export class RoutstrClient {
       // Error payment recovery is handled in _handleErrorResponse. There is no
       // successful usage to account for; keep finalization off passthrough errors.
       if ((prepared.response as any).passthrough) {
+        // Except an upstream error through a confidential session: the node
+        // settled it (the session fee, the abandon fee, or for a 5xx up to the
+        // reservation) and its receipt names the charge, so it is accounted
+        // like any settled request.
+        if (prepared.response.headers.has("x-routstr-confidential-sid")) {
+          const accounting = this._accountConfidentialUpstreamError(params, prepared).catch((error) => {
+            this._log("ERROR", "[RoutstrClient] accounting a confidential upstream error failed:", error);
+            return 0;
+          });
+          (prepared.response as any).finalize = () => accounting;
+        }
         return prepared.response;
       }
 

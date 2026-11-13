@@ -174,6 +174,47 @@ describe("streamed confidential response finalization", () => {
     expect((response as any).satsSpent).toBe(1.234);
   });
 
+  /** An upstream error through a confidential session, as `_makeRequest` returns it (no failover). */
+  function upstreamError(costMsats: number): Response {
+    const r = new Response('{"error":"internal"}', {
+      status: 500,
+      headers: {
+        "content-type": "application/json",
+        "x-routstr-confidential-sid": "ab".repeat(32),
+        "x-routstr-cost-msats": String(costMsats),
+      },
+    });
+    (r as any).passthrough = true;
+    (r as any).confidentialSettled = Promise.resolve({ costMsats });
+    return r;
+  }
+  const chat = { path: "/v1/chat/completions", method: "POST", baseUrl, mintUrl, modelId: model.id, headers: {} };
+
+  it("an upstream error the node charged is accounted (apikeys, finding 20)", async () => {
+    const { client, balanceUpdate } = setup();
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstreamError(2_687_000));
+    const response = await client.routeRequest({ ...chat, body: { model: model.id, messages: [] } });
+    expect(response.status).toBe(500);
+    // The caller still reads the provider's error.
+    expect(await response.text()).toBe('{"error":"internal"}');
+    await (response as any).finalize();
+    expect(balanceUpdate).toHaveBeenCalledTimes(1);
+    const accounted = balanceUpdate.mock.calls[0]![0] as { response: Response; modelId: string };
+    expect(accounted.response.headers.get("x-routstr-cost-msats")).toBe("2687000");
+    expect(accounted.modelId).toBe(model.id);
+  });
+
+  it("an upstream error the node charged is accounted (xcashu: its change was taken already, finding 20)", async () => {
+    const { client, balanceUpdate } = setup("xcashu");
+    const track = vi.spyOn(client as any, "_trackResponseUsage").mockResolvedValue(undefined);
+    vi.spyOn(client as any, "_makeRequest").mockResolvedValue(upstreamError(5_000));
+    const response = await client.routeRequest({ ...chat, body: { model: model.id, messages: [] } });
+    await (response as any).finalize();
+    // No second attempt to receive the change.
+    expect(balanceUpdate).not.toHaveBeenCalled();
+    expect(track).toHaveBeenCalledWith(expect.objectContaining({ satsSpent: 5, modelId: model.id }));
+  });
+
   it("a failed settlement is logged without the change token it carries", async () => {
     const { client } = setup("xcashu");
     const logged: unknown[][] = [];
