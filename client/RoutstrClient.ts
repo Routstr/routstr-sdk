@@ -90,6 +90,11 @@ import type {
 } from "./confidential/transport";
 import type { ConfidentialOffer } from "./confidential/offer";
 import { chooseImageVariant } from "./confidential/imagePlan";
+import {
+  confidentialErrorCode,
+  confidentialFailoverError,
+  mayHaveReachedProvider,
+} from "./confidential/errors";
 import { confidentialKind } from "./confidential/endpoints";
 import {
   isTinfoilModel,
@@ -479,8 +484,10 @@ export function confidentialDepositMsats(offer?: ConfidentialDepositOffer): numb
  * context length (the larger of the model's and its `top_provider`'s, at the
  * dearer of the input and cache-write rates) plus the pinned completion cap
  * and the offer's `reserve_margin_tokens` at the signed (surcharged) rates; without a known
- * context length, the model's undiscounted maximum cost raised by the
- * surcharge plus the same margin. The larger of the session and abandon fees
+ * context length, the model's undiscounted maximum cost scaled by
+ * max(1, cache_write / in) (when both rates are positive: the prompt may be
+ * all cache writes) and raised by the surcharge, plus the same margin at the
+ * output rate. The larger of the session and abandon fees
  * comes on top. With the signed offer every input is the node's; without it
  * the rates come from the model listing (sats per token, raised by the
  * listed surcharge), the fees from its `confidential_upstream` field, and the
@@ -533,22 +540,79 @@ export function confidentialReservationMsats(
   } else {
     completion = 4096;
   }
-  // The node's prompt limit: the larger of the positive integer context
-  // lengths (the catalogue's `top_provider` one may describe another provider).
-  const top = (model as { top_provider?: { context_length?: unknown } }).top_provider;
-  const known = [top?.context_length, model.context_length].filter(
-    (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0
-  );
-  const limit = known.length ? Math.max(...known) : undefined;
+  const limit = confidentialContextLimit(model);
   let msats: number;
   if (limit !== undefined) {
     if (!inRate || !outRate) return undefined;
     msats = Math.ceil((limit * inRate + (completion + margin) * outRate) / 1000);
   } else {
     if (!sp || !positive(sp.max_cost)) return undefined;
-    msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * factor + (margin * outRate) / 1000);
+    // The node scales the undiscounted maximum by the cache-write premium of
+    // the signed rates (the listing's without an offer), in the same order:
+    // ceil(undiscounted × ratio × (1 + pct/100) + margin × out / 1000).
+    const baseIn = signed ? positive(signed.in) : positive(sp.prompt);
+    const write = signed ? positive(signed.cache_write) : positive(sp.input_cache_write);
+    const ratio = baseIn && write ? Math.max(1, write / baseIn) : 1;
+    msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * ratio * factor + (margin * outRate) / 1000);
   }
   return msats + feeMsat;
+}
+
+/**
+ * The node's prompt limit for a model: the larger of the positive integer
+ * context lengths (the catalogue's `top_provider` one may describe another
+ * provider); undefined when none is known.
+ */
+function confidentialContextLimit(model: Model): number | undefined {
+  const top = (model as { top_provider?: { context_length?: unknown } }).top_provider;
+  const known = [top?.context_length, model.context_length].filter(
+    (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0
+  );
+  return known.length ? Math.max(...known) : undefined;
+}
+
+/**
+ * The ceiling (msats) a client may hold a node's announced reservation for a
+ * confidential chat request to (`maxReservationMsat`): never below what an
+ * honest node reserves. Only computed where the node's formula depends on
+ * nothing but the signed offer and the model's context length: the offer
+ * prices the model, the model has a known context length (the fallback
+ * branch reads the model's maximum cost in sats, which moves with the
+ * exchange rate) and the offer takes a connection deposit, whose amount the
+ * node never sets below its minimum reservation (`min_request_msat`, the
+ * floor of every reservation). Undefined: no ceiling.
+ */
+export function confidentialReservationCeilingMsats(
+  model: Model,
+  maxTokens: number | undefined,
+  offer: ConfidentialDepositOffer | undefined
+): number | undefined {
+  if (!offer || !offer.price_list || !Object.hasOwn(offer.price_list, model.id)) return undefined;
+  if (confidentialContextLimit(model) === undefined) return undefined;
+  const deposit = confidentialDepositMsats(offer);
+  if (deposit <= 0) return undefined;
+  const msats = confidentialReservationMsats(model, maxTokens, offer);
+  if (msats === undefined || !Number.isFinite(msats)) return undefined;
+  const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const fee = Math.max(count(offer.session_fee_msat), count(offer.abandon_fee_msat));
+  // max(min_request_msat, formula) + fee, with min_request_msat ≤ deposit.
+  return Math.max(msats, deposit + fee);
+}
+
+/**
+ * The reservation ceiling a confidential chat request passes to the transport:
+ * for the model the client selected on this node, by the offer the request is
+ * priced by (`confidentialReservationCeilingMsats`). A request whose body
+ * names another model gets none.
+ */
+function confidentialCeiling(
+  model: Model | undefined
+): ConfidentialFetchParams["maxReservationMsat"] {
+  if (!model) return undefined;
+  return (offer, request) =>
+    request.model === model.id
+      ? confidentialReservationCeilingMsats(model, request.maxTokens, offer)
+      : undefined;
 }
 
 /**
@@ -1867,6 +1931,10 @@ export class RoutstrClient {
             options: params.confidential,
             // Requests of different scopes never share a connection to the provider.
             reuseScope: params.confidential.reuseScope,
+            // Chat: the node's announced reservation may not exceed what its
+            // own formula gives for this model on this node (none when the
+            // client cannot compute that bound).
+            maxReservationMsat: confidentialCeiling(params.selectedModel),
             method,
             path,
             returnChange: this.mode === "xcashu",
@@ -2052,6 +2120,42 @@ export class RoutstrClient {
         typeof error?.cashuChange === "string"
       ) {
         await this._receiveConfidentialChange(baseUrl, token, error.cashuChange);
+      }
+      if (params.confidential) {
+        // The body was released: the provider may have run the request. No
+        // retry, top-up or failover may send it again, whatever the error says.
+        if (mayHaveReachedProvider(error)) throw error;
+        // A confidential error's message may carry the node's own text (a
+        // close reason): its type decides, never `isNetworkErrorMessage`.
+        if (confidentialErrorCode(error) !== undefined) {
+          if (!headersReceived && !signal?.aborted && confidentialFailoverError(error)) {
+            const code = confidentialErrorCode(error);
+            this._log("ERROR", "[RoutstrClient] confidential connection failed before release", {
+              baseUrl,
+              code,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return await this._handleErrorResponse(
+              params,
+              token,
+              -1, // a connection failure: no status
+              undefined,
+              undefined,
+              // A fixed text: nothing of the node's reaches the error parser.
+              `confidential connection failed before release (${code})`,
+              params.retryCount ?? 0
+            );
+          }
+          if (
+            this.mode === "xcashu" &&
+            !headersReceived &&
+            typeof error?.cashuChange !== "string" &&
+            token.startsWith("cashu")
+          ) {
+            await this._reclaimUnsentConfidentialToken(baseUrl, token);
+          }
+          throw error;
+        }
       }
       // Handle network errors with failover. Classified by message *and* by
       // the system error code the runtime attaches (Bun: `error.code`, undici:

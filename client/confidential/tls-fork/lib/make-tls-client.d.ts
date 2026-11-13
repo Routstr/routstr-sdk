@@ -75,5 +75,7 @@ export declare function makeTLSClient({ host, verifyServerCertificate, rootCAs, 
      */
     updateTrafficKeys(requestUpdateFromServer?: boolean): Promise<void>;
     write(data: Uint8Array): Promise<void>;
+    /** FORK PATCH (v3, SDK only): zero the traffic secrets and IVs, drop the keys, end the client. */
+    destroySecrets(): void;
     end: (error?: Error) => Promise<void>;
 };

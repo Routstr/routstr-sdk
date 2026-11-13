@@ -692,9 +692,13 @@ describe("receipt verification", () => {
     expect(() => checkUpstreamErrorReceipt(err(503, { cost_msats: 2001, reserved_msats: 9000 }), 503, 2000)).toThrow(
       ReceiptVerificationError,
     );
-    // Other 5xx: at most the reservation the receipt names.
-    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0)).toThrow(
+    // Other 5xx: at most the reservation the receipt names, and a bound known before the release.
+    const known = { reservationMsat: 9000 };
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0, known)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toThrow(
+      /no reservation bound/,
+    );
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0, known)).toThrow(
       /reservation/,
     );
     expect(() => checkUpstreamErrorReceipt(err(502, { cost_msats: 1e12 }), 502, 0)).toThrow(/reservation/);
@@ -1174,10 +1178,13 @@ describe("confidential deposit sizing", () => {
   }) => {
     // The opaque prompt may be all cache writes: max(in, cache_write).
     const promptRate = Math.max(o.rates.in, o.rates.cache_write ?? 0);
+    // Without a context length: the undiscounted maximum scaled by the cache-write premium.
+    const cw = o.rates.cache_write ?? 0;
+    const ratio = o.rates.in > 0 && cw > 0 ? Math.max(1, cw / o.rates.in) : 1;
     const base =
       o.limit !== undefined
         ? Math.ceil((o.limit * promptRate + (o.maxTokens + o.margin) * o.rates.out) / 1000)
-        : Math.ceil(Math.ceil(o.maxCost * 1000) * (1 + o.pct / 100) + (o.margin * o.rates.out) / 1000);
+        : Math.ceil(Math.ceil(o.maxCost * 1000) * ratio * (1 + o.pct / 100) + (o.margin * o.rates.out) / 1000);
     return Math.max(1, base) + Math.max(o.fee, Math.max(o.abandon, o.fee));
   };
   // Listing prices in sats per token; the node's rates are msats per 1k tokens.
@@ -1296,6 +1303,29 @@ describe("confidential deposit sizing", () => {
       abandon: 5000,
     });
     expect(confidentialReservationMsats(model(), 100, offer())).toBe(want);
+  });
+
+  it("scales the fallback by the cache-write premium of the signed rates, like the node", () => {
+    const rates = { in: 6000, cached_in: 600, cache_write: 7500, out: 30_000 };
+    const withWrites = offer({ price_list: { m: rates } });
+    const want = nodeReservation({ maxCost: 70, rates, maxTokens: 100, margin: 16, pct: 20, fee: 2000, abandon: 5000 });
+    // ceil(70 000 × 1.25 × 1.2 + 16 × 30 000 / 1000) + 5000
+    expect(want).toBe(Math.ceil(70_000 * 1.25 * 1.2 + 480) + 5000);
+    expect(confidentialReservationMsats(model(), 100, withWrites)).toBe(want);
+    // A cache write at or below `in` scales nothing.
+    for (const cache_write of [6000, 100, 0]) {
+      const r = { ...rates, cache_write };
+      expect(confidentialReservationMsats(model(), 100, offer({ price_list: { m: r } }))).toBe(
+        nodeReservation({ maxCost: 70, rates: { in: 6000, out: 30_000 }, maxTokens: 100, margin: 16, pct: 20, fee: 2000, abandon: 5000 }),
+      );
+    }
+    // Without the offer: the ratio of the listing's cache-write and prompt prices.
+    const cu = { rate_surcharge_pct: 20, session_fee_msat: 2000, abandon_fee_msat: 5000 };
+    const listed = {
+      ...(model({ cu }) as object),
+      sats_pricing: { prompt: 0.004, completion: 0.02, input_cache_write: 0.005, max_cost: 70 },
+    } as never;
+    expect(confidentialReservationMsats(listed, 100)).toBe(Math.ceil(70_000 * 1.25 * 1.2 + (16 * 0.02 * 1_000_000 * 1.2) / 1000) + 5000);
   });
 
   it("without the offer: listing rates and fees, a default margin, never below the node", () => {

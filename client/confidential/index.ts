@@ -30,6 +30,12 @@ export {
   ResponseVerificationError,
   StreamNotProcessedError,
   ConfidentialTimeoutError,
+  ReservationAboveCeilingError,
+  MAY_HAVE_REACHED_PROVIDER,
+  mayHaveReachedProvider,
+  confidentialErrorCode,
+  confidentialFailoverError,
+  CONFIDENTIAL_ERROR_CODES,
   type ConfidentialErrorCode,
 } from "./errors";
 

@@ -17,6 +17,11 @@ export interface TlsHandle {
   write(data: Uint8Array): Promise<void>;
   /** One record with exactly this inner plaintext (FORK PATCH v3). */
   writeInner(inner: Uint8Array): Promise<void>;
+  /**
+   * Zero the traffic secrets and IVs the client holds and drop its keys
+   * (FORK PATCH v3); the client is ended. Best effort: see the fork notes.
+   */
+  destroySecrets?(): void;
 }
 
 export interface ConfidentialReceipt {

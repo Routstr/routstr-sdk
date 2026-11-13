@@ -37,10 +37,12 @@
 import {
   ConfidentialError,
   ConnectionDepositError,
+  MAY_HAVE_REACHED_PROVIDER,
   NodeProtocolOutdatedError,
   OfferUnavailableError,
   ProverMissingError,
   RequestRefusedError,
+  ReservationAboveCeilingError,
   SessionRejectedError,
   StreamNotProcessedError,
   TwoPcVersionMismatchError,
@@ -245,6 +247,8 @@ export function chooseFraming(
  */
 export function http2OpenFailure(error: unknown): boolean {
   if (error instanceof RequestRefusedError || error instanceof ConnectionDepositError) return false;
+  // The node's reservation, not the framing: "1.1" would be refused the same way.
+  if (error instanceof ReservationAboveCeilingError) return false;
   if (error instanceof UpgradeRequiredError || error instanceof TwoPcVersionMismatchError) return false;
   if (error instanceof ProverMissingError) return false;
   // The provider refused one stream or went away: the framing worked.
@@ -267,7 +271,7 @@ export function http2OpenFailure(error: unknown): boolean {
  * request), which a new connection would not change.
  */
 function retryOnFreshConnection(error: unknown): boolean {
-  if (error instanceof RequestRefusedError) return false;
+  if (error instanceof RequestRefusedError || error instanceof ReservationAboveCeilingError) return false;
   return !(error instanceof SessionRejectedError && error.status !== undefined && error.status !== 408);
 }
 
@@ -638,6 +642,19 @@ export interface ConfidentialFetchParams {
    * caller serving several users keeps them unlinkable to the provider.
    */
   reuseScope?: string;
+  /**
+   * Chat: the most the node may reserve for the request (msat), or a function
+   * of the verified offer the request is priced by and the request's pinned
+   * terms that returns it (undefined: no ceiling). A node announcing more in
+   * `request_ok` (`reserved_msats`) gets no record of the request: the call
+   * fails with `ReservationAboveCeilingError` before anything reaches the
+   * provider. The ceiling also bounds a receipt that charges the reservation
+   * for a provider error when the node announced none. It must never be below
+   * what an honest node reserves (`confidentialReservationCeilingMsats`).
+   */
+  maxReservationMsat?:
+    | number
+    | ((offer: VerifiedOffer, request: { model: string; maxTokens: number }) => number | undefined);
   signal?: AbortSignal;
 }
 
@@ -668,6 +685,8 @@ interface RequestSpec {
   maxTokens: number;
   image?: { variant: string; count: number };
   body: Uint8Array;
+  /** The caller's reservation ceiling for this request (msat). */
+  maxReservationMsat?: number;
   onResponseHead?: ConnectionRequestOptions["onResponseHead"];
   onResponseBody?: ConnectionRequestOptions["onResponseBody"];
 }
@@ -770,6 +789,8 @@ async function runOnPool(
           return c;
         },
         params.signal,
+        // This request's reuse policy, whatever another call sets on the shared pool meanwhile.
+        options.http2?.reuse ?? "shared",
       );
     } catch (error) {
       traffic.done();
@@ -802,6 +823,7 @@ async function runOnPool(
         image: spec.image,
         body: spec.body,
         padBucket: options.padBucket,
+        maxReservationMsat: spec.maxReservationMsat,
         onResponseHead: (h) => {
           state.headSeen = true;
           spec.onResponseHead?.(h);
@@ -945,22 +967,26 @@ async function fetchConfidentialImageOnce(
     { kind: "images", model: plan.model, maxTokens: 0, image: { variant: plan.variant.id, count: plan.count }, body: plan.body },
     state,
     tRequest,
-  ).finally(() => abort.done());
+  )
+    .catch((error: unknown) => {
+      throw withReleased(error, releasedNow(state));
+    })
+    .finally(() => abort.done());
   let r: ConnectionRequestResult;
   try {
     r = await Promise.race([runP, abort.aborted]);
   } catch (error) {
-    const released = state.handle?.bodyReleased ?? false;
+    const released = releasedNow(state);
     offerRetry(baseUrl, error, released);
     // The caller left after the release: the request settles on its own.
-    if (abort.detached) throw error;
+    if (abort.detached) throw withReleased(error, released);
     const change = await failureChange(params, state, runP);
     // After release the provider has the request: a node error is not a
     // refusal, and failing over would run (and pay for) it again.
     if (isNodeRefusal(error) && !released) {
       return refusalResponse(error, change);
     }
-    throw withChange(error, change);
+    throw withReleased(withChange(error, change), released);
   }
   const headers = new Headers();
   confidentialHeaders(headers, r, state, options);
@@ -1034,6 +1060,7 @@ async function fetchConfidentialOnce(
   // The suffix pins the provider's id (`upstream_models`); the request names the public one.
   const body = buildPinnedBody(request, pinnedModelId(offer, model), maxTokens, offer.chat);
   const wantStream = request.stream === true;
+  const maxReservationMsat = reservationCeiling(params.maxReservationMsat, offer, { model, maxTokens });
   // The request's start: it may first wait for a connection, and that wait
   // belongs in its timings.
   const tRequest = Date.now();
@@ -1057,6 +1084,7 @@ async function fetchConfidentialOnce(
       model,
       maxTokens,
       body,
+      maxReservationMsat,
       onResponseHead: (h) => resolveHead(h),
       onResponseBody: (chunk) => {
         if (!chunk.length) return;
@@ -1068,7 +1096,12 @@ async function fetchConfidentialOnce(
     },
     state,
     tRequest,
-  ).finally(() => abort.done());
+  )
+    // Every failure after the release says so (the stream's error too).
+    .catch((error: unknown) => {
+      throw withReleased(error, releasedNow(state));
+    })
+    .finally(() => abort.done());
   let head: Head;
   try {
     head = await Promise.race([
@@ -1079,7 +1112,8 @@ async function fetchConfidentialOnce(
       abort.aborted,
     ]);
   } catch (error) {
-    const released = state.handle?.bodyReleased ?? false;
+    const released = releasedNow(state);
+    withReleased(error, released);
     if (!abort.detached && !(error instanceof RequestRefusedError)) state.handle?.close();
     void writer.abort(error).catch(() => {});
     // Retried only while nothing can have reached the provider: the node
@@ -1087,7 +1121,7 @@ async function fetchConfidentialOnce(
     // body went out.
     offerRetry(baseUrl, error, released);
     // The caller left after the release: the request settles on its own.
-    if (abort.detached) throw error;
+    if (abort.detached) throw withReleased(error, released);
     const change = await failureChange(params, state, runP);
     // A node-side refusal (e.g. 402 insufficient balance) becomes the same
     // HTTP error a normal request would get, so the client's existing
@@ -1097,7 +1131,7 @@ async function fetchConfidentialOnce(
     if (isNodeRefusal(error) && !released) {
       return refusalResponse(error, change);
     }
-    throw withChange(error, change);
+    throw withReleased(withChange(error, change), released);
   }
 
   let response: Response | undefined;
@@ -1114,7 +1148,8 @@ async function fetchConfidentialOnce(
       return { change, costMsats: receiptCostMsats(r) };
     },
     async (error: unknown) => {
-      throw callerGone() ? error : withChange(error, await failureChange(params, state, runP));
+      const released = releasedNow(state);
+      throw withReleased(callerGone() ? error : withChange(error, await failureChange(params, state, runP)), released);
     },
   );
   // A stream ends only once the request's settlement verified (and only then
@@ -1317,6 +1352,43 @@ function withChange(error: unknown, change: string | undefined): unknown {
   const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
   Object.defineProperty(e, "cashuChange", { value: change, enumerable: false, writable: true, configurable: true });
   return e;
+}
+
+/**
+ * Mark an error that leaves the transport after the request's body was
+ * released (`MAY_HAVE_REACHED_PROVIDER`, not enumerable): the provider may
+ * have run the request, so the caller must not send it again, to this node or
+ * another, whatever the error's text says (a node's close reason is its own
+ * text). Returns the error (a non-object becomes a `ConfidentialError`).
+ */
+function withReleased(error: unknown, released: boolean): unknown {
+  if (!released) return error;
+  const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
+  try {
+    Object.defineProperty(e, MAY_HAVE_REACHED_PROVIDER, { value: true, enumerable: false, writable: true, configurable: true });
+  } catch {
+    /* a frozen error: the caller then sees it unmarked */
+  }
+  return e;
+}
+
+/** Whether anything of the call's request may have reached the provider. */
+function releasedNow(state: RunState): boolean {
+  return (state.handle?.bodyReleased ?? false) || state.headSeen;
+}
+
+/** The caller's reservation ceiling for a chat request priced by `offer` (undefined: none). */
+function reservationCeiling(
+  ceiling: ConfidentialFetchParams["maxReservationMsat"],
+  offer: VerifiedOffer,
+  request: { model: string; maxTokens: number },
+): number | undefined {
+  const v = typeof ceiling === "function" ? ceiling(offer, request) : ceiling;
+  if (v === undefined) return undefined;
+  if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) {
+    throw new ConfidentialError("not_configured", `maxReservationMsat ${String(v)} is not an amount of msat`);
+  }
+  return Math.floor(v);
 }
 
 function delay(ms: number): Promise<void> {
