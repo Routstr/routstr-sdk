@@ -740,3 +740,41 @@ describe("the deposit outcome in the connection's last frame", () => {
     expect(warnings.join("\n")).toMatch(/provider_closed/);
   });
 });
+
+describe("a kept connection holds nothing of what it waited for (finding 25)", () => {
+  // Run with NODE_OPTIONS=--expose-gc to include it.
+  it.runIf(typeof (globalThis as { gc?: unknown }).gc === "function")(
+    "a control frame, a proof result and a sent record are released once their wait is over",
+    async () => {
+      const conn = await connection("2");
+      const refs: WeakRef<object>[] = [];
+      for (let i = 0; i < 20; i++) {
+        await (async () => {
+          const c = conn as any;
+          const msg = { type: "x", pad: "y".repeat(1 << 16) };
+          const p = c.wait(["x"], 1000);
+          c.inbox.push("x", msg);
+          refs.push(new WeakRef(msg));
+          await p;
+        })();
+      }
+      // A full request too: its frames, proofs and records were awaited the same way.
+      await conn.request(chatRequest()).done;
+      expect(conn.idle).toBe(true);
+      for (let i = 0; i < 10 && refs.some((r) => r.deref()); i++) {
+        await new Promise((r) => setTimeout(r, 0));
+        (globalThis as unknown as { gc: () => void }).gc();
+      }
+      expect(refs.filter((r) => r.deref()).length).toBe(0);
+      conn.close();
+    },
+  );
+
+  it("leaves no failure waiter behind on a live connection", async () => {
+    const conn = await connection("2");
+    await conn.request(chatRequest()).done;
+    await conn.request(chatRequest()).done;
+    expect((conn as any).failWaiters.size).toBe(0);
+    conn.close();
+  });
+});
