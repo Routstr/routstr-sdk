@@ -358,12 +358,18 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
    * (framing "2"), else an armed spare, else a new one (`open` builds it;
    * this connects it), else, at the limits, the next that becomes free.
    * Rejects if the connection cannot be opened.
+   *
+   * `reuse` is this request's policy (default: the pool's when the call
+   * starts). It holds for the whole acquisition and the lease, whatever
+   * `configure` sets meanwhile: a `none` request never takes a connection
+   * that served another request, and its connection is closed after it.
    */
   async acquire(
     key: string,
     framing: ConfidentialFraming,
     open: (framing: ConfidentialFraming) => C,
     signal?: AbortSignal,
+    reuse: "shared" | "none" = this.http2.reuse ?? HTTP2_DEFAULTS.reuse,
   ): Promise<PoolLease<C>> {
     const deadline = Date.now() + this.opt("acquireTimeoutMs");
     for (;;) {
@@ -375,13 +381,13 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       const mineOf = (e: Entry<C>) => e.key === key && e.conn.framing === framing;
       // `reuse: none` is enforced here too, not only when a request ends: an
       // open connection that served a request is never taken by another.
-      if (framing === "2" && this.http2.reuse !== "none") {
+      if (framing === "2" && reuse !== "none") {
         const idle = this.entries.find((e) => mineOf(e) && e.state === "idle");
         if (idle) {
           if (idle.timer) clearTimeout(idle.timer);
           idle.timer = undefined;
           idle.state = "busy";
-          return this.lease(idle, "open");
+          return this.lease(idle, "open", reuse);
         }
       }
       // An armed spare, or one whose arm is still running (the wait is shorter than a cold open).
@@ -404,9 +410,19 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
           continue;
         }
         spare.state = "busy";
-        return this.lease(spare, wasArmed ? "armed" : "cold");
+        return this.lease(spare, wasArmed ? "armed" : "cold", reuse);
       }
-      const mine = this.entries.filter((e) => e.key === key && !this.isSpare(e)).length;
+      let mine = this.entries.filter((e) => e.key === key && !this.isSpare(e)).length;
+      if (reuse === "none" && mine >= this.opt("maxConnectionsPerKey")) {
+        // A kept connection of the key is of no use to this request: it makes room.
+        const kept = this.entries
+          .filter((e) => e.key === key && e.state === "idle")
+          .sort((a, b) => a.conn.tLastSettled - b.conn.tLastSettled)[0];
+        if (kept) {
+          this.retire(kept, "making room for a request that does not reuse connections");
+          mine--;
+        }
+      }
       if (mine >= this.opt("maxConnectionsPerKey")) {
         // An idle connection of the key's other framing (e.g. "2" after a bad
         // mark) cannot serve this request: it must not hold the key's slot.
@@ -436,7 +452,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
             throw error;
           }
           entry.state = "busy";
-          return this.lease(entry, "cold");
+          return this.lease(entry, "cold", reuse);
         }
       }
       const left = deadline - Date.now();
@@ -466,7 +482,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     });
   }
 
-  private lease(entry: Entry<C>, warm: "open" | "armed" | "cold"): PoolLease<C> {
+  private lease(entry: Entry<C>, warm: "open" | "armed" | "cold", reuse: "shared" | "none"): PoolLease<C> {
     let released = false;
     // A connection just became busy: a spare may be due (off the request's path).
     queueMicrotask(() => this.replenish());
@@ -477,23 +493,23 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       release: (settled = false) => {
         if (released) return;
         released = true;
-        this.release(entry, settled);
+        this.release(entry, settled, reuse);
       },
     };
   }
 
-  private release(entry: Entry<C>, settled: boolean): void {
+  private release(entry: Entry<C>, settled: boolean, reuse: "shared" | "none"): void {
     const k = this.keys.get(entry.key);
     if (k && settled) {
       k.settled++;
       k.failures = 0;
     }
-    if (this.entries.includes(entry)) this.park(entry);
+    if (this.entries.includes(entry)) this.park(entry, reuse);
     this.replenish();
   }
 
-  /** A connection whose request is over: idle again, an armed spare again, or closed. */
-  private park(entry: Entry<C>): void {
+  /** A connection whose request is over: idle again, an armed spare again, or closed (`reuse`: the lease's policy). */
+  private park(entry: Entry<C>, reuse: "shared" | "none"): void {
     const conn = entry.conn;
     const now = Date.now();
     if (!conn.idle) return this.retireQuietly(entry);
@@ -507,7 +523,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       this.wake();
       return;
     }
-    if (this.http2.reuse === "none") return this.retire(entry, "reuse is off");
+    if (reuse === "none") return this.retire(entry, "reuse is off");
     const maxRequests = Math.min(this.http2.maxRequestsPerConnection ?? Infinity, conn.maxRequests);
     if (conn.requests >= maxRequests) return this.retire(entry, "request limit reached");
     const lifetimeMs = (conn.h2?.max_lifetime_s ?? 3600) * 1000;
