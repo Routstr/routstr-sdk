@@ -26,6 +26,8 @@ function setup() {
   } as WalletAdapter;
   const removeApiKey = vi.fn();
   const storage = {
+    getCachedReceiveTokens: () => [],
+    setCachedReceiveTokens: () => {},
     getApiKey: () => ({ key: credential, baseUrl, balance: 399, lastUsed: null }),
     removeApiKey,
     getApiKeyDistribution: () => [],
