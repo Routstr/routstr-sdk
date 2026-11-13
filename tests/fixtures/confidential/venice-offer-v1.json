@@ -1,0 +1,69 @@
+{
+  "v": 1,
+  "min_v": 1,
+  "max_v": 1,
+  "upstream_host": "api.venice.ai",
+  "ws": "ws://127.0.0.1:8010/v1/confidential/ws",
+  "notary_pubkey": "e5244e94e8e6b2a16ad2f3b458b8583a01179db87ef3cb21aeafe46ba989f04c",
+  "notary_pubkey_curve": "secp256k1-schnorr",
+  "max_tokens_cap": 4096,
+  "key_length": 42,
+  "key_alphabet": "[A-Za-z0-9_-]",
+  "head_template": "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
+  "suffix_keys": [
+    "model",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stream",
+    "stream_options",
+    "venice_parameters"
+  ],
+  "price_list": {
+    "qwen3-235b-a22b-thinking-2507": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "hermes-3-llama-3.1-405b": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "deepseek-v4-pro": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "deepseek-v4-flash": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "deepseek-v4-flash-0731": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "deepseek-v3.2": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "deepseek-v4-pro-0813": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    },
+    "mercury-2": {
+      "in": 1000.0,
+      "cached_in": 1000.0,
+      "out": 1000.0
+    }
+  },
+  "mints": [
+    "http://127.0.0.1:3338"
+  ],
+  "sig_payload": "{\"head_template\":\"POST /api/v1/chat/completions HTTP/1.1\\r\\nHost: api.venice.ai\\r\\nAuthorization: Bearer {KEY:42}\\r\\nContent-Type: application/json\\r\\nAccept-Encoding: identity\\r\\nConnection: close\\r\\nContent-Length: {LEN}\\r\\n\\r\\n\",\"key_alphabet\":\"[A-Za-z0-9_-]\",\"key_length\":42,\"max_tokens_cap\":4096,\"max_v\":1,\"min_v\":1,\"mints\":[\"http://127.0.0.1:3338\"],\"notary_pubkey\":\"e5244e94e8e6b2a16ad2f3b458b8583a01179db87ef3cb21aeafe46ba989f04c\",\"notary_pubkey_curve\":\"secp256k1-schnorr\",\"price_list\":{\"deepseek-v3.2\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"deepseek-v4-flash\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"deepseek-v4-flash-0731\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"deepseek-v4-pro\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"deepseek-v4-pro-0813\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"hermes-3-llama-3.1-405b\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"mercury-2\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0},\"qwen3-235b-a22b-thinking-2507\":{\"cached_in\":1000.0,\"in\":1000.0,\"out\":1000.0}},\"suffix_keys\":[\"model\",\"max_tokens\",\"max_completion_tokens\",\"n\",\"stream\",\"stream_options\",\"venice_parameters\"],\"upstream_host\":\"api.venice.ai\",\"v\":1,\"ws\":\"ws://127.0.0.1:8010/v1/confidential/ws\"}",
+  "sig": "73c0c76f0604afe028a11a61303e8de38773789cd945c41eb192fdf8650ac48362a79c16a8abb20d53261aa462e50e3da2c379480b7a1693db5e715a7914e51d"
+}

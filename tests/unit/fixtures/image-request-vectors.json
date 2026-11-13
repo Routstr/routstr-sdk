@@ -1,0 +1,1333 @@
+{
+  "description": "Shared confidential image request vectors: the SDK's planImageRequest and the web library's request splitting must give the same variant, count and private keys, or both refuse.",
+  "images": {
+    "count_key": "variants",
+    "max_count": 4,
+    "fixed_pins": [
+      [
+        "return_binary",
+        false
+      ],
+      [
+        "enhance_prompt",
+        false
+      ],
+      [
+        "enable_web_search",
+        false
+      ],
+      [
+        "style_references",
+        []
+      ]
+    ],
+    "price_list": {
+      "flat": [
+        {
+          "id": "webp",
+          "pins": [
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 12180
+        }
+      ],
+      "tiered": [
+        {
+          "id": "1K-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 219229
+        },
+        {
+          "id": "2K-webp",
+          "pins": [
+            [
+              "resolution",
+              "2K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 280126
+        },
+        {
+          "id": "4K-webp",
+          "pins": [
+            [
+              "resolution",
+              "4K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 426278
+        }
+      ],
+      "quality": [
+        {
+          "id": "1K-low-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "quality",
+              "low"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 30000
+        },
+        {
+          "id": "1K-high-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "quality",
+              "high"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 90000
+        },
+        {
+          "id": "2K-low-webp",
+          "pins": [
+            [
+              "resolution",
+              "2K"
+            ],
+            [
+              "quality",
+              "low"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 40000
+        }
+      ],
+      "z-image-turbo": [
+        {
+          "id": "webp",
+          "pins": [
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 12100
+        }
+      ],
+      "nano-banana-pro": [
+        {
+          "id": "1K-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 217800
+        },
+        {
+          "id": "2K-webp",
+          "pins": [
+            [
+              "resolution",
+              "2K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 278300
+        }
+      ],
+      "q-model": [
+        {
+          "id": "1K-low-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "quality",
+              "low"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 10000
+        },
+        {
+          "id": "1K-high-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "quality",
+              "high"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 30000
+        }
+      ],
+      "capped": [
+        {
+          "id": "1K-webp",
+          "pins": [
+            [
+              "resolution",
+              "1K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 20000
+        },
+        {
+          "id": "4K-webp",
+          "pins": [
+            [
+              "resolution",
+              "4K"
+            ],
+            [
+              "format",
+              "webp"
+            ]
+          ],
+          "msat_per_image": 80000,
+          "max_count": 1
+        }
+      ]
+    },
+    "param_space": {
+      "resolution": [
+        "1K",
+        "2K",
+        "4K"
+      ],
+      "quality": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "format": [
+        "webp"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "flat model, prompt only",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count from n",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "n": 3
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 3,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count from variants",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "variants": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count from count",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "count": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count key and n disagree: refused",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "variants": 2,
+        "n": 3
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "size ignored on an untiered model",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "size": "1792x1024"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "resolution on an untiered model",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "resolution": "1K"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "quality on an untiered model",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "quality": "high"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "format webp accepted",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "format": "webp",
+        "output_format": "webp"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "output_format png refused",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "output_format": "png"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "format png refused",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "format": "png"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "width and height private on an untiered model",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "width": 1280,
+        "height": 720
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "height",
+          "prompt",
+          "width"
+        ]
+      }
+    },
+    {
+      "name": "price-free options private",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "aspect_ratio": "16:9",
+        "seed": 7,
+        "negative_prompt": "x",
+        "safe_mode": false,
+        "steps": 20
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "aspect_ratio",
+          "negative_prompt",
+          "prompt",
+          "safe_mode",
+          "seed",
+          "steps"
+        ]
+      }
+    },
+    {
+      "name": "a fixed pin set by the caller",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "enhance_prompt": true
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "response_format is a selector, not private",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "response_format": "b64_json"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "tiered model, no selector: cheapest",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "tiered model, resolution case-insensitive",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "resolution": "2k"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "tiered model, size to 2K",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "size": "2048x2048"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "tiered model, size to 1K",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "size": "1024x1024"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "tiered model, size to an unoffered 4K",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "size": "4096x4096"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered model, unoffered resolution",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "resolution": "4K"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered model, width refused",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "width": 1280
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered model, height refused",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "height": 1280
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered model without a quality axis",
+      "body": {
+        "model": "nano-banana-pro",
+        "prompt": "p",
+        "quality": "high"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "quality axis selects",
+      "body": {
+        "model": "q-model",
+        "prompt": "p",
+        "quality": "high"
+      },
+      "expect": {
+        "variant": "1K-high-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "quality axis open: cheapest",
+      "body": {
+        "model": "q-model",
+        "prompt": "p"
+      },
+      "expect": {
+        "variant": "1K-low-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count above max",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "n": 5
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count zero",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "n": 0
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count not a number",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "n": "2"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "unknown model",
+      "body": {
+        "model": "flux",
+        "prompt": "p"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "unknown extra keys stay private",
+      "body": {
+        "model": "z-image-turbo",
+        "prompt": "p",
+        "user": "u",
+        "stream": false
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt",
+          "stream",
+          "user"
+        ]
+      }
+    },
+    {
+      "name": "flat default",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "flat n",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "flat variants",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "variants": 3
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 3,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "flat count",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "count": 4
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 4,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "count_key and n disagree: refused",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2,
+        "variants": 3
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count above max (2)",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 5
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count zero (2)",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 0
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count not a number (2)",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": "2"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "count fractional",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 1.5
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "size ignored without a resolution axis",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "size": "1024x1024"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "resolution on an untiered model (2)",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "resolution": "1K"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "quality on a model without qualities",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "quality": "high"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "format png refused (2)",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "format": "png"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "output_format jpeg refused",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "output_format": "jpeg"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "webp and response_format are selectors",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "format": "webp",
+        "output_format": "webp",
+        "response_format": "b64_json"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "response_format url ignored",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "response_format": "url"
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "untiered keeps width/height private",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "width": 1280,
+        "height": 720,
+        "aspect_ratio": "16:9",
+        "seed": 7
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 1,
+        "private": [
+          "aspect_ratio",
+          "height",
+          "prompt",
+          "seed",
+          "width"
+        ]
+      }
+    },
+    {
+      "name": "fixed pin as a private option",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "enhance_prompt": true
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered default is the cheapest",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "size 1792x1024 is 1K",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "1792x1024"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "size 2048x2048 is 2K",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "2048x2048"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "size 4096x4096 is 4K",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "4096x4096"
+      },
+      "expect": {
+        "variant": "4K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "size auto is absent",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "auto"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "bad size refused",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "big"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "resolution 2K",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "resolution": "2K"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "resolution wins over size",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "resolution": "4K",
+        "size": "1024x1024"
+      },
+      "expect": {
+        "variant": "4K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "unknown resolution refused",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "resolution": "8K"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered refuses width",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "width": 1280
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered refuses height",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "height": 720
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "tiered keeps aspect_ratio private",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "aspect_ratio": "16:9"
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 1,
+        "private": [
+          "aspect_ratio",
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "quality on a model with no quality axis",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "quality": "high"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "quality model default is the cheapest",
+      "body": {
+        "model": "quality",
+        "prompt": "a cat"
+      },
+      "expect": {
+        "variant": "1K-low-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "quality high",
+      "body": {
+        "model": "quality",
+        "prompt": "a cat",
+        "quality": "high"
+      },
+      "expect": {
+        "variant": "1K-high-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "resolution 2K picks the cheapest 2K",
+      "body": {
+        "model": "quality",
+        "prompt": "a cat",
+        "resolution": "2K"
+      },
+      "expect": {
+        "variant": "2K-low-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "no variant with both",
+      "body": {
+        "model": "quality",
+        "prompt": "a cat",
+        "resolution": "2K",
+        "quality": "high"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "unknown model (2)",
+      "body": {
+        "model": "nope",
+        "prompt": "a cat"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "counts that agree are one count",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2,
+        "variants": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "n and count disagree: refused",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 1,
+        "count": 3
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "missing prompt refused",
+      "body": {
+        "model": "flat"
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "empty prompt refused",
+      "body": {
+        "model": "flat",
+        "prompt": "  "
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "non-string prompt refused",
+      "body": {
+        "model": "flat",
+        "prompt": [
+          "a"
+        ]
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "size with an upper-case X",
+      "body": {
+        "model": "tiered",
+        "prompt": "a cat",
+        "size": "2048X2048"
+      },
+      "expect": {
+        "variant": "2K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "variant count cap: one 4K image",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "resolution": "4K"
+      },
+      "expect": {
+        "variant": "4K-webp",
+        "count": 1,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "variant count cap: two 4K images refused",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "resolution": "4K",
+        "n": 2
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "variant count cap: the 1K variant takes the offer's max",
+      "body": {
+        "model": "capped",
+        "prompt": "a cat",
+        "n": 4
+      },
+      "expect": {
+        "variant": "1K-webp",
+        "count": 4,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "agreeing count fields",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "n": 2,
+        "variants": 2,
+        "count": 2
+      },
+      "expect": {
+        "variant": "webp",
+        "count": 2,
+        "private": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "prompt empty",
+      "body": {
+        "model": "flat",
+        "prompt": ""
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "prompt not a string",
+      "body": {
+        "model": "flat",
+        "prompt": [
+          "a",
+          "cat"
+        ]
+      },
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "another fixed pin as a private option",
+      "body": {
+        "model": "flat",
+        "prompt": "a cat",
+        "style_references": []
+      },
+      "expect": {
+        "error": true
+      }
+    }
+  ]
+}

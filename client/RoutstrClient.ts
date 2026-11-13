@@ -84,6 +84,18 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
+import type {
+  ConfidentialFetchParams,
+  ConfidentialRequestOptions,
+} from "./confidential/transport";
+import type { ConfidentialOffer } from "./confidential/offer";
+import { chooseImageVariant } from "./confidential/imagePlan";
+import {
+  confidentialErrorCode,
+  confidentialFailoverError,
+  mayHaveReachedProvider,
+} from "./confidential/errors";
+import { confidentialKind } from "./confidential/endpoints";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -316,6 +328,8 @@ function rewrapRoutstrResponse(
     "usageEntryId", "usagePromise", "baseUrl", "token", "selectedMintUrl",
     "requestResponseLogId", "lifecycleAttemptId", "initialTokenBalanceInSats",
     "initialTokenBalanceUnknown", "passthrough", "streamError",
+    // A confidential session's settlement (receipt check and xcashu change).
+    "confidentialSettled",
   ]) {
     Object.defineProperty(target, key, {
       configurable: true,
@@ -328,6 +342,302 @@ function rewrapRoutstrResponse(
   // terminal-flush wait without replacing the inspector's accounting function.
   if (source.finalize) target.finalize = source.finalize;
   return target;
+}
+
+// The confidential transport is Node/Bun-only (it spawns the prover and uses
+// node:fs); the node/bun entrypoints register it, so the browser-safe bundle
+// never imports it. The registry lives on globalThis because each entrypoint
+// is a separate bundle with its own copy of this module.
+type ConfidentialTransport = (params: ConfidentialFetchParams) => Promise<Response>;
+/**
+ * Checks, without a credential, that a node would run a confidential session
+ * for a model (its signed offer verifies under the caller's policy and names
+ * the model) and, given the request body, that the request can be pinned
+ * under that offer; throws the error the session would raise.
+ */
+type ConfidentialQualifier = (
+  baseUrl: string,
+  model: string,
+  options: ConfidentialRequestOptions,
+  kind?: "chat" | "images",
+  request?: unknown
+) => Promise<unknown>;
+const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
+const CONFIDENTIAL_QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
+
+export function setConfidentialTransport(
+  transport: ConfidentialTransport,
+  qualify?: ConfidentialQualifier
+): void {
+  (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_TRANSPORT] = transport;
+  if (qualify) (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] = qualify;
+}
+
+/**
+ * Qualify `baseUrl` for a confidential request before any token is spent on
+ * it. Without a registered qualifier (an older entrypoint) the transport's
+ * own check after the spend still fails closed.
+ */
+async function qualifyConfidentialNode(
+  baseUrl: string,
+  model: unknown,
+  options: ConfidentialRequestOptions,
+  kind: "chat" | "images" = "chat",
+  request?: unknown
+): Promise<ConfidentialDepositOffer | undefined> {
+  requireConfidentialTransport();
+  const qualify = (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] as
+    | ConfidentialQualifier
+    | undefined;
+  if (!qualify) return undefined;
+  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options, kind, request);
+  return offer && typeof offer === "object" && "price_list" in offer
+    ? (offer as ConfidentialDepositOffer)
+    : undefined;
+}
+
+/**
+ * Errors raised while a node was being qualified for a confidential request
+ * (nothing was spent on it), so the first pick can be replaced like a
+ * failover candidate is.
+ */
+const confidentialQualifyFailures = new WeakSet<object>();
+
+/** A qualification failure that is this client's own: no other node would differ. */
+function isLocalConfidentialFailure(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === "prover_missing";
+}
+
+function requireConfidentialTransport(): ConfidentialTransport {
+  const confidentialTransport = (globalThis as Record<symbol, unknown>)[
+    CONFIDENTIAL_TRANSPORT
+  ] as ConfidentialTransport | undefined;
+  if (!confidentialTransport) {
+    throw new Error(
+      "confidential requests need the @routstr/sdk node or bun entrypoint"
+    );
+  }
+  return confidentialTransport;
+}
+
+/** The endpoints a confidential session implements (see the transport). */
+function isConfidentialEndpoint(method: string, path: string): boolean {
+  return method.toUpperCase() === "POST" && confidentialKind(path) !== undefined;
+}
+
+/**
+ * The deposit (sats) a confidential image request needs: the price of the
+ * variant the request selects times the image count, plus the larger fee
+ * (what the node reserves). Undefined when the offer does not price the
+ * model; throws when the offer cannot serve the request.
+ */
+export function confidentialImageRequiredSats(
+  offer: ConfidentialDepositOffer | undefined,
+  model: string,
+  body: Record<string, unknown>
+): number | undefined {
+  const images = offer?.images;
+  const variants = images?.price_list?.[model];
+  if (!images || !Array.isArray(variants) || variants.length === 0) return undefined;
+  // The variant and count the request itself will ask for. A request the
+  // offer cannot serve throws here, before a deposit is spent on it (the
+  // session would refuse it after the spend, with the same error).
+  const chosen = chooseImageVariant({ ...body, model }, images);
+  const price = chosen.variant.msat_per_image;
+  const count = chosen.count;
+  const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const msats = Math.ceil(price * count) + Math.max(fee(offer!.session_fee_msat), fee(offer!.abandon_fee_msat));
+  // The connection deposit is held beside the reservation until the request settles.
+  return Math.ceil((msats + confidentialDepositMsats(offer)) / 1000);
+}
+
+/** Reserve margin assumed when the node's signed offer is not at hand. */
+export const CONFIDENTIAL_DEFAULT_RESERVE_MARGIN_TOKENS = 16;
+
+/** The signed-offer fields the deposit depends on. */
+type ConfidentialDepositOffer = Pick<
+  ConfidentialOffer,
+  | "price_list"
+  | "max_tokens_cap"
+  | "session_fee_msat"
+  | "abandon_fee_msat"
+  | "rate_surcharge_pct"
+  | "reserve_margin_tokens"
+  | "images"
+  | "connection_deposit_msat"
+>;
+
+/**
+ * The connection deposit (msats) of a node's signed offer: held from a
+ * connection's setup until its first request settles, so the balance a
+ * request needs before a connection is opened is the deposit plus the
+ * request's reservation (PROTOCOL-V3 §8).
+ */
+export function confidentialDepositMsats(offer?: ConfidentialDepositOffer): number {
+  const d = offer?.connection_deposit_msat;
+  return typeof d === "number" && Number.isSafeInteger(d) && d > 0 ? d : 0;
+}
+
+/**
+ * The reservation (msats) a confidential node holds for this request, by the
+ * node's own formula. The prompt is opaque, so it reserves the model's full
+ * context length (the larger of the model's and its `top_provider`'s, at the
+ * dearer of the input and cache-write rates) plus the pinned completion cap
+ * and the offer's `reserve_margin_tokens` at the signed (surcharged) rates; without a known
+ * context length, the model's undiscounted maximum cost scaled by
+ * max(1, cache_write / in) (when both rates are positive: the prompt may be
+ * all cache writes) and raised by the surcharge, plus the same margin at the
+ * output rate. The larger of the session and abandon fees
+ * comes on top. With the signed offer every input is the node's; without it
+ * the rates come from the model listing (sats per token, raised by the
+ * listed surcharge), the fees from its `confidential_upstream` field, and the
+ * margin is a conservative default.
+ */
+export function confidentialReservationMsats(
+  model: Model,
+  maxTokens: number | undefined,
+  offer?: ConfidentialDepositOffer
+): number | undefined {
+  const sp = model.sats_pricing as
+    | {
+        max_cost?: number;
+        max_completion_cost?: number;
+        prompt?: number;
+        completion?: number;
+        input_cache_write?: number;
+      }
+    | undefined;
+  const cu = model.confidential_upstream;
+  const positive = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+  const pct = positive(offer ? offer.rate_surcharge_pct : cu?.rate_surcharge_pct);
+  const factor = 1 + pct / 100;
+  const signed = offer?.price_list?.[model.id];
+  // The prompt is opaque and may be all prompt-cache writes: the node prices
+  // it at max(in, cache_write) (cache writes cost more than input on some
+  // models, and every signed entry carries the rate).
+  const inRate = signed
+    ? Math.max(Number(signed.in), positive(signed.cache_write))
+    : Math.max(positive(sp?.prompt), positive(sp?.input_cache_write)) * 1_000_000 * factor;
+  const outRate = signed ? Number(signed.out) : positive(sp?.completion) * 1_000_000 * factor;
+  // Integer offer fields as the offer helpers read them (kept local so the
+  // browser bundle does not pull in the offer verifier).
+  const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const margin = offer ? count(offer.reserve_margin_tokens) : CONFIDENTIAL_DEFAULT_RESERVE_MARGIN_TOKENS;
+  const feeMsat = offer
+    ? Math.max(count(offer.session_fee_msat), count(offer.abandon_fee_msat))
+    : Math.max(positive(cu?.session_fee_msat), positive(cu?.abandon_fee_msat));
+  // The completion cap the transport pins: the request's, clamped to the
+  // offer's cap; the offer's cap when the request names none.
+  const cap = offer && positive(offer.max_tokens_cap) ? Math.trunc(offer.max_tokens_cap) : undefined;
+  let completion: number;
+  if (maxTokens !== undefined && Number.isFinite(maxTokens) && maxTokens > 0) {
+    const asked = Math.max(1, Math.trunc(maxTokens));
+    completion = cap !== undefined ? Math.min(asked, cap) : asked;
+  } else if (cap !== undefined) {
+    completion = cap;
+  } else if (positive(sp?.completion) && positive(sp?.max_completion_cost)) {
+    completion = Math.ceil(sp!.max_completion_cost! / sp!.completion!);
+  } else {
+    completion = 4096;
+  }
+  const limit = confidentialContextLimit(model);
+  let msats: number;
+  if (limit !== undefined) {
+    if (!inRate || !outRate) return undefined;
+    msats = Math.ceil((limit * inRate + (completion + margin) * outRate) / 1000);
+  } else {
+    if (!sp || !positive(sp.max_cost)) return undefined;
+    // The node scales the undiscounted maximum by the cache-write premium of
+    // the signed rates (the listing's without an offer), in the same order:
+    // ceil(undiscounted × ratio × (1 + pct/100) + margin × out / 1000).
+    const baseIn = signed ? positive(signed.in) : positive(sp.prompt);
+    const write = signed ? positive(signed.cache_write) : positive(sp.input_cache_write);
+    const ratio = baseIn && write ? Math.max(1, write / baseIn) : 1;
+    msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * ratio * factor + (margin * outRate) / 1000);
+  }
+  return msats + feeMsat;
+}
+
+/**
+ * The node's prompt limit for a model: the larger of the positive integer
+ * context lengths (the catalogue's `top_provider` one may describe another
+ * provider); undefined when none is known.
+ */
+function confidentialContextLimit(model: Model): number | undefined {
+  const top = (model as { top_provider?: { context_length?: unknown } }).top_provider;
+  const known = [top?.context_length, model.context_length].filter(
+    (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0
+  );
+  return known.length ? Math.max(...known) : undefined;
+}
+
+/**
+ * The ceiling (msats) a client may hold a node's announced reservation for a
+ * confidential chat request to (`maxReservationMsat`): never below what an
+ * honest node reserves. Only computed where the node's formula depends on
+ * nothing but the signed offer and the model's context length: the offer
+ * prices the model, the model has a known context length (the fallback
+ * branch reads the model's maximum cost in sats, which moves with the
+ * exchange rate) and the offer takes a connection deposit, whose amount the
+ * node never sets below its minimum reservation (`min_request_msat`, the
+ * floor of every reservation). Undefined: no ceiling.
+ */
+export function confidentialReservationCeilingMsats(
+  model: Model,
+  maxTokens: number | undefined,
+  offer: ConfidentialDepositOffer | undefined
+): number | undefined {
+  if (!offer || !offer.price_list || !Object.hasOwn(offer.price_list, model.id)) return undefined;
+  if (confidentialContextLimit(model) === undefined) return undefined;
+  const deposit = confidentialDepositMsats(offer);
+  if (deposit <= 0) return undefined;
+  const msats = confidentialReservationMsats(model, maxTokens, offer);
+  if (msats === undefined || !Number.isFinite(msats)) return undefined;
+  const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
+  const fee = Math.max(count(offer.session_fee_msat), count(offer.abandon_fee_msat));
+  // max(min_request_msat, formula) + fee, with min_request_msat ≤ deposit.
+  return Math.max(msats, deposit + fee);
+}
+
+/**
+ * The reservation ceiling a confidential chat request passes to the transport:
+ * for the model the client selected on this node, by the offer the request is
+ * priced by (`confidentialReservationCeilingMsats`). A request whose body
+ * names another model gets none.
+ */
+function confidentialCeiling(
+  model: Model | undefined
+): ConfidentialFetchParams["maxReservationMsat"] {
+  if (!model) return undefined;
+  return (offer, request) =>
+    request.model === model.id
+      ? confidentialReservationCeilingMsats(model, request.maxTokens, offer)
+      : undefined;
+}
+
+/**
+ * The smallest output-token limit a request body sets, the cap a
+ * confidential session pins before the node's cap applies.
+ */
+function callerMaxTokens(body: Record<string, unknown>): number | undefined {
+  const limits = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+    .map((k) => body[k])
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+  return limits.length ? Math.min(...limits) : undefined;
+}
+
+/**
+ * The balance (sats) a confidential request needs before its connection is
+ * opened: the node's reservation for it (see `confidentialReservationMsats`)
+ * plus the offer's connection deposit, rounded up.
+ */
+export function confidentialRequiredSats(
+  model: Model,
+  maxTokens: number | undefined,
+  offer?: ConfidentialDepositOffer
+): number | undefined {
+  const msats = confidentialReservationMsats(model, maxTokens, offer);
+  return msats === undefined ? undefined : Math.ceil((msats + confidentialDepositMsats(offer)) / 1000);
 }
 
 export interface RouteRequestParams {
@@ -367,6 +677,14 @@ export interface RouteRequestParams {
    * never fail over to a different node.
    */
   pinnedProvider?: boolean;
+  /**
+   * Run the request as a confidential-upstream session (the node relays TLS
+   * to the provider and never sees the prompt or response) instead of a
+   * plain HTTP request. Node-only (Bun/Node entrypoints). The options are
+   * per request: `reuseScope` in them names what this request may share a
+   * connection with (failover and retries keep it).
+   */
+  confidential?: ConfidentialRequestOptions;
 }
 
 export interface RequestResponseLogRequestInput {
@@ -676,7 +994,66 @@ export class RoutstrClient {
     }
   }
 
+  /**
+   * The usage row (and, with an API key, the balance) of an upstream error a
+   * confidential session returned: the charge is the verified receipt's
+   * (`confidentialSettled`, also in `x-routstr-cost-msats`). A one-off
+   * bearer's change was taken where the error was returned.
+   */
+  private async _accountConfidentialUpstreamError(
+    params: RouteRequestParams,
+    prepared: Awaited<ReturnType<RoutstrClient["_prepareRoutedRequest"]>>
+  ): Promise<number> {
+    const source = prepared.response;
+    const settlement = (await (source as any).confidentialSettled?.catch(() => undefined)) as
+      | { costMsats?: unknown }
+      | undefined;
+    // Headers only: the body is the caller's to read.
+    const headers = new Headers(source.headers);
+    const cost = settlement?.costMsats;
+    if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+      headers.set("x-routstr-cost-msats", String(cost));
+    }
+    const response = new Response(null, { status: source.status, headers });
+    const requestId = params.lifecycle?.requestId;
+    let satsSpent: number;
+    if (this.mode === "xcashu") {
+      satsSpent = extractUsageFromResponseHeaders(headers)?.reportedSatsCost ?? 0;
+      await this._trackResponseUsage({
+        token: prepared.tokenUsed,
+        baseUrl: prepared.baseUrlUsed,
+        response,
+        responseBody: null,
+        modelId: prepared.modelId,
+        satsSpent,
+        requestId,
+        clientApiKey: prepared.clientApiKey,
+      });
+    } else {
+      satsSpent = await this._handlePostResponseBalanceUpdate({
+        token: prepared.tokenUsed,
+        baseUrl: prepared.baseUrlUsed,
+        initialTokenBalance: prepared.tokenBalanceInSats,
+        response,
+        responseBody: null,
+        modelId: prepared.modelId,
+        requestId,
+        clientApiKey: prepared.clientApiKey,
+      });
+    }
+    (source as any).satsSpent = satsSpent;
+    if ((response as any).usageEntryId !== undefined) (source as any).usageEntryId = (response as any).usageEntryId;
+    return satsSpent;
+  }
+
   private async _routeRequest(params: RouteRequestParams): Promise<Response> {
+    // Refuse before any credential or deposit: the confidential transport
+    // only speaks chat completions, and must never fall back to plaintext.
+    if (params.confidential && !isConfidentialEndpoint(params.method, params.path)) {
+      throw new Error(
+        `confidential mode supports only POST /v1/chat/completions and /v1/images/generations, not ${params.method} ${params.path}`
+      );
+    }
     const preparing = this._prepareRoutedRequestWithMintFailover(params);
     let prepared: Awaited<typeof preparing>;
     try {
@@ -694,6 +1071,17 @@ export class RoutstrClient {
       // Error payment recovery is handled in _handleErrorResponse. There is no
       // successful usage to account for; keep finalization off passthrough errors.
       if ((prepared.response as any).passthrough) {
+        // Except an upstream error through a confidential session: the node
+        // settled it (the session fee, the abandon fee, or for a 5xx up to the
+        // reservation) and its receipt names the charge, so it is accounted
+        // like any settled request.
+        if (prepared.response.headers.has("x-routstr-confidential-sid")) {
+          const accounting = this._accountConfidentialUpstreamError(params, prepared).catch((error) => {
+            this._log("ERROR", "[RoutstrClient] accounting a confidential upstream error failed:", error);
+            return 0;
+          });
+          (prepared.response as any).finalize = () => accounting;
+        }
         return prepared.response;
       }
 
@@ -740,6 +1128,39 @@ export class RoutstrClient {
       }
 
       const runFinalize = async (): Promise<number> => {
+        // A confidential response settles on the node after its body ends
+        // (usage proof + charge); balance accounting must read it afterwards.
+        // A failed settlement check already errored the response stream; the
+        // balance is still re-read, since the node may have charged.
+        // A one-off bearer's change comes with the settlement (a stream's
+        // wrapper copied the headers before the transport could set it).
+        const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
+          // The message only: the error may carry a one-off bearer's change
+          // token (`cashuChange`), which must never reach a log.
+          this._log(
+            "ERROR",
+            "[RoutstrClient] confidential settlement check failed:",
+            error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+          );
+          return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
+        })) as { change?: unknown; costMsats?: unknown } | undefined;
+        // The node's charge from the verified receipt. A confidential chat
+        // response carries no cost of its own (the provider's usage event
+        // has none, and a stream's headers left before the receipt existed):
+        // without this the request is accounted at 0 sats.
+        if (
+          typeof settlement?.costMsats === "number" &&
+          Number.isFinite(settlement.costMsats) &&
+          settlement.costMsats >= 0
+        ) {
+          try {
+            if (!accountingResponse.headers.has("x-routstr-cost-msats")) {
+              accountingResponse.headers.set("x-routstr-cost-msats", String(settlement.costMsats));
+            }
+          } catch {
+            // Immutable headers: accounting falls back to the usage event.
+          }
+        }
         const { capturedUsage, capturedResponseId } = await prepared.usagePromise;
         const usage = capturedUsage ?? prepared.capturedUsage ??
           (!isSSE ? extractUsageFromResponseBody(jsonBody) ?? undefined : undefined);
@@ -754,6 +1175,8 @@ export class RoutstrClient {
           initialTokenBalance: prepared.tokenBalanceInSats,
           response: accountingResponse,
           responseBody: jsonBody,
+          refundToken:
+            typeof settlement?.change === "string" ? settlement.change : undefined,
           modelId: prepared.modelId,
           usage,
           requestId,
@@ -799,14 +1222,69 @@ export class RoutstrClient {
     let previousPreflightBaseUrl = params.baseUrl;
     const attempted = new Set<string>();
     const triedModelPaths = new Set<string>();
+    let failoverReason = "preflight_funding";
+    // The first node that did not qualify for a confidential session: its
+    // error is the one reported when no other node qualifies either.
+    let firstQualifyError: unknown;
     for (;;) {
       if (current.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
       try {
-        if (current !== params) await current.lifecycle?.event("preflight_provider_failover", { from: previousPreflightBaseUrl, to: current.baseUrl, reason: "preflight_funding" });
+        if (current !== params) await current.lifecycle?.event("preflight_provider_failover", { from: previousPreflightBaseUrl, to: current.baseUrl, reason: failoverReason });
         previousPreflightBaseUrl = current.baseUrl;
         return await this._prepareRoutedRequest(current);
       } catch (error) {
+        // A node whose signed offer does not qualify (unreachable, not signed
+        // by a pinned key, another upstream host, the model not priced, the
+        // request not one it can pin): nothing was spent on it, so the next
+        // confidential node is tried, as the failover path does for its
+        // candidates. Never for a caller-pinned provider or model path, and
+        // never for a failure that is this client's own.
+        if (
+          error !== null &&
+          typeof error === "object" &&
+          confidentialQualifyFailures.has(error) &&
+          current.confidential
+        ) {
+          firstQualifyError ??= error;
+          const pinnedSelector = this._findModelPathHeader(current.headers ?? {});
+          if (
+            isLocalConfidentialFailure(error) ||
+            current.pinnedProvider ||
+            (pinnedSelector && !current.autoModelPath) ||
+            !current.modelId
+          ) {
+            throw firstQualifyError;
+          }
+          attempted.add(current.baseUrl);
+          const next = this._findNextBestProvider(
+            current.modelId,
+            current.baseUrl,
+            attempted,
+            await this._fundedMintUrls(),
+            true
+          );
+          if (!next || attempted.has(next)) throw firstQualifyError;
+          this._log(
+            "WARN",
+            `[RoutstrClient] routeRequest: ${current.baseUrl} does not qualify for a confidential session; trying ${next}`,
+            error instanceof Error ? error.message : String(error)
+          );
+          failoverReason = "confidential_not_qualified";
+          // An SDK-chosen model path belongs to the node it was chosen for.
+          current = {
+            ...current,
+            baseUrl: next,
+            headers: Object.fromEntries(
+              Object.entries(current.headers ?? {}).filter(
+                ([name]) => name.toLowerCase() !== MODEL_PATH_HEADER
+              )
+            ),
+            autoModelPath: undefined,
+          };
+          continue;
+        }
         if (!(error instanceof ProviderMintBalanceError)) throw error;
+        failoverReason = "preflight_funding";
         await current.lifecycle?.event("preflight_funding_failed", { reason: "provider_mint_balance" }, { baseUrl: current.baseUrl });
         const selector = this._findModelPathHeader(current.headers ?? {});
         if (current.pinnedProvider || (selector && !current.autoModelPath)) {
@@ -814,13 +1292,7 @@ export class RoutstrClient {
         }
         attempted.add(current.baseUrl);
         if (!current.modelId) throw error;
-        const fundedMints = Object.entries(
-          await this.walletAdapter.getBalances()
-        )
-          .filter(([, balance]) => typeof balance === "number" && balance > 0)
-          .map(([mintUrl]) =>
-            mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl
-          );
+        const fundedMints = await this._fundedMintUrls();
         if (current.autoModelPath) {
           triedModelPaths.add(modelPathCandidateKey(
             current.baseUrl, current.autoModelPath.selector
@@ -846,7 +1318,8 @@ export class RoutstrClient {
               current.modelId,
               current.baseUrl,
               attempted,
-              fundedMints
+              fundedMints,
+              Boolean(current.confidential)
             );
             if (!fallback || attempted.has(fallback)) throw error;
             this._log(
@@ -876,7 +1349,8 @@ export class RoutstrClient {
           current.modelId,
           current.baseUrl,
           attempted,
-          fundedMints
+          fundedMints,
+          Boolean(current.confidential)
         );
         if (!nextProvider || attempted.has(nextProvider)) throw error;
         this._log(
@@ -886,6 +1360,13 @@ export class RoutstrClient {
         current = { ...current, baseUrl: nextProvider };
       }
     }
+  }
+
+  /** The mints the wallet holds a balance on (no trailing slash). */
+  private async _fundedMintUrls(): Promise<string[]> {
+    return Object.entries(await this.walletAdapter.getBalances())
+      .filter(([, balance]) => typeof balance === "number" && balance > 0)
+      .map(([mintUrl]) => (mintUrl.endsWith("/") ? mintUrl.slice(0, -1) : mintUrl));
   }
 
   private async _prepareRoutedRequest(params: RouteRequestParams): Promise<{
@@ -934,6 +1415,33 @@ export class RoutstrClient {
         modelId
       );
       selectedModel = providerModel ?? undefined;
+    }
+
+    // A confidential request: the node must hold a valid offer for the model
+    // before a token is spent on it, and the request must be one the session
+    // can pin under that offer; the offer also sizes the deposit. The model
+    // is the id the body will carry to this node (its own spelling of the
+    // caller's id, see the body rewrite below), which is what its offer prices.
+    const confidentialImages =
+      params.confidential !== undefined && confidentialKind(requestPath) === "images";
+    const confidentialModelId = params.confidential
+      ? this._confidentialBodyModelId(body, headers, selectedModel)
+      : undefined;
+    const confidentialOffer = params.confidential
+      ? await qualifyConfidentialNode(
+          baseUrl,
+          confidentialModelId,
+          params.confidential,
+          confidentialImages ? "images" : "chat",
+          body
+        ).catch((error: unknown) => {
+          // Nothing was spent on this node: the caller may try another one.
+          if (error !== null && typeof error === "object") confidentialQualifyFailures.add(error);
+          throw error;
+        })
+      : undefined;
+
+    if (modelId) {
       if (selectedModel) {
         const requestMessages = Array.isArray(
           (body as { messages?: unknown })?.messages
@@ -946,7 +1454,10 @@ export class RoutstrClient {
         // (the OpenAI-standard chat field routstrd injects as its default
         // cap) and `max_output_tokens` (Responses API). Undefined prices at
         // the provider's worst-case max_completion_cost.
-        requestMaxTokens = completionCapFromBody(requestBodyForPricing);
+        // A confidential session pins the smallest limit the caller set.
+        requestMaxTokens = params.confidential
+          ? callerMaxTokens(requestBodyForPricing)
+          : completionCapFromBody(requestBodyForPricing);
 
         this._log(
           "DEBUG",
@@ -958,7 +1469,16 @@ export class RoutstrClient {
           }
         );
 
-        requiredSats = this.providerManager.getRequiredSatsForModel(
+        requiredSats = params.confidential
+          ? confidentialRequiredSats(selectedModel, requestMaxTokens, confidentialOffer) ??
+            this.providerManager.getRequiredSatsForModel(
+              selectedModel,
+              [],
+              requestMaxTokens,
+              { model: selectedModel.id, max_tokens: requestMaxTokens },
+              params.autoModelPath?.satsPricing
+            )
+          : this.providerManager.getRequiredSatsForModel(
           selectedModel,
           requestMessages,
           requestMaxTokens,
@@ -966,6 +1486,16 @@ export class RoutstrClient {
           params.autoModelPath?.satsPricing
         );
       }
+    }
+
+    // A confidential image request: the deposit is the signed per-image price.
+    if (confidentialImages) {
+      const imageSats = confidentialImageRequiredSats(
+        confidentialOffer,
+        String(confidentialModelId ?? ""),
+        (body ?? {}) as Record<string, unknown>
+      );
+      if (imageSats !== undefined) requiredSats = imageSats;
     }
 
     let requestBody = body;
@@ -1081,6 +1611,7 @@ export class RoutstrClient {
       baseUrl,
       mintUrl,
       requiredSats,
+      topupFactor: TOPUP_MARGIN,
       tokenBalance,
       tokenReserved,
       tokenBalanceUnit,
@@ -1124,6 +1655,7 @@ export class RoutstrClient {
       autoModelPath: params.autoModelPath,
       pinnedProvider: params.pinnedProvider,
       requestedModelId: modelId,
+      confidential: params.confidential,
     });
 
     try {
@@ -1166,6 +1698,12 @@ export class RoutstrClient {
         const requestResponseLogId = (response as any).requestResponseLogId as
           | string
           | undefined;
+        // Raw logging is off for confidential responses unless the request
+        // opted in (see `_makeRequest`).
+        const logSink: RequestResponseLogSink | undefined = (response as any)
+          .requestResponseLogSuppressed
+          ? undefined
+          : this.requestResponseLogSink;
 
         processedResponse = new Response(clientStream, {
           status: response.status,
@@ -1179,6 +1717,13 @@ export class RoutstrClient {
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
+        (processedResponse as any).requestResponseLogSuppressed = (
+          response as any
+        ).requestResponseLogSuppressed;
+        // finalize() awaits a confidential response's settlement through this.
+        (processedResponse as any).confidentialSettled = (
+          response as any
+        ).confidentialSettled;
 
         usagePromise = inspectSSEWebStream(
           inspectStream,
@@ -1193,7 +1738,7 @@ export class RoutstrClient {
           {
             onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
             onRawChunk: (_chunk, sequence, text) => {
-              void this.requestResponseLogSink?.logResponseChunk?.(
+              void logSink?.logResponseChunk?.(
                 requestResponseLogId,
                 sequence,
                 text
@@ -1201,10 +1746,10 @@ export class RoutstrClient {
             },
           }
         ).then(async (result) => {
-          await this.requestResponseLogSink?.logResponseEnd?.(requestResponseLogId);
+          await logSink?.logResponseEnd?.(requestResponseLogId);
           return result;
         }).catch(async (error) => {
-          await this.requestResponseLogSink?.logResponseError?.(requestResponseLogId, error);
+          await logSink?.logResponseError?.(requestResponseLogId, error);
           throw error;
         });
 
@@ -1288,6 +1833,8 @@ export class RoutstrClient {
     networkRetryCount?: number;
     /** Route the request body through Tinfoil SecureClient.fetch (EHBP). */
     tinfoilEnabled?: boolean;
+    /** Run the request as a confidential-upstream session. */
+    confidential?: ConfidentialRequestOptions;
     /** Secret scoping Tinfoil's prompt cache for this request. */
     userCacheSecret?: string;
     /** File path for the persisted default secret (client-level). */
@@ -1350,8 +1897,15 @@ export class RoutstrClient {
     const releaseHold = trackInFlight(providerKey(baseUrl, token), signal);
     try {
       const url = `${baseUrl.replace(/\/$/, "")}${path}`;
+      // A confidential request exists so that its prompt and response stay
+      // on this machine and out of every log: the raw request/response sink
+      // is skipped for it unless the caller opted in (`logPlaintext`).
+      const logSink: RequestResponseLogSink | undefined =
+        params.confidential && params.confidential.logPlaintext !== true
+          ? undefined
+          : this.requestResponseLogSink;
       let requestLogId: string | undefined;
-      try { requestLogId = await this.requestResponseLogSink?.logRequest?.({
+      try { requestLogId = await logSink?.logRequest?.({
         requestId: params.lifecycle?.requestId,
         attemptId: attempt?.attemptId,
         ordinal: attempt?.ordinal,
@@ -1369,7 +1923,24 @@ export class RoutstrClient {
       // Request headers contain bearer credentials / x-cashu tokens. The
       // request-response sink has its own header redaction; do not log raw headers.
 
-      const response = tinfoilEnabled
+      const response = params.confidential
+        ? await requireConfidentialTransport()({
+            baseUrl,
+            body,
+            bearer: token,
+            options: params.confidential,
+            // Requests of different scopes never share a connection to the provider.
+            reuseScope: params.confidential.reuseScope,
+            // Chat: the node's announced reservation may not exceed what its
+            // own formula gives for this model on this node (none when the
+            // client cannot compute that bound).
+            maxReservationMsat: confidentialCeiling(params.selectedModel),
+            method,
+            path,
+            returnChange: this.mode === "xcashu",
+            signal,
+          })
+        : tinfoilEnabled
         ? await fetchTinfoilPreservingPlaintextErrors(
             {
               baseUrl,
@@ -1408,12 +1979,56 @@ export class RoutstrClient {
       (response as any).token = token;
       (response as any).selectedMintUrl = params.selectedMintUrl;
       (response as any).requestResponseLogId = requestLogId;
-      await this.requestResponseLogSink?.logResponseStart?.(requestLogId, response);
+      if (!logSink) (response as any).requestResponseLogSuppressed = true;
+      await logSink?.logResponseStart?.(requestLogId, response);
 
       const contentType = response.headers.get("content-type") || "";
 
       if (!response.ok) {
-        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+        void logSink?.logResponseBody?.(requestLogId, response.clone());
+        // An HTTP error the *upstream* returned through a confidential session
+        // (the transport marks those with the session id; a node-side refusal
+        // carries no sid). The node has settled it: a 4xx/503 at the session
+        // fee, another 5xx at the full reservation. Failing over would run the
+        // same request again on another node and pay for it twice, and the
+        // refund/cooldown logic below was written for node-originated errors.
+        if (params.confidential && response.headers.has("x-routstr-confidential-sid")) {
+          this._log("WARN", "[RoutstrClient] confidential upstream error; returned as is (no failover)", {
+            baseUrl,
+            status: response.status,
+          });
+          (response as any).passthrough = true;
+          // A passthrough is never finalized, so a one-off bearer's change
+          // is taken here: the transport withdrew what the node left of the
+          // deposit, and the bearer's stored copy is spent. A stream's
+          // settlement resolves after its body; a failed check still
+          // carries the change.
+          if (this.mode === "xcashu") {
+            const headerChange = response.headers.get("x-cashu") ?? undefined;
+            const settled = (response as any).confidentialSettled as
+              | Promise<{ change?: unknown } | undefined>
+              | undefined;
+            void Promise.resolve(settled)
+              .then(
+                (s) => s?.change,
+                (e: { cashuChange?: unknown } | undefined) => e?.cashuChange
+              )
+              .then((change) => {
+                const changeToken = typeof change === "string" ? change : headerChange;
+                return changeToken
+                  ? this._receiveConfidentialChange(baseUrl, token, changeToken)
+                  : undefined;
+              })
+              .catch((e: unknown) =>
+                this._log(
+                  "ERROR",
+                  "[xcashu] Failed to receive the change of a confidential upstream error:",
+                  e instanceof Error ? e.message : String(e)
+                )
+              );
+          }
+          return response;
+        }
         const requestId =
           response.headers.get("x-routstr-request-id") || undefined;
         // Capture the wire-level envelope before the body read consumes the response.
@@ -1487,7 +2102,7 @@ export class RoutstrClient {
       }
 
       if (!contentType.includes("text/event-stream")) {
-        void this.requestResponseLogSink?.logResponseBody?.(requestLogId, response.clone());
+        void logSink?.logResponseBody?.(requestLogId, response.clone());
       }
 
       (response as any).releaseHold = releaseHold;
@@ -1498,6 +2113,50 @@ export class RoutstrClient {
         endedAt: Date.now(), outcome: signal?.aborted || error?.name === "AbortError" ? "aborted" : "failed",
         failurePhase: "network", errorType: error?.name,
       });
+      // A failed confidential session hands back a one-off bearer's change.
+      if (
+        params.confidential &&
+        this.mode === "xcashu" &&
+        typeof error?.cashuChange === "string"
+      ) {
+        await this._receiveConfidentialChange(baseUrl, token, error.cashuChange);
+      }
+      if (params.confidential) {
+        // The body was released: the provider may have run the request. No
+        // retry, top-up or failover may send it again, whatever the error says.
+        if (mayHaveReachedProvider(error)) throw error;
+        // A confidential error's message may carry the node's own text (a
+        // close reason): its type decides, never `isNetworkErrorMessage`.
+        if (confidentialErrorCode(error) !== undefined) {
+          if (!headersReceived && !signal?.aborted && confidentialFailoverError(error)) {
+            const code = confidentialErrorCode(error);
+            this._log("ERROR", "[RoutstrClient] confidential connection failed before release", {
+              baseUrl,
+              code,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return await this._handleErrorResponse(
+              params,
+              token,
+              -1, // a connection failure: no status
+              undefined,
+              undefined,
+              // A fixed text: nothing of the node's reaches the error parser.
+              `confidential connection failed before release (${code})`,
+              params.retryCount ?? 0
+            );
+          }
+          if (
+            this.mode === "xcashu" &&
+            !headersReceived &&
+            typeof error?.cashuChange !== "string" &&
+            token.startsWith("cashu")
+          ) {
+            await this._reclaimUnsentConfidentialToken(baseUrl, token);
+          }
+          throw error;
+        }
+      }
       // Handle network errors with failover. Classified by message *and* by
       // the system error code the runtime attaches (Bun: `error.code`, undici:
       // `error.cause.code`) so a reworded runtime message cannot silently send
@@ -1561,6 +2220,22 @@ export class RoutstrClient {
         );
         // return await this._handleNetworkError(error, params);
       }
+      // A confidential session that failed without handing back change may
+      // never have sent the one-off token to the node (a local failure, an
+      // abort or a refused request before the setup): take the token back.
+      // One the node already redeemed fails to receive and stays stored for
+      // the refund sweep. Only when the transport itself threw: an error
+      // response went through `_handleErrorResponse`, which recovers the
+      // token itself.
+      if (
+        params.confidential &&
+        this.mode === "xcashu" &&
+        !headersReceived &&
+        typeof error?.cashuChange !== "string" &&
+        token.startsWith("cashu")
+      ) {
+        await this._reclaimUnsentConfidentialToken(baseUrl, token);
+      }
       throw error;
     }
   }
@@ -1620,6 +2295,23 @@ export class RoutstrClient {
   }
 
   /**
+   * The `model` a confidential request's body carries to a node: the id the
+   * body rewrite in `_prepareRoutedRequest` puts there (a pinned model path's
+   * model id, else the node's own id for the requested model), or the
+   * caller's own when nothing rewrites it.
+   */
+  private _confidentialBodyModelId(
+    body: unknown,
+    headers: Record<string, string>,
+    selectedModel: Model | undefined
+  ): unknown {
+    const bodyModel = (body as { model?: unknown } | undefined)?.model;
+    if (typeof bodyModel !== "string") return bodyModel;
+    const selector = this._findModelPathHeader(headers);
+    return (selector ? selectorModelId(selector) : null) ?? selectedModel?.id ?? bodyModel;
+  }
+
+  /**
    * Mint-aware failover candidate search. Omits the mint option entirely
    * when the wallet has no funded mints, so providers are never filtered on
    * an empty set (and callers/tests observe the plain three-argument call).
@@ -1628,20 +2320,22 @@ export class RoutstrClient {
     modelId: string,
     currentBaseUrl: string,
     attempted: ReadonlySet<string>,
-    fundedMints: string[]
+    fundedMints: string[],
+    requireConfidential = false
   ): string | null {
+    // A confidential request only ever fails over to a node that advertises
+    // confidential sessions for the model.
+    const confidential = requireConfidential ? { requireConfidential: true } : {};
     if (fundedMints.length === 0) {
-      return this.providerManager.findNextBestProvider(
-        modelId,
-        currentBaseUrl,
-        attempted
-      );
+      return requireConfidential
+        ? this.providerManager.findNextBestProvider(modelId, currentBaseUrl, attempted, confidential)
+        : this.providerManager.findNextBestProvider(modelId, currentBaseUrl, attempted);
     }
     return this.providerManager.findNextBestProvider(
       modelId,
       currentBaseUrl,
       attempted,
-      { acceptableMintUrls: fundedMints }
+      { acceptableMintUrls: fundedMints, ...confidential }
     );
   }
 
@@ -1722,6 +2416,8 @@ export class RoutstrClient {
       lifecycle?: RequestLifecycleContext;
       transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
       attemptKind?: "mint_retry";
+      /** Run as a confidential-upstream session (failover keeps it). */
+      confidential?: ConfidentialRequestOptions;
     },
     token: string,
     status: number,
@@ -2647,7 +3343,8 @@ export class RoutstrClient {
             failoverModelId,
             baseUrl,
             failures.attemptedProviders,
-            fundedMintUrlsForFailover
+            fundedMintUrlsForFailover,
+            Boolean(params.confidential)
           );
           if (nextProvider && failures.attemptedProviders.has(nextProvider)) {
             nextProvider = null;
@@ -2668,7 +3365,8 @@ export class RoutstrClient {
         failoverModelId,
         baseUrl,
         failures.attemptedProviders,
-        fundedMintUrlsForFailover
+        fundedMintUrlsForFailover,
+        Boolean(params.confidential)
       );
     }
 
@@ -2714,7 +3412,7 @@ export class RoutstrClient {
           ? ((body as { messages?: unknown }).messages as any[])
           : [];
 
-        newRequiredSats =
+        const plainRequiredSats = () =>
           this.providerManager.getRequiredSatsForModel(
             newModel,
             messagesForPricing,
@@ -2724,6 +3422,55 @@ export class RoutstrClient {
               : undefined,
             nextModelPathPricing
           );
+        let failoverOffer: ConfidentialDepositOffer | undefined;
+        // An image request's deposit is the signed per-image price on this
+        // node, as for the first node; the chat formula would fall back to
+        // the model's listed maximum, far below what the node reserves.
+        let failoverImageSats: number | undefined;
+        if (params.confidential) {
+          // Never spend on a node that would refuse the session: qualify its
+          // signed offer first, and move on to the next node if it fails.
+          try {
+            const failoverKind = confidentialKind(params.path) === "images" ? "images" : "chat";
+            failoverOffer = await qualifyConfidentialNode(
+              nextProvider,
+              newModel.id,
+              params.confidential,
+              failoverKind,
+              body
+            );
+            if (failoverKind === "images") {
+              failoverImageSats = confidentialImageRequiredSats(
+                failoverOffer,
+                newModel.id,
+                (body ?? {}) as Record<string, unknown>
+              );
+            }
+          } catch (error) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: ${nextProvider} does not qualify for a confidential session; trying another provider`,
+              error instanceof Error ? error.message : String(error)
+            );
+            attemptedForSpend.add(nextProvider);
+            nextProvider = this._findNextBestProvider(
+              failoverModelId,
+              baseUrl,
+              attemptedForSpend,
+              fundedMintUrlsForFailover,
+              true
+            );
+            if (nextProvider && attemptedForSpend.has(nextProvider)) {
+              nextProvider = null;
+            }
+            continue;
+          }
+        }
+        newRequiredSats = params.confidential
+          ? failoverImageSats ??
+            confidentialRequiredSats(newModel, params.maxTokens, failoverOffer) ??
+            plainRequiredSats()
+          : plainRequiredSats();
 
         if (params.tinfoilEnabled) {
           this._log(
@@ -2788,7 +3535,8 @@ export class RoutstrClient {
                   failoverModelId,
                   baseUrl,
                   attemptedForSpend,
-                  fundedMintUrlsForFailover
+                  fundedMintUrlsForFailover,
+                  Boolean(params.confidential)
                 );
                 if (nextProvider && attemptedForSpend.has(nextProvider)) {
                   nextProvider = null;
@@ -2805,7 +3553,8 @@ export class RoutstrClient {
               failoverModelId,
               baseUrl,
               attemptedForSpend,
-              fundedMintUrlsForFailover
+              fundedMintUrlsForFailover,
+              Boolean(params.confidential)
             );
             if (nextProvider && attemptedForSpend.has(nextProvider)) {
               nextProvider = null;
@@ -3144,6 +3893,59 @@ export class RoutstrClient {
   /**
    * Handle post-response balance update for all modes
    */
+  /**
+   * Receive the change a failed confidential session withdrew for a one-off
+   * xcashu bearer; the bearer's stored copy is then spent.
+   */
+  private async _receiveConfidentialChange(
+    baseUrl: string,
+    token: string,
+    change: string
+  ): Promise<void> {
+    const receiveResult = await this.cashuSpender.receiveToken(change);
+    if (receiveResult.success) {
+      this.storageAdapter.removeXcashuToken(baseUrl, token);
+    } else {
+      this.cashuSpender.cacheReceiveToken(change);
+      this._log(
+        "ERROR",
+        `[xcashu] Failed to receive confidential change token: ${receiveResult.message}`
+      );
+    }
+  }
+
+  /**
+   * Take back a one-off xcashu token minted for a confidential session that
+   * failed without change. Never throws: the session's own error is the one
+   * the caller gets.
+   */
+  private async _reclaimUnsentConfidentialToken(
+    baseUrl: string,
+    token: string
+  ): Promise<void> {
+    try {
+      const receiveResult = await this.cashuSpender.receiveToken(token, false);
+      if (receiveResult.success) {
+        this.storageAdapter.removeXcashuToken(baseUrl, token);
+        this._log(
+          "DEBUG",
+          `[xcashu] confidential session failed before its deposit was used; token restored, amount=${receiveResult.amount}`
+        );
+      } else {
+        this._log(
+          "WARN",
+          `[xcashu] confidential session failed and its deposit could not be taken back (left for the refund sweep): ${receiveResult.message}`
+        );
+      }
+    } catch (error) {
+      this._log(
+        "WARN",
+        "[xcashu] confidential deposit recovery failed (left for the refund sweep):",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
   private async _handlePostResponseBalanceUpdate(params: {
     token: string;
     baseUrl: string;
@@ -3152,6 +3954,8 @@ export class RoutstrClient {
     /** Body already read from `response` (non-SSE). Saves a second read and
      *  keeps accounting off a body the caller may already have consumed. */
     responseBody?: unknown;
+    /** The xcashu change, when it does not come as the response's header. */
+    refundToken?: string;
     modelId?: string;
     usage?: UsageTrackingData;
     requestId?: string;
@@ -3172,7 +3976,8 @@ export class RoutstrClient {
     let satsSpent: number = initialTokenBalance;
 
     if (this.mode === "xcashu" && response) {
-      const refundToken = response.headers.get("x-cashu") ?? undefined;
+      const refundToken =
+        params.refundToken ?? response.headers.get("x-cashu") ?? undefined;
       if (refundToken) {
         const receiveResult =
           await this.cashuSpender.receiveToken(refundToken);
@@ -3445,6 +4250,8 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     requiredSats: number;
+    /** Multiple of `requiredSats` to keep available (default TOPUP_MARGIN). */
+    topupFactor?: number;
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
@@ -3466,16 +4273,18 @@ export class RoutstrClient {
       snapshot.tokenBalanceUnit
     );
     // Maintain the margin up front: proactively top up whenever the available
-    // balance is below the request price scaled by TOPUP_MARGIN, so the
-    // key stays covered at the margin instead of reacting only after a 402.
-    const targetSats = snapshot.requiredSats * TOPUP_MARGIN;
+    // balance is below the request price scaled by TOPUP_MARGIN (more for a
+    // pre-warmed confidential key), so the key stays covered at the margin
+    // instead of reacting only after a 402.
+    const factor = snapshot.topupFactor ?? TOPUP_MARGIN;
+    const targetSats = snapshot.requiredSats * factor;
     if (snapshotAvailableSats >= targetSats) return;
 
     const key = providerKey(snapshot.baseUrl, snapshot.token);
     const mustWait = snapshotAvailableSats < snapshot.requiredSats;
     this._log(
       "DEBUG",
-      `[RoutstrClient] _topUpIfNeeded: snapshot available=${snapshotAvailableSats} sat, reserved=${snapshotReservedSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${TOPUP_MARGIN}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
+      `[RoutstrClient] _topUpIfNeeded: snapshot available=${snapshotAvailableSats} sat, reserved=${snapshotReservedSats} sat < target=${targetSats} sat (required=${snapshot.requiredSats} x ${factor}) for ${snapshot.baseUrl}; ${mustWait ? "awaiting topup" : "spinning off background topup"}`
     );
 
     // Concurrent callers join the same deposit. In the margin zone this is
@@ -3513,6 +4322,7 @@ export class RoutstrClient {
     baseUrl: string;
     mintUrl: string;
     requiredSats: number;
+    topupFactor?: number;
     tokenBalance: number;
     tokenReserved?: number;
     tokenBalanceUnit: "sat" | "msat";
@@ -3526,7 +4336,7 @@ export class RoutstrClient {
         baseUrl: snapshot.baseUrl,
         token: snapshot.token,
         requiredSats: snapshot.requiredSats,
-        targetSats: snapshot.requiredSats * TOPUP_MARGIN,
+        targetSats: snapshot.requiredSats * (snapshot.topupFactor ?? TOPUP_MARGIN),
         minimumFraction: PROACTIVE_TOPUP_MIN_FRACTION,
         minimumDeposit: MIN_DEPOSIT_SATS,
       });

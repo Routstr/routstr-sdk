@@ -18,6 +18,21 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  external: ["better-sqlite3", "bun:sqlite", "applesauce-sqlite"],
+  external: [
+    "better-sqlite3",
+    "bun:sqlite",
+    "applesauce-sqlite",
+    // Confidential-upstream TLS fork runtime deps: resolved from the consumer's
+    // node_modules at runtime, never bundled.
+    "@noble/ciphers",
+    "@noble/curves",
+    "@noble/hashes",
+    "@peculiar/asn1-cms",
+    "@peculiar/asn1-ecc",
+    "@peculiar/asn1-rsa",
+    "@peculiar/asn1-schema",
+    "@peculiar/x509",
+    "micro-rsa-dsa-dh",
+  ],
   treeshake: true,
 });

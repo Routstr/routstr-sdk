@@ -87,6 +87,17 @@ const client = new RoutstrClient(
 const currentMode = client.getMode(); // Returns the active mode
 ```
 
+## Confidential upstream (Bun/Node)
+
+`routeRequests({ …, confidential: { trustedHosts, nodePubkeys, proverPath } })`
+runs the request so the node relays ciphertext and never sees the prompt or the
+response; chat completions and, on nodes that offer them, image generation. Only nodes advertising `confidential_upstream` for the model are
+used; credentials and balance accounting are unchanged. Connections are kept
+for the next request (framing "2", pre-warmed spares): a script that should exit
+after its last request calls `closeConfidentialConnections()` (from
+`@routstr/sdk/node` or `/bun`). See
+[`client/confidential/README.md`](client/confidential/README.md).
+
 ## Exponential model cooldowns
 
 Model/provider and pinned upstream-path/provider failures immediately trigger a
