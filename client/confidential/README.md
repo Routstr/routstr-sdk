@@ -151,6 +151,16 @@ not fall back. After a body was released nothing is retried. `"2"` or
   abandon fee). `confidentialRequiredSats` / `confidentialImageRequiredSats`
   size the deposit as that reservation **plus the connection deposit**, the
   balance needed before a connection is opened.
+- The node names the request's whole reservation in `request_ok`
+  (`reserved_msats`; older nodes omit it). With a ceiling
+  (`ConfidentialFetchParams.maxReservationMsat`, per request;
+  `RoutstrClient` passes its mirror of the node's formula for chat, floored
+  at the connection deposit, and none when it cannot compute one) a larger
+  announcement stops the request before any of its records is sent
+  (framing `"1.1"`: before the ClientHello) with
+  `ReservationAboveCeilingError`, and the connection is closed (the node's
+  abort rules apply: the abandon fee, or the deposit on a connection with no
+  settlement yet).
 - The session fee falls due once per connection, at its first settlement: the
   receipt checks bound request 1 by usage + fee and later requests by usage
   alone (`maxChargeMsats`, `verifyFlatReceipt`, `checkUpstreamErrorReceipt`).
@@ -169,7 +179,10 @@ what must not be linked: a scope never shares a connection with another.
   connections. A connection is kept after a settled 2xx and after a refused
   request, and closed `idleMarginMs` (20 s, at most a quarter) before the
   node's `idle_timeout_s`, at `h2.max_requests`, before `h2.max_lifetime_s`,
-  and on any failure. `http2.reuse: "none"` closes it after its request.
+  and on any failure. `http2.reuse: "none"` closes it after its request. The
+  policy is the request's own (passed to `acquire`, kept on its lease): a
+  `none` request never takes a kept connection and its connection is closed
+  after it, whatever another request configured on the shared pool meanwhile.
 - One-off Cashu bearers (`returnChange`, `cashu…`): framing `"1.1"` when
   offered (a connection per token), else `"2"` with a connection of their own;
   never pooled, never pre-warmed. The xcashu change handling is unchanged.
@@ -261,7 +274,11 @@ chain extended online (from the third request of a connection on).
   plus the offer's session fee (`maxChargeMsats`); a receipt naming larger
   fees than the signed ones is refused. For an upstream HTTP error the
   receipt must name the status the client saw; 4xx/503 may cost at most the
-  session fee, any other error at most the reservation the receipt names
+  session fee, any other 4xx at most the abandon fee, any other error at most
+  the reservation, bounded by what the client knew before the release: the
+  reservation the node announced in `request_ok` (the receipt must name the
+  same number), else the caller's ceiling, else (images) price × count plus
+  the abandon fee. With none of these only the fee is accepted
   (`checkUpstreamErrorReceipt`).
 
 A non-streaming call fails if any check after the response fails; a stream
@@ -287,11 +304,20 @@ The prover gets its job, including the traffic secret it proves about, on stdin;
 is written to disk. The same holds for `cu-2pc`, whose secrets come back on its
 stdout control channel and are never logged.
 
-What this does not cover: JavaScript cannot wipe memory reliably. The witness buffers
-handed to the prover are zeroed after the write, but the session's traffic secrets
-(`c_ap_1`, `s_ap_0`), the TLS library's keys and the decrypted response live in ordinary
-JS objects until the garbage collector reclaims them, and may be in a heap snapshot or core
-dump taken before then. `cu-prover` and `cu-2pc` are spawned with the parent's
+When a connection ends (it fails or is closed, or a framing-"1.1" connection settled
+its one request), it erases what it can: its copies of the traffic secrets (`c_ap_1`,
+`s_ap_0`, and the anchors beside them) are zero-filled and dropped, and the TLS fork
+zero-fills its traffic secrets and IVs, the handshake secrets included, and drops its
+keys (`destroySecrets`, see `tls-fork/FORK-NOTES.md`). Anything still running on the
+connection then gets the connection's failure, never a cleared secret.
+
+What this does not cover: JavaScript cannot guarantee erasure of every copy. The
+witness buffers handed to the prover are zeroed after the write, but other copies of
+the traffic secrets (the hex strings of the 2PC and prover control channels, arrays the
+runtime copied), the AES keys (WebCrypto `CryptoKey` objects, which cannot be zeroed)
+and the decrypted response live in ordinary JS memory until the garbage collector
+reclaims them, and may be in a heap snapshot or core dump taken before then.
+`cu-prover` and `cu-2pc` are spawned with the parent's
 environment (`process.env`), so they see every variable the client process has; run the
 client with only the environment it needs, and use only prover and 2PC binaries you trust.
 

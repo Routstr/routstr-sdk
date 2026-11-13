@@ -6,29 +6,34 @@
  * message. All errors extend `ConfidentialError` and carry a stable `code`.
  */
 
-export type ConfidentialErrorCode =
-  | "offer_unavailable"
-  | "offer_malformed"
-  | "offer_bad_signature"
-  | "offer_unpinned"
-  | "offer_pin_mismatch"
-  | "offer_unsupported_version"
-  | "node_protocol_outdated"
-  | "upgrade_required"
-  | "twopc_version_mismatch"
-  | "request_refused"
-  | "trusted_host_rejected"
-  | "session_protocol"
-  | "session_rejected"
-  | "prover_failed"
-  | "prover_missing"
-  | "receipt_verification"
-  | "response_verification"
-  | "timeout"
-  | "not_configured"
-  | "unsupported_endpoint"
-  | "offer_no_images"
-  | "pinned_parameter";
+/** Every `code` a confidential error carries (stable; callers match on it). */
+export const CONFIDENTIAL_ERROR_CODES = [
+  "offer_unavailable",
+  "offer_malformed",
+  "offer_bad_signature",
+  "offer_unpinned",
+  "offer_pin_mismatch",
+  "offer_unsupported_version",
+  "node_protocol_outdated",
+  "upgrade_required",
+  "twopc_version_mismatch",
+  "request_refused",
+  "trusted_host_rejected",
+  "session_protocol",
+  "session_rejected",
+  "prover_failed",
+  "prover_missing",
+  "receipt_verification",
+  "response_verification",
+  "timeout",
+  "not_configured",
+  "unsupported_endpoint",
+  "offer_no_images",
+  "pinned_parameter",
+  "reservation_above_ceiling",
+] as const;
+
+export type ConfidentialErrorCode = (typeof CONFIDENTIAL_ERROR_CODES)[number];
 
 export class ConfidentialError extends Error {
   readonly code: ConfidentialErrorCode;
@@ -248,5 +253,87 @@ export class ConfidentialTimeoutError extends ConfidentialError {
   constructor(message: string, detail?: string) {
     super("timeout", message, detail);
     this.name = "ConfidentialTimeoutError";
+  }
+}
+
+/**
+ * The node announced a reservation for the request (`request_ok`
+ * `reserved_msats`) above the caller's ceiling (`maxReservationMsat`). The
+ * client stopped before any record of the request was sent (framing "1.1":
+ * before the ClientHello): nothing of it reached the provider, and the
+ * connection is closed. Another node may serve the request.
+ */
+export class ReservationAboveCeilingError extends ConfidentialError {
+  /** What the node announced (msat). */
+  readonly reservedMsat: number;
+  /** The caller's ceiling (msat). */
+  readonly ceilingMsat: number;
+  constructor(reservedMsat: number, ceilingMsat: number) {
+    super(
+      "reservation_above_ceiling",
+      `the node reserves ${reservedMsat} msat for the request, above the client's ceiling of ${ceilingMsat} msat`,
+    );
+    this.name = "ReservationAboveCeilingError";
+    this.reservedMsat = reservedMsat;
+    this.ceilingMsat = ceilingMsat;
+  }
+}
+
+/**
+ * The property the confidential transport sets (true, not enumerable) on
+ * every error it throws once the request's body was released towards the
+ * provider: the request may have run there, so it must not be sent again,
+ * to this node or another.
+ */
+export const MAY_HAVE_REACHED_PROVIDER = "mayHaveReachedProvider";
+
+/**
+ * True when `error` carries the transport's release marker. Read by shape:
+ * the transport and the client may come from different bundles.
+ */
+export function mayHaveReachedProvider(error: unknown): boolean {
+  return (
+    error !== null &&
+    (typeof error === "object" || typeof error === "function") &&
+    (error as Record<string, unknown>)[MAY_HAVE_REACHED_PROVIDER] === true
+  );
+}
+
+/** The `code` of a confidential error, read by shape (any bundle); undefined for anything else. */
+export function confidentialErrorCode(error: unknown): ConfidentialErrorCode | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && (CONFIDENTIAL_ERROR_CODES as readonly string[]).includes(code)
+    ? (code as ConfidentialErrorCode)
+    : undefined;
+}
+
+/**
+ * Whether a confidential request that failed with `error` may run on another
+ * node: only before its release (no `MAY_HAVE_REACHED_PROVIDER`), and only for
+ * a failure of the node or its connection, decided by the error's type, never
+ * by its message (which may carry the node's own text): the connection failed
+ * or was closed without a status, the node broke the protocol, a step timed
+ * out, its offer could not be fetched, the upstream's TLS could not be
+ * verified, or its reservation was above the caller's ceiling. A refusal with
+ * a status is a `Response`, not an error; local and caller faults
+ * (configuration, binaries, versions, pinned parameters) stay where they are.
+ */
+export function confidentialFailoverError(error: unknown): boolean {
+  if (mayHaveReachedProvider(error)) return false;
+  const code = confidentialErrorCode(error);
+  switch (code) {
+    case "session_rejected": {
+      const e = error as { status?: unknown; name?: unknown };
+      return typeof e.status !== "number" && e.name !== "ConnectionDepositError";
+    }
+    case "session_protocol":
+    case "timeout":
+    case "offer_unavailable":
+    case "response_verification":
+    case "reservation_above_ceiling":
+      return true;
+    default:
+      return false;
   }
 }

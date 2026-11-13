@@ -43,6 +43,7 @@ import {
   ConnectionDepositError,
   ReceiptVerificationError,
   RequestRefusedError,
+  ReservationAboveCeilingError,
   ResponseVerificationError,
   SessionProtocolError,
   SessionRejectedError,
@@ -250,6 +251,16 @@ export interface ConnectionRequestOptions {
    * is padded with JSON whitespace before the suffix to the bucket.
    */
   padBucket?: PadBucket;
+  /**
+   * The most the caller lets the node reserve for this request (msat). When
+   * the node announces a larger reservation (`request_ok.reserved_msats`),
+   * the request stops before any of its records is sent (framing "1.1":
+   * before the ClientHello) with `ReservationAboveCeilingError`, and the
+   * connection is closed. Also the bound of a receipt that charges the
+   * reservation for a provider error when the node announced none. Absent:
+   * no ceiling.
+   */
+  maxReservationMsat?: number;
   onResponseHead?: (head: { status: number; statusText: string; headers: Record<string, string> }) => void;
   onResponseBody?: (chunk: Uint8Array) => void;
 }
@@ -385,6 +396,8 @@ interface Cur {
   streamCredit: number;
   /** `request_ok` arrived: the node reserved and the sidecar accepted. */
   accepted: boolean;
+  /** The reservation the node announced in `request_ok` (msat), when it named one. */
+  reservedMsat?: number;
   /** We sent a `release`: from here the request may reach the provider. */
   releaseSent: boolean;
   /** `body_released`: every record of the request was written to the provider. */
@@ -752,6 +765,32 @@ export class ConfidentialConnection {
     } catch {
       /* ignore */
     }
+    this.eraseSecrets();
+  }
+
+  /**
+   * Best-effort erasure of the connection's traffic secrets once nothing may
+   * use them: our copies of s_ap_0 and c_ap_1 (and the public anchors beside
+   * them) are zero-filled and dropped, and the TLS client zeroes and drops
+   * its own keys. Whatever still runs afterwards reads them through
+   * `secrets()`, which throws the connection's failure instead.
+   */
+  private eraseSecrets(): void {
+    const ap = this.ap;
+    this.ap = undefined;
+    if (ap) for (const v of Object.values(ap)) if (v instanceof Uint8Array) v.fill(0);
+    try {
+      (this.tls as TlsHandle | undefined)?.destroySecrets?.();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** The application traffic secrets, while the connection may still use them. */
+  private secrets(): TwoPcApplicationSecrets {
+    if (this.failure) throw this.failure;
+    if (!this.ap) throw new SessionProtocolError("the connection holds no application traffic secrets");
+    return this.ap;
   }
 
   /**
@@ -1222,13 +1261,20 @@ export class ConfidentialConnection {
       },
       onServerFinished: async (thSF) => {
         this.thSF = thSF;
-        this.ap = await twoPc.application(thSF);
-        return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 };
+        const ap = await twoPc.application(thSF);
+        this.ap = ap;
+        // The connection ended while the 2PC answered: the secrets go at once.
+        if (this.failure) {
+          this.eraseSecrets();
+          throw this.failure;
+        }
+        return { serverAp0: ap.serverAp0, clientAp1: ap.clientAp1 };
       },
     });
     await this.tls.startHandshake();
     await Promise.race([this.orFail(handshakeP), rejectAfter(this.timeouts.handshake, "handshake")]);
-    if (!this.ap) throw new SessionProtocolError("handshake finished without 2PC application secrets");
+    if (!this.ap && !this.failure) throw new SessionProtocolError("handshake finished without 2PC application secrets");
+    this.secrets();
     await this.wait(["hs_verified"], this.timeouts.hsVerified);
   }
 
@@ -1239,8 +1285,8 @@ export class ConfidentialConnection {
    * our request 1.
    */
   private async proveHead(req?: { kind: "chat" | "images"; bodyLen: number; headLen: number; headTemplate: string }): Promise<void> {
-    const ap = this.ap!;
     const commit = (await this.wait(["c_commit"], this.timeouts.cCommit)).msg;
+    const ap = this.secrets();
     for (const k of ["h1", "h2", "hk"] as const) {
       if (commit[k] !== undefined && commit[k] !== hex(ap[k])) {
         throw new SessionProtocolError(`c_commit: ${k} differs from our 2PC output`);
@@ -1631,14 +1677,14 @@ export class ConfidentialConnection {
       throw new SessionProtocolError("π_WIN: malformed batch");
     }
     const covered = Array.from({ length: count }, (_, i) => first + i);
-    if (!this.ap) throw new SessionProtocolError("π_WIN before the handshake");
+    if (!this.ap && !this.failure) throw new SessionProtocolError("π_WIN before the handshake");
     const shape = checkPiWinParams(m.params, {
-      anchor: this.ap.h1,
+      anchor: this.secrets().h1,
       lookup: (seq) => (seq >= first && seq < first + count && this.unproven.has(seq) ? this.source(seq) : undefined),
       covered,
     });
     const cur = this.cur;
-    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.ap.clientAp1) });
+    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().clientAp1) });
     (cur ?? this.cur)?.proofs.push({ ...t, purpose: "records", ...shape });
     this.event({ ev: "pi_win_ok", first_seq: first, count, windows: shape.windows });
     for (const seq of covered) {
@@ -1662,6 +1708,10 @@ export class ConfidentialConnection {
     let opts = requestOpts;
     if (!this.idle) {
       throw this.failure ?? new SessionRejectedError("the connection cannot take a request now");
+    }
+    const ceiling = opts.maxReservationMsat;
+    if (ceiling !== undefined && !(Number.isSafeInteger(ceiling) && ceiling >= 0)) {
+      throw new ConfidentialError("not_configured", `maxReservationMsat ${String(ceiling)} is not a whole number of msat`);
     }
     const offer = opts.offer ?? this.offer;
     if (offer !== this.offer && connectionTerms(offer) !== this.terms) {
@@ -1808,8 +1858,20 @@ export class ConfidentialConnection {
     if (msg.suffix !== new TextDecoder().decode(suffix)) {
       throw new SessionProtocolError("node expects a different pinned suffix than ours");
     }
+    // The whole reservation of the request, announced before anything of it
+    // is released (a node of an older release names none).
+    const reserved = msg.reserved_msats;
+    if (reserved !== undefined && !(Number.isSafeInteger(reserved) && reserved >= 0)) {
+      throw new SessionProtocolError("request_ok names a malformed reservation");
+    }
     this.requests = cur.n;
     cur.accepted = true;
+    cur.reservedMsat = reserved;
+    const ceiling = cur.opts.maxReservationMsat;
+    if (reserved !== undefined && ceiling !== undefined && reserved > ceiling) {
+      // Nothing of the request has been sent: the connection ends here.
+      throw new ReservationAboveCeilingError(reserved, ceiling);
+    }
     return msg;
   }
 
@@ -2079,10 +2141,10 @@ export class ConfidentialConnection {
     this.event({ ev: "body_sent", len: body.length, records: this.bodyRecords.length });
 
     const zp = (await this.wait(["zk_params:pi_win:records"], this.timeouts.zkParams)).msg;
-    const shape = checkPiWinFinalRecord(zp, { anchor: this.ap!.h1, seq: finalSeq, wire: finalRecord, suffix });
+    const shape = checkPiWinFinalRecord(zp, { anchor: this.secrets().h1, seq: finalSeq, wire: finalRecord, suffix });
     // From here the request may reach the provider: never run it again elsewhere.
     cur.releaseSent = true;
-    const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.ap!.clientAp1) });
+    const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.secrets().clientAp1) });
     cur.proofs.push({ ...tw, purpose: "records", ...shape });
     await this.until(() => cur.released, "body_released", this.timeouts.released);
 
@@ -2147,6 +2209,8 @@ export class ConfidentialConnection {
     await this.until(() => this.closedReason !== undefined, "closed", this.timeouts.closed).catch(() => {});
     this.twoPc?.close();
     this.zkChan?.close();
+    // The connection's one request is settled: its secrets are not needed again.
+    this.eraseSecrets();
 
     const accepted = cur.image !== undefined && status < 300;
     const chunks = cur.parts.map((p) => p.data);
@@ -2158,7 +2222,6 @@ export class ConfidentialConnection {
 
   /** `disclose` (the usage tail) or `disclose_head` (the response head), then π_C3S over the last server records. */
   private async disclose11(cur: Cur, type: "disclose" | "disclose_head", r: Uint8Array, skip: number): Promise<void> {
-    const ap = this.ap!;
     const tailLens = disclosureTailLens(this.rawLens, r.length + skip);
     const epoch = serverTailEpoch(this.serverPost, tailLens.length);
     const msg: Record<string, unknown> = { type, n: 1, r: hex(r), tail_lens: tailLens, skip, trailing: epoch.trailing };
@@ -2174,7 +2237,7 @@ export class ConfidentialConnection {
     const kept = [...this.serverRecords.values()];
     const handshakeRecords = this.wireRecords - this.serverPost.length;
     checkPiC3SParams(c3.params, {
-      h2: ap.h2,
+      h2: this.secrets().h2,
       serverRecords: kept,
       r,
       skip,
@@ -2183,7 +2246,7 @@ export class ConfidentialConnection {
       trailing: epoch.trailing,
       tailLens,
     });
-    const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(ap.serverAp0) });
+    const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(this.secrets().serverAp0) });
     cur.proofs.push(purpose ? { ...t, purpose } : t);
   }
 
@@ -2291,7 +2354,6 @@ export class ConfidentialConnection {
   }
 
   private async settleUsage(cur: Cur): Promise<{ receipt: ConfidentialReceipt; attestation: unknown }> {
-    const ap = this.ap!;
     for (let attempt = 0; ; attempt++) {
       await this.drained();
       if (this.failure) throw this.failure;
@@ -2332,7 +2394,7 @@ export class ConfidentialConnection {
         tail.push(rec);
       }
       checkPiC3SParams(c3.params, {
-        h2: ap.h2,
+        h2: this.secrets().h2,
         serverRecords: tail,
         r: d.r,
         skip: 0,
@@ -2341,7 +2403,7 @@ export class ConfidentialConnection {
         trailing: 0,
         tailLens: d.tailLens,
       });
-      const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(ap.serverAp0) });
+      const t = await this.proof("pi_c3s", "prove", c3.params, { Secret: Array.from(this.secrets().serverAp0) });
       cur.proofs.push(t);
       const got = await this.takeReceipt(cur, att.json);
       this.checkUsageReceipt(cur, got, d.ownUsage);
@@ -2382,7 +2444,6 @@ export class ConfidentialConnection {
 
   /** The error head (§5.4): the response HEADERS frame, which must start a record. */
   private async settleErrorHead(cur: Cur, status: number): Promise<{ receipt: ConfidentialReceipt; attestation: unknown }> {
-    const ap = this.ap!;
     await this.drained();
     // Our own records must be proven first (one π_WIN at a time).
     await this.until(
@@ -2426,7 +2487,7 @@ export class ConfidentialConnection {
       left -= take;
     }
     const shape = checkPiWinParams(m.params, {
-      anchor: ap.h2,
+      anchor: this.secrets().h2,
       keyUpdates,
       lookup: (seq) => {
         const abs = this.hsCipher + epochStart + seq;
@@ -2438,7 +2499,7 @@ export class ConfidentialConnection {
       },
       covered: [...chunks.keys()].map((abs) => abs - this.hsCipher - epochStart),
     });
-    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(ap.serverAp0) });
+    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
     cur.proofs.push({ ...t, purpose: "error_head", ...shape });
     const { receipt } = await this.takeReceipt(cur, att.json);
     this.checkErrorReceipt(cur, receipt, status);
@@ -2600,7 +2661,12 @@ export class ConfidentialConnection {
 
   private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
     this.checkPinnedModel(cur, receipt);
+    // The reservation as known before the release: the node's announcement,
+    // else the caller's ceiling (never the receipt's own number).
+    const announced = cur.reservedMsat !== undefined;
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
+      reservationMsat: announced ? cur.reservedMsat : cur.opts.maxReservationMsat,
+      reservationAnnounced: announced,
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
       image: cur.image
         ? {
