@@ -809,18 +809,41 @@ export function verifyConfidentialOffer(
  * Fetch + verify the node's offer. `baseUrl` is the node HTTP(S) base (e.g.
  * `http://127.0.0.1:8000`) — the offer lives at `/v1/confidential/offer`.
  */
+/** How long `fetchConfidentialOffer` waits for a node's offer by default. */
+export const OFFER_FETCH_TIMEOUT_MS = 10_000;
+
 export async function fetchConfidentialOffer(
   baseUrl: string,
-  options: VerifyOfferOptions & { fetchImpl?: typeof fetch } = {},
+  options: VerifyOfferOptions & {
+    fetchImpl?: typeof fetch;
+    /** How long the node may take to send its offer (default 10 s). */
+    timeoutMs?: number;
+  } = {},
 ): Promise<VerifiedOffer> {
   const base = baseUrl.replace(/\/$/, "");
   // The query tells an older node's access log that v3 clients are asking (§11).
   const url = `${base}/v1/confidential/offer?v=${CONFIDENTIAL_VERSION}`;
   const doFetch = options.fetchImpl ?? fetch;
   let resp: Response;
+  let json: unknown;
   try {
-    resp = await doFetch(url);
+    // The offer is fetched before a request goes anywhere: a node that does
+    // not answer must not hold the request for the transport's own timeout.
+    const signal = AbortSignal.timeout(options.timeoutMs ?? OFFER_FETCH_TIMEOUT_MS);
+    resp = await doFetch(url, { signal });
+    if (resp.ok) {
+      try {
+        json = await resp.json();
+      } catch (error) {
+        if (signal.aborted) throw error;
+        throw new OfferMalformedError(
+          "offer is not valid JSON",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
   } catch (error) {
+    if (error instanceof OfferMalformedError) throw error;
     throw new OfferUnavailableError(
       `could not reach ${url}`,
       error instanceof Error ? error.message : String(error),
@@ -828,15 +851,6 @@ export async function fetchConfidentialOffer(
   }
   if (!resp.ok) {
     throw new OfferUnavailableError(`${url} returned HTTP ${resp.status}`);
-  }
-  let json: unknown;
-  try {
-    json = await resp.json();
-  } catch (error) {
-    throw new OfferMalformedError(
-      "offer is not valid JSON",
-      error instanceof Error ? error.message : String(error),
-    );
   }
   return verifyConfidentialOffer(json, options);
 }
