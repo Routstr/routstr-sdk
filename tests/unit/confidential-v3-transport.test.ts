@@ -575,6 +575,19 @@ describe("v3 transport: a pooled connection is a cache, never a promise", () => 
     expect(http2OpenFailure(new StreamNotProcessedError("x"))).toBe(false);
   });
 
+  it("adds what a proven refusal was charged (its receipt) to the call's cost", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const refused = new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM); the refusal was proven and settled", {
+      receipt: { sid: "ab".repeat(32), model: "m", usage: { refused: "rst_stream", error_code: 7, choices: [] } as never, cost_msats: 500 },
+      costMsats: 500,
+    });
+    fakeConnections(() => (calls++ === 0 ? { released: true, fail: refused } : {}));
+    const res = await call(freshNode(), {}, { http2: quiet });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-routstr-cost-msats")).toBe("507");
+  });
+
   // Run with NODE_OPTIONS=--expose-gc to include it.
   it.runIf(typeof (globalThis as { gc?: unknown }).gc === "function")(
     "keeps no request body reachable from a kept connection's key (finding 25)",

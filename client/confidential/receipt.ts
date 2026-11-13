@@ -12,6 +12,7 @@ import { verifySchnorrSignature } from "./canonical";
 import { ReceiptVerificationError } from "./errors";
 import type { ConfidentialReceipt } from "./wire";
 import type { UpstreamUsageEvent } from "./suffix";
+import type { Refusal } from "./h2";
 
 export interface ReceiptVerificationInput {
   receipt: ConfidentialReceipt;
@@ -261,6 +262,43 @@ export function checkUpstreamErrorReceipt(
     }
   }
   return usageMatch;
+}
+
+/**
+ * A receipt for a refusal the client proved (`disclose_reset`, PROTOCOL-V3.md
+ * §12.8): the provider refused the stream without processing it, and the node
+ * settles it like a 429: at most the session fee still due on the connection,
+ * nothing for the request. Its usage must name exactly the refusal we saw.
+ * Throws on any mismatch.
+ */
+export function checkRefusalReceipt(
+  receipt: ConfidentialReceipt,
+  refusal: Refusal,
+  sessionFeeMsat = 0,
+  abandonFeeMsat = 0,
+): void {
+  const fail = (what: string): never => {
+    throw new ReceiptVerificationError(`refusal receipt: ${what}`);
+  };
+  const u = receipt.usage as unknown as Record<string, unknown> | undefined;
+  if (!u || u.refused !== refusal.refused || u.error_code !== refusal.error_code) {
+    fail(`usage ${JSON.stringify(u ?? null).slice(0, 120)} does not name the ${refusal.refused} we saw`);
+  }
+  if (refusal.refused === "goaway" && u!.last_stream_id !== refusal.last_stream_id) {
+    fail(`last stream ${String(u!.last_stream_id).slice(0, 16)} is not ${refusal.last_stream_id}`);
+  }
+  if (!Array.isArray(u!.choices) || (u!.choices as unknown[]).length !== 0) fail("usage carries choices");
+  const fee = Math.max(0, sessionFeeMsat);
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    fail(`session fee ${receipt.session_fee_msat} msats exceeds the one due (${fee} msats)`);
+  }
+  if (typeof receipt.abandon_fee_msat === "number" && receipt.abandon_fee_msat > Math.max(fee, abandonFeeMsat)) {
+    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
+  }
+  if (!isMsatAmount(receipt.cost_msats)) fail(`cost ${String(receipt.cost_msats)} is not a valid amount`);
+  if (receipt.cost_msats! > fee) {
+    fail(`node charged ${receipt.cost_msats} msats for a refused stream, more than the session fee due (${fee} msats)`);
+  }
 }
 
 /**

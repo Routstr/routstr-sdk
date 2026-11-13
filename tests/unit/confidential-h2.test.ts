@@ -25,6 +25,8 @@ import {
   checkPiWinParams,
   decodeBlock,
   errorHeadPrefixProblem,
+  parseRefusal,
+  refusalProblem,
   frame,
   frameHeader,
   h2Head,
@@ -1160,5 +1162,72 @@ describe("http 2: the error head's record prefix and the body-size bucket", () =
     expect(paddedBodyLength(100, "pow2")).toBe(1024);
     expect(paddedBodyLength(MAX_BODY_LEN - 1, "pow2")).toBe(MAX_BODY_LEN);
     expect(() => paddedBodyLength(10, 3)).toThrow(/bucket/);
+  });
+});
+
+describe("http 2: a refusal of the request's stream (disclose_reset, §5.4)", () => {
+  const cat = (...xs: Uint8Array[]) => Uint8Array.from(xs.flatMap((x) => [...x]));
+  const u32 = (v: number) => Uint8Array.from([v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+  const rst = (st: number, code: number) => frame(FRAME.RST_STREAM, 0, st, u32(code));
+  const goaway = (last: number, code: number, debug = new Uint8Array(0)) => frame(FRAME.GOAWAY, 0, 0, cat(u32(last), u32(code), debug));
+
+  it("takes RST_STREAM(REFUSED_STREAM) on the stream and GOAWAY(NO_ERROR) below it, after harmless frames", () => {
+    expect(parseRefusal(rst(3, 7), 3, true)).toEqual({ refused: "rst_stream", error_code: 7 });
+    expect(parseRefusal(goaway(1, 0), 3, true)).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1 });
+    expect(parseRefusal(goaway(1, 0), 3, false)).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1 });
+    expect(parseRefusal(goaway(0x80000001, 0), 5, true)).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1 });
+    expect(parseRefusal(goaway(3, 0, new TextEncoder().encode("shutting down")), 5, true)).toMatchObject({ last_stream_id: 3 });
+    const before = [
+      frame(FRAME.WINDOW_UPDATE, 0, 0, u32(256)),
+      frame(FRAME.WINDOW_UPDATE, 0, 3, u32(256)),
+      frame(FRAME.SETTINGS, 0, 0, Uint8Array.from([0, 3, 0, 0, 0, 100])),
+      frame(FRAME.SETTINGS, FLAG.ACK, 0),
+      frame(FRAME.PING, 0, 0, new Uint8Array(8).fill(1)),
+      frame(FRAME.DATA, FLAG.END_STREAM, 1, new TextEncoder().encode('{"data":[]}')),
+      rst(1, 7),
+      goaway(3, 0),
+      goaway(0x7fffffff, 0),
+    ];
+    expect(refusalProblem(cat(...before, rst(3, 7)), 3, true)).toBeUndefined();
+    for (const f of before) expect(refusalProblem(cat(f, rst(3, 7)), 3, true)).toBeUndefined();
+  });
+
+  it("refuses what a client could point at instead", () => {
+    const bad: [string, Uint8Array, boolean][] = [
+      ["CANCEL", rst(3, 8), true],
+      ["NO_ERROR reset", rst(3, 0), true],
+      ["another stream", rst(5, 7), true],
+      ["the probe stream", rst(1, 7), true],
+      ["a reset before anything was written", rst(3, 7), false],
+      ["GOAWAY covering the stream", goaway(3, 0), true],
+      ["GOAWAY with an error", goaway(1, 1), true],
+      ["GOAWAY ENHANCE_YOUR_CALM", goaway(1, 11), true],
+      ["a short GOAWAY", frame(FRAME.GOAWAY, 0, 0, u32(1)), true],
+      ["GOAWAY on a stream", frame(FRAME.GOAWAY, 0, 3, cat(u32(1), u32(0))), true],
+      ["a long reset", frame(FRAME.RST_STREAM, 0, 3, cat(u32(7), Uint8Array.from([0]))), true],
+      ["nothing", new Uint8Array(0), true],
+    ];
+    for (const [what, r, rstOk] of bad) expect(refusalProblem(r, 3, rstOk), what).toBeDefined();
+    expect(refusalProblem(rst(1, 7), 1, true)).toBeDefined();
+    for (const f of [
+      frame(FRAME.HEADERS, FLAG.END_HEADERS, 3, Uint8Array.from([0x88])),
+      frame(FRAME.DATA, 0, 3, new TextEncoder().encode("data: {}\n\n")),
+      frame(FRAME.HEADERS, FLAG.END_HEADERS, 5, Uint8Array.from([0x88])),
+      frame(FRAME.PING, 0, 3, new Uint8Array(8)),
+      frame(5, 0, 0, new Uint8Array(4)),
+      goaway(1, 2),
+    ]) {
+      expect(refusalProblem(cat(f, rst(3, 7)), 3, true)).toBeDefined();
+      expect(refusalProblem(cat(f, goaway(1, 0)), 3, true)).toBeDefined();
+    }
+    expect(refusalProblem(cat(rst(3, 7), frame(FRAME.PING, 0, 0, new Uint8Array(8))), 3, true)).toMatch(/does not end/);
+    const r = rst(3, 7);
+    expect(refusalProblem(r.subarray(0, r.length - 1), 3, true)).toBeDefined();
+    const ping = frame(FRAME.PING, FLAG.ACK, 0, new Uint8Array(8).fill(1));
+    ping[2] = 12;
+    expect(refusalProblem(cat(ping, rst(3, 7)), 3, true)).toBeDefined();
+    const reserved = rst(3, 7);
+    reserved[5]! |= 0x80;
+    expect(refusalProblem(reserved, 3, true)).toBeDefined();
   });
 });
