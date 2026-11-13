@@ -516,8 +516,12 @@ export class ConfidentialConnection {
     this.fail(new SessionProtocolError(`node sent too many unanswered ${JSON.stringify(key).slice(0, 64)} frames`)),
   );
   private failure?: Error;
-  private errRej!: (e: Error) => void;
-  private readonly errP: Promise<never>;
+  /**
+   * Waits that end with the connection's failure (`orFail`). Each is removed
+   * when its own promise settles: a long-lived promise raced against every
+   * wait would keep each wait's result reachable (it does under Bun).
+   */
+  private failWaiters = new Set<(e: Error) => void>();
   private endedRes!: (e: Error) => void;
   /** Resolves (never rejects) with the reason once the connection has ended. */
   readonly ended: Promise<Error> = new Promise<Error>((res) => (this.endedRes = res));
@@ -660,8 +664,6 @@ export class ConfidentialConnection {
     this.chunk = Math.max(1, Math.min(options.chunk ?? MAX_DATA_IN_RECORD, MAX_DATA_IN_RECORD));
     this.onEvent = options.onEvent;
     this.onWarning = options.onWarning ?? ((m) => console.warn(`[confidential] ${m}`));
-    this.errP = new Promise<never>((_, rej) => (this.errRej = rej));
-    this.errP.catch(() => {});
   }
 
   // --- state ------------------------------------------------------------------
@@ -734,7 +736,9 @@ export class ConfidentialConnection {
     if (this.failure) return;
     this.failure = e;
     this.phaseNow = "closed";
-    this.errRej(e);
+    const waiters = [...this.failWaiters];
+    this.failWaiters.clear();
+    for (const w of waiters) w(e);
     this.endedRes(e);
     this.teardown();
     this.kick();
@@ -845,7 +849,7 @@ export class ConfidentialConnection {
           this.pendingTls -= bytes.length;
         });
     };
-    return Promise.race([opened, this.errP]);
+    return this.orFail(opened);
   }
 
   private onText(d: string): void {
@@ -976,14 +980,35 @@ export class ConfidentialConnection {
     }
   }
 
+  /** `p`, or the connection's failure, whichever comes first (nothing is kept once `p` settles). */
+  private orFail<T>(p: Promise<T>): Promise<T> {
+    if (this.failure) {
+      p.catch(() => {});
+      return Promise.reject(this.failure);
+    }
+    return new Promise<T>((res, rej) => {
+      const onFail = (e: Error) => rej(e);
+      this.failWaiters.add(onFail);
+      p.then(
+        (v) => {
+          this.failWaiters.delete(onFail);
+          res(v);
+        },
+        (e) => {
+          this.failWaiters.delete(onFail);
+          rej(e);
+        },
+      );
+    });
+  }
+
   /** The next control frame of one of `keys`, or the connection's failure, or a timeout. */
   private async wait(keys: string[], ms: number): Promise<{ key: string; msg: any }> {
     const t = this.inbox.take(keys);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        t.promise,
-        this.errP,
+        this.orFail(t.promise),
         new Promise<never>((_, rej) => {
           timer = setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${keys.join("/")}`)), ms);
         }),
@@ -1136,14 +1161,14 @@ export class ConfidentialConnection {
     // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
     this.zkChan = this.proofChannelFactory?.() ?? new ProofChannel({ binaryPath: this.prover.path });
     this.zkChan.start(this.zkUrl("zkchan"));
-    this.keyShare = await Promise.race([twoPc.keyShare(this.timeouts.twoPcKeyShare), this.errP]);
+    this.keyShare = await this.orFail(twoPc.keyShare(this.timeouts.twoPcKeyShare));
     const tKeyShare = Date.now();
     this.setupTimings.readyMs = this.tReady - t0;
     this.setupTimings.twoPcKeyShareMs = tKeyShare - this.tReady;
     if (prewarm) {
       // Pre-warm: the proof channel's correlations are part of it. A channel
       // that does not come up is not fatal (the proofs then run one by one).
-      await Promise.race([this.zkChan.ready(this.timeouts.proofChannelReady), this.errP]);
+      await this.orFail(this.zkChan.ready(this.timeouts.proofChannelReady));
     }
     this.tArmed = Date.now();
     this.setupTimings.armMs = this.tArmed - t0;
@@ -1202,7 +1227,7 @@ export class ConfidentialConnection {
       },
     });
     await this.tls.startHandshake();
-    await Promise.race([handshakeP, this.errP, rejectAfter(this.timeouts.handshake, "handshake")]);
+    await Promise.race([this.orFail(handshakeP), rejectAfter(this.timeouts.handshake, "handshake")]);
     if (!this.ap) throw new SessionProtocolError("handshake finished without 2PC application secrets");
     await this.wait(["hs_verified"], this.timeouts.hsVerified);
   }
@@ -1386,7 +1411,7 @@ export class ConfidentialConnection {
       const t = Date.now();
       const ch = this.zkChan;
       if (ch && (ch.used || (await ch.ready(this.timeouts.proofChannelReady)))) {
-        const m = await Promise.race([ch.run(cmd, proof, params, witness, this.timeouts.proof), this.errP]);
+        const m = await this.orFail(ch.run(cmd, proof, params, witness, this.timeouts.proof));
         return { proof, ms: Date.now() - t, innerMs: m.ms, bytesSent: m.bytes_sent, bytesRecv: m.bytes_recv };
       }
       this.event({ ev: "proof_channel_fallback", proof, err: String(ch?.failure?.message ?? "") });
@@ -1837,7 +1862,7 @@ export class ConfidentialConnection {
       this.unackedSettings--;
       void this.sendCtl("settings_ack", new Uint8Array(0));
     }
-    for (const p of plan) cur.seqs.push(await Promise.race([this.sendRecord(p.content, p.pub), this.errP]));
+    for (const p of plan) cur.seqs.push(await this.orFail(this.sendRecord(p.content, p.pub)));
     cur.dataLens = plan.slice(1).map((p) => p.data);
     this.event({ ev: "request_sent", n, records: plan.length, body_len: bodyLen });
     this.updateRelease();
