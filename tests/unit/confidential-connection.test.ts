@@ -88,7 +88,7 @@ vi.mock("../../client/confidential/params", async (orig) => ({
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
-import { ReceiptVerificationError, RequestRefusedError } from "../../client/confidential/errors";
+import { ReceiptVerificationError, RequestRefusedError, StreamNotProcessedError } from "../../client/confidential/errors";
 import { BOTH, NODE_PRIV, NODE_PUB, ONLY_11, v3OfferFields } from "./fixtures/v3";
 import { VENICE_CHAT } from "./fixtures/chat";
 
@@ -138,6 +138,10 @@ interface Script {
   receipt?: (s: Settle, honest: Receipt) => Receipt;
   /** The provider's SETTINGS payload after the head. */
   settings?: Uint8Array;
+  /** Framing "2": provider records sent when request n arrives, before `request_ok`. */
+  beforeRequestOk?: (n: number, stream: number) => Uint8Array[];
+  /** Framing "2": provider records sent (once) when a `release` does not cover every record yet. */
+  partialRelease?: () => Uint8Array[];
 }
 
 const head200 = (stream: number) => frame(FRAME.HEADERS, FLAG.END_HEADERS, stream, Uint8Array.from([0x88]));
@@ -217,6 +221,7 @@ class FakeNode {
           this.text({ type: "request_refused", n: m.n, ...refused });
           return;
         }
+        for (const c of this.script.beforeRequestOk?.(m.n, 2 * m.n + 1) ?? []) this.record(c);
         const suffix = canonicalSuffix(VENICE_CHAT, m.model, m.max_tokens);
         this.cur = { n: m.n, model: m.model, maxTokens: m.max_tokens, suffix, recs: [], released: false };
         this.text(
@@ -231,7 +236,12 @@ class FakeNode {
         return;
       case "release": {
         const cur = this.cur!;
-        if (cur.released || m.upto < cur.recs.length) return;
+        if (cur.released) return;
+        if (m.upto < cur.recs.length) {
+          for (const c of this.script.partialRelease?.() ?? []) this.record(c);
+          this.script.partialRelease = undefined;
+          return;
+        }
         cur.released = true;
         this.text({ type: "zk_params", proof: "pi_win", purpose: "records", first_seq: this.proven, count: this.seqs - this.proven, params: {} });
         this.proven = this.seqs;
@@ -553,6 +563,43 @@ describe("framing 2: requests on one connection", () => {
     expect(r.status).toBe(401);
     // The error-body wait is 10 s in this test: the reset ended it.
     expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("REFUSED_STREAM: the provider did not process the request (RFC 9113 §8.7)", async () => {
+    const conn = await connection("2", { respond2: (_n, s) => [rst(s, 7)] });
+    const h = conn.request(chatRequest());
+    await expect(h.done).rejects.toBeInstanceOf(StreamNotProcessedError);
+  });
+
+  it("GOAWAY below the request's stream: nothing is released, the request was not processed", async () => {
+    // The provider goes away with last-stream-id 1 (the probe) while request 1 (stream 3) is opening.
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0]));
+    const conn = await connection("2", { beforeRequestOk: () => [goaway] });
+    const h = conn.request(chatRequest());
+    await expect(h.done).rejects.toBeInstanceOf(StreamNotProcessedError);
+    expect(h.bodyReleased).toBe(false);
+    expect(node.log).not.toContain("release");
+  });
+
+  it("GOAWAY at or above the request's stream lets it finish", async () => {
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 3, 0, 0, 0, 0]));
+    const conn = await connection("2", { beforeRequestOk: () => [goaway] });
+    const r = await conn.request(chatRequest()).done;
+    expect(r.status).toBe(200);
+    expect(conn.idle).toBe(false);
+  });
+
+  it("SETTINGS_INITIAL_WINDOW_SIZE changes the open stream's window (RFC 9113 §6.9.2)", async () => {
+    // The provider starts with a 100-byte stream window (the body does not fit) and raises it later.
+    const setting = (v: number) => frame(FRAME.SETTINGS, 0, 0, Uint8Array.from([0, 4, v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]));
+    const conn = await connection("2", {
+      settings: setting(100).subarray(9),
+      partialRelease: () => [setting(65535)],
+    });
+    (conn as any).timeouts.released = 3_000;
+    const r = await conn.request(chatRequest()).done;
+    expect(r.status).toBe(200);
+    expect(node.log.filter((t) => t === "release")).toHaveLength(2);
   });
 
   it("a reset without an error head still fails the request", async () => {

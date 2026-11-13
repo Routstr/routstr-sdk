@@ -215,6 +215,20 @@ export class ProverMissingError extends ConfidentialError {
 }
 
 /** The receipt/attestation signature or its arithmetic did not check out. */
+/**
+ * The provider did not process the request (RFC 9113 §8.7): it refused the
+ * stream (`RST_STREAM(REFUSED_STREAM)`) or went away with a last-stream-id
+ * below it (`GOAWAY`). Nothing of the response came; the request may run
+ * again on another connection, even after its body was released (the node may
+ * still charge a released request's reservation: PROTOCOL-V3.md §12.10).
+ */
+export class StreamNotProcessedError extends SessionRejectedError {
+  constructor(message: string) {
+    super(message);
+    this.name = "StreamNotProcessedError";
+  }
+}
+
 export class ReceiptVerificationError extends ConfidentialError {
   constructor(message: string, detail?: string) {
     super("receipt_verification", message, detail);
