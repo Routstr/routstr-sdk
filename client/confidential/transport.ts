@@ -38,6 +38,7 @@ import {
   ConfidentialError,
   ConnectionDepositError,
   NodeProtocolOutdatedError,
+  OfferUnavailableError,
   ProverMissingError,
   RequestRefusedError,
   SessionRejectedError,
@@ -270,6 +271,11 @@ function retryOnFreshConnection(error: unknown): boolean {
   return !(error instanceof SessionRejectedError && error.status !== undefined && error.status !== 408);
 }
 
+/** Nodes whose offer could not be fetched (unreachable, an HTTP error, a timeout), until when. */
+const offerUnreachable = new Map<string, { until: number; failures: number; error: Error }>();
+const OFFER_COOLDOWN_BASE_MS = 30_000;
+const OFFER_COOLDOWN_MAX_MS = 10 * 60_000;
+
 /** Signed offers by node; every use re-verifies it under the caller's policy. */
 const offerCache = new Map<string, { offer: VerifiedOffer; at: number }>();
 
@@ -309,9 +315,25 @@ async function verifiedOffer(
     // call: a cached offer accepted under a looser policy must not leak.
     offer = verifyConfidentialOffer(hit.offer, policy);
   } else {
+    // A node whose offer could not be fetched lately is not asked again
+    // until its cooldown ends: each request would otherwise wait for it
+    // (a connect timeout) before failing over (§2.2).
+    const cool = offerUnreachable.get(key);
+    if (cool && Date.now() < cool.until) {
+      throw new OfferUnavailableError(
+        `${key} did not serve its offer lately; not asked again for ${Math.ceil((cool.until - Date.now()) / 1000)} s`,
+        cool.error.message,
+      );
+    }
     try {
       offer = await fetchConfidentialOffer(key, policy);
+      offerUnreachable.delete(key);
     } catch (error) {
+      if (error instanceof OfferUnavailableError) {
+        const failures = (cool?.failures ?? 0) + 1;
+        const ms = Math.min(OFFER_COOLDOWN_BASE_MS * 2 ** (failures - 1), OFFER_COOLDOWN_MAX_MS);
+        offerUnreachable.set(key, { until: Date.now() + ms, failures, error });
+      }
       if (error instanceof NodeProtocolOutdatedError) {
         try {
           options.onNodeProtocolOutdated?.(key, error.nodeVersion);
