@@ -1731,6 +1731,12 @@ export class RoutstrClient {
     retryCount: number = 0,
     upstream?: UpstreamEnvelope
   ): Promise<Response> {
+    // Refund proofs can be the only recoverable value even after disconnect.
+    if (params.signal?.aborted && xCashuRefundToken) {
+      this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
+      await this.storageAdapter.flush?.();
+    }
+    throwIfFundingAborted(params.signal);
     const MAX_RETRIES_PER_PROVIDER = 2;
     const { path, method, body, selectedModel, baseUrl, mintUrl } = params;
     let tryNextProvider: boolean = false;
@@ -1850,6 +1856,7 @@ export class RoutstrClient {
     // prevents double-receiving when both are somehow valid.
     // Skipped entirely for token_already_spent (handled above).
     let refundReceived = false;
+    let recoveryPending = false;
 
     if (!tryNextProvider && this.mode === "xcashu" && xCashuRefundToken) {
       this._log(
@@ -1858,7 +1865,13 @@ export class RoutstrClient {
       );
       recoveryAttempted = true;
       const receiveResult =
-        await this.cashuSpender.receiveToken(xCashuRefundToken);
+        await this.cashuSpender.receiveTokenForRecovery(xCashuRefundToken, params.signal, () => {
+          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        });
+      if (receiveResult.pending) {
+        recoveryPending = true;
+        tryNextProvider = true;
+      }
       if (receiveResult.success) {
         this._log(
           "DEBUG",
@@ -1866,7 +1879,6 @@ export class RoutstrClient {
         );
         // Refund claimed — remove the original spent token from storage so
         // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
-        this.storageAdapter.removeXcashuToken(baseUrl, params.token);
         tryNextProvider = true;
         refundReceived = true;
         recoverySucceeded = true;
@@ -1890,28 +1902,19 @@ export class RoutstrClient {
       (!xCashuRefundToken || xCashuRefundToken !== params.token)
     ) {
       recoveryAttempted = true;
-      const receiveResult = await this.cashuSpender.receiveToken(params.token);
+      const receiveResult = await this.cashuSpender.receiveTokenForRecovery(params.token, params.signal, () => {
+        if (this.mode === "xcashu") this.storageAdapter.removeXcashuToken(baseUrl, params.token);
+        else if (this.storageAdapter.getApiKey(baseUrl)?.key === params.token) this.storageAdapter.removeApiKey(baseUrl);
+      });
+      if (receiveResult.pending) {
+        recoveryPending = true;
+        tryNextProvider = true;
+      }
       if (receiveResult.success) {
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Token restored successfully, amount=${receiveResult.amount}`
         );
-        // The original token is back in the wallet. Drop the stored
-        // credential: an xcashu IOU in xcashu mode, or the (now permanently
-        // dead) bootstrap API key in apikeys mode — but only if a concurrent
-        // request hasn't already swapped in the provider's canonical key.
-        if (this.mode === "xcashu") {
-          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
-        } else if (
-          this.mode === "apikeys" &&
-          this.storageAdapter.getApiKey(baseUrl)?.key === params.token
-        ) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Removing dead bootstrap API key for ${baseUrl} (token restored to wallet)`
-          );
-          this.storageAdapter.removeApiKey(baseUrl);
-        }
         tryNextProvider = true;
         recoverySucceeded = true;
       } else {
@@ -1922,6 +1925,8 @@ export class RoutstrClient {
       }
     }
 
+    throwIfFundingAborted(params.signal);
+
     // A foreign-mint swap failure (mint_error) and an unreachable mint
     // (mint_unreachable) both identify the mint, not the provider. Once the
     // rejected token has been reclaimed, retry this same provider first with
@@ -1930,6 +1935,7 @@ export class RoutstrClient {
     if (
       params.token.startsWith("cashu") &&
       tryNextProvider &&
+      !recoveryPending &&
       shouldFailoverToAnotherMint(parsedError) &&
       retryCount < MAX_RETRIES_PER_PROVIDER
     ) {
@@ -2687,6 +2693,7 @@ export class RoutstrClient {
       let newRequiredSats = params.requiredSats;
 
       while (nextProvider) {
+        throwIfFundingAborted(params.signal);
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Failing over to next provider: ${nextProvider}, model: ${failoverModelId}`

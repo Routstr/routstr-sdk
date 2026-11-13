@@ -1,3 +1,4 @@
+import { awaitWithAbort } from "../client/abortable";
 import { throwIfFundingAborted } from "./fundingCancellation";
 /**
  * CashuSpender - Core spending logic for Cashu tokens
@@ -104,6 +105,52 @@ export class CashuSpender {
     }
   }
 
+  /** Bound only the foreground wait. The receive retains ownership until it settles.
+   * Cache before starting so timeout/disconnect cannot lose the recovery token.
+   */
+  async receiveTokenForRecovery(
+    token: string, signal?: AbortSignal, onSuccess?: () => void,
+    timeoutMs = 10_000,
+  ): Promise<Awaited<ReturnType<CashuSpender["receiveToken"]>> & { pending?: boolean }> {
+    this.cacheReceiveToken(token);
+    let operation = this.pendingReceives.get(token);
+    if (!operation) {
+      // Register before yielding (including storage flush) so another caller
+      // cannot start or finish a competing receive between lookup and start.
+      operation = Promise.resolve().then(async () => {
+        await this.storageAdapter.flush?.();
+        throwIfFundingAborted(signal);
+        return this.receiveToken(token);
+      }).then(result => {
+        if (result.success || /already spent/i.test(result.message ?? "")) {
+          this.storageAdapter.setCachedReceiveTokens(
+            this.storageAdapter.getCachedReceiveTokens().filter(entry => entry.token !== token)
+          );
+        }
+        return result;
+      }).finally(() => { this.pendingReceives.delete(token); });
+      this.pendingReceives.set(token, operation);
+    }
+    const settlement = operation.then(result => {
+      if (result.success) onSuccess?.();
+      return result;
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await awaitWithAbort(Promise.race([
+        settlement,
+        new Promise<Awaited<ReturnType<CashuSpender["receiveToken"]>> & { pending?: boolean }>(resolve => {
+          timer = setTimeout(() => resolve({ success: false, pending: true, ...this._decodeTokenAmount(token),
+            message: "Payment recovery timed out; recovery remains pending" }), timeoutMs);
+        }),
+      ]), signal);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private readonly pendingReceives = new Map<string, ReturnType<CashuSpender["receiveToken"]>>();
+
   /** Preserve an unrecovered token without adding duplicate entries. */
   cacheReceiveToken(token: string): void {
     const cached = this.storageAdapter.getCachedReceiveTokens();
@@ -124,7 +171,12 @@ export class CashuSpender {
   > {
     const results: { token: string; success: boolean }[] = [];
     for (const entry of this.storageAdapter.getCachedReceiveTokens()) {
-      const result = await this.receiveToken(entry.token);
+      if (this.pendingReceives.has(entry.token)) continue;
+      const work = this.receiveToken(entry.token).finally(() => {
+        this.pendingReceives.delete(entry.token);
+      });
+      this.pendingReceives.set(entry.token, work);
+      const result = await work;
       if (result.success || /already spent/i.test(result.message ?? "")) {
         // Re-read so tokens cached during the receive are not overwritten.
         this.storageAdapter.setCachedReceiveTokens(

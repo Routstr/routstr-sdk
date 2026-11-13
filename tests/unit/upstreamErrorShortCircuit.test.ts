@@ -59,6 +59,8 @@ function setup(mode: "apikeys" | "xcashu" = "apikeys", selectedModel: Model = mo
   const removeApiKey = vi.fn();
   const removeXcashuToken = vi.fn();
   const storage = {
+    getCachedReceiveTokens: () => [],
+    setCachedReceiveTokens: () => {},
     getApiKey: () => ({ key: credential, baseUrl, balance: 399, lastUsed: null }),
     removeApiKey,
     removeXcashuToken,
@@ -139,8 +141,9 @@ const okResponse = () =>
     headers: { "content-type": "application/json" },
   });
 
-function routeRequest(client: RoutstrClient) {
+function routeRequest(client: RoutstrClient, signal?: AbortSignal) {
   return client.routeRequest({
+    signal,
     path: "/v1/messages",
     method: "POST",
     body: {
@@ -157,8 +160,44 @@ function routeRequest(client: RoutstrClient) {
 
 describe("upstream request errors keep the key, fail over, and aggregate at exhaustion", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("fails over after a hung refund deadline without redeeming original proofs", async () => {
+    vi.useFakeTimers();
+    const { client, spend } = setup("xcashu");
+    let settle!: (value: any) => void;
+    const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockImplementation(() => new Promise(resolve => { settle = resolve; }));
+    stubFetch({ status: 500, statusText: "Error", body: "upstream failed", headers: { "x-cashu": "cashu-refund" } }, okResponse());
+    const pending = routeRequest(client);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect((await pending).status).toBe(200);
+    expect(receive.mock.calls).toEqual([["cashu-refund"]]);
+    expect(spend).toHaveBeenCalledTimes(2);
+    settle({ success: true, amount: 100, unit: "sat" });
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("does not fund or dispatch failover after cancellation during recovery", async () => {
+    const { client, spend } = setup("xcashu");
+    const controller = new AbortController();
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let settle!: (value: any) => void;
+    vi.spyOn(client.getCashuSpender(), "receiveToken").mockImplementation(() => {
+      entered(); return new Promise(resolve => { settle = resolve; });
+    });
+    const transport = stubFetch({ status: 500, statusText: "Error", body: "upstream failed", headers: { "x-cashu": "cashu-refund" } }, okResponse());
+    const pending = routeRequest(client, controller.signal);
+    await started;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    settle({ success: true, amount: 100, unit: "sat" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(spend).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
   it("walks three real provider candidates once and groups duplicate errors", async () => {
@@ -386,7 +425,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
     const response = await routeRequest(client);
     expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
-    expect(cache).toHaveBeenCalledExactlyOnceWith("cashu-refund");
+    expect(cache.mock.calls).toEqual([["cashu-refund"], ["cashu-refund"], ["cashu-original"]]);
     expect(removeXcashuToken).not.toHaveBeenCalled();
     expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     expect(response.status).toBe(400);
@@ -422,7 +461,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(response.status).toBe(200);
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([`${baseUrl}v1/messages`, `${nextUrl}v1/messages`]);
     expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
-    expect(cache).toHaveBeenCalledExactlyOnceWith("cashu-refund");
+    expect(cache.mock.calls).toEqual([["cashu-refund"], ["cashu-refund"], ["cashu-original"]]);
     expect(removeXcashuToken).not.toHaveBeenCalled();
     expect(spend).toHaveBeenCalledTimes(2);
     expect(providerManager.markFailed).not.toHaveBeenCalled();
