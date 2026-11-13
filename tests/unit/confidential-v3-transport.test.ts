@@ -22,6 +22,7 @@ import {
   RequestRefusedError,
   SessionProtocolError,
   SessionRejectedError,
+  StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
 } from "../../client/confidential/errors";
@@ -556,6 +557,21 @@ describe("v3 transport: a pooled connection is a cache, never a promise", () => 
     expect(confidentialConnectionsSnapshot()).toHaveLength(0);
     expect((await call(url)).status).toBe(200);
     expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs a request the provider did not process again, even after its release (REFUSED_STREAM, GOAWAY)", async () => {
+    mockNodeOffer();
+    const logs: string[] = [];
+    let calls = 0;
+    const { connect } = fakeConnections(() =>
+      calls++ === 0 ? { released: true, fail: new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM)") } : {},
+    );
+    const res = await call(freshNode(), {}, { http2: { log: (l: string) => logs.push(l) } });
+    expect(res.status).toBe(200);
+    // Not a failure of framing "2": the retry stays on it.
+    expect(framings(connect)).toEqual(["2", "2"]);
+    expect(logs.some((l) => /not processed by the provider/.test(l))).toBe(true);
+    expect(http2OpenFailure(new StreamNotProcessedError("x"))).toBe(false);
   });
 
   it("a setup the node refuses with a status is the HTTP error", async () => {
