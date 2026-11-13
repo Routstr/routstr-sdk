@@ -700,6 +700,12 @@ interface RunState {
   conns: ConfidentialConnection[];
   /** The response head reached the caller: never run the request again. */
   headSeen: boolean;
+  /**
+   * What the node charged for attempts the provider refused and that were
+   * settled (`disclose_reset`: the session fee if it was still due), run
+   * again on a new connection: part of what this call cost.
+   */
+  refusedCostMsats?: number;
 }
 
 function credentialSent(state: RunState): boolean {
@@ -883,6 +889,9 @@ async function runOnPool(
       // release. The node cannot see why nothing came: a released request's
       // reservation may still be charged (PROTOCOL-V3.md §12.10).
       if (error instanceof StreamNotProcessedError) {
+        // A refusal the node settled on its proof costs what its receipt says
+        // (the session fee if it was still due), whatever the next attempt costs.
+        if (error.costMsats !== undefined) state.refusedCostMsats = (state.refusedCostMsats ?? 0) + error.costMsats;
         log(
           `sid=${handle.sid.slice(0, 8)} request ${handle.n} was not processed by the provider (${errorText(error)}); ` +
             `running it on a new connection${handle.bodyReleased ? " (the node may charge the released request's reservation)" : ""}`,
@@ -958,7 +967,7 @@ async function fetchConfidentialImageOnce(
   const offer = await qualifiedOffer(baseUrl, model, options, freshOffer, "images");
   const plan = planImageRequest(request, offer.images!);
   throwIfAborted(params.signal);
-  const state: RunState = { conns: [], headSeen: false };
+  const state: RunState = { conns: [], headSeen: false, refusedCostMsats: 0 };
   const abort = callerAbort(params.signal, () => state.handle);
   const tRequest = Date.now();
   const runP = runOnPool(
@@ -991,7 +1000,8 @@ async function fetchConfidentialImageOnce(
   const headers = new Headers();
   confidentialHeaders(headers, r, state, options);
   headers.set("x-routstr-confidential-variant", plan.variant.id);
-  if (typeof r.receipt.cost_msats === "number") headers.set("x-routstr-cost-msats", String(r.receipt.cost_msats));
+  const costMsats = receiptCostMsats(r, state);
+  if (costMsats !== undefined) headers.set("x-routstr-cost-msats", String(costMsats));
   let response: Response;
   if (r.status >= 200 && r.status < 300) {
     // Accepted and paid at the flat price: what fell short is reported, not
@@ -1026,7 +1036,7 @@ async function fetchConfidentialImageOnce(
   const change = params.returnChange ? await withdrawBalance(baseUrl, params.bearer) : undefined;
   if (change) response.headers.set("x-cashu", change);
   (response as unknown as { confidentialSettled: Promise<ConfidentialSettlement> }).confidentialSettled =
-    Promise.resolve({ change, costMsats: receiptCostMsats(r) });
+    Promise.resolve({ change, costMsats: receiptCostMsats(r, state) });
   return response;
 }
 
@@ -1064,7 +1074,7 @@ async function fetchConfidentialOnce(
   // The request's start: it may first wait for a connection, and that wait
   // belongs in its timings.
   const tRequest = Date.now();
-  const state: RunState = { conns: [], headSeen: false };
+  const state: RunState = { conns: [], headSeen: false, refusedCostMsats: 0 };
 
   const stream = new TransformStream<Uint8Array, Uint8Array>();
   const writer = stream.writable.getWriter();
@@ -1145,7 +1155,7 @@ async function fetchConfidentialOnce(
         change = await withdrawBalance(baseUrl, params.bearer);
         if (change) response?.headers.set("x-cashu", change);
       }
-      return { change, costMsats: receiptCostMsats(r) };
+      return { change, costMsats: receiptCostMsats(r, state) };
     },
     async (error: unknown) => {
       const released = releasedNow(state);
@@ -1195,7 +1205,7 @@ async function fetchConfidentialOnce(
     if (change) response.headers.set("x-cashu", change);
     // What the node charged, as on any priced response (a stream's caller
     // reads it from `confidentialSettled`: its headers left before the receipt).
-    const cost = receiptCostMsats(await runP);
+    const cost = receiptCostMsats(await runP, state);
     if (cost !== undefined) response.headers.set("x-routstr-cost-msats", String(cost));
     const warnings = (await runP).warnings;
     if (warnings?.length) setWarnings(response.headers, warnings);
@@ -1221,10 +1231,11 @@ export interface ConfidentialSettlement {
   costMsats?: number;
 }
 
-/** The verified receipt's charge, when it names one. */
-function receiptCostMsats(r: ConnectionRequestResult): number | undefined {
+/** The verified receipt's charge, when it names one, plus what refused attempts of the call were charged. */
+function receiptCostMsats(r: ConnectionRequestResult, state?: RunState): number | undefined {
   const cost = r.receipt?.cost_msats;
-  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+  if (!(typeof cost === "number" && Number.isFinite(cost) && cost >= 0)) return undefined;
+  return cost + (state?.refusedCostMsats ?? 0);
 }
 
 /**

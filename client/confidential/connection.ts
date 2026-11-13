@@ -64,6 +64,9 @@ import {
   decodeBlock,
   errorHeadPrefixProblem,
   frame,
+  NO_ERROR,
+  parseRefusal,
+  REFUSED_STREAM,
   frameHeader,
   latin1,
   requestBlock,
@@ -92,7 +95,7 @@ import {
 } from "./offer";
 import { checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params";
 import { CuProverBackend } from "./prover";
-import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
+import { checkRefusalReceipt, checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
 import {
   countKeyUpdates,
   cryptoRandom,
@@ -411,6 +414,12 @@ interface Cur {
   parts: { off: number; data: Uint8Array }[];
   ended: boolean;
   reset?: number;
+  /**
+   * The provider refused the stream before any response on it: the stream
+   * offsets of the refusing frame (RST_STREAM(REFUSED_STREAM) on it, or
+   * GOAWAY(NO_ERROR) below it), disclosed with `disclose_reset` (§5.4).
+   */
+  refusal?: { start: number; end: number };
   proofs: ProofTiming[];
   settled: boolean;
 }
@@ -1544,12 +1553,22 @@ export class ConfidentialConnection {
         if (f.payload.length >= 8) {
           const last = u32(f.payload) & 0x7fffffff;
           this.goawayLast = Math.min(last, this.goawayLast ?? last);
+          // A graceful GOAWAY that leaves out the open request's stream: it
+          // was not processed, and the client can prove it (§5.4).
+          if (cur && last < cur.stream && u32(f.payload, 4) === NO_ERROR && cur.status === undefined && !cur.refusal) {
+            cur.refusal = { start: f.off, end: f.off + 9 + f.payload.length };
+          }
         }
         this.event({ ev: "goaway", last_stream: this.goawayLast });
         break;
       }
       case FRAME.RST_STREAM:
-        if (cur && f.stream === cur.stream && f.payload.length >= 4) cur.reset = u32(f.payload);
+        if (cur && f.stream === cur.stream && f.payload.length >= 4) {
+          cur.reset = u32(f.payload);
+          if (f.payload.length === 4 && cur.reset === REFUSED_STREAM && cur.status === undefined && !cur.refusal) {
+            cur.refusal = { start: f.off, end: f.off + 13 };
+          }
+        }
         break;
       case FRAME.HEADERS: {
         if (!cur || f.stream !== cur.stream) break; // the probe stream's answer, if any
@@ -1932,11 +1951,16 @@ export class ConfidentialConnection {
     // Released (in steps, as the provider's window opens) or refused early.
     const errored = () => (cur.status ?? 0) >= 400;
     const unprocessed = () => this.notProcessed(cur) && cur.status === undefined;
+    // The provider's close before the release ends the wait too (§12.10: the
+    // node then waits only for a refusal's disclosure).
     await this.until(
-      () => cur.released || errored() || cur.reset !== undefined || unprocessed(),
+      () => cur.released || errored() || cur.reset !== undefined || unprocessed() || this.tlsEnded,
       `body_released for request ${n}`,
       this.timeouts.released,
     );
+    if (this.tlsEnded && !cur.released && !errored() && cur.reset === undefined && !unprocessed()) {
+      throw new SessionRejectedError(`the provider closed the connection before request ${n} was complete (nothing billed)`);
+    }
     // An image response is silent until the image is done: wait as long as
     // the signed offer says the provider may take.
     const idleMs = cur.image
@@ -1953,11 +1977,22 @@ export class ConfidentialConnection {
     // with NO_ERROR) is still disclosed and settled by its status.
     // RFC 9113 §8.7: a refused stream, or one above a GOAWAY's last stream, was not processed.
     if (!errored() && (cur.reset === 7 || unprocessed())) {
-      throw new StreamNotProcessedError(
+      const what =
         cur.reset === 7
           ? `the provider refused stream ${stream} (REFUSED_STREAM): request ${n} was not processed`
-          : `the provider is going away (GOAWAY, last stream ${this.goawayLast}): request ${n} on stream ${stream} was not processed`,
-      );
+          : `the provider is going away (GOAWAY, last stream ${this.goawayLast}): request ${n} on stream ${stream} was not processed`;
+      // Proven to the node, it settles like a 429: the session fee if it is
+      // still due, and the reservation is released (§12.8 `disclose_reset`).
+      const settled = await this.settleRefusal(cur);
+      if (settled) {
+        // The node closes the connection after it.
+        this.goaway = true;
+        throw new StreamNotProcessedError(`${what}; the refusal was proven and settled`, {
+          receipt: settled.receipt,
+          costMsats: settled.receipt.cost_msats ?? 0,
+        });
+      }
+      throw new StreamNotProcessedError(what);
     }
     if (cur.reset !== undefined && !errored()) {
       throw new ResponseVerificationError(`the provider reset stream ${stream} (code ${cur.reset})`);
@@ -2507,6 +2542,98 @@ export class ConfidentialConnection {
   }
 
   /**
+   * A refusal of the request's stream (§5.4, `disclose_reset`): R runs from
+   * byte 0 of the record the request's interval cannot start before (the
+   * records decrypted when it was sent, `recvAtSend`; or the record of a
+   * GOAWAY that came before even that) to the end of the refusing frame, so
+   * every frame the provider sent since is shown to be no response on the
+   * stream. Returns undefined, with nothing sent, when the refusal cannot be
+   * disclosed (the request then fails as before, unsettled).
+   */
+  private async settleRefusal(cur: Cur): Promise<{ receipt: ConfidentialReceipt; attestation: unknown } | undefined> {
+    await this.drained();
+    const ref = cur.refusal;
+    if (!ref || this.framing !== "2") return undefined;
+    const skip = (why: string) => {
+      this.event({ ev: "refusal_not_disclosed", n: cur.n, why });
+      return undefined;
+    };
+    let refRec;
+    try {
+      refRec = this.reader.recordAt(ref.start);
+    } catch {
+      return skip("the refusing frame is no longer held");
+    }
+    const startAbs = Math.min(cur.recvAtSend, refRec.abs);
+    const recs = this.reader.records.filter((x) => x.abs >= startAbs && x.abs <= refRec.abs);
+    // Consecutive application-data records (no KeyUpdate inside), each held in plaintext.
+    if (!recs.length || recs[0]!.abs !== startAbs || recs.some((x, i) => x.abs !== startAbs + i || !this.plain.has(x.abs))) {
+      return skip("the records from the request's start are not all held, or a KeyUpdate lies between them");
+    }
+    if (recs.length > 8) return skip("the refusal lies more than 8 records after the request's start");
+    const rec = recs[0]!;
+    const r = this.reader.slice(rec.start, ref.end);
+    if (r.length > 16 << 10) return skip("the disclosure would exceed 16 KiB");
+    const parsed = parseRefusal(r, cur.stream, cur.releaseSent);
+    if (typeof parsed === "string") return skip(parsed);
+    // Our own records are proven first (one π_WIN at a time).
+    try {
+      await this.until(() => this.unproven.size === 0, "our records to be proven", this.timeouts.proof);
+    } catch (e) {
+      if (e instanceof ConfidentialTimeoutError) return skip("our records were not proven");
+      throw e;
+    }
+    const postIdx = rec.abs - this.hsCipher;
+    let keyUpdates = 0;
+    let epochStart = 0;
+    for (let i = 0; i < postIdx; i++) {
+      if (this.serverPost[i]!.keyUpdates > 0) {
+        keyUpdates += this.serverPost[i]!.keyUpdates;
+        epochStart = i + 1;
+      }
+    }
+    const msg: Record<string, unknown> = { type: "disclose_reset", n: cur.n, record: rec.abs, r: hex(r) };
+    if (keyUpdates > 0) {
+      msg.key_updates = keyUpdates;
+      msg.epoch_start = epochStart;
+    }
+    this.sendOrdered(msg);
+    const att = await this.checkAttestation((await this.wait(["attestation"], this.timeouts.attestation)).msg, cur, undefined);
+    const m = (await this.wait(["zk_params:pi_win:refusal"], this.timeouts.zkParams)).msg;
+    if (m.n !== undefined && m.n !== cur.n) throw new SessionProtocolError("π_WIN for a refusal names another request");
+    if (m.record !== undefined && m.record !== rec.abs) throw new SessionProtocolError("π_WIN for a refusal names another record");
+    // The windows may touch only R's bytes and each record's final type byte.
+    const chunks = new Map<number, number>();
+    let left = r.length;
+    for (const x of recs) {
+      if (left <= 0) break;
+      const take = Math.min(left, x.content.length);
+      chunks.set(x.abs, take);
+      left -= take;
+    }
+    const shape = checkPiWinParams(m.params, {
+      anchor: this.secrets().h2,
+      keyUpdates,
+      lookup: (seq) => {
+        const abs = this.hsCipher + epochStart + seq;
+        const take = chunks.get(abs);
+        const plain = this.plain.get(abs);
+        const wire = this.serverRecords.get(abs);
+        if (take === undefined || !plain || !wire) return undefined;
+        return { ct: wire.subarray(0, wire.length - 16), plain, pub: [[0, take], [plain.length - 1, plain.length]] };
+      },
+      covered: [...chunks.keys()].map((abs) => abs - this.hsCipher - epochStart),
+    });
+    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
+    cur.proofs.push({ ...t, purpose: "refusal", ...shape });
+    const { receipt } = await this.takeReceipt(cur, att.json);
+    this.checkPinnedModel(cur, receipt);
+    checkRefusalReceipt(receipt, parsed, this.feeDue(cur), offerAbandonFeeMsat(cur.offer));
+    this.event({ ev: "refusal_settled", n: cur.n, refused: parsed.refused, cost_msats: receipt.cost_msats });
+    return { receipt, attestation: att.a };
+  }
+
+  /**
    * The per-request attestation: signed by the node's key, naming this
    * connection, handshake and request, an interval that starts no earlier
    * than the request and no later than its response, and hashes we can
@@ -2702,6 +2829,12 @@ export class ConfidentialConnection {
     if (receipt.http !== this.framing || receipt.n !== cur.n) {
       throw new ReceiptVerificationError(
         `receipt is for http ${JSON.stringify(receipt.http ?? null).slice(0, 16)} request ${String(receipt.n).slice(0, 16)}, not "${this.framing}" request ${cur.n}`,
+      );
+    }
+    // §12.4: every receipt names the reservation `request_ok` announced.
+    if (cur.reservedMsat !== undefined && receipt.reserved_msats !== undefined && receipt.reserved_msats !== cur.reservedMsat) {
+      throw new ReceiptVerificationError(
+        `receipt names a reservation of ${String(receipt.reserved_msats).slice(0, 32)} msats, the node announced ${cur.reservedMsat} msats`,
       );
     }
     // The connection's first settled request returns the deposit: its

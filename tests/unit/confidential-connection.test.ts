@@ -122,8 +122,10 @@ interface Settle {
   n: number;
   /** The node's own count: no request settled on this connection before. */
   first: boolean;
-  kind: "usage" | "error";
+  kind: "usage" | "error" | "refusal";
   status: number;
+  /** A refusal's usage (`disclose_reset`). */
+  refused?: Record<string, unknown>;
 }
 
 /** What the fake node does; every hook defaults to an honest node. */
@@ -142,6 +144,8 @@ interface Script {
   beforeRequestOk?: (n: number, stream: number) => Uint8Array[];
   /** Framing "2": provider records sent (once) when a `release` does not cover every record yet. */
   partialRelease?: () => Uint8Array[];
+  /** `request_ok.reserved_msats`, when the node announces one. */
+  reservedMsats?: number;
 }
 
 const head200 = (stream: number) => frame(FRAME.HEADERS, FLAG.END_HEADERS, stream, Uint8Array.from([0x88]));
@@ -160,6 +164,8 @@ class FakeNode {
   framing: "2" | "1.1" = "2";
   /** Control frames the client sent, by type, in order. */
   log: string[] = [];
+  /** Every control message the client sent, parsed. */
+  msgs: any[] = [];
   errors: Error[] = [];
   private hello = false;
   private headWritten = false;
@@ -205,6 +211,7 @@ class FakeNode {
     if (typeof d !== "string") return this.binary(d);
     const m = JSON.parse(d);
     this.log.push(m.type);
+    this.msgs.push(m);
     switch (m.type) {
       case "setup":
         this.framing = m.http;
@@ -226,8 +233,8 @@ class FakeNode {
         this.cur = { n: m.n, model: m.model, maxTokens: m.max_tokens, suffix, recs: [], released: false };
         this.text(
           this.framing === "2"
-            ? { type: "request_ok", n: m.n, sid: SID, stream: 2 * m.n + 1, suffix }
-            : { type: "request_ok", n: m.n, sid: SID, suffix, head_len: 100 },
+            ? { type: "request_ok", n: m.n, sid: SID, stream: 2 * m.n + 1, suffix, reserved_msats: this.script.reservedMsats }
+            : { type: "request_ok", n: m.n, sid: SID, suffix, head_len: 100, reserved_msats: this.script.reservedMsats },
         );
         return;
       }
@@ -243,8 +250,10 @@ class FakeNode {
           return;
         }
         cur.released = true;
-        this.text({ type: "zk_params", proof: "pi_win", purpose: "records", first_seq: this.proven, count: this.seqs - this.proven, params: {} });
-        this.proven = this.seqs;
+        if (this.proven < this.seqs) {
+          this.text({ type: "zk_params", proof: "pi_win", purpose: "records", first_seq: this.proven, count: this.seqs - this.proven, params: {} });
+          this.proven = this.seqs;
+        }
         this.text({ type: "body_released", n: cur.n });
         cur.sK = this.serverRecs.length;
         const stream = 2 * cur.n + 1;
@@ -288,6 +297,40 @@ class FakeNode {
         }
         return;
       }
+      case "disclose_reset": {
+        // §12.8: from byte 0 of `record` to the refusing frame; nothing
+        // written yet: the interval is fixed, empty, at the disclosure.
+        const cur = this.cur!;
+        const sK = cur.sK ?? this.serverRecs.length;
+        const end = this.serverRecs.length;
+        const sent = createHash("sha256");
+        const written = cur.sK === undefined ? 0 : cur.recs.length;
+        for (const r of cur.recs.slice(0, written)) sent.update(r);
+        this.attest({
+          sid: SID,
+          http: "2",
+          n: cur.n,
+          stream: 2 * cur.n + 1,
+          th_sh: TH_SH,
+          th_sf: TH_SF,
+          c_commit: hexOf(C_COMMIT),
+          s_k: sK,
+          server_records: end - sK,
+          sha256_recv: this.hashRecs(sK, end),
+          client_records: written,
+          sha256_sent: sent.digest("hex"),
+        });
+        this.text({ type: "zk_params", proof: "pi_win", purpose: "refusal", n: cur.n, record: m.record, params: {} });
+        const r = Buffer.from(m.r, "hex");
+        const refused =
+          r.length >= 13 && r[r.length - 13 + 3] === FRAME.RST_STREAM
+            ? { refused: "rst_stream", error_code: 7, choices: [] }
+            : { refused: "goaway", error_code: 0, last_stream_id: r.readUInt32BE(r.length - 8) & 0x7fffffff, choices: [] };
+        this.sendReceipt({ n: cur.n, first: this.settledCount === 0, kind: "refusal", status: 0, refused });
+        this.settledCount++;
+        this.text({ type: "closed", reason: "error_settled" });
+        return;
+      }
       default:
         return;
     }
@@ -314,6 +357,9 @@ class FakeNode {
     if (s.kind === "usage") {
       cost = USAGE_MSAT + fee;
       usage = JSON.parse(USAGE_EVENT);
+    } else if (s.kind === "refusal") {
+      cost = fee;
+      usage = s.refused;
     } else {
       cost = [401, 402, 403, 429, 503].includes(s.status) ? fee : ABANDON;
       usage = { error_status: s.status };
@@ -354,6 +400,14 @@ class FakeNode {
     const cur = this.cur;
     if (!cur) return;
     cur.recs.push(rec);
+    if (this.framing === "2") {
+      // As the sidecar: the request's records are proven once they are all in.
+      const inner = rec.subarray(5, rec.length - 16);
+      if (Buffer.from(inner.subarray(0, inner.length - 1)).toString().endsWith(cur.suffix)) {
+        this.text({ type: "zk_params", proof: "pi_win", purpose: "records", first_seq: this.proven, count: this.seqs - this.proven, params: {} });
+        this.proven = this.seqs;
+      }
+    }
     if (this.framing === "1.1") {
       const inner = rec.subarray(5, rec.length - 16);
       if (Buffer.from(inner.subarray(0, inner.length - 1)).toString() !== cur.suffix) return;
@@ -600,6 +654,78 @@ describe("framing 2: requests on one connection", () => {
     const r = await conn.request(chatRequest()).done;
     expect(r.status).toBe(200);
     expect(node.log.filter((t) => t === "release")).toHaveLength(2);
+  });
+
+  it("REFUSED_STREAM after a WINDOW_UPDATE: the refusal is proven (disclose_reset) and settled at the fee due", async () => {
+    const wu = (s: number) => frame(FRAME.WINDOW_UPDATE, 0, s, Uint8Array.from([0, 0, 1, 0]));
+    const conn = await connection("2", { respond2: (_n, s) => [wu(s), rst(s, 7)] });
+    const h = conn.request(chatRequest());
+    const err = await h.done.catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(err.costMsats).toBe(FEE);
+    expect(err.receipt?.usage).toEqual({ refused: "rst_stream", error_code: 7, choices: [] });
+    const m = node.msgs.find((x) => x.type === "disclose_reset");
+    // From byte 0 of the first record after the request was sent (the SETTINGS is record 0).
+    expect(m).toMatchObject({ n: 1, record: 1, r: hexOf(cat(wu(3), rst(3, 7))) });
+    expect(proofs.filter((p) => p !== "pi_nk")).toEqual(["pi_win", "pi_win"]);
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "released", reason: "request_settled", signed: true });
+  });
+
+  it("GOAWAY(NO_ERROR) below the stream before the release: proven, nothing released", async () => {
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0]));
+    const conn = await connection("2", { beforeRequestOk: () => [goaway] });
+    const h = conn.request(chatRequest());
+    const err = await h.done.catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(err.receipt?.usage).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1, choices: [] });
+    expect(node.log).not.toContain("release");
+    expect(node.msgs.find((x) => x.type === "disclose_reset")).toMatchObject({ record: 1, r: hexOf(goaway) });
+  });
+
+  it("GOAWAY with an error code is not disclosed (the client's frames may have caused it)", async () => {
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 1]));
+    const conn = await connection("2", { beforeRequestOk: () => [goaway] });
+    const err = await conn.request(chatRequest()).done.catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(err.receipt).toBeUndefined();
+    expect(node.log).not.toContain("disclose_reset");
+  });
+
+  it("a response head before REFUSED_STREAM: no refusal is disclosed", async () => {
+    const conn = await connection("2", { respond2: (_n, s) => [head200(s), rst(s, 7)] });
+    const err = await conn.request(chatRequest()).done.catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(node.log).not.toContain("disclose_reset");
+  });
+
+  it("refuses a refusal receipt that charges more than the session fee due", async () => {
+    const conn = await connection("2", {
+      respond2: (_n, s) => [rst(s, 7)],
+      receipt: (s, honest) => (s.kind === "refusal" ? { ...honest, cost_msats: ABANDON } : honest),
+    });
+    await expect(conn.request(chatRequest()).done).rejects.toBeInstanceOf(ReceiptVerificationError);
+  });
+
+  it("refuses a refusal receipt naming another refusal than the one seen", async () => {
+    const conn = await connection("2", {
+      respond2: (_n, s) => [rst(s, 7)],
+      receipt: (s, honest) => (s.kind === "refusal" ? { ...honest, usage: { refused: "goaway", error_code: 0, last_stream_id: 1, choices: [] } } : honest),
+    });
+    await expect(conn.request(chatRequest()).done).rejects.toBeInstanceOf(ReceiptVerificationError);
+  });
+
+  it("refuses any receipt whose reserved_msats differs from request_ok's", async () => {
+    const conn = await connection("2", {
+      reservedMsats: 5000,
+      receipt: (_s, honest) => ({ ...honest, reserved_msats: 6000 }),
+    });
+    await expect(conn.request(chatRequest()).done).rejects.toThrow(/announced 5000/);
+  });
+
+  it("accepts a receipt naming the announced reservation", async () => {
+    const conn = await connection("2", { reservedMsats: 5000, receipt: (_s, honest) => ({ ...honest, reserved_msats: 5000 }) });
+    expect((await conn.request(chatRequest()).done).status).toBe(200);
+    conn.close();
   });
 
   it("a reset without an error head still fails the request", async () => {

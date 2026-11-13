@@ -161,6 +161,7 @@ export {
   verifyReceipt,
   maxChargeMsats,
   feeOnlyChargeOk,
+  checkRefusalReceipt,
   checkUpstreamErrorReceipt,
   errorStatusCharge,
   verifyFlatReceipt,
