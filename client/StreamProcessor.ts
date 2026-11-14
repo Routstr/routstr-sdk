@@ -193,9 +193,12 @@ export class StreamProcessor {
         result.content = parsed.choices[0].delta.content;
       }
 
-      // Extract reasoning (OpenRouter style)
-      if (parsed.choices?.[0]?.delta?.reasoning) {
-        result.reasoning = parsed.choices[0].delta.reasoning;
+      // Extract reasoning (OpenRouter `reasoning`, DeepSeek/vLLM `reasoning_content`)
+      const reasoning =
+        parsed.choices?.[0]?.delta?.reasoning ||
+        parsed.choices?.[0]?.delta?.reasoning_content;
+      if (reasoning) {
+        result.reasoning = reasoning;
       }
 
       // Extract usage (usually in final chunk)
