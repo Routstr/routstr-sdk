@@ -387,7 +387,6 @@ export async function fetchAIResponse(
 async function convertMessages(messages: Message[]): Promise<any[]> {
   return Promise.all(
     messages
-      .filter((m) => m.role !== "system")
       .map(async (m) => ({
         role: m.role,
         content: typeof m.content === "string" ? m.content : m.content,
