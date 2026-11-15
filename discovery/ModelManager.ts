@@ -139,8 +139,36 @@ const MAX_EVENT_FUTURE_DRIFT_SECONDS = 15 * 60;
 /** Kinds whose persisted events are discovery evidence. */
 const DISCOVERY_KINDS = [38421, 38423, 38425, 38426, 38427];
 
+/**
+ * Kinds where the operator's own identity may outrank the configured author.
+ *
+ * These are the discovery kinds whose content is *client policy* — the
+ * whitelist of routes, the id-mapping table, the curated model list — so a
+ * local operator can legitimately want a different answer than the
+ * advertiser's. Kind 38425 (reviews) is deliberately absent: provider
+ * enable/disable already has a first-class local-override mechanism in
+ * `manuallyEnabledProviders` / `manuallyDisabledProviders`, which the router
+ * unions into the effective disabled set. Folding identity precedence in here
+ * would give that one decision two competing sources of truth. Kind 38421 is
+ * absent because it is multi-author by construction: every provider signs its
+ * own announcement, so "ours versus the configured one" does not exist.
+ */
+const IDENTITY_PRECEDENCE_KINDS: ReadonlySet<number> = new Set([38423, 38426, 38427]);
+
 /** Address of the authoritative replaceable model mapping snapshot. */
 const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";
+
+/**
+ * Query-cache keys for the reads widened by `identityPubkey`.
+ *
+ * The cache is keyed by the relay filter, which stays author-scoped for these
+ * kinds so identity config is never pulled back from relays. These stable keys
+ * keep that entry distinct from the widened store read instead of reusing the
+ * relay filter's key for both.
+ */
+const WHITELIST_QUERY_KEY = "identity-precedence:38427:model-path-whitelist";
+const MAPPINGS_QUERY_KEY = "identity-precedence:38426:model-id-mappings";
+const MODELS_QUERY_KEY = "identity-precedence:38423:routstr-21-models";
 
 // Deletes are chunked so one pruning pass never builds an unbounded SQL
 // statement; the store read itself is never limited.
@@ -175,6 +203,31 @@ export interface ModelManagerConfig {
    * When set, these relays are used for all Nostr queries (kinds 38421, 38423, 38425, 38426, 38427).
    * When unset, DEFAULT_NOSTR_RELAYS is used for all Nostr queries. */
   nostrRelays?: string[];
+  /**
+   * This client's own pubkey. Events authored by it take precedence over the
+   * configured discovery authors for the kinds that carry client policy
+   * (`IDENTITY_PRECEDENCE_KINDS`). Leave unset to keep the configured author
+   * as the only source.
+   *
+   * This is an explicit trust root, not a heuristic: a pubkey only wins here
+   * because the operator named it. Events from it must still carry a valid
+   * signature, so naming a pubkey you hold no key for grants nothing.
+   */
+  identityPubkey?: string;
+  /**
+   * Signs an event template as `identityPubkey`. Required for
+   * `setModelPathWhitelistFromIdentity`; inference-only clients can omit it.
+   *
+   * The returned event must be really signed by `identityPubkey`: the event
+   * store verifies on read, so a mismatch makes a local override look like it
+   * was never written. `publishModelPathWhitelist` asserts the relation.
+   */
+  identitySigner?: (template: {
+    kind: number;
+    created_at: number;
+    tags: string[][];
+    content: string;
+  }) => NostrEvent;
   /** Optional injectable logger */
   logger?: SdkLogger;
   /** Path to database for persistent Nostr event storage.
@@ -240,6 +293,9 @@ export class ModelManager {
   private readonly routstrPubkey: string;
   private readonly routstrModelsPubkey: string;
   private readonly nostrRelays: string[] | undefined;
+  /** Undefined unless the operator named an identity; see ModelManagerConfig. */
+  private readonly identityPubkey: string | undefined;
+  private readonly identitySigner: ModelManagerConfig["identitySigner"];
   private readonly logger: SdkLogger;
   private providerNodePubkeysByUrl = new Map<string, Set<string>>();
   /** One pool for all queries, so repeated bootstraps reuse relay sockets. */
@@ -288,6 +344,11 @@ export class ModelManager {
       config.routstrPubkey ||
       "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8";
     this.nostrRelays = config.nostrRelays;
+    // A blank or whitespace-only value is "not configured", never an author id:
+    // the precedence comparisons test equality, so an empty string would only
+    // ever add a permanently unmatched author.
+    this.identityPubkey = config.identityPubkey?.trim() || undefined;
+    this.identitySigner = config.identitySigner;
     this.logger = (config.logger ?? consoleLogger).child("ModelManager");
 
     this.eventStoreDbPath = config.eventStoreDbPath;
@@ -507,6 +568,49 @@ export class ModelManager {
   }
 
   /**
+   * True for an event from the configured discovery author, or from the
+   * operator's own identity on a kind where local policy may outrank it.
+   *
+   * Callers must still apply {@link isNostrEventTrustworthy}; this answers only
+   * "is this event from an author we are willing to read policy from?", which
+   * is what the previous `event.pubkey === <configured>` checks were really
+   * asking.
+   */
+  private isTrustedPolicyAuthor(event: NostrEvent, expected: string): boolean {
+    if (event.pubkey === expected) return true;
+    return this.identityPubkey !== undefined &&
+      event.pubkey === this.identityPubkey &&
+      IDENTITY_PRECEDENCE_KINDS.has(event.kind);
+  }
+
+  /**
+   * Rank authors for one replaceable address: the operator's own identity
+   * first, then the configured/other authors. Stable and content-independent,
+   * so it never changes which event wins within a tier.
+   */
+  private authorRank(pubkey: string): number {
+    return this.identityPubkey !== undefined && pubkey === this.identityPubkey ? 0 : 1;
+  }
+
+  /**
+   * Pick the winner among several signed versions of one config document.
+   *
+   * Identity precedence means an explicit local choice ("these are the routes
+   * I want") is not undone by a newer external publication; that is the entire
+   * point of configuring an identity. Within a tier the existing newness rule
+   * still applies, so a stale local document does not shadow a newer local one.
+   *
+   * Trade-off, accepted: because a local document wins regardless of age, an
+   * external author can no longer shadow it merely by publishing later. That is
+   * intended, and `reset` is the way back to the external document.
+   */
+  private compareConfigVersions(a: NostrEvent, b: NostrEvent): number {
+    return this.authorRank(a.pubkey) - this.authorRank(b.pubkey) ||
+      b.created_at - a.created_at ||
+      (a.id === b.id ? 0 : a.id < b.id ? 1 : -1);
+  }
+
+  /**
    * Query Nostr events for a filter from the event store (persistent or
    * memory fallback), live-fetching from relays only when forced, the store is
    * empty for the filter, or the last successful fetch for the filter is
@@ -514,15 +618,27 @@ export class ModelManager {
    * once per call; `onEvent` fires once per returned event. `accept` scopes a
    * query to the events it can actually use, so unrelated publishers sharing
    * the kind are never stored, verified, or counted as evidence.
+   *
+   * `extraAuthors` widens only the *store* read. Identity-authored config is
+   * local by definition, so it must never be pulled back from relays: doing so
+   * would both depend on relay availability for a local setting and publish the
+   * operator's own preferences to anyone serving the query. `queryKey` names
+   * that distinction in the query cache, so the widened read cannot share a
+   * cache entry with the relay-scoped query.
    */
   private async getNostrEvents(
     filter: Filter,
     forceRefresh: boolean = false,
     onEvent?: (event: NostrEvent) => void,
-    accept?: (event: NostrEvent) => boolean
+    accept?: (event: NostrEvent) => boolean,
+    extraAuthors: readonly string[] = [],
+    queryKey?: string
   ): Promise<NostrEvent[]> {
     const eventStore = (await this.ensureEventStore()) ?? this.memoryEventStore;
-    const query = JSON.stringify(filter);
+    const storeFilter: Filter = extraAuthors.length > 0
+      ? { ...filter, authors: [...new Set([...(filter.authors ?? []), ...extraAuthors])] }
+      : filter;
+    const query = queryKey ?? JSON.stringify(filter);
     const lastUpdate = this.queryLastUpdate.get(query) ??
       this.adapter.getNostrQueryLastUpdate?.()?.[query];
     const now = Date.now();
@@ -534,7 +650,7 @@ export class ModelManager {
     // read would be discarded, so skip it entirely.
     const cached = forceRefresh
       ? []
-      : this.readStoredEvents(eventStore, filter, accept);
+      : this.readStoredEvents(eventStore, storeFilter, accept);
 
     if (forceRefresh || cached.length === 0 || !cacheValid) {
       await this.collectNostrEvents(
@@ -561,7 +677,7 @@ export class ModelManager {
 
       // Refresh timing does not expire saved announcements or reviews; the
       // re-read picks up both newly stored and previously saved events.
-      const events = this.readStoredEvents(eventStore, filter, accept);
+      const events = this.readStoredEvents(eventStore, storeFilter, accept);
       for (const event of events) {
         if (!received.has(event.id)) onEvent?.(event);
       }
@@ -1709,7 +1825,7 @@ export class ModelManager {
   }
 
   private isModelPathWhitelistEvidence(event: NostrEvent): boolean {
-    return event.kind === 38427 && event.pubkey === this.routstrModelsPubkey &&
+    return event.kind === 38427 && this.isTrustedPolicyAuthor(event, this.routstrModelsPubkey) &&
       getReplaceableIdentifier(event) === "model-path-whitelist" && this.isNostrEventTrustworthy(event);
   }
 
@@ -1751,13 +1867,16 @@ export class ModelManager {
     }
     const events = await this.getNostrEvents(
       { kinds: [38427], "#d": ["model-path-whitelist"], authors: [this.routstrModelsPubkey] },
-      forceRefresh || changed, undefined, event => this.isModelPathWhitelistEvent(event, mappings)
+      forceRefresh || changed, undefined, event => this.isModelPathWhitelistEvent(event, mappings),
+      this.identityPubkey ? [this.identityPubkey] : [],
+      this.identityPubkey ? WHITELIST_QUERY_KEY : undefined
     );
     this.whitelistMappingsKey = mappingsKey;
-    // Even when changed mappings invalidate saved content, its signed version
-    // remains the high-water mark. Never roll back to an older valid candidate.
-    const compare = (a: NostrEvent, b: NostrEvent) =>
-      b.created_at - a.created_at || a.id.localeCompare(b.id);
+    // Identity precedence outranks newness (see compareConfigVersions): a local
+    // whitelist is an explicit choice, not a cached observation. `saved` stays
+    // in the candidate set because the adapter's persisted event may predate
+    // this store and is still the operator's own most recent accepted version.
+    const compare = (a: NostrEvent, b: NostrEvent) => this.compareConfigVersions(a, b);
     const candidates = (saved ? [...events, saved] : events)
       .filter(event => this.isModelPathWhitelistEvent(event, mappings))
       .filter(event => !saved || !this.isModelPathWhitelistEvidence(saved) || compare(event, saved) <= 0)
@@ -1768,8 +1887,101 @@ export class ModelManager {
     this.adapter.setModelPathWhitelistEvent(event);
     this.adapter.setModelPathWhitelist(policy);
     this.adapter.setModelPathWhitelistLastUpdate?.(Date.now());
-    this.logger.debug("Accepted model-path whitelist", event.created_at, Object.keys(policy));
+    this.logger.debug(
+      "Accepted model-path whitelist",
+      event.created_at,
+      Object.keys(policy),
+      event.pubkey === this.identityPubkey ? "(local identity)" : "(configured author)"
+    );
     return policy;
+  }
+
+  /**
+   * Replace this client's own model-path whitelist with `models` and make it
+   * the active policy immediately.
+   *
+   * The document is signed by `identitySigner`, validated with the same parser
+   * the advertiser's event goes through, and stored **locally only**. It is not
+   * broadcast: a routing preference is not public information, so publishing is
+   * a separate, explicit decision.
+   *
+   * Pass an empty object to clear the local policy and fall back to the
+   * configured author's event.
+   */
+  async setModelPathWhitelistFromIdentity(
+    models: ModelPathWhitelist
+  ): Promise<ModelPathWhitelist> {
+    const pubkey = this.identityPubkey;
+    const signer = this.identitySigner;
+    if (!pubkey || !signer) {
+      throw new Error(
+        "Identity config requires ModelManagerConfig.identityPubkey and identitySigner"
+      );
+    }
+    const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
+
+    if (Object.keys(models).length === 0) {
+      // Clearing means "no local document", not "a local document that
+      // authorizes nothing": an absent entry is what lets the configured
+      // author's policy apply again.
+      store.removeByFilters({
+        kinds: [38427],
+        authors: [pubkey],
+        "#d": ["model-path-whitelist"],
+      });
+      // The adapter's persisted event is a second copy of the same document.
+      // Leaving it in place would let the next pass re-add it to the store and
+      // silently undo the clear.
+      if (this.adapter.getModelPathWhitelistEvent()?.pubkey === pubkey) {
+        this.adapter.setModelPathWhitelistEvent(null);
+      }
+      return this.fetchModelPathWhitelist(true);
+    }
+
+    // Validate before signing: a document the reader would reject must never
+    // reach the store, where it would look like a policy that silently does
+    // nothing.
+    const content = JSON.stringify({ version: 1, models });
+    parseModelPathWhitelist(content, this.getModelIdMappings());
+
+    const signed = signer({
+      kind: 38427,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["d", "model-path-whitelist"]],
+      content,
+    });
+    if (signed.kind !== 38427 || signed.pubkey !== pubkey || !verifyEvent(signed)) {
+      throw new Error(
+        "identitySigner must return a valid kind 38427 event signed by identityPubkey"
+      );
+    }
+
+    this.storeDiscoveryEvent(store, signed);
+    return this.fetchModelPathWhitelist(true);
+  }
+
+  /**
+   * Broadcast this client's own model-path whitelist to the configured relays.
+   *
+   * Separate from {@link setModelPathWhitelistFromIdentity} on purpose: the
+   * local write is a private preference, and making it discoverable by others
+   * is a decision the operator should take explicitly.
+   */
+  async publishModelPathWhitelist(): Promise<void> {
+    const pubkey = this.identityPubkey;
+    if (!pubkey) throw new Error("Identity config requires identityPubkey");
+    const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
+    // getTimeline makes no ordering promise; pick the newest version explicitly.
+    const event = store
+      .getTimeline({ kinds: [38427], authors: [pubkey], "#d": ["model-path-whitelist"] })
+      .sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))[0];
+    if (!event) throw new Error("No local model-path whitelist to publish");
+    await this.relayPoolForPublish().publish(this.getNostrRelays(), event);
+  }
+
+  private relayPoolForPublish(): RelayPool {
+    if (!this.relayPool) this.relayPool = new RelayPool();
+    return this.relayPool;
   }
 
   /** Current per-adapter mapping snapshot; offline first runs use the bundled fallback. */
@@ -1801,7 +2013,9 @@ export class ModelManager {
       { kinds: [38426], "#d": [MODEL_ID_MAPPINGS_D_TAG], authors: [this.routstrModelsPubkey] },
       forceRefresh,
       undefined,
-      event => this.isModelIdMappingEvent(event)
+      event => this.isModelIdMappingEvent(event),
+      this.identityPubkey ? [this.identityPubkey] : [],
+      this.identityPubkey ? MAPPINGS_QUERY_KEY : undefined
     );
     return this.applyModelIdMappingEvents(events);
   }
@@ -1829,7 +2043,7 @@ export class ModelManager {
   }
 
   private isModelIdMappingEvent(event: NostrEvent): boolean {
-    if (event.kind !== 38426 || event.pubkey !== this.routstrModelsPubkey ||
+    if (event.kind !== 38426 || !this.isTrustedPolicyAuthor(event, this.routstrModelsPubkey) ||
         getReplaceableIdentifier(event) !== MODEL_ID_MAPPINGS_D_TAG ||
         !this.isNostrEventTrustworthy(event)) return false;
     try {
@@ -1846,9 +2060,8 @@ export class ModelManager {
     // but a stale relay must never roll back the accepted snapshot on restart.
     const saved = this.adapter.getModelIdMappingsEvent();
     const candidates = saved ? [...events, saved] : events;
-    const event = candidates.filter(e => this.isModelIdMappingEvent(e)).sort(
-      (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id)
-    )[0];
+    const event = candidates.filter(e => this.isModelIdMappingEvent(e))
+      .sort((a, b) => this.compareConfigVersions(a, b))[0];
     if (!event) return this.getModelIdMappings();
     const snapshot = this.parseModelIdMappings(event);
     this.adapter.setModelIdMappingsEvent(event);
@@ -1873,29 +2086,56 @@ export class ModelManager {
       }
     }
 
+    // The identity tier is read only when it exists: without an identity the
+    // query stays exactly as it was (one author, one relay filter, and the
+    // original cache key), so nothing changes for existing installs.
+    const extraAuthors = this.identityPubkey ? [this.identityPubkey] : [];
     const events = await this.getNostrEvents(
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
-      forceRefresh
-    );
-    const event = events.reduce<NostrEvent | null>(
-      (latest, event) => !latest || event.created_at > latest.created_at ? event : latest,
-      null
+      forceRefresh,
+      undefined,
+      undefined,
+      extraAuthors,
+      extraAuthors.length > 0 ? MODELS_QUERY_KEY : undefined
     );
 
-    if (!event) {
+    // One curated list per author: newest version within each tier.
+    const newestFor = (rank: number): NostrEvent | null => {
+      const tier = events.filter((candidate) => this.authorRank(candidate.pubkey) === rank);
+      return tier.reduce<NostrEvent | null>(
+        (latest, event) => !latest || event.created_at > latest.created_at ? event : latest,
+        null
+      );
+    };
+    const localEvent = this.identityPubkey ? newestFor(0) : null;
+    const externalEvent = newestFor(localEvent ? 1 : 0);
+    const isDistinctLocal = localEvent !== null && localEvent !== externalEvent;
+
+    if (!externalEvent && !localEvent) {
       return cachedModels.length > 0 ? cachedModels : [];
     }
 
+    // A locally-curated list is an *addition* to the advertised catalog, not a
+    // replacement for it: replacing would silently drop every model the
+    // operator did not restate. Identity entries come first so a local
+    // preference is visible at the head of the list, mirroring how
+    // `includeProviderUrls` supplements announced providers.
     try {
-      const content = JSON.parse(event.content);
-      const models = Array.isArray(content?.models) ? content.models : [];
+      const parseModels = (event: NostrEvent): string[] => {
+        const content = JSON.parse(event.content);
+        const list = Array.isArray(content?.models) ? content.models : [];
+        return list.filter((model: unknown): model is string => typeof model === "string");
+      };
+      const localModels = isDistinctLocal && localEvent ? parseModels(localEvent) : [];
+      const externalModels = externalEvent ? parseModels(externalEvent) : [];
+      const models = [...new Set([...localModels, ...externalModels])];
       this.adapter.setRoutstr21Models(models);
       this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
       return models;
     } catch {
       this.logger.warn(
         "Routstr21Models: failed to parse Nostr event content:",
-        event.id
+        localEvent?.id ?? externalEvent?.id
       );
       return cachedModels.length > 0 ? cachedModels : [];
     }
