@@ -317,7 +317,7 @@ function rewrapBody(response: Response, body: ReadableStream<Uint8Array>): Respo
   const source = response as any;
   for (const key of [
     "lifecycleAttemptId", "baseUrl", "token", "selectedMintUrl",
-    "requestResponseLogId", "releaseHold", "releaseDeadline",
+    "requestResponseLogId", "releaseHold", "releaseDeadline", "deadlineExpired",
   ]) {
     if (source[key] !== undefined) (target as any)[key] = source[key];
   }
@@ -769,7 +769,12 @@ export class RoutstrClient {
             (prepared.response as RoutstrResponse).upstreamResponseId =
               bodyResponseId;
           }
-        } catch {
+        } catch (error) {
+          // An expired body budget must not be swallowed with the other
+          // legitimate read failures (EHBP/encrypted payloads, non-JSON
+          // bodies). Handing back a response whose body is already dead would
+          // report success for a request that failed, and record no fault.
+          if (prepared.deadlineExpired?.()) throw error;
           // Encrypted (EHBP/Tinfoil) or non-JSON body: usage then comes from the
           // response headers, exactly as when accounting read the body itself.
           jsonBody = undefined;
@@ -962,6 +967,8 @@ export class RoutstrClient {
     releaseHold?: () => void;
     /** Stops the per-attempt inference deadline. Must outlive the stream. */
     releaseDeadline?: () => void;
+    /** True when a local budget (not the caller) ended this attempt. */
+    deadlineExpired?: () => boolean;
   }> {
     const {
       path: requestPath,
@@ -1237,6 +1244,7 @@ export class RoutstrClient {
         (processedResponse as any).baseUrl = (response as any).baseUrl;
         (processedResponse as any).token = (response as any).token;
         (processedResponse as any).releaseDeadline = (response as any).releaseDeadline;
+        (processedResponse as any).deadlineExpired = (response as any).deadlineExpired;
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
@@ -1285,6 +1293,7 @@ export class RoutstrClient {
         usagePromise,
         releaseHold: (response as any).releaseHold,
         releaseDeadline: (response as any).releaseDeadline,
+        deadlineExpired: (response as any).deadlineExpired,
       };
     } catch (error) {
       (response as any).releaseHold?.();
@@ -1656,6 +1665,9 @@ export class RoutstrClient {
       // composed signal) must outlive this call: the per-chunk re-arm and the
       // abort that stops an idle body depend on it. Released with the response.
       (response as any).releaseDeadline = () => deadline.dispose();
+      // Lets a caller that reads (or clones) the body distinguish an expired
+      // local budget from an ordinary body read failure after the fact.
+      (response as any).deadlineExpired = () => deadline.timedOut();
       return response;
     } catch (error: any) {
       releaseHold();
@@ -1690,6 +1702,11 @@ export class RoutstrClient {
           errorType: "TimeoutError",
         });
         deadline.dispose();
+        // Deliberately the same status -1 path as a network failure, so the
+        // existing recovery semantics apply unchanged: in xcashu mode that
+        // includes trying to reclaim the token, exactly as a socket reset
+        // already did. A local deadline is a transport failure, not a new
+        // failure class, so it must not invent new financial handling.
         return await this._handleErrorResponse(
           params,
           token,
