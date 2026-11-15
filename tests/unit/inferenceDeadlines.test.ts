@@ -228,6 +228,38 @@ async function startSteadyStreamServer(chunks: number, gapMs: number): Promise<{
   };
 }
 
+/** Server that sends complete headers at once, then stalls the body. */
+async function startHeadersThenStallServer(): Promise<{
+  port: number;
+  close: () => Promise<void>;
+}> {
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    socket.on("data", () => {
+      // Headers land immediately, so the request is past its headers budget and
+      // the body budget becomes the only thing that can fire.
+      socket.write(
+        "HTTP/1.1 200 OK\r\n" +
+          "Content-Type: application/json\r\n" +
+          "content-length: 64\r\n\r\n"
+      );
+      // ...then the body never arrives.
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = server.address() as net.AddressInfo;
+  return {
+    port,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
 /** Server that waits `delayMs`, then answers one complete JSON body. */
 async function startSlowJsonServer(delayMs: number): Promise<{
   port: number;
@@ -432,6 +464,35 @@ describe("inference deadlines", () => {
 
     await expect(response.text()).rejects.toBeTruthy();
     expect(markFailed).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("surfaces an expired opt-in body budget instead of reporting success", async () => {
+    // `bodyMs` is the opt-in budget for a non-streaming body. When it expires
+    // while the body is read for usage accounting, that read fails. The
+    // "encrypted / non-JSON body" fallback must not swallow it: handing back a
+    // response whose body is already dead would report success for a request
+    // that failed, and record no fault. The guard lives in `_routeRequest`, so
+    // this asserts at that level.
+    const stalled = await startHeadersThenStallServer();
+    cleanup = () => stalled.close();
+
+    const client = makeClient();
+    await expect(
+      (client as any)._routeRequest({
+        path: "/v1/chat/completions",
+        method: "POST",
+        body: { model: model.id, stream: false },
+        baseUrl: `http://127.0.0.1:${stalled.port}/`,
+        mintUrl,
+        token: credential,
+        requiredSats: 100,
+        headers: { "content-type": "application/json" },
+        baseHeaders: { "content-type": "application/json" },
+        selectedModel: model,
+        // Headers arrive immediately; only the opt-in body budget can fire.
+        deadlines: { ttfbMs: 20_000, idleMs: 20_000, bodyMs: 150 },
+      })
+    ).rejects.toMatchObject({ name: "TimeoutError" });
   }, 20_000);
 
   it("is disabled by a zero budget", async () => {
