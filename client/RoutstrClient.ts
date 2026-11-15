@@ -57,6 +57,7 @@ import {
   isCoreInternalError,
   isHandledRedemptionError,
   isUpstreamRequestError,
+  isRequestPayloadTooLargeError,
   isUnknownPathError,
   isNodeAccountError,
   shouldFailoverToAnotherMint,
@@ -2002,8 +2003,15 @@ export class RoutstrClient {
       (status === 404 &&
         hasImageInput(body) &&
         !selectedModel?.architecture?.input_modalities?.includes("image"));
+    // A 413 that reports body size, not a balance: nothing about the node or
+    // the key is wrong, and re-sending the same bytes cannot succeed.
+    const requestPayloadTooLarge = isRequestPayloadTooLargeError(
+      status,
+      parsedError
+    );
     const unknownPathError = isUnknownPathError(status, parsedError);
-    const aggregateFailure = upstreamRequestError || status >= 500 ||
+    const aggregateFailure = upstreamRequestError || requestPayloadTooLarge ||
+      status >= 500 ||
       status === 424 || status === 429 || status === -1 ||
       ([401, 402, 403].includes(status) &&
         !isNodeAccountError(parsedError, upstream?.headers["x-routstr-error-scope"]));
@@ -2209,6 +2217,17 @@ export class RoutstrClient {
       this._log(
         "WARN",
         `[RoutstrClient] _handleErrorResponse: recovery failed for retryable error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
+      );
+      tryNextProvider = true;
+    }
+
+    // The node refused the body before redeeming it, so the X-Cashu token was
+    // never spent: try the other candidates rather than failing the request.
+    // (Recovery above already returned the token to the wallet when it could.)
+    if (requestPayloadTooLarge && !tryNextProvider) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: ${baseUrl} rejected the request body as too large; failing over without cooling the provider down`
       );
       tryNextProvider = true;
     }
@@ -2465,8 +2484,13 @@ export class RoutstrClient {
       }
     }
 
+    // The 413 balance condition is repairable (refresh the key, retry). A
+    // body-size 413 is not: the retry re-sends identical bytes, so it burns a
+    // paid attempt on a guaranteed failure. That one falls through to plain
+    // failover, where the next candidate may not enforce the same cap.
     if (
       status === 413 &&
+      !requestPayloadTooLarge &&
       !tryNextProvider &&
       this.mode === "apikeys"
     ) {
@@ -2580,6 +2604,8 @@ export class RoutstrClient {
       // The node rejected the path before charging: the key is untouched
       // and still serves the paths this node allows, so keep it.
       !unknownPathError &&
+      // A rejected body was never accepted, let alone charged.
+      !requestPayloadTooLarge &&
       // An upstream error rejects the request, not the API key: nothing was
       // charged, so the key keeps its balance for the next request.
       !(
@@ -2738,7 +2764,12 @@ export class RoutstrClient {
       pinnedModelPath,
       params.requestedModelId
     );
-    if (!upstreamRequestError && !unknownPathError && !localWalletShortfall) {
+    if (
+      !upstreamRequestError &&
+      !requestPayloadTooLarge &&
+      !unknownPathError &&
+      !localWalletShortfall
+    ) {
       this.providerManager.markFailed(
         baseUrl,
         failReason,
@@ -3222,6 +3253,10 @@ export class RoutstrClient {
           ? statuses[0]
           : uniform && (statuses[0] === 429 || statuses[0] === 424)
             ? statuses[0]
+          // Every candidate rejected the body itself: the caller can act on a
+          // 413 (compact the prompt), but not on a generic 502.
+          : uniform && statuses[0] === 413
+            ? 413
             : 502;
       // Correlation is useful, but auth, cookies, URLs and per-node rate budgets
       // do not describe the chain. Only a uniform 429 gets a retry deadline.

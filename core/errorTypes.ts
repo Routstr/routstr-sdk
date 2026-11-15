@@ -468,6 +468,50 @@ export function isUpstreamRequestError(
 }
 
 /**
+ * A 413 that reports a missing balance rather than an oversized body.
+ *
+ * routstr-core reuses 413 for the API-key insufficient-balance condition, and
+ * that one *is* repairable (refresh the key, then retry) — every other 413 is
+ * the HTTP-conventional"request entity too large" and no retry can shrink the
+ * bytes. Keep the two apart here so both call sites agree on the split.
+ */
+function isInsufficientBalance413(parsed: ParsedCoreError): boolean {
+  if (parsed.type === CoreErrorType.INSUFFICIENT_QUOTA) return true;
+  if (
+    parsed.code === CoreErrorCode.INSUFFICIENT_BALANCE ||
+    parsed.code === CoreErrorCode.MINIMUM_BALANCE_REQUIRED
+  ) {
+    return true;
+  }
+  // Legacy envelopes carry no structured code; the message is all there is.
+  return /insufficient\s+balance/i.test(parsed.message ?? "");
+}
+
+/**
+ * Classify a request-entity rejection (HTTP 413).
+ *
+ * The upstream refused the request *body*, not the payment or the credential:
+ * routstr-core answers `Request body exceeds the 20971520 byte limit`, nginx in
+ * front of a provider answers an HTML `413 Request Entity Too Large`, and
+ * OpenAI-style upstreams say `Payload Too Large` / `Content Too Large`.
+ *
+ * This must not be treated as a provider failure. A failed attempt says nothing
+ * about the node (the same bytes fail everywhere that enforces a cap) and
+ * nothing about the key (nothing was charged), so cooling the model path down
+ * strands a healthy provider for the whole cooldown window. Re-sending the
+ * identical body to the same node is guaranteed to fail again, so this is also
+ * never a same-provider retry: failover is the only useful response, and the
+ * next candidate may not enforce the same limit.
+ */
+export function isRequestPayloadTooLargeError(
+  status: number,
+  parsed: ParsedCoreError
+): boolean {
+  if (status !== 413) return false;
+  return !isInsufficientBalance413(parsed);
+}
+
+/**
  * Detect a node's "unknown route" 404, e.g.
  * `{"error":{"type":"not_found","message":"Path '/v1/v1/messages' not found"}}`.
  *
