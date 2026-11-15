@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Inference deadlines
+
+- Bound the inference request itself, which previously had no local deadline:
+  `fetch` was called with only the caller's abort signal, so a provider that
+  accepted the connection and then stopped talking held the request until the
+  runtime's own ~300 s network timeout. Nothing fired earlier, so the provider
+  was never cooled down and no failover was attempted.
+- Two budgets, because they cover different failures:
+  - **Time to first byte** (`deadlines.ttfbMs`, default 180 s) bounds the wait
+    for response headers. The default is measured: on production traffic the
+    p99 is 33.5 s, but reasoning models legitimately emit nothing for up to
+    ~260 s while thinking, so a shorter default would abort real answers.
+  - **Inter-chunk idle** (`deadlines.idleMs`, default 180 s) bounds silence in a
+    started stream, re-armed whenever a read begins. It is deliberately as
+    generous as the headers budget: a provider may return `200` and then stay
+    silent while a reasoning model thinks, and there is no failover left at that
+    point, so the cost of too small a value is a truncated answer. A healthy stream that keeps
+    emitting is never cut off, however long it runs, and a consumer that pauses
+    (backpressure) is not mistaken for a stall.
+- A response body that is not a stream gets `deadlines.bodyMs` (disabled by
+  default) instead of the inter-chunk budget, since silence until the complete
+  body is expected.
+- Expiry before headers is reported as `InferenceTimeoutError`
+  (`name: "TimeoutError"`, with the phase in the message) and takes the existing
+  network-error path: the provider is cooled down and the request fails over.
+- Expiry after headers cannot fail over — bytes already reached the caller and
+  re-sending would duplicate the answer — so the stall is surfaced to the
+  consumer and the same cooldown scope is recorded for the next request.
+- Deadlines never change what a caller sees: a caller abort stays an
+  `AbortError` and is never recorded as a provider fault. This includes a
+  caller's own `AbortSignal.timeout`, whose rejection is also named
+  `TimeoutError`: classification uses the local deadline flag, not the error
+  name, so a caller's timeout never cools a healthy provider down.
+- A stall after headers is scoped to the model (or pinned model path) instead of
+  the whole provider: the node answered, so its other models stay usable. It is
+  recorded as one failure, so `ProviderManager`'s existing two-strike policy
+  still decides when a cooldown begins; this change records the fault and does
+  not re-tune cooldown behaviour.
+- The attempt's deadline is disposed before an error response is handed to
+  failover, so an opt-in `bodyMs` budget cannot fire during the failover chain
+  and be misread as a new provider stall.
+
 ## 0.5.1
 
 ### Exhausted upstream errors (PR #141 and follow-up)
