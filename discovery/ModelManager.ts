@@ -1896,6 +1896,33 @@ export class ModelManager {
     return policy;
   }
 
+  /** The configured identity pubkey, or undefined when none is set. */
+  getIdentityPubkey(): string | undefined {
+    return this.identityPubkey;
+  }
+
+  /**
+   * Only the operator's own policy, keyed by model. Empty when no identity is
+   * configured or nothing local has been written.
+   *
+   * Separate from {@link getModelPathWhitelist} (the effective merged view) so
+   * a caller can say which tier supplied a model's policy.
+   */
+  getLocalModelPathWhitelist(): ModelPathWhitelist {
+    const pubkey = this.identityPubkey;
+    if (!pubkey) return {};
+    const event = this.adapter.getModelPathWhitelistEvent();
+    if (!event || event.pubkey !== pubkey) return {};
+    try {
+      return parseModelPathWhitelist(event.content, this.getModelIdMappings());
+    } catch {
+      // Unparseable local content cannot be in force; the effective view falls
+      // back to the configured author, so report no local policy rather than a
+      // projection of something the reader rejects.
+      return {};
+    }
+  }
+
   /**
    * Replace this client's own model-path whitelist with `models` and make it
    * the active policy immediately.
