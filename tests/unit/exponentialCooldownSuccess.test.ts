@@ -85,9 +85,14 @@ describe("successful model request cooldown reset", () => {
     const { client, providerManager, params } = setup();
     const response = new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
-    expect(await (client as any)._makeRequest(params)).toBe(response);
+    // An SSE body may come back wrapped (the inter-chunk idle budget observes
+    // reads), so assert the observable contract rather than object identity:
+    // success is recorded from the headers alone, without consuming the stream.
+    const got = await (client as any)._makeRequest(params);
+    expect(got.status).toBe(response.status);
+    expect(got.headers.get("content-type")).toBe("text/event-stream");
     expect(providerManager.recordSuccess).toHaveBeenCalledExactlyOnceWith(BASE_URL, REQUESTED, undefined);
-    await response.body?.cancel();
+    await got.body?.cancel();
   });
 
   it("resets successful non-chat model inference such as embeddings", async () => {
