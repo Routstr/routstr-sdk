@@ -24,6 +24,13 @@ export interface LightningRefund {
   /** Gross balance debited by the provider, not necessarily net Lightning payout. */
   sats?: string;
   msats?: string;
+  /** Lightning routing fee the provider paid, in millisats. */
+  fee_msats?: string;
+  /**
+   * Balance left on the key after the payout (the provider's fee reserve).
+   * A repeat refund replays the same claim; sweep this with a Cashu refund.
+   */
+  remaining_msats?: string;
 }
 
 export class LightningPaymentError extends Error {
