@@ -1,9 +1,11 @@
+import { Readable } from "stream";
 import { describe, expect, it } from "vitest";
 import {
   extractUsageFromResponseBody,
   extractUsageFromResponseHeaders,
   extractUsageFromSSEJson,
 } from "../../client/usage";
+import { createSSEParserTransform } from "../../client/sse";
 
 const costBreakdown = {
   base_msats: 0,
@@ -176,6 +178,140 @@ describe("usage extraction", () => {
   });
 });
 
+
+describe("Anthropic-shaped usage", () => {
+  it("maps /v1/messages cache tokens into the total prompt count", () => {
+    const response = {
+      id: "msg_01ABC",
+      type: "message",
+      role: "assistant",
+      usage: {
+        input_tokens: 2,
+        cache_read_input_tokens: 63226,
+        output_tokens: 7,
+      },
+    };
+
+    const body = extractUsageFromResponseBody(response);
+    expect(body).toMatchObject({
+      promptTokens: 63228, // input + cache_read (Anthropic input_tokens excludes cached)
+      completionTokens: 7,
+      totalTokens: 63235,
+      cacheReadInputTokens: 63226,
+    });
+    expect(extractUsageFromSSEJson(response)).toEqual(body);
+  });
+
+  it("sums cache_creation ephemeral 5m/1h buckets when the aggregate is absent", () => {
+    const response = {
+      usage: {
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 100,
+          ephemeral_1h_input_tokens: 50,
+        },
+      },
+    };
+
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: 160, // 10 + 100 + 50
+      completionTokens: 3,
+      cacheCreationInputTokens: 150,
+    });
+  });
+
+  it("prefers the aggregate cache_creation_input_tokens over the bucket split", () => {
+    const response = {
+      usage: {
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_creation_input_tokens: 150,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 999,
+          ephemeral_1h_input_tokens: 999,
+        },
+      },
+    };
+
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: 160,
+      cacheCreationInputTokens: 150,
+    });
+  });
+
+  it("records no cache tokens for Anthropic usage without cache keys", () => {
+    const response = {
+      usage: { input_tokens: 12, output_tokens: 8 },
+    };
+
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: 12,
+      completionTokens: 8,
+      cacheReadInputTokens: undefined,
+      cacheCreationInputTokens: undefined,
+    });
+  });
+
+  it("keeps the OpenAI shape byte-for-byte: prompt_tokens already includes cached subsets", () => {
+    const response = {
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+        input_tokens: 2,
+        cache_read_input_tokens: 98,
+      },
+    };
+
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: 100, // NOT 100 + 98
+      completionTokens: 10,
+      totalTokens: 110,
+    });
+  });
+
+  it("returns null for genuinely empty usage", () => {
+    expect(extractUsageFromResponseBody({ usage: {} })).toBeNull();
+  });
+
+  it("extracts usage across Anthropic message_start/message_delta SSE events", async () => {
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_01ABC",
+          type: "message",
+          usage: {
+            input_tokens: 2,
+            cache_read_input_tokens: 63226,
+            output_tokens: 1,
+          },
+        },
+      },
+      { type: "message_delta", usage: { output_tokens: 8 } },
+    ];
+
+    const captured: Array<Record<string, unknown>> = [];
+    const transform = createSSEParserTransform(usage => {
+      captured.push({ ...usage });
+    });
+    const source = Readable.from(
+      events.map(event => `data: ${JSON.stringify(event)}\n\n`)
+    );
+    const merged = await new Promise<Record<string, unknown>>(resolve => {
+      source.pipe(transform);
+      transform.on("data", () => {});
+      transform.on("end", () => resolve(captured.at(-1) ?? {}));
+    });
+
+    expect(merged).toMatchObject({
+      promptTokens: 63228,
+      completionTokens: 8,
+      cacheReadInputTokens: 63226,
+    });
+  });
+});
 
 describe("reported sats-cost provenance", () => {
   it("distinguishes missing cost from an explicitly free response", () => {

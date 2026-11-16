@@ -61,7 +61,32 @@ export function extractUsageFromResponseBody(
   const usage = (body as { usage?: Record<string, unknown> }).usage;
   if (!usage || typeof usage !== "object") return null;
 
-  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  // Anthropic-shaped usage (POST /v1/messages): cache counts live directly on
+  // `usage` and `input_tokens` EXCLUDES them, so the total prompt count is
+  // input + cache_read + cache_creation. OpenAI-shaped `prompt_tokens` already
+  // includes cached subsets, so those are never added here.
+  const anthropicShaped =
+    usage.prompt_tokens === undefined &&
+    (usage.input_tokens !== undefined ||
+      usage.cache_read_input_tokens !== undefined ||
+      usage.cache_creation_input_tokens !== undefined);
+  const anthropicCacheRead = numOrUndef(usage.cache_read_input_tokens);
+  const cacheCreationObj =
+    usage.cache_creation && typeof usage.cache_creation === "object"
+      ? (usage.cache_creation as Record<string, unknown>)
+      : undefined;
+  const anthropicCacheCreation =
+    numOrUndef(usage.cache_creation_input_tokens) ??
+    (cacheCreationObj
+      ? (numOrUndef(cacheCreationObj.ephemeral_5m_input_tokens) ?? 0) +
+        (numOrUndef(cacheCreationObj.ephemeral_1h_input_tokens) ?? 0)
+      : undefined);
+
+  const promptTokens = anthropicShaped
+    ? (numOrUndef(usage.input_tokens) ?? 0) +
+      (anthropicCacheRead ?? 0) +
+      (anthropicCacheCreation ?? 0)
+    : Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
   const completionTokens = Number(
     usage.completion_tokens ?? usage.output_tokens ?? 0
   );
@@ -134,11 +159,15 @@ export function extractUsageFromResponseBody(
     ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
     provider,
     ...breakdown,
-    cacheReadInputTokens:
-      breakdown.cacheReadInputTokens ?? numOrUndef(details?.cached_tokens),
+    cacheReadInputTokens: breakdown.cacheReadInputTokens
+      ?? (anthropicShaped
+        ? anthropicCacheRead
+        : numOrUndef(details?.cached_tokens)),
     cacheCreationInputTokens:
       breakdown.cacheCreationInputTokens ??
-      numOrUndef(details?.created_cache_tokens),
+      (anthropicShaped
+        ? anthropicCacheCreation
+        : numOrUndef(details?.created_cache_tokens)),
   };
 }
 
@@ -181,7 +210,14 @@ export function extractUsageFromSSEJson(
     };
   }
 
-  return extractUsageFromResponseBody(parsed, fallbackSatsCost);
+  // Anthropic SSE: message_start nests usage under `message.usage`, while
+  // message_delta carries it at the top level. Unwrap so the shared extractor
+  // sees both.
+  const usageSource =
+    parsed.usage || !parsed.message?.usage
+      ? parsed
+      : { ...parsed, usage: parsed.message.usage };
+  return extractUsageFromResponseBody(usageSource, fallbackSatsCost);
 }
 
 /**
