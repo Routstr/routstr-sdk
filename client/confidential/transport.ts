@@ -885,16 +885,18 @@ async function runOnPool(
       traffic.done();
       if (refused || state.headSeen || params.signal?.aborted || attempt >= 3) throw error;
       // A request the provider did not process (RFC 9113 §8.7: REFUSED_STREAM,
-      // or a stream above a GOAWAY's last one) may run again, even after its
-      // release. The node cannot see why nothing came: a released request's
-      // reservation may still be charged (PROTOCOL-V3.md §12.10).
-      if (error instanceof StreamNotProcessedError) {
+      // or a stream above a GOAWAY(NO_ERROR)'s last one) may run again: when
+      // nothing of it was released, or when the refusal was proven and the
+      // node settled it (the error carries the receipt). A released request
+      // without that proof fails (§9.4): the node charges its reservation
+      // (PROTOCOL-V3.md §12.10), and each further attempt would cost another.
+      if (error instanceof StreamNotProcessedError && (error.receipt !== undefined || !handle.bodyReleased)) {
         // A refusal the node settled on its proof costs what its receipt says
         // (the session fee if it was still due), whatever the next attempt costs.
         if (error.costMsats !== undefined) state.refusedCostMsats = (state.refusedCostMsats ?? 0) + error.costMsats;
         log(
           `sid=${handle.sid.slice(0, 8)} request ${handle.n} was not processed by the provider (${errorText(error)}); ` +
-            `running it on a new connection${handle.bodyReleased ? " (the node may charge the released request's reservation)" : ""}`,
+            `running it on a new connection`,
         );
         state.handle = undefined;
         continue;
