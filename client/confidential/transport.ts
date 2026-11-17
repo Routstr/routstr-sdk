@@ -165,6 +165,12 @@ export interface ConfidentialRequestOptions {
    */
   onNodeProtocolOutdated?: (baseUrl: string, nodeVersion: number) => void;
   /**
+   * Where each connection reports what the node did against its own terms
+   * (for instance a deposit outcome that disagrees with the signed offer).
+   * One line, no secrets. Default: `console.warn`.
+   */
+  onWarning?: (message: string) => void;
+  /**
    * Pre-warming (§9.2, `pool.ts`): armed connections bound to the credential
    * only, for both framings. Off unless set; `{}` enables it with the
    * defaults. Not used for one-off Cashu bearers (`returnChange`).
@@ -758,7 +764,7 @@ function connectionOpener(
   options: ConfidentialFetchParams["options"],
   maxDepositMsat: number,
 ): (framing: ConfidentialFraming) => ConfidentialConnection {
-  const { proverPath, twoPcPath, allowInsecureTransport } = options;
+  const { proverPath, twoPcPath, allowInsecureTransport, onWarning } = options;
   return (framing) =>
     new ConfidentialConnection({
       baseUrl,
@@ -769,6 +775,7 @@ function connectionOpener(
       twoPcPath,
       allowInsecureTransport,
       maxDepositMsat,
+      onWarning,
     });
 }
 
