@@ -141,7 +141,10 @@ not fall back. After a body was released nothing is retried. `"2"` or
 
 - The node reserves the offer's `connection_deposit_msat` at the setup, for
   both framings, and releases it with the connection's first settled request
-  (`deposit_released_msat` in that receipt, required, and only there). A
+  (`deposit_released_msat` in that receipt, required, and only there). The
+  `ready` must name the same amount (`deposit_msat`, required when the offer
+  names a deposit); otherwise the connection fails before anything else is
+  sent. A
   connection that ends without a settled request loses it, unless the node,
   its sidecar or the provider failed (the signed `deposit` of the last frame
   says which; `conn.deposit`).
@@ -270,8 +273,9 @@ chain extended online (from the third request of a connection on).
   bytes in each direction, the credential-record commitment, the time), signed
   by the sidecar's per-process Ed25519 key and re-signed by the node's Nostr
   key. The client requires the node's signature and checks that the sid,
-  both transcript hashes and the credential-record commitment (the one π_NK
-  proved) are its own (`checkAttestationBinding`).
+  both transcript hashes, the credential-record commitment (the one π_NK
+  proved) and the certificate-chain hash are its own; a client that captured
+  no certificate chain refuses the attestation.
 - The receipt: required Schnorr signature over the exact signed bytes, this
   connection's sid, its framing and request number, the attestation hash, the
   deposit released once (on the first settled request, the offer's amount), the usage equal to the client's own

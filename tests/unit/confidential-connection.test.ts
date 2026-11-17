@@ -30,8 +30,13 @@ const tlsFake = vi.hoisted(() => {
     }
     return out;
   };
+  /** The provider's certificate chain (one DER stand-in); `certs = false`: the client captures none. */
+  const cert = new Uint8Array(64).fill(0x30);
+  const state = { certs: true };
   return {
     cat,
+    cert,
+    state,
     /** A TLS client whose records carry their inner plaintext in the clear (plus a 16-byte "tag"). */
     makeTLSClient(o: any) {
       let pending = new Uint8Array(0);
@@ -42,6 +47,7 @@ const tlsFake = vi.hoisted(() => {
       return {
         async startHandshake() {
           o.write({ header: Uint8Array.from([0x16, 3, 1, 0, 4]), content: Uint8Array.from([1, 0, 0, 0]) });
+          if (state.certs) o.onRecvCertificates?.({ certificates: [{ internal: { rawData: cert.slice().buffer } }] });
           await o.external.onServerHello(new Uint8Array(65).fill(4), new Uint8Array(32).fill(0xa1));
           await o.external.onServerFinished(new Uint8Array(32).fill(0xa2));
           o.onHandshake();
@@ -88,7 +94,14 @@ vi.mock("../../client/confidential/params", async (orig) => ({
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
-import { ReceiptVerificationError, RequestRefusedError, SessionRejectedError, StreamNotProcessedError } from "../../client/confidential/errors";
+import {
+  ReceiptVerificationError,
+  RequestRefusedError,
+  SessionProtocolError,
+  SessionRejectedError,
+  StreamNotProcessedError,
+} from "../../client/confidential/errors";
+import { checkRefusalReceipt } from "../../client/confidential/receipt";
 import { BOTH, NODE_PRIV, NODE_PUB, ONLY_11, v3OfferFields } from "./fixtures/v3";
 import { VENICE_CHAT } from "./fixtures/chat";
 
@@ -98,6 +111,7 @@ const hexOf = (b: Uint8Array) => Buffer.from(b).toString("hex");
 const sign = (json: string) => bytesToHex(schnorr.sign(sha256(utf8ToBytes(json)), NODE_PRIV));
 
 const SID = "ab".repeat(32);
+const CERT_CHAIN_HASH = createHash("sha256").update(tlsFake.cert).digest("hex");
 const FEE = 500;
 const ABANDON = 800;
 const DEPOSIT = 1000;
@@ -146,6 +160,10 @@ interface Script {
   partialRelease?: () => Uint8Array[];
   /** `request_ok.reserved_msats`, when the node announces one. */
   reservedMsats?: number;
+  /** The `ready` the node sends, from the honest one. */
+  ready?: (honest: Record<string, unknown>) => Record<string, unknown>;
+  /** The attestation the node signs, from the honest one. */
+  attestation?: (honest: Record<string, unknown>) => Record<string, unknown>;
 }
 
 const head200 = (stream: number) => frame(FRAME.HEADERS, FLAG.END_HEADERS, stream, Uint8Array.from([0x88]));
@@ -215,7 +233,8 @@ class FakeNode {
     switch (m.type) {
       case "setup":
         this.framing = m.http;
-        this.text({ type: "ready", v: 3, http: m.http, sid: SID, pubkey: NODE_PUB, deposit_msat: DEPOSIT, armed: m.armed });
+        const ready = { type: "ready", v: 3, http: m.http, sid: SID, pubkey: NODE_PUB, deposit_msat: DEPOSIT, armed: m.armed };
+        this.text(this.script.ready ? this.script.ready(ready) : ready);
         return;
       case "release_head":
         this.headWritten = true;
@@ -345,7 +364,9 @@ class FakeNode {
   }
 
   private lastAttJson = "";
-  private attest(a: Record<string, unknown>): void {
+  private attest(honest: Record<string, unknown>): void {
+    const withChain = { ...honest, cert_chain_hash: CERT_CHAIN_HASH };
+    const a = this.script.attestation ? this.script.attestation(withChain) : withChain;
     this.lastAttJson = JSON.stringify(a);
     this.text({ type: "attestation", n: a.n, a_json: this.lastAttJson, sig: sign(this.lastAttJson) });
   }
@@ -539,6 +560,7 @@ function chatRequest(maxTokens = 20): ConnectionRequestOptions {
 
 beforeEach(() => {
   (globalThis as any).WebSocket = FakeWs;
+  tlsFake.state.certs = true;
   proofs.length = 0;
 });
 afterEach(() => {
@@ -930,4 +952,95 @@ describe("a kept connection holds nothing of what it waited for (finding 25)", (
     expect((conn as any).failWaiters.size).toBe(0);
     conn.close();
   });
+});
+
+describe("the deposit the setup reserved (ready.deposit_msat)", () => {
+  for (const framing of ["2", "1.1"] as const) {
+    const open = (conn: ConfidentialConnection) => (framing === "2" ? conn.connect() : conn.arm());
+
+    it(`framing ${framing}: a ready without deposit_msat fails the connection before anything else is sent`, async () => {
+      const conn = newConnection(framing, {
+        ready: (r) => {
+          const { deposit_msat: _, ...rest } = r;
+          return rest;
+        },
+      });
+      await expect(open(conn)).rejects.toThrow(/does not name the connection deposit of 1000 msat/);
+      expect(node.log).toEqual(["setup"]);
+    });
+
+    it(`framing ${framing}: a ready naming another deposit fails the connection before anything else is sent`, async () => {
+      for (const bad of [DEPOSIT + 1, 0, "1000", null]) {
+        const conn = newConnection(framing, { ready: (r) => ({ ...r, deposit_msat: bad }) });
+        await expect(open(conn)).rejects.toBeInstanceOf(SessionProtocolError);
+        expect(node.log).toEqual(["setup"]);
+      }
+    });
+  }
+});
+
+describe("a refusal receipt names the request's terms", () => {
+  const refusal = { refused: "rst_stream", error_code: 7 } as const;
+  const usage = { refused: "rst_stream", error_code: 7, choices: [] };
+  const image = { model: "z", variant: "webp", count: 2 };
+  const ok = { sid: SID, kind: "images", model: "z", variant: "webp", count: 2, usage, cost_msats: 0 };
+
+  it("an image refusal receipt must carry the request's kind, model, variant and count", () => {
+    expect(() => checkRefusalReceipt(ok as never, refusal as never, 0, 0, image)).not.toThrow();
+    for (const wrong of [{ kind: "chat" }, { kind: undefined }, { model: "y" }, { variant: "1K-webp" }, { count: 1 }]) {
+      expect(() => checkRefusalReceipt({ ...ok, ...wrong } as never, refusal as never, 0, 0, image)).toThrow(ReceiptVerificationError);
+    }
+  });
+
+  it("the connection checks a refusal receipt against its image request", () => {
+    const conn = newConnection("2") as any;
+    const cur = {
+      n: 1,
+      first: false,
+      model: "z",
+      offer: conn.offer,
+      opts: {},
+      image: { variant: { id: "webp", msat_per_image: 12_000 }, count: 2 },
+    };
+    expect(() => conn.checkRefusal(cur, ok, refusal)).not.toThrow();
+    expect(() => conn.checkRefusal(cur, { ...ok, count: 1 }, refusal)).toThrow(/count 1 is not 2/);
+    expect(() => conn.checkRefusal(cur, { ...ok, variant: "png" }, refusal)).toThrow(/variant png is not webp/);
+  });
+
+  it("a chat refusal receipt naming another model is refused", async () => {
+    const conn = await connection("2", {
+      respond2: (_n, s) => [rst(s, 7)],
+      receipt: (s, honest) => (s.kind === "refusal" ? { ...honest, model: "other" } : honest),
+    });
+    await expect(conn.request(chatRequest()).done).rejects.toThrow(/model other/);
+  });
+});
+
+describe("the certificate chain an attestation names", () => {
+  for (const framing of ["2", "1.1"] as const) {
+    it(`framing ${framing}: an attestation is accepted when it names the chain the client received`, async () => {
+      const conn = await connection(framing);
+      expect((await conn.request(chatRequest()).done).status).toBe(200);
+      conn.close();
+    });
+
+    it(`framing ${framing}: an attestation naming another chain, or none, is refused`, async () => {
+      for (const attestation of [
+        (a: Record<string, unknown>) => ({ ...a, cert_chain_hash: "00".repeat(32) }),
+        (a: Record<string, unknown>) => {
+          const { cert_chain_hash: _, ...rest } = a;
+          return rest;
+        },
+      ]) {
+        const conn = await connection(framing, { attestation });
+        await expect(conn.request(chatRequest()).done).rejects.toThrow(/certificate chain/);
+      }
+    });
+
+    it(`framing ${framing}: an attestation is refused when the client captured no certificate chain`, async () => {
+      tlsFake.state.certs = false;
+      const conn = await connection(framing);
+      await expect(conn.request(chatRequest()).done).rejects.toThrow(/certificate chain/);
+    });
+  }
 });

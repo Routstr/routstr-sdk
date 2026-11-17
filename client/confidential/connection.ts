@@ -72,6 +72,7 @@ import {
   requestBlock,
   requestStream,
   splitBody,
+  type Refusal,
   type RxFrame,
   type WinSource,
 } from "./h2";
@@ -1197,8 +1198,13 @@ export class ConfidentialConnection {
     if (this.ready.armed !== undefined && this.ready.armed !== prewarm) {
       throw new SessionProtocolError("ready names another armed state than the setup");
     }
-    // What the setup reserved must be the signed offer's deposit (a sidecar
-    // without a node names none).
+    // What the setup reserved must be the signed offer's deposit (§12.3). An
+    // offer that names a deposit (a node's always does) requires the field; a
+    // sidecar without a node names neither.
+    const namesDeposit = this.offer.connection_deposit_msat !== undefined;
+    if (namesDeposit && this.ready.deposit_msat === undefined) {
+      throw new SessionProtocolError(`ready does not name the connection deposit of ${this.depositMsat} msat the signed offer names`);
+    }
     if (this.ready.deposit_msat !== undefined && this.ready.deposit_msat !== this.depositMsat) {
       throw new SessionProtocolError(
         `node reserved a connection deposit of ${String(this.ready.deposit_msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat}`,
@@ -2341,7 +2347,9 @@ export class ConfidentialConnection {
       bad("names a different TLS handshake");
     }
     if (!this.cCommitHex || a.c_commit !== this.cCommitHex) bad("names a different head-record commitment");
-    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) bad("names a different certificate chain");
+    // Always compared: a client that captured no chain refuses the attestation.
+    if (!this.certChainHash) bad("cannot be checked: no certificate chain was received");
+    if (a.cert_chain_hash !== hex(this.certChainHash!)) bad("names a different certificate chain");
     // Records may still be on their way to us when the attestation arrives.
     if (Number.isSafeInteger(a.server_records)) {
       await this.until(() => this.recvRecords >= a.server_records, "the records the attestation counts", 15_000).catch((e) => {
@@ -2655,8 +2663,7 @@ export class ConfidentialConnection {
     const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
     cur.proofs.push({ ...t, purpose: "refusal", ...shape });
     const { receipt } = await this.takeReceipt(cur, att.json);
-    this.checkPinnedModel(cur, receipt);
-    checkRefusalReceipt(receipt, parsed, this.feeDue(cur), offerAbandonFeeMsat(cur.offer));
+    this.checkRefusal(cur, receipt, parsed);
     this.event({ ev: "refusal_settled", n: cur.n, refused: parsed.refused, cost_msats: receipt.cost_msats });
     return { receipt, attestation: att.a };
   }
@@ -2689,7 +2696,9 @@ export class ConfidentialConnection {
       bad("names a different TLS handshake");
     }
     if (!this.cCommitHex || a.c_commit !== this.cCommitHex) bad("names a different head-record commitment");
-    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) bad("names a different certificate chain");
+    // Always compared: a client that captured no chain refuses the attestation.
+    if (!this.certChainHash) bad("cannot be checked: no certificate chain was received");
+    if (a.cert_chain_hash !== hex(this.certChainHash!)) bad("names a different certificate chain");
     const sK = a.s_k;
     const count = a.server_records;
     if (!Number.isSafeInteger(sK) || !Number.isSafeInteger(count) || sK < 0 || count < 0) bad("interval malformed");
@@ -2812,6 +2821,18 @@ export class ConfidentialConnection {
     if ((receipt.upstream_model ?? receipt.model) !== want) {
       throw new ReceiptVerificationError(`receipt names the pinned model ${String(receipt.upstream_model)}, not ${want}`);
     }
+  }
+
+  /** A refusal receipt: the request's terms (model; images: kind, variant, count) and at most the fee due. */
+  private checkRefusal(cur: Cur, receipt: ConfidentialReceipt, refusal: Refusal): void {
+    this.checkPinnedModel(cur, receipt);
+    checkRefusalReceipt(
+      receipt,
+      refusal,
+      this.feeDue(cur),
+      offerAbandonFeeMsat(cur.offer),
+      cur.image ? { model: cur.model, variant: cur.image.variant.id, count: cur.image.count } : undefined,
+    );
   }
 
   private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
