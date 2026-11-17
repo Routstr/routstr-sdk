@@ -154,8 +154,11 @@ not fall back. After a body was released nothing is retried. `"2"` or
 - The node names the request's whole reservation in `request_ok`
   (`reserved_msats`; older nodes omit it). With a ceiling
   (`ConfidentialFetchParams.maxReservationMsat`, per request;
-  `RoutstrClient` passes its mirror of the node's formula for chat, floored
-  at the connection deposit, and none when it cannot compute one) a larger
+  `RoutstrClient` passes its mirror of the node's formula for chat, by the
+  prompt limit the offer signs for the model (`context_lengths`), floored
+  at the connection deposit, and none when the offer signs no limit or no
+  deposit; the balance pre-check prefers the signed limit too, else the
+  model listing's context length) a larger
   announcement stops the request before any of its records is sent
   (framing `"1.1"`: before the ClientHello) with
   `ReservationAboveCeilingError`, and the connection is closed (the node's
