@@ -364,7 +364,8 @@ type ConfidentialQualifier = (
   model: string,
   options: ConfidentialRequestOptions,
   kind?: "chat" | "images",
-  request?: unknown
+  request?: unknown,
+  qualify?: { probe?: boolean }
 ) => Promise<unknown>;
 const CONFIDENTIAL_TRANSPORT = Symbol.for("@routstr/sdk/confidentialTransport");
 const CONFIDENTIAL_QUALIFIER = Symbol.for("@routstr/sdk/confidentialQualifier");
@@ -387,14 +388,22 @@ async function qualifyConfidentialNode(
   model: unknown,
   options: ConfidentialRequestOptions,
   kind: "chat" | "images" = "chat",
-  request?: unknown
+  request?: unknown,
+  probe = false
 ): Promise<ConfidentialDepositOffer | undefined> {
   requireConfidentialTransport();
   const qualify = (globalThis as Record<symbol, unknown>)[CONFIDENTIAL_QUALIFIER] as
     | ConfidentialQualifier
     | undefined;
   if (!qualify) return undefined;
-  const offer = await qualify(baseUrl, typeof model === "string" ? model : "", options, kind, request);
+  const offer = await qualify(
+    baseUrl,
+    typeof model === "string" ? model : "",
+    options,
+    kind,
+    request,
+    probe ? { probe: true } : undefined
+  );
   return offer && typeof offer === "object" && "price_list" in offer
     ? (offer as ConfidentialDepositOffer)
     : undefined;
@@ -406,6 +415,36 @@ async function qualifyConfidentialNode(
  * failover candidate is.
  */
 const confidentialQualifyFailures = new WeakSet<object>();
+
+/**
+ * Nodes one request skipped only because their offer is in its cooldown (no
+ * fetch was made): when the cooldown ends, and when the node may be tried
+ * again as the last candidate (the transport's `coolingUntil`, `probeAt`).
+ */
+type ConfidentialCooling = Map<string, { until: number; probeAt: number }>;
+
+function noteConfidentialCooling(cooling: ConfidentialCooling, baseUrl: string, error: unknown): void {
+  const e = error as { coolingUntil?: unknown; probeAt?: unknown } | null;
+  if (e && typeof e.coolingUntil === "number" && typeof e.probeAt === "number") {
+    cooling.set(baseUrl, { until: e.coolingUntil, probeAt: e.probeAt });
+  }
+}
+
+/**
+ * The cooldown orders nodes rather than excluding them: once no other
+ * candidate is left, the skipped node whose cooldown ends first is tried
+ * (`probe`), if its last failure is old enough. Taken from the map: one
+ * request probes at most once.
+ */
+function takeConfidentialProbe(cooling: ConfidentialCooling): string | undefined {
+  const now = Date.now();
+  let best: [string, number] | undefined;
+  for (const [baseUrl, c] of cooling) {
+    if (c.probeAt <= now && (!best || c.until < best[1])) best = [baseUrl, c.until];
+  }
+  cooling.clear();
+  return best?.[0];
+}
 
 /** A qualification failure that is this client's own: no other node would differ. */
 function isLocalConfidentialFailure(error: unknown): boolean {
@@ -664,6 +703,8 @@ export interface RouteRequestParams {
   trackLifecycle?: boolean;
   /** @internal Request-local final transport correlation. */
   transportState?: { nodeRequestId?: string; baseUrl?: string; attemptId?: string; errorType?: string; errorCode?: string };
+  /** @internal The node qualified even in its offer cooldown: the last candidate left. */
+  confidentialOfferProbe?: string;
   path: string;
   method: string;
   body?: unknown;
@@ -1245,6 +1286,7 @@ export class RoutstrClient {
     // The first node that did not qualify for a confidential session: its
     // error is the one reported when no other node qualifies either.
     let firstQualifyError: unknown;
+    const cooling: ConfidentialCooling = new Map();
     for (;;) {
       if (current.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
       try {
@@ -1265,24 +1307,29 @@ export class RoutstrClient {
           current.confidential
         ) {
           firstQualifyError ??= error;
+          if (isLocalConfidentialFailure(error)) throw firstQualifyError;
+          if (current.confidentialOfferProbe !== current.baseUrl) noteConfidentialCooling(cooling, current.baseUrl, error);
           const pinnedSelector = this._findModelPathHeader(current.headers ?? {});
-          if (
-            isLocalConfidentialFailure(error) ||
-            current.pinnedProvider ||
-            (pinnedSelector && !current.autoModelPath) ||
-            !current.modelId
-          ) {
-            throw firstQualifyError;
-          }
+          let next: string | null = null;
+          if (current.modelId && !current.pinnedProvider && !(pinnedSelector && !current.autoModelPath)) {
           attempted.add(current.baseUrl);
-          const next = this._findNextBestProvider(
+            next = this._findNextBestProvider(
             current.modelId,
             current.baseUrl,
             attempted,
             await this._fundedMintUrls(),
             true
           );
-          if (!next || attempted.has(next)) throw firstQualifyError;
+            if (next && attempted.has(next)) next = null;
+          }
+          // Every candidate left is cooling: the one whose cooldown ends first.
+          const probe = next ? undefined : takeConfidentialProbe(cooling);
+          if (probe === current.baseUrl) {
+            current = { ...current, confidentialOfferProbe: probe };
+            continue;
+          }
+          next ??= probe ?? null;
+          if (!next) throw firstQualifyError;
           this._log(
             "WARN",
             `[RoutstrClient] routeRequest: ${current.baseUrl} does not qualify for a confidential session; trying ${next}`,
@@ -1299,6 +1346,7 @@ export class RoutstrClient {
               )
             ),
             autoModelPath: undefined,
+            confidentialOfferProbe: probe,
           };
           continue;
         }
@@ -1452,7 +1500,8 @@ export class RoutstrClient {
           confidentialModelId,
           params.confidential,
           confidentialImages ? "images" : "chat",
-          body
+          body,
+          params.confidentialOfferProbe === baseUrl
         ).catch((error: unknown) => {
           // Nothing was spent on this node: the caller may try another one.
           if (error !== null && typeof error === "object") confidentialQualifyFailures.add(error);
@@ -3430,6 +3479,10 @@ export class RoutstrClient {
         | undefined;
       let newModel: Model = selectedModel;
       let newRequiredSats = params.requiredSats;
+      // Confidential candidates skipped for their offer cooldown, and the one
+      // the next qualification probes (the last candidate left).
+      const cooling: ConfidentialCooling = new Map();
+      let probeProvider: string | undefined;
 
       while (nextProvider) {
         throwIfFundingAborted(params.signal);
@@ -3485,7 +3538,8 @@ export class RoutstrClient {
               newModel.id,
               params.confidential,
               failoverKind,
-              body
+              body,
+              probeProvider === nextProvider
             );
             if (failoverKind === "images") {
               failoverImageSats = confidentialImageRequiredSats(
@@ -3500,6 +3554,7 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: ${nextProvider} does not qualify for a confidential session; trying another provider`,
               error instanceof Error ? error.message : String(error)
             );
+            if (probeProvider !== nextProvider) noteConfidentialCooling(cooling, nextProvider, error);
             attemptedForSpend.add(nextProvider);
             nextProvider = this._findNextBestProvider(
               failoverModelId,
@@ -3510,6 +3565,11 @@ export class RoutstrClient {
             );
             if (nextProvider && attemptedForSpend.has(nextProvider)) {
               nextProvider = null;
+            }
+            // Every candidate left is cooling: the one whose cooldown ends first.
+            if (!nextProvider) {
+              probeProvider = takeConfidentialProbe(cooling);
+              nextProvider = probeProvider ?? null;
             }
             continue;
           }

@@ -275,10 +275,37 @@ function retryOnFreshConnection(error: unknown): boolean {
   return !(error instanceof SessionRejectedError && error.status !== undefined && error.status !== 408);
 }
 
-/** Nodes whose offer could not be fetched (unreachable, an HTTP error, a timeout), until when. */
-const offerUnreachable = new Map<string, { until: number; failures: number; error: Error }>();
+/**
+ * Nodes whose offer could not be fetched (unreachable, an HTTP error, a
+ * timeout): until when, and when it last failed. The cooldown orders nodes,
+ * it does not exclude them: a cooling node is skipped while another
+ * candidate remains, and while every candidate cools the client tries the
+ * one whose cooldown ends first (`probe`), once its last failure is
+ * `OFFER_PROBE_MIN_MS` old.
+ */
+const offerUnreachable = new Map<string, { until: number; at: number; failures: number; error: Error }>();
 const OFFER_COOLDOWN_BASE_MS = 30_000;
 const OFFER_COOLDOWN_MAX_MS = 10 * 60_000;
+/**
+ * How long after a failed offer fetch a node is never asked again, even as
+ * the last candidate: a caller retrying in a loop then costs a node at most
+ * one fetch per this interval, and a client whose network is back waits at
+ * most this long.
+ */
+export const OFFER_PROBE_MIN_MS = 10_000;
+
+/**
+ * The `OfferUnavailableError` of a node in its cooldown: no fetch was made.
+ * `coolingUntil` is when the cooldown ends and `probeAt` when the node may
+ * be tried again as the last candidate (epoch ms; read by shape).
+ */
+function coolingError(key: string, cool: { until: number; at: number; error: Error }): OfferUnavailableError {
+  const error = new OfferUnavailableError(
+    `${key} did not serve its offer lately; not asked again for ${Math.ceil((cool.until - Date.now()) / 1000)} s`,
+    cool.error.message,
+  );
+  return Object.assign(error, { coolingUntil: cool.until, probeAt: cool.at + OFFER_PROBE_MIN_MS });
+}
 
 /** Signed offers by node; every use re-verifies it under the caller's policy. */
 const offerCache = new Map<string, { offer: VerifiedOffer; at: number }>();
@@ -305,6 +332,7 @@ async function verifiedOffer(
   baseUrl: string,
   options: ConfidentialRequestOptions,
   fresh = false,
+  probe = false,
 ): Promise<VerifiedOffer> {
   const key = baseUrl.replace(/\/$/, "");
   const policy = {
@@ -321,13 +349,12 @@ async function verifiedOffer(
   } else {
     // A node whose offer could not be fetched lately is not asked again
     // until its cooldown ends: each request would otherwise wait for it
-    // (a connect timeout) before failing over (§2.2).
+    // (a connect timeout) before failing over (§2.2). As the caller's last
+    // candidate (`probe`) it is, once its last failure is old enough.
     const cool = offerUnreachable.get(key);
-    if (cool && Date.now() < cool.until) {
-      throw new OfferUnavailableError(
-        `${key} did not serve its offer lately; not asked again for ${Math.ceil((cool.until - Date.now()) / 1000)} s`,
-        cool.error.message,
-      );
+    const now = Date.now();
+    if (cool && now < cool.until && !(probe && now - cool.at >= OFFER_PROBE_MIN_MS)) {
+      throw coolingError(key, cool);
     }
     try {
       offer = await fetchConfidentialOffer(key, policy);
@@ -336,7 +363,7 @@ async function verifiedOffer(
       if (error instanceof OfferUnavailableError) {
         const failures = (cool?.failures ?? 0) + 1;
         const ms = Math.min(OFFER_COOLDOWN_BASE_MS * 2 ** (failures - 1), OFFER_COOLDOWN_MAX_MS);
-        offerUnreachable.set(key, { until: Date.now() + ms, failures, error });
+        offerUnreachable.set(key, { until: Date.now() + ms, at: Date.now(), failures, error });
       }
       if (error instanceof NodeProtocolOutdatedError) {
         try {
@@ -369,8 +396,9 @@ async function qualifiedOffer(
   options: ConfidentialRequestOptions,
   fresh = false,
   kind: "chat" | "images" = "chat",
+  probe = false,
 ): Promise<VerifiedOffer> {
-  const offer = await verifiedOffer(baseUrl, options, fresh);
+  const offer = await verifiedOffer(baseUrl, options, fresh, probe);
   if (kind === "images") {
     if (!offerSupportsImages(offer)) {
       throw new ConfidentialError("offer_no_images", `node ${baseUrl} serves no confidential image generation`);
@@ -398,7 +426,9 @@ async function qualifiedOffer(
  * would raise; returns the verified offer. The client calls this before it
  * spends a token on a node, and sizes the deposit from the offer: a one-off
  * Cashu deposit minted for a session that then fails locally would stay in
- * the store, unspent, until a refund sweep.
+ * the store, unspent, until a refund sweep. A node in its offer cooldown
+ * fails at once (`coolingUntil`, `probeAt` on the error) unless `probe` is
+ * set: the caller's last candidate, asked once `probeAt` has passed.
  */
 export async function qualifyConfidentialNode(
   baseUrl: string,
@@ -406,10 +436,11 @@ export async function qualifyConfidentialNode(
   options: ConfidentialRequestOptions,
   kind: "chat" | "images" = "chat",
   request?: unknown,
+  qualify?: { probe?: boolean },
 ): Promise<VerifiedOffer> {
   // Local, so first: no node can run a session without them.
   requireHelperBinaries({ proverPath: resolveProverPath(options.proverPath), twoPcPath: options.twoPcPath });
-  const offer = await qualifiedOffer(baseUrl, model, options, false, kind);
+  const offer = await qualifiedOffer(baseUrl, model, options, false, kind, qualify?.probe === true);
   // A framing the caller allows must serve the request, and the deposit must
   // be one the caller accepts: otherwise the node is not used at all.
   chooseFraming(offer, kind, { http: options.http, baseUrl });
