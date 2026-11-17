@@ -6,6 +6,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProviderManager } from "../../client/ProviderManager";
 import { RoutstrClient, setConfidentialTransport } from "../../client/RoutstrClient";
+import { PoolBusyError } from "../../client/confidential/pool";
+import { ConfidentialTimeoutError, confidentialFailoverError } from "../../client/confidential/errors";
 import type { Model, SdkLogger } from "../../core/types";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
@@ -45,6 +47,8 @@ function setup(
     nativeIdOnA?: string;
     /** The verified offer the qualifier returns (sizes the deposit). */
     offer?: unknown;
+    /** What the transport throws for node A (default: a fetch failure). */
+    errorOnA?: () => unknown;
   } = {},
 ) {
   const models: Record<string, Model[]> = {
@@ -97,7 +101,7 @@ function setup(
     async ({ baseUrl, body }) => {
       sessions.push(baseUrl);
       bodies.push(body);
-      if (baseUrl === A && !opts.nativeIdOnA) throw new TypeError("Failed to fetch");
+      if (baseUrl === A && !opts.nativeIdOnA) throw opts.errorOnA ? opts.errorOnA() : new TypeError("Failed to fetch");
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -131,6 +135,22 @@ afterEach(() => {
 });
 
 describe("confidential failover", () => {
+  it("a busy pool (every connection of the key busy) is the caller's, not a node failure", async () => {
+    expect(confidentialFailoverError(new PoolBusyError("busy"))).toBe(false);
+    // By shape, from another bundle.
+    const foreign = Object.assign(new Error("busy"), { code: "timeout", name: "PoolBusyError" });
+    expect(confidentialFailoverError(foreign)).toBe(false);
+    // A node's step timing out still fails over.
+    expect(confidentialFailoverError(new ConfidentialTimeoutError("2PC timed out"))).toBe(true);
+
+    const { client, spent, sessions } = setup({ errorOnA: () => new PoolBusyError("every connection is busy") });
+    const markFailed = vi.spyOn(ProviderManager.prototype, "markFailed");
+    await expect(route(client)).rejects.toBeInstanceOf(PoolBusyError);
+    expect(sessions).toEqual([A]);
+    expect(spent.map((s) => s.baseUrl)).toEqual([A]);
+    expect(markFailed).not.toHaveBeenCalled();
+  });
+
   it("skips nodes without confidential sessions and qualifies before spending", async () => {
     const { client, spent, sessions, qualified } = setup();
     const res = await route(client);

@@ -329,7 +329,7 @@ export function confidentialErrorCode(error: unknown): ConfidentialErrorCode | u
  * a failure of the node or its connection, decided by the error's type, never
  * by its message (which may carry the node's own text): the connection failed
  * or was closed without a status, the node broke the protocol, a step timed
- * out, its offer could not be fetched, the upstream's TLS could not be
+ * out (not the pool's own wait for a free connection), its offer could not be fetched, the upstream's TLS could not be
  * verified, or its reservation was above the caller's ceiling. A refusal with
  * a status is a `Response`, not an error; local and caller faults
  * (configuration, binaries, versions, pinned parameters) stay where they are.
@@ -342,8 +342,11 @@ export function confidentialFailoverError(error: unknown): boolean {
       const e = error as { status?: unknown; name?: unknown };
       return typeof e.status !== "number" && e.name !== "ConnectionDepositError";
     }
-    case "session_protocol":
     case "timeout":
+      // The pool's own limit (every connection of the key busy) is not the
+      // node's failure: it is neither failed over nor cooled down.
+      return (error as { name?: unknown }).name !== "PoolBusyError";
+    case "session_protocol":
     case "offer_unavailable":
     case "response_verification":
     case "reservation_above_ceiling":
