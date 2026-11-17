@@ -245,6 +245,7 @@ describe("the reservation ceiling a client derives", () => {
       abandon_fee_msat: 300,
       reserve_margin_tokens: 16,
       connection_deposit_msat: 2000,
+      context_lengths: { m: 8192 },
       ...extra,
     }) as never;
 
@@ -261,8 +262,9 @@ describe("the reservation ceiling a client derives", () => {
   it("is none where the client cannot bound what an honest node reserves", () => {
     // No deposit: the node's minimum reservation is unknown.
     expect(confidentialReservationCeilingMsats(model(), 100, offer({ connection_deposit_msat: 0 }))).toBeUndefined();
-    // No context length: the node's fallback reads the model's sats price.
-    expect(confidentialReservationCeilingMsats(model({ context_length: undefined }), 100, offer())).toBeUndefined();
+    // No signed context length: the listing's row may be another upstream's,
+    // and the node's fallback reads the model's sats price.
+    expect(confidentialReservationCeilingMsats(model(), 100, offer({ context_lengths: undefined }))).toBeUndefined();
     // The offer does not price the model, or there is no offer.
     expect(confidentialReservationCeilingMsats(model({ id: "other" }), 100, offer())).toBeUndefined();
     expect(confidentialReservationCeilingMsats(model(), 100, undefined)).toBeUndefined();
@@ -325,7 +327,11 @@ const MINT = "https://mint.example";
 const SSE_HEAD = { status: 200, statusText: "OK", headers: { "content-type": "text/event-stream" } };
 
 const nodeOffer = () =>
-  signedOffer({ price_list: { [MODEL]: { in: 1000, cached_in: 1000, out: 1000 } }, connection_deposit_msat: 2000 });
+  signedOffer({
+    price_list: { [MODEL]: { in: 1000, cached_in: 1000, out: 1000 } },
+    connection_deposit_msat: 2000,
+    context_lengths: { [MODEL]: 8192 },
+  });
 
 const realFetch = globalThis.fetch;
 function mockNode() {

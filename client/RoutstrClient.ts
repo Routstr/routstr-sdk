@@ -469,6 +469,7 @@ type ConfidentialDepositOffer = Pick<
   | "reserve_margin_tokens"
   | "images"
   | "connection_deposit_msat"
+  | "context_lengths"
 >;
 
 /**
@@ -485,8 +486,8 @@ export function confidentialDepositMsats(offer?: ConfidentialDepositOffer): numb
 /**
  * The reservation (msats) a confidential node holds for this request, by the
  * node's own formula. The prompt is opaque, so it reserves the model's full
- * context length (the larger of the model's and its `top_provider`'s, at the
- * dearer of the input and cache-write rates) plus the pinned completion cap
+ * context length (the one the signed offer names in `context_lengths`, else
+ * the larger of the listing's and its `top_provider`'s, at the dearer of the input and cache-write rates) plus the pinned completion cap
  * and the offer's `reserve_margin_tokens` at the signed (surcharged) rates; without a known
  * context length, the model's undiscounted maximum cost scaled by
  * max(1, cache_write / in) (when both rates are positive: the prompt may be
@@ -544,7 +545,9 @@ export function confidentialReservationMsats(
   } else {
     completion = 4096;
   }
-  const limit = confidentialContextLimit(model);
+  // The node's own number when its offer signs one; the listing's row may be
+  // another upstream's (another context length), or stale.
+  const limit = signedContextLimit(offer, model.id) ?? confidentialContextLimit(model);
   let msats: number;
   if (limit !== undefined) {
     if (!inRate || !outRate) return undefined;
@@ -560,6 +563,13 @@ export function confidentialReservationMsats(
     msats = Math.ceil(Math.ceil(sp.max_cost! * 1000) * ratio * factor + (margin * outRate) / 1000);
   }
   return msats + feeMsat;
+}
+
+/** The prompt limit the node's signed offer names for `id` (`context_lengths`), if any. */
+function signedContextLimit(offer: ConfidentialDepositOffer | undefined, id: string): number | undefined {
+  const m = offer?.context_lengths;
+  const v = m && typeof m === "object" && Object.hasOwn(m, id) ? m[id] : undefined;
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : undefined;
 }
 
 /**
@@ -579,10 +589,11 @@ function confidentialContextLimit(model: Model): number | undefined {
  * The ceiling (msats) a client may hold a node's announced reservation for a
  * confidential chat request to (`maxReservationMsat`): never below what an
  * honest node reserves. Only computed where the node's formula depends on
- * nothing but the signed offer and the model's context length: the offer
- * prices the model, the model has a known context length (the fallback
- * branch reads the model's maximum cost in sats, which moves with the
- * exchange rate) and the offer takes a connection deposit, whose amount the
+ * nothing but the signed offer: the offer prices the model, signs the prompt
+ * limit it reserves for (`context_lengths`; the listing's row may be another
+ * upstream's, and without a context length the node's fallback branch reads
+ * the model's maximum cost in sats, which moves with the exchange rate) and
+ * takes a connection deposit, whose amount the
  * node never sets below its minimum reservation (`min_request_msat`, the
  * floor of every reservation). Undefined: no ceiling.
  */
@@ -592,7 +603,10 @@ export function confidentialReservationCeilingMsats(
   offer: ConfidentialDepositOffer | undefined
 ): number | undefined {
   if (!offer || !offer.price_list || !Object.hasOwn(offer.price_list, model.id)) return undefined;
-  if (confidentialContextLimit(model) === undefined) return undefined;
+  // Only with the prompt limit the node signed (`context_lengths`): the
+  // listing's row is the node's best-ranked upstream for the id, which need
+  // not be the provider the node reserves for.
+  if (signedContextLimit(offer, model.id) === undefined) return undefined;
   const deposit = confidentialDepositMsats(offer);
   if (deposit <= 0) return undefined;
   const msats = confidentialReservationMsats(model, maxTokens, offer);
