@@ -22,6 +22,20 @@ export const CU_PROVER_ENV_VARS = ["CU_PROVER_BIN", "CU_PROVER"] as const;
  */
 export const MAX_UNFLUSHED_STDIN = 32 << 20;
 
+/**
+ * The environment of a helper process (`cu-prover`, `cu-2pc`): `PATH`,
+ * `HOME`, `TMPDIR` and the variables starting with `CU_` or `RUST_`. Nothing
+ * else of the host's environment (credentials, tokens, keys) reaches it.
+ */
+export function helperEnv(env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {}): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (k === "PATH" || k === "HOME" || k === "TMPDIR" || k.startsWith("CU_") || k.startsWith("RUST_")) out[k] = v;
+  }
+  return out;
+}
+
 /** The part of a child's stdin the budget writes to. */
 interface StdinLike {
   write(chunk: Uint8Array, cb: (error?: Error | null) => void): unknown;
@@ -41,12 +55,17 @@ export class StdinBudget {
     return this.unflushed;
   }
 
-  /** Write `bytes`, or return false (writing nothing) when they would exceed the budget. */
-  write(stdin: StdinLike, bytes: Uint8Array): boolean {
+  /**
+   * Write `bytes`, or return false (writing nothing) when they would exceed
+   * the budget. With `wipe`, `bytes` (the caller's own buffer) is zeroed once
+   * the write is done.
+   */
+  write(stdin: StdinLike, bytes: Uint8Array, wipe = false): boolean {
     if (this.unflushed + bytes.length > this.limit) return false;
     this.unflushed += bytes.length;
     stdin.write(bytes, () => {
       this.unflushed -= bytes.length;
+      if (wipe) bytes.fill(0);
     });
     return true;
   }
@@ -127,7 +146,7 @@ export class CuProverBackend {
     try {
       child = this.spawnImpl(this.binary, ["--job-stdin", "--role", job.role], {
         stdio: ["pipe", "pipe", "inherit"],
-        env: process.env,
+        env: helperEnv(),
       }) as unknown as ChildProcessWithoutNullStreams;
     } catch (error) {
       throw new ProverMissingError(
@@ -151,8 +170,11 @@ export class CuProverBackend {
     );
     const lenPrefix = Buffer.alloc(4);
     lenPrefix.writeUInt32BE(jobBytes.length);
-    child.stdin.write(Buffer.concat([lenPrefix, jobBytes]));
+    // The job holds the witness: its buffer is zeroed once the write is done
+    // (not before: a queued write still reads it).
+    const jobFrame = Buffer.concat([lenPrefix, jobBytes]);
     jobBytes.fill(0);
+    child.stdin.write(jobFrame, () => jobFrame.fill(0));
 
     const ws = new WebSocket(zkUrl);
     ws.binaryType = "arraybuffer";

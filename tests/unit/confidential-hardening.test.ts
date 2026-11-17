@@ -534,3 +534,96 @@ describe("closing ends the waits at once (finding 22)", () => {
     expect(Date.now() - t0).toBeLessThan(1000);
   });
 });
+
+describe("the helper processes' environment and stdin", () => {
+  /** A child whose stdin holds each write and its callback until `flush()`. */
+  function holdingChild() {
+    const writes: { buf: Uint8Array; cb?: () => void }[] = [];
+    const stdin = Object.assign(new EventEmitter(), {
+      write: (buf: Uint8Array, cb?: () => void) => {
+        writes.push({ buf, cb });
+        return true;
+      },
+      end() {},
+    });
+    const child = Object.assign(new EventEmitter(), { stdin, stdout: new PassThrough(), kill: () => true });
+    return { child, writes, flush: () => writes.forEach((w) => w.cb?.()) };
+  }
+
+  const ALLOWED = (k: string) => ["PATH", "HOME", "TMPDIR"].includes(k) || k.startsWith("CU_") || k.startsWith("RUST_");
+  const SECRET = "ROUTSTR_TEST_SECRET_KEY";
+
+  function spawnEnvs(): Promise<Record<string, string | undefined>[]> {
+    const envs: Record<string, string | undefined>[] = [];
+    const spawnImpl = ((_bin: string, _args: string[], opts: { env?: Record<string, string> }) => {
+      envs.push(opts.env ?? (process.env as Record<string, string>));
+      return holdingChild().child;
+    }) as never;
+    const Ws = fakeSocketClass();
+    const real = (globalThis as { WebSocket: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = Ws;
+    try {
+      new TwoPcSession({ binaryPath: "/fake/cu-2pc", spawnImpl, webSocketImpl: Ws as never }).start("ws://node/twopc");
+      new ProofChannel({ binaryPath: "/fake/cu-prover", spawnImpl, webSocketImpl: Ws as never }).start("ws://node/zkchan");
+      new CuProverBackend({ binaryPath: "/fake/cu-prover", spawnImpl })
+        .run("ws://node/zk", { proof: "pi_c3s", role: "prover", params: {} }, 50)
+        .catch(() => {});
+    } finally {
+      (globalThis as { WebSocket: unknown }).WebSocket = real;
+    }
+    return Promise.resolve(envs);
+  }
+
+  it("cu-2pc, the proof channel and the per-proof prover get only PATH, HOME, TMPDIR, CU_* and RUST_*", async () => {
+    const saved = { ...process.env };
+    process.env[SECRET] = "sk-not-for-children";
+    process.env.CU_2PC_TEST = "/x/cu-2pc";
+    process.env.RUST_LOG = "warn";
+    process.env.PATH = process.env.PATH ?? "/usr/bin";
+    try {
+      const envs = await spawnEnvs();
+      expect(envs).toHaveLength(3);
+      for (const env of envs) {
+        expect(env).not.toBe(process.env);
+        expect(Object.keys(env).filter((k) => !ALLOWED(k))).toEqual([]);
+        expect(env[SECRET]).toBeUndefined();
+        expect(env.CU_2PC_TEST).toBe("/x/cu-2pc");
+        expect(env.RUST_LOG).toBe("warn");
+        expect(env.PATH).toBe(process.env.PATH);
+      }
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it("the per-proof prover's job buffer is zeroed once its write is done", async () => {
+    const { child, writes, flush } = holdingChild();
+    const Ws = fakeSocketClass();
+    const real = (globalThis as { WebSocket: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = Ws;
+    try {
+      const prover = new CuProverBackend({ binaryPath: "/fake/cu-prover", spawnImpl: (() => child) as never });
+      prover.run("ws://node/zk", { proof: "pi_c3s", role: "prover", params: {}, witness: { secret: "w1tness" } }, 50).catch(() => {});
+      const job = writes[0]!.buf;
+      // Intact while the write is in flight.
+      expect(Buffer.from(job).toString("latin1")).toContain("w1tness");
+      flush();
+      expect(job.every((b) => b === 0)).toBe(true);
+    } finally {
+      (globalThis as { WebSocket: unknown }).WebSocket = real;
+    }
+  });
+
+  it("the proof channel's command frame (with the witness) is zeroed once its write is done", async () => {
+    const { child, writes, flush } = holdingChild();
+    const Ws = fakeSocketClass();
+    const c = new ProofChannel({ binaryPath: "/fake/cu-prover", spawnImpl: (() => child) as never, webSocketImpl: Ws as never });
+    c.start("ws://node/zkchan");
+    c.run("prove", "pi_c3s", {}, { secret: "w1tness" }, 50).catch(() => {});
+    const frame = writes.find((w) => Buffer.from(w.buf).toString("latin1").includes("w1tness"))!.buf;
+    flush();
+    expect(frame.every((b) => b === 0)).toBe(true);
+    c.close();
+  });
+});
