@@ -1,0 +1,74 @@
+{
+  "description": "The canonical TLS 1.3 ClientHello every client stack must write (crypto/relay/src/tls_v2.rs canonical_client_hello; PROTOCOL-V3.md). One entry per framing. A client test builds its hello from `inputs` and compares it with `client_hello_hex`, or masks the `free_ranges` of its own hello (fresh random, session id and key share) and compares the rest.",
+  "format": {
+    "client_hello_hex": "the ClientHello handshake message with its 4-byte handshake header (01 <len:3>), without the 5-byte TLS record header; lowercase hex",
+    "inputs.host": "server_name, the offer's upstream host (ASCII DNS name)",
+    "inputs.alpn": "the one ALPN protocol: h2 for framing \"2\", http/1.1 for framing \"1.1\"",
+    "inputs.random_hex": "the 32-byte client random",
+    "inputs.session_id_hex": "the 32-byte legacy session id",
+    "inputs.key_share_hex": "the 65-byte uncompressed P-256 point in the single secp256r1 key_share entry (here the generator)",
+    "free_ranges": "byte offsets into client_hello_hex's bytes, half-open [start, end), of the three fields a client fills freshly per connection; every other byte is fixed by host and framing. The key_share offset depends on the host length (server_name comes before key_share), so it holds for this host only"
+  },
+  "vectors": [
+    {
+      "name": "framing-2",
+      "framing": "2",
+      "inputs": {
+        "host": "api.venice.ai",
+        "alpn": "h2",
+        "random_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "session_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "key_share_hex": "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      },
+      "client_hello_hex": "010000df0303aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0002130101000094ff0100010000000012001000000d6170692e76656e6963652e6169000a00040002001700230000002b0003020304000d000e000c04030503080404010501060100330047004500170041046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5001000050003026832",
+      "client_hello_len": 227,
+      "free_ranges": [
+        {
+          "field": "random",
+          "start": 6,
+          "end": 38
+        },
+        {
+          "field": "session_id",
+          "start": 39,
+          "end": 71
+        },
+        {
+          "field": "key_share",
+          "start": 153,
+          "end": 218
+        }
+      ]
+    },
+    {
+      "name": "framing-1.1",
+      "framing": "1.1",
+      "inputs": {
+        "host": "api.venice.ai",
+        "alpn": "http/1.1",
+        "random_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "session_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "key_share_hex": "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      },
+      "client_hello_hex": "010000e50303aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000213010100009aff0100010000000012001000000d6170692e76656e6963652e6169000a00040002001700230000002b0003020304000d000e000c04030503080404010501060100330047004500170041046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f50010000b000908687474702f312e31",
+      "client_hello_len": 233,
+      "free_ranges": [
+        {
+          "field": "random",
+          "start": 6,
+          "end": 38
+        },
+        {
+          "field": "session_id",
+          "start": 39,
+          "end": 71
+        },
+        {
+          "field": "key_share",
+          "start": 153,
+          "end": 218
+        }
+      ]
+    }
+  ]
+}
