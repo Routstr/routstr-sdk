@@ -132,6 +132,16 @@ request once more (`offer_changed` on a new connection: the pool key includes
 the offer's connection-level fields, `connectionTerms`). π_C2S and the v2
 one-request session are gone.
 
+**A stream the provider refused** (framing `"2"`: `RST_STREAM(REFUSED_STREAM)`,
+or a GOAWAY(`NO_ERROR`) whose last stream is below the request's) was not
+processed. The client proves the refusal to the node (`disclose_reset`: π_WIN
+under `s_ap_0` over the refusing frame), and the node settles it like a 429:
+at most the session fee if it is still due, nothing for the request (the
+receipt is checked by `checkRefusalReceipt`, for images also its kind,
+model, variant and count). The request then runs again on a new
+connection (up to three attempts); what a refused attempt cost is part of
+the call's cost.
+
 **Choosing the framing** (§2.3; `confidential.http`, default `auto`):
 the first entry of the signed offer's `http` that serves the request (images
 on `"2"` only when `h2.kinds` lists them) and is not marked bad for the node.

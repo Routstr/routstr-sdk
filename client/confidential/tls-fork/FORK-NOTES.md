@@ -53,7 +53,8 @@ Marked `// FORK PATCH (v2)` (`lib/make-tls-client.js`, `lib/utils/client-hello.j
 types in `lib/types/tls.d.ts`, `lib/make-tls-client.d.ts`, `lib/utils/client-hello.d.ts`).
 Mirrored byte for byte from the reference client (`crypto/client/vendor/tls`).
 Opt-in via the `external` option; without it the client behaves exactly as
-before. `session.ts` always uses it (protocol v2, docs/TWOPC-DESIGN.md).
+before. `connection.ts` always uses it, for both framings (the two-party key
+schedule, docs/TWOPC-DESIGN.md).
 
 ```ts
 external: {
@@ -84,7 +85,7 @@ external: {
 Marked `// FORK PATCH (v3)` (`lib/make-tls-client.js`), mirrored from the
 reference client. `writeInner(inner)` writes one TLS 1.3 record whose whole
 inner plaintext the caller supplies (content, the content-type byte, no
-padding in this SDK). An `http: 2` session (`h2conn.ts`) sends exactly one
+padding in this SDK). A framing-`"2"` connection (`connection.ts`) sends exactly one
 HTTP/2 frame per record, up to the full 2^14 bytes of content, and must know
 each record's plaintext to check the node's π_WIN windows against it.
 
