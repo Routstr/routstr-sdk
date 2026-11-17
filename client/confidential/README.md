@@ -25,7 +25,9 @@ await routeRequests({
 `POST /v1/chat/completions` and the image paths `POST /v1/images/generations`
 (OpenAI shape) and `POST /v1/image/generate` (Venice shape) are supported;
 other endpoints are refused before any credential or deposit. Only nodes whose `/v1/models` entry
-advertises `confidential_upstream` for the model are selected. Credentials, top-ups, failover, usage tracking and balance
+advertises `confidential_upstream` for the model are selected; when none does
+(or a pinned provider does not), the request fails with
+`ConfidentialError` `no_confidential_provider` before anything is sent. Credentials, top-ups, failover, usage tracking and balance
 accounting are the client's normal ones: `RoutstrClient` runs
 `fetchConfidential` (`transport.ts`) in place of `fetch()`. The Bun/Node
 entrypoints register the transport, so the browser-safe bundle never imports

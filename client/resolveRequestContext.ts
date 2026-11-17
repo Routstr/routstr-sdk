@@ -7,6 +7,7 @@
  */
 
 import { modelPathPolicyFor } from "../core/modelPathWhitelist";
+import { ConfidentialError } from "./confidential/errors";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -253,13 +254,17 @@ export async function resolveRequestContext(
     // Match by native id or a mapped variant/alias of it, so a
     // forced provider also serves requests using the canonical id.
     const match = findModelForId(models, modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined);
+    // A confidential request the pinned provider cannot serve is the
+    // caller's error (`no_confidential_provider`), never a failover.
     if (!match) {
-      throw new Error(
-        `Provider ${normalizedProvider} does not offer model: ${modelId}`
-      );
+      const message = `Provider ${normalizedProvider} does not offer model: ${modelId}`;
+      throw requireConfidential
+        ? new ConfidentialError("no_confidential_provider", message)
+        : new Error(message);
     }
     if (requireConfidential && !match.confidential_upstream) {
-      throw new Error(
+      throw new ConfidentialError(
+        "no_confidential_provider",
         `Provider ${normalizedProvider} does not offer model ${modelId} confidentially`
       );
     }
@@ -366,11 +371,13 @@ export async function resolveRequestContext(
       })
       .filter((p) => !requireConfidential || Boolean(p.model.confidential_upstream));
     if (ranking.length === 0) {
-      throw new Error(
-        requireConfidential
-          ? `No provider offers model ${modelId} confidentially`
-          : `No providers found for model: ${modelId}`
-      );
+      if (requireConfidential) {
+        throw new ConfidentialError(
+          "no_confidential_provider",
+          `No provider offers model ${modelId} confidentially`
+        );
+      }
+      throw new Error(`No providers found for model: ${modelId}`);
     }
     // Cheapest-first among providers that accept a funded mint (fail open
     // when the mint cache is empty).
