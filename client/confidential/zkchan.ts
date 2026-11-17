@@ -20,7 +20,7 @@
 
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ProverError, ProverMissingError } from "./errors";
-import { resolveProverPath, StdinBudget } from "./prover";
+import { helperEnv, resolveProverPath, StdinBudget } from "./prover";
 import {
   encodeTwoPcFrame,
   TWOPC_CHANNEL_CONTROL,
@@ -119,7 +119,7 @@ export class ProofChannel {
     try {
       child = this.spawnImpl(this.binary, args, {
         stdio: ["pipe", "pipe", "inherit"],
-        env: process.env,
+        env: helperEnv(),
       }) as unknown as ChildProcessWithoutNullStreams;
     } catch (error) {
       this.fail(
@@ -168,7 +168,9 @@ export class ProofChannel {
   private writeChild(channel: number, payload: Uint8Array): void {
     if (!this.child || this.failureErr) return;
     try {
-      if (!this.stdinBudget.write(this.child.stdin, encodeTwoPcFrame(channel, payload))) {
+      // A command frame may carry a witness: zeroed once written.
+      const wipe = channel === TWOPC_CHANNEL_CONTROL;
+      if (!this.stdinBudget.write(this.child.stdin, encodeTwoPcFrame(channel, payload), wipe)) {
         this.fail(new ProverError(`cu-prover stdin: more than ${this.stdinBudget.limit} bytes not yet read`));
       }
     } catch (e) {

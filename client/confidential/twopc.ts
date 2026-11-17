@@ -16,7 +16,7 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fromHex, hex } from "./advice";
 import { ProverError, ProverMissingError, TwoPcVersionMismatchError } from "./errors";
-import { isExecutable, resolveProverPath, StdinBudget } from "./prover";
+import { helperEnv, isExecutable, resolveProverPath, StdinBudget } from "./prover";
 
 export const CU_2PC_ENV_VARS = ["CU_2PC_BIN", "CU_2PC"] as const;
 
@@ -197,7 +197,7 @@ export class TwoPcSession {
     try {
       child = this.spawnImpl(this.binary, [], {
         stdio: ["pipe", "pipe", "inherit"],
-        env: process.env,
+        env: helperEnv(),
       }) as unknown as ChildProcessWithoutNullStreams;
     } catch (error) {
       throw new ProverMissingError(
