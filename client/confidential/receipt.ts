@@ -264,18 +264,26 @@ export function checkUpstreamErrorReceipt(
  * A receipt for a refusal the client proved (`disclose_reset`, PROTOCOL-V3.md
  * §12.8): the provider refused the stream without processing it, and the node
  * settles it like a 429: at most the session fee still due on the connection,
- * nothing for the request. Its usage must name exactly the refusal we saw.
- * Throws on any mismatch.
+ * nothing for the request. Its usage must name exactly the refusal we saw. An
+ * image request's receipt must also name its terms (kind, model, variant,
+ * count), as an error receipt does. Throws on any mismatch.
  */
 export function checkRefusalReceipt(
   receipt: ConfidentialReceipt,
   refusal: Refusal,
   sessionFeeMsat = 0,
   abandonFeeMsat = 0,
+  image?: { model: string; variant: string; count: number },
 ): void {
   const fail = (what: string): never => {
     throw new ReceiptVerificationError(`refusal receipt: ${what}`);
   };
+  if (image) {
+    if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+    if (receipt.model !== image.model) fail(`model ${String(receipt.model)} is not ${image.model}`);
+    if (receipt.variant !== image.variant) fail(`variant ${String(receipt.variant)} is not ${image.variant}`);
+    if (receipt.count !== image.count) fail(`count ${String(receipt.count)} is not ${image.count}`);
+  }
   const u = receipt.usage as unknown as Record<string, unknown> | undefined;
   if (!u || u.refused !== refusal.refused || u.error_code !== refusal.error_code) {
     fail(`usage ${JSON.stringify(u ?? null).slice(0, 120)} does not name the ${refusal.refused} we saw`);
