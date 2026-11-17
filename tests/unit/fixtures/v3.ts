@@ -106,6 +106,8 @@ export type Behaviour = (
   refuse?: { status: number; reason: string; detail?: unknown };
   wait?: Promise<void>;
   status?: number;
+  /** Provider response headers besides `content-type`. */
+  headers?: Record<string, string>;
 };
 
 /**
@@ -174,7 +176,8 @@ export function fakeConnections(
       const image = opts.image !== undefined;
       const status = b.status ?? 200;
       const type = image ? "application/json" : "text/event-stream";
-      opts.onResponseHead?.({ status, statusText: "", headers: { "content-type": type } });
+      const headers = { "content-type": type, ...b.headers };
+      opts.onResponseHead?.({ status, statusText: "", headers });
       opts.onResponseBody?.(enc(image ? IMAGE_BODY : SSE));
       conn.cur = undefined;
       conn.settled++;
@@ -188,7 +191,7 @@ export function fakeConnections(
         stream: conn.framing === "2" ? 2 * n + 1 : undefined,
         model: opts.model,
         status,
-        headers: { "content-type": type },
+        headers,
         body: image ? new Uint8Array(0) : enc(SSE),
         bodyChunks: image ? [enc(IMAGE_BODY.slice(0, 10)), enc(IMAGE_BODY.slice(10))] : undefined,
         receipt: { sid: conn.sid, model: opts.model, usage: {}, cost_msats: image ? 12100 : 7, http: conn.framing, n },

@@ -99,12 +99,28 @@ describe("HTTP framing", () => {
     expect(http("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", "3\r\nabc\r\n").complete).toBe(false);
   });
 
-  it("does not hand on the provider account's state", () => {
-    expect(exposedProviderHeader("content-type")).toBe(true);
-    expect(exposedProviderHeader("x-venice-balance-usd")).toBe(false);
-    expect(exposedProviderHeader("X-Venice-Balance-Diem")).toBe(false);
-    expect(exposedProviderHeader("x-ratelimit-remaining-requests")).toBe(false);
-    expect(exposedProviderHeader("connection")).toBe(false);
+  it("hands on only the allow-listed response headers", () => {
+    for (const h of ["content-type", "Content-Type", "cache-control", "date", "retry-after", "x-request-id", "request-id"]) {
+      expect(exposedProviderHeader(h)).toBe(true);
+    }
+    // The provider account's state, cookies, any provider's own headers, hop-by-hop headers.
+    for (const h of [
+      "x-venice-balance-usd",
+      "X-Venice-Balance-Diem",
+      "x-ratelimit-remaining-requests",
+      "anthropic-ratelimit-tokens-remaining",
+      "openai-organization",
+      "x-groq-region",
+      "set-cookie",
+      "server",
+      "cf-ray",
+      "x-account-balance",
+      "connection",
+      "transfer-encoding",
+      "content-length",
+    ]) {
+      expect(exposedProviderHeader(h)).toBe(false);
+    }
   });
 });
 
