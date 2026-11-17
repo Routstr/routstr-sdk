@@ -147,7 +147,10 @@ not fall back. After a body was released nothing is retried. `"2"` or
   sent. A
   connection that ends without a settled request loses it, unless the node,
   its sidecar or the provider failed (the signed `deposit` of the last frame
-  says which; `conn.deposit`).
+  says which; `conn.deposit`). An outcome that disagrees with the signed
+  offer or with how the connection ended is reported as one line to the
+  `confidential.onWarning` option (default `console.warn`), on every
+  connection the transport opens.
 - A node whose deposit exceeds `maxConnectionDepositMsat` (default 100 000
   msat; also read from `http2.maxConnectionDepositMsat`) is not used: the
   check runs when the node is qualified, before any token is spent.

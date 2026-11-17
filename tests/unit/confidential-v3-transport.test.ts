@@ -785,3 +785,31 @@ describe("a node whose offer cannot be fetched (finding 21)", () => {
     expect(Date.now() - t0).toBeLessThan(2_000);
   });
 });
+
+describe("v3 transport: where a connection's warnings go", () => {
+  it("confidential.onWarning reaches every connection the transport opens", async () => {
+    mockNodeOffer();
+    const { connect } = fakeConnections();
+    const warnings: string[] = [];
+    const onWarning = (m: string) => warnings.push(m);
+    const url = freshNode();
+    // Two overlapping requests: two connections.
+    const [a, b] = await Promise.all([call(url, {}, { onWarning }), call(url, {}, { onWarning })]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const conns = connect.mock.contexts as any[];
+    expect(conns.length).toBeGreaterThanOrEqual(1);
+    for (const c of conns) {
+      c.onWarning("the node did something against its terms");
+    }
+    expect(warnings).toEqual(conns.map(() => "the node did something against its terms"));
+  });
+
+  it("without it, a warning goes to console.warn", async () => {
+    mockNodeOffer();
+    const { connect } = fakeConnections();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect((await call(freshNode())).status).toBe(200);
+    (connect.mock.contexts[0] as any).onWarning("x");
+    expect(warn).toHaveBeenCalledWith("[confidential] x");
+  });
+});
