@@ -109,6 +109,13 @@ export interface ConfidentialOffer {
    * when every id is the provider's own.
    */
   upstream_models?: Record<string, string>;
+  /**
+   * Public id -> the prompt limit (tokens) the node sizes a chat request's
+   * reservation by: its own number, so a client bounds the reservation
+   * (`request_ok.reserved_msats`) without the listing's row, which may be
+   * another upstream's. Absent: the client sets no ceiling.
+   */
+  context_lengths?: Record<string, number>;
   mints?: string[];
   prewarm?: boolean;
   /**
@@ -297,6 +304,23 @@ export function upstreamModelsProblem(offer: { price_list: Record<string, unknow
   return undefined;
 }
 
+/**
+ * Why an offer's `context_lengths` is refused, or undefined (absent is fine).
+ * Each key must be a priced id, each value a positive safe integer.
+ */
+export function contextLengthsProblem(offer: { price_list: Record<string, unknown>; context_lengths?: unknown }): string | undefined {
+  const m = offer.context_lengths;
+  if (m === undefined) return undefined;
+  if (m === null || typeof m !== "object" || Array.isArray(m)) return "context_lengths is not an object";
+  for (const [pub, limit] of Object.entries(m as Record<string, unknown>)) {
+    if (!Object.hasOwn(offer.price_list, pub)) return `context_lengths names ${JSON.stringify(pub)}, which price_list does not`;
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0) {
+      return `context_lengths[${JSON.stringify(pub)}] is not a positive integer`;
+    }
+  }
+  return undefined;
+}
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -361,6 +385,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   }
   const upstreamProblem = upstreamModelsProblem(offer as { price_list: Record<string, unknown>; upstream_models?: unknown });
   if (upstreamProblem) throw new OfferMalformedError(`offer.${upstreamProblem}`);
+  const contextProblem = contextLengthsProblem(offer as { price_list: Record<string, unknown>; context_lengths?: unknown });
+  if (contextProblem) throw new OfferMalformedError(`offer.${contextProblem}`);
   if (
     typeof offer.max_tokens_cap !== "number" ||
     !Number.isSafeInteger(offer.max_tokens_cap) ||
