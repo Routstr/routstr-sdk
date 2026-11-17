@@ -813,3 +813,31 @@ describe("v3 transport: where a connection's warnings go", () => {
     expect(warn).toHaveBeenCalledWith("[confidential] x");
   });
 });
+
+describe("v3 transport: the provider's response headers the caller gets", () => {
+  const provider = {
+    "cache-control": "no-cache",
+    date: "Tue, 17 Nov 2026 10:00:00 GMT",
+    "retry-after": "3",
+    "x-request-id": "req-1",
+    "request-id": "req-2",
+    "x-ratelimit-remaining-requests": "99",
+    "x-account-balance-usd": "12.5",
+    "openai-organization": "org-x",
+    "set-cookie": "a=b",
+    server: "upstream",
+  };
+  const kept = ["cache-control", "date", "retry-after", "x-request-id", "request-id"];
+  const dropped = ["x-ratelimit-remaining-requests", "x-account-balance-usd", "openai-organization", "set-cookie", "server"];
+
+  for (const [what, status] of [["a 2xx", 200], ["an error", 503]] as const) {
+    it(`${what}: only the allow-listed ones`, async () => {
+      mockNodeOffer();
+      fakeConnections(() => ({ status, headers: provider }));
+      const res = await call(freshNode());
+      expect(res.status).toBe(status);
+      for (const h of kept) expect(res.headers.get(h)).toBe(provider[h as keyof typeof provider]);
+      for (const h of dropped) expect(res.headers.has(h)).toBe(false);
+    });
+  }
+});

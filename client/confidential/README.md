@@ -86,6 +86,12 @@ change and the verified receipt's cost, which `finalize()` accounts (a chat
 stream's headers left before the receipt existed). A stream ends when the
 session's settlement checks passed; it does not wait for the change.
 
+Of the provider's response headers the caller gets only `content-type`,
+`cache-control`, `date`, `retry-after`, `x-request-id` and `request-id`
+(`EXPOSED_PROVIDER_HEADERS`); the rest (the provider account's balance and
+rate-limit counters, cookies, a provider's own headers) is dropped. The
+`x-routstr-confidential-*` headers are the client's own.
+
 ## Protocol version (v3)
 
 The client speaks routstr-confidential **protocol v3** only

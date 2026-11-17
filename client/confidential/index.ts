@@ -123,6 +123,7 @@ export {
   ChunkedDecoder,
   HOP_BY_HOP_HEADERS,
   exposedProviderHeader,
+  EXPOSED_PROVIDER_HEADERS,
   type ParsedHttpResponse,
   type UpstreamUsageEvent,
 } from "./suffix";

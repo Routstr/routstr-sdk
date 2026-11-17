@@ -529,14 +529,24 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 /**
- * Whether a provider response header is passed on to the caller: not a
- * hop-by-hop header, and not the provider account's own state (its balance
- * and rate-limit counters belong to the node operator; the client can read
- * them in the decrypted response, but they are not handed on).
+ * The provider response headers handed on to the caller. Everything else is
+ * dropped: the provider account's state (balances, rate-limit counters),
+ * cookies and any provider's own headers belong to the node operator's
+ * account. The client still reads them in the decrypted response; they are
+ * just not passed on.
  */
+export const EXPOSED_PROVIDER_HEADERS: ReadonlySet<string> = new Set([
+  "content-type",
+  "cache-control",
+  "date",
+  "retry-after",
+  "x-request-id",
+  "request-id",
+]);
+
+/** Whether a provider response header is passed on to the caller (`EXPOSED_PROVIDER_HEADERS`). */
 export function exposedProviderHeader(name: string): boolean {
-  const n = name.toLowerCase();
-  return !HOP_BY_HOP_HEADERS.has(n) && !n.startsWith("x-venice-balance-") && !n.startsWith("x-ratelimit-");
+  return EXPOSED_PROVIDER_HEADERS.has(name.toLowerCase());
 }
 
 function joinParts(parts: Uint8Array[]): Uint8Array {
