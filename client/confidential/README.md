@@ -280,10 +280,10 @@ chain extended online (from the third request of a connection on).
   fees than the signed ones is refused. For an upstream HTTP error the
   receipt must name the status the client saw; 4xx/503 may cost at most the
   session fee, any other 4xx at most the abandon fee, any other error at most
-  the reservation, bounded by what the client knew before the release: the
-  reservation the node announced in `request_ok` (the receipt must name the
-  same number), else the caller's ceiling, else (images) price × count plus
-  the abandon fee. With none of these only the fee is accepted
+  the reservation the node announced in `request_ok` (the receipt must name
+  the same number; images also at most price × count plus the larger fee).
+  Without an announcement such an error costs at most the session fee still
+  due, for chat and images: the caller's ceiling is no bound for it
   (`checkUpstreamErrorReceipt`).
 
 A non-streaming call fails if any check after the response fails; a stream

@@ -81,9 +81,9 @@ describe("error receipts for a status billed at the reservation", () => {
     for (const status of [500, 502, 504]) {
       // A validly shaped receipt whose cost and reservation were both inflated.
       const inflated = err(status, { cost_msats: 9_000_000, reserved_msats: 9_000_000 });
-      expect(() => checkUpstreamErrorReceipt(inflated, status, 0)).toThrow(/no reservation bound/);
+      expect(() => checkUpstreamErrorReceipt(inflated, status, 0)).toThrow(/no reservation was announced/);
       expect(() => checkUpstreamErrorReceipt(inflated, status, 0, { reservationMsat: 50_000 })).toThrow(
-        /reservation bound \(50000 msats\)/,
+        /no reservation was announced/,
       );
       // The node announced 50 000 and signs another reservation in the receipt.
       expect(() =>
@@ -95,26 +95,33 @@ describe("error receipts for a status billed at the reservation", () => {
   it("accept a charge at the exact bound, and the fee without any bound", () => {
     const at = err(500, { cost_msats: 50_000, reserved_msats: 50_000 });
     expect(checkUpstreamErrorReceipt(at, 500, 0, { reservationMsat: 50_000, reservationAnnounced: true })).toBe(true);
-    expect(checkUpstreamErrorReceipt(at, 500, 0, { reservationMsat: 50_000 })).toBe(true);
-    // The caller's ceiling is an upper bound, the node may reserve (and charge) less.
-    expect(checkUpstreamErrorReceipt(at, 500, 0, { reservationMsat: 80_000 })).toBe(true);
+    // A bound that is not the node's announcement (the caller's ceiling) is not one.
+    expect(() => checkUpstreamErrorReceipt(at, 500, 0, { reservationMsat: 80_000 })).toThrow(/no reservation was announced/);
     expect(() =>
-      checkUpstreamErrorReceipt(err(500, { cost_msats: 50_001, reserved_msats: 50_001 }), 500, 0, { reservationMsat: 50_000 }),
-    ).toThrow(ReceiptVerificationError);
+      checkUpstreamErrorReceipt(err(500, { cost_msats: 50_001, reserved_msats: 50_001 }), 500, 0, {
+        reservationMsat: 50_001,
+        reservationAnnounced: true,
+      }),
+    ).not.toThrow();
     // At most the fee needs no reservation at all.
     expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 2000 }), 502, 2000)).toBe(true);
     // A malformed bound is refused, not ignored.
     expect(() => checkUpstreamErrorReceipt(at, 500, 0, { reservationMsat: -1 })).toThrow(/not a valid amount/);
   });
 
-  it("an image request keeps its own ceiling as the bound", () => {
+  it("an image request is bounded by the announced reservation and by price × count", () => {
     const image = { model: "z", variant: "webp", count: 2, msatPerImage: 12_000 };
     const ok = { kind: "images", model: "z", variant: "webp", count: 2 };
+    const announced = (r: number) => ({ abandonFeeMsat: 2000, image, reservationMsat: r, reservationAnnounced: true });
     expect(
-      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_000, reserved_msats: 26_000 }), 500, 0, { abandonFeeMsat: 2000, image }),
+      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_000, reserved_msats: 26_000 }), 500, 0, announced(26_000)),
     ).toBe(true);
+    // Without an announcement the image terms are no bound for the reservation: only the fee.
     expect(() =>
-      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_001, reserved_msats: 26_001 }), 500, 0, { abandonFeeMsat: 2000, image }),
+      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_000, reserved_msats: 26_000 }), 500, 0, { abandonFeeMsat: 2000, image }),
+    ).toThrow(/no reservation was announced/);
+    expect(() =>
+      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_001, reserved_msats: 26_001 }), 500, 0, announced(26_001)),
     ).toThrow(/price × count/);
   });
 });
@@ -213,24 +220,42 @@ describe("the reservation announced in request_ok", () => {
     expect(sent).toEqual([]);
   });
 
-  it("bounds a 5xx receipt by the announced reservation, else the caller's ceiling, else only the fee", () => {
+  it("bounds a 5xx receipt by the announced reservation, else only by the session fee still due", () => {
     const { c, offer } = conn("2");
-    const cur = (opts: Record<string, unknown>, reservedMsat?: number) =>
-      ({ n: 2, first: false, model: "cheap", offer, opts, reservedMsat }) as never;
+    const cur = (opts: Record<string, unknown>, reservedMsat?: number, first = false, o: unknown = offer) =>
+      ({ n: 2, first, model: "cheap", offer: o, opts, reservedMsat }) as never;
     const receipt = (cost: number, reserved: number) =>
       ({ sid: "s", model: "cheap", usage: { error_status: 500 }, cost_msats: cost, reserved_msats: reserved }) as never;
     // Announced: the receipt must name exactly that, and cost no more.
     expect(() => c.checkErrorReceipt(cur({}, 30_000), receipt(30_000, 30_000), 500)).not.toThrow();
     expect(() => c.checkErrorReceipt(cur({}, 30_000), receipt(30_000, 31_000), 500)).toThrow(/announced 30000/);
     expect(() => c.checkErrorReceipt(cur({}, 30_000), receipt(31_000, 31_000), 500)).toThrow(ReceiptVerificationError);
-    // An old node (no announcement): the caller's ceiling.
-    expect(() => c.checkErrorReceipt(cur({ maxReservationMsat: 40_000 }), receipt(40_000, 40_000), 500)).not.toThrow();
-    expect(() => c.checkErrorReceipt(cur({ maxReservationMsat: 40_000 }), receipt(40_001, 40_001), 500)).toThrow(
-      /reservation bound/,
+    // No announcement: the caller's ceiling does not widen the bound.
+    expect(() => c.checkErrorReceipt(cur({ maxReservationMsat: 40_000 }), receipt(40_000, 40_000), 500)).toThrow(
+      /no reservation was announced/,
     );
-    // Neither: fail closed above the fee.
-    expect(() => c.checkErrorReceipt(cur({}), receipt(1, 1), 500)).toThrow(/no reservation bound/);
+    expect(() => c.checkErrorReceipt(cur({}), receipt(1, 1), 500)).toThrow(/no reservation was announced/);
     expect(() => c.checkErrorReceipt(cur({}), receipt(0, 0), 500)).not.toThrow();
+    // The session fee, while it is still due, is the whole bound.
+    const feeOffer = { ...(offer as object), session_fee_msat: 2000 };
+    expect(() => c.checkErrorReceipt(cur({ maxReservationMsat: 40_000 }, undefined, true, feeOffer), receipt(2000, 2000), 500)).not.toThrow();
+    expect(() => c.checkErrorReceipt(cur({ maxReservationMsat: 40_000 }, undefined, true, feeOffer), receipt(2001, 2001), 500)).toThrow(
+      /session fee still due \(2000 msats\)/,
+    );
+    expect(() => c.checkErrorReceipt(cur({}, undefined, false, feeOffer), receipt(2000, 2000), 500)).toThrow(
+      /session fee still due \(0 msats\)/,
+    );
+  });
+
+  it("bounds an image 5xx receipt without an announced reservation by the session fee still due", () => {
+    const { c, offer } = conn("2");
+    const image = { variant: { id: "webp", msat_per_image: 12_000 }, count: 2 };
+    const cur = (reservedMsat?: number) => ({ n: 2, first: false, model: "z", offer, opts: {}, image, reservedMsat }) as never;
+    const receipt = (cost: number) =>
+      ({ sid: "s", kind: "images", model: "z", variant: "webp", count: 2, usage: { error_status: 502 }, cost_msats: cost, reserved_msats: cost }) as never;
+    expect(() => c.checkErrorReceipt(cur(), receipt(24_000), 502)).toThrow(/no reservation was announced/);
+    expect(() => c.checkErrorReceipt(cur(), receipt(0), 502)).not.toThrow();
+    expect(() => c.checkErrorReceipt(cur(24_000), receipt(24_000), 502)).not.toThrow();
   });
 });
 

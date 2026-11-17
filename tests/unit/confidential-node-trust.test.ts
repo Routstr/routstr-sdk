@@ -47,12 +47,13 @@ describe("provider error charges", () => {
     expect(
       checkUpstreamErrorReceipt(err(400, { ...ok, cost_msats: 2000 }), 400, 0, { abandonFeeMsat: 2000, image }),
     ).toBe(true);
-    // A 5xx is charged at most price × count + the larger fee, whatever reservation it names.
+    // A 5xx is charged at most price × count + the larger fee, whatever reservation was announced.
+    const announced = (r: number) => ({ abandonFeeMsat: 2000, image, reservationMsat: r, reservationAnnounced: true });
     expect(
-      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26000, reserved_msats: 26000 }), 500, 0, { abandonFeeMsat: 2000, image }),
+      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26000, reserved_msats: 26000 }), 500, 0, announced(26000)),
     ).toBe(true);
     expect(() =>
-      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 1e12, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image }),
+      checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 1e12, reserved_msats: 1e12 }), 500, 0, announced(1e12)),
     ).toThrow(/exceeds price × count/);
     for (const wrong of [{ kind: "chat" }, { model: "y" }, { variant: "1K-webp" }, { count: 1 }]) {
       expect(() =>
