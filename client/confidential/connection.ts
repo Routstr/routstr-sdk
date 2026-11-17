@@ -630,6 +630,12 @@ export class ConfidentialConnection {
   private goaway = false;
   /** The last-stream-id of the provider's GOAWAY: a stream above it is never processed (RFC 9113 §6.8). */
   private goawayLast?: number;
+  /**
+   * The last-stream-id of a GOAWAY(NO_ERROR): only such a GOAWAY says a
+   * stream above it was not processed (§5.4.1). One with an error code is a
+   * connection error, which the client's own frames may have caused.
+   */
+  private goawayGracefulLast?: number;
   private cur?: Cur;
   private kicks: (() => void)[] = [];
 
@@ -1553,6 +1559,7 @@ export class ConfidentialConnection {
         if (f.payload.length >= 8) {
           const last = u32(f.payload) & 0x7fffffff;
           this.goawayLast = Math.min(last, this.goawayLast ?? last);
+          if (u32(f.payload, 4) === NO_ERROR) this.goawayGracefulLast = Math.min(last, this.goawayGracefulLast ?? last);
           // A graceful GOAWAY that leaves out the open request's stream: it
           // was not processed, and the client can prove it (§5.4).
           if (cur && last < cur.stream && u32(f.payload, 4) === NO_ERROR && cur.status === undefined && !cur.refusal) {
@@ -1656,7 +1663,7 @@ export class ConfidentialConnection {
     const cur = this.cur;
     if (!cur || !cur.accepted || cur.dataLens.length === 0) return;
     // The provider is going away and will not process this stream: nothing more of it goes out.
-    if (this.notProcessed(cur)) return;
+    if (this.goawayBeyond(cur)) return;
     const credit = Math.min(cur.streamCredit, this.connCredit);
     let upto = 1;
     let sum = 0;
@@ -1673,9 +1680,17 @@ export class ConfidentialConnection {
     }
   }
 
-  /** The provider's GOAWAY names a last stream below the request's: it will not process it. */
-  private notProcessed(cur: Cur): boolean {
+  /** A GOAWAY of the provider, with any code, names a last stream below the request's (RFC 9113 §6.8). */
+  private goawayBeyond(cur: Cur): boolean {
     return this.goawayLast !== undefined && cur.stream > this.goawayLast;
+  }
+
+  /**
+   * A graceful GOAWAY (`NO_ERROR`) names a last stream below the request's:
+   * the provider did not process it (§5.4.1).
+   */
+  private notProcessed(cur: Cur): boolean {
+    return this.goawayGracefulLast !== undefined && cur.stream > this.goawayGracefulLast;
   }
 
   // --- proofs of our own records --------------------------------------------------
@@ -1951,14 +1966,16 @@ export class ConfidentialConnection {
     // Released (in steps, as the provider's window opens) or refused early.
     const errored = () => (cur.status ?? 0) >= 400;
     const unprocessed = () => this.notProcessed(cur) && cur.status === undefined;
+    // Any GOAWAY below the stream ends the waits: nothing more comes on it.
+    const gone = () => this.goawayBeyond(cur) && cur.status === undefined;
     // The provider's close before the release ends the wait too (§12.10: the
     // node then waits only for a refusal's disclosure).
     await this.until(
-      () => cur.released || errored() || cur.reset !== undefined || unprocessed() || this.tlsEnded,
+      () => cur.released || errored() || cur.reset !== undefined || gone() || this.tlsEnded,
       `body_released for request ${n}`,
       this.timeouts.released,
     );
-    if (this.tlsEnded && !cur.released && !errored() && cur.reset === undefined && !unprocessed()) {
+    if (this.tlsEnded && !cur.released && !errored() && cur.reset === undefined && !gone()) {
       throw new SessionRejectedError(`the provider closed the connection before request ${n} was complete (nothing billed)`);
     }
     // An image response is silent until the image is done: wait as long as
@@ -1967,7 +1984,7 @@ export class ConfidentialConnection {
       ? Math.max(this.timeouts.responseIdle, Math.max(1, cur.offer.images?.response_idle_s ?? 300) * 1000)
       : this.timeouts.responseIdle;
     await this.until(
-      () => cur.ended || cur.reset !== undefined || errored() || unprocessed(),
+      () => cur.ended || cur.reset !== undefined || errored() || gone(),
       `the response to request ${n}`,
       idleMs,
       () => Math.max(cur.tLastData, cur.tReleased ?? 0),
@@ -1992,10 +2009,22 @@ export class ConfidentialConnection {
           costMsats: settled.receipt.cost_msats ?? 0,
         });
       }
-      throw new StreamNotProcessedError(what);
+      // Nothing of the request went out: it may run again elsewhere.
+      if (!cur.releaseSent) throw new StreamNotProcessedError(`${what}; nothing of it was released`);
+      // Released and not proven (§9.4): the node charges the request's
+      // reservation (§12.10), so it fails here and is not run again.
+      throw new ResponseVerificationError(
+        `${what}, but the refusal was not proven: its body was released, so the node may charge its reservation`,
+      );
     }
     if (cur.reset !== undefined && !errored()) {
       throw new ResponseVerificationError(`the provider reset stream ${stream} (code ${cur.reset})`);
+    }
+    if (gone() && !errored() && !cur.ended) {
+      // A GOAWAY with an error code: a connection error, not a statement that the stream was not processed.
+      const why = `the provider ended the connection (GOAWAY with an error code, last stream ${this.goawayLast}) before answering request ${n}`;
+      if (!cur.releaseSent) throw new SessionRejectedError(`${why}; nothing of it was released`);
+      throw new ResponseVerificationError(why);
     }
     const status = cur.status ?? 0;
     let receipt: ConfidentialReceipt;

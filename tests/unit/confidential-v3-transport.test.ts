@@ -26,6 +26,8 @@ import {
   StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
+  confidentialFailoverError,
+  mayHaveReachedProvider,
 } from "../../client/confidential/errors";
 import { fetchConfidentialOffer, verifyConfidentialOffer } from "../../client/confidential/offer";
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
@@ -560,12 +562,12 @@ describe("v3 transport: a pooled connection is a cache, never a promise", () => 
     expect(connect).toHaveBeenCalledTimes(2);
   });
 
-  it("runs a request the provider did not process again, even after its release (REFUSED_STREAM, GOAWAY)", async () => {
+  it("runs a request the provider did not process again when nothing of it was released (GOAWAY)", async () => {
     mockNodeOffer();
     const logs: string[] = [];
     let calls = 0;
     const { connect } = fakeConnections(() =>
-      calls++ === 0 ? { released: true, fail: new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM)") } : {},
+      calls++ === 0 ? { fail: new StreamNotProcessedError("the provider is going away (GOAWAY, last stream 1)") } : {},
     );
     const res = await call(freshNode(), {}, { http2: { log: (l: string) => logs.push(l) } });
     expect(res.status).toBe(200);
@@ -573,6 +575,32 @@ describe("v3 transport: a pooled connection is a cache, never a promise", () => 
     expect(framings(connect)).toEqual(["2", "2"]);
     expect(logs.some((l) => /not processed by the provider/.test(l))).toBe(true);
     expect(http2OpenFailure(new StreamNotProcessedError("x"))).toBe(false);
+  });
+
+  it("never runs a released request again when its refusal was not proven (the node may charge its reservation)", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const { connect } = fakeConnections(() =>
+      calls++ === 0 ? { released: true, fail: new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM)") } : {},
+    );
+    const err = await call(freshNode()).catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(mayHaveReachedProvider(err)).toBe(true);
+    expect(confidentialFailoverError(err)).toBe(false);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs a released request again once its refusal was proven and settled", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const refused = new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM); the refusal was proven and settled", {
+      receipt: { sid: "ab".repeat(32), model: "m", usage: { refused: "rst_stream", error_code: 7, choices: [] } as never, cost_msats: 0 },
+      costMsats: 0,
+    });
+    const { connect } = fakeConnections(() => (calls++ === 0 ? { released: true, fail: refused } : {}));
+    const res = await call(freshNode());
+    expect(res.status).toBe(200);
+    expect(framings(connect)).toEqual(["2", "2"]);
   });
 
   it("adds what a proven refusal was charged (its receipt) to the call's cost", async () => {

@@ -88,7 +88,7 @@ vi.mock("../../client/confidential/params", async (orig) => ({
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
-import { ReceiptVerificationError, RequestRefusedError, StreamNotProcessedError } from "../../client/confidential/errors";
+import { ReceiptVerificationError, RequestRefusedError, SessionRejectedError, StreamNotProcessedError } from "../../client/confidential/errors";
 import { BOTH, NODE_PRIV, NODE_PUB, ONLY_11, v3OfferFields } from "./fixtures/v3";
 import { VENICE_CHAT } from "./fixtures/chat";
 
@@ -682,19 +682,46 @@ describe("framing 2: requests on one connection", () => {
     expect(node.msgs.find((x) => x.type === "disclose_reset")).toMatchObject({ record: 1, r: hexOf(goaway) });
   });
 
-  it("GOAWAY with an error code is not disclosed (the client's frames may have caused it)", async () => {
+  it("GOAWAY with an error code is not disclosed and does not count as not processed (the client's frames may have caused it)", async () => {
     const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 1]));
     const conn = await connection("2", { beforeRequestOk: () => [goaway] });
-    const err = await conn.request(chatRequest()).done.catch((e) => e);
-    expect(err).toBeInstanceOf(StreamNotProcessedError);
-    expect(err.receipt).toBeUndefined();
+    const h = conn.request(chatRequest());
+    const err = await h.done.catch((e) => e);
+    expect(err).toBeInstanceOf(SessionRejectedError);
+    expect(err).not.toBeInstanceOf(StreamNotProcessedError);
+    expect(h.bodyReleased).toBe(false);
+    expect(node.log).not.toContain("release");
     expect(node.log).not.toContain("disclose_reset");
   });
 
-  it("a response head before REFUSED_STREAM: no refusal is disclosed", async () => {
+  it("GOAWAY with an error code after the release: the request fails, not as one the provider did not process", async () => {
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 2]));
+    const conn = await connection("2", { respond2: () => [goaway] });
+    const h = conn.request(chatRequest());
+    const err = await h.done.catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(StreamNotProcessedError);
+    expect(h.bodyReleased).toBe(true);
+    expect(node.log).not.toContain("disclose_reset");
+  });
+
+  it("REFUSED_STREAM after the release that cannot be disclosed: the request fails, not as one to run again", async () => {
+    // Nine records between the request and the refusal: more than a disclosure may cover.
+    const wu = (s: number) => frame(FRAME.WINDOW_UPDATE, 0, s, Uint8Array.from([0, 0, 1, 0]));
+    const conn = await connection("2", { respond2: (_n, s) => [...Array.from({ length: 9 }, () => wu(0)), rst(s, 7)] });
+    const h = conn.request(chatRequest());
+    const err = await h.done.catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(StreamNotProcessedError);
+    expect(err.message).toMatch(/not proven/);
+    expect(h.bodyReleased).toBe(true);
+    expect(node.log).not.toContain("disclose_reset");
+  });
+
+  it("a response head before REFUSED_STREAM: no refusal is disclosed, the request is not run again", async () => {
     const conn = await connection("2", { respond2: (_n, s) => [head200(s), rst(s, 7)] });
     const err = await conn.request(chatRequest()).done.catch((e) => e);
-    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(err).not.toBeInstanceOf(StreamNotProcessedError);
     expect(node.log).not.toContain("disclose_reset");
   });
 
