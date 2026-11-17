@@ -693,10 +693,10 @@ describe("receipt verification", () => {
       ReceiptVerificationError,
     );
     // Other 5xx: at most the reservation the receipt names, and a bound known before the release.
-    const known = { reservationMsat: 9000 };
+    const known = { reservationMsat: 9000, reservationAnnounced: true };
     expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0, known)).toBe(true);
     expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toThrow(
-      /no reservation bound/,
+      /no reservation was announced/,
     );
     expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0, known)).toThrow(
       /reservation/,

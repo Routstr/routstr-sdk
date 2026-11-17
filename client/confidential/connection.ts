@@ -259,9 +259,8 @@ export interface ConnectionRequestOptions {
    * the node announces a larger reservation (`request_ok.reserved_msats`),
    * the request stops before any of its records is sent (framing "1.1":
    * before the ClientHello) with `ReservationAboveCeilingError`, and the
-   * connection is closed. Also the bound of a receipt that charges the
-   * reservation for a provider error when the node announced none. Absent:
-   * no ceiling.
+   * connection is closed. Absent: no ceiling. (Without an announcement a
+   * provider error costs at most the session fee still due, whatever this is.)
    */
   maxReservationMsat?: number;
   onResponseHead?: (head: { status: number; statusText: string; headers: Record<string, string> }) => void;
@@ -2817,12 +2816,11 @@ export class ConfidentialConnection {
 
   private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
     this.checkPinnedModel(cur, receipt);
-    // The reservation as known before the release: the node's announcement,
-    // else the caller's ceiling (never the receipt's own number).
-    const announced = cur.reservedMsat !== undefined;
+    // Only the node's announcement bounds a 5xx charge above the session fee
+    // still due (never the caller's ceiling or the receipt's own number, §12.10).
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
-      reservationMsat: announced ? cur.reservedMsat : cur.opts.maxReservationMsat,
-      reservationAnnounced: announced,
+      reservationMsat: cur.reservedMsat,
+      reservationAnnounced: cur.reservedMsat !== undefined,
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
       image: cur.image
         ? {
