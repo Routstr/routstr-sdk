@@ -33,6 +33,7 @@ export const CONFIDENTIAL_ERROR_CODES = [
   "offer_no_images",
   "pinned_parameter",
   "reservation_above_ceiling",
+  "no_confidential_provider",
 ] as const;
 
 export type ConfidentialErrorCode = (typeof CONFIDENTIAL_ERROR_CODES)[number];
