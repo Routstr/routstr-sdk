@@ -170,6 +170,22 @@ describe("the offer cooldown orders nodes", () => {
     expect(sessions).toEqual([a]);
   });
 
+  it("a failed probe reports its own error, not the cooldown that skipped the node", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const [a] = nodes(1) as [string];
+    const net = network();
+    const { route } = setup([a]);
+    net.down.add(a);
+    at(0);
+    await expect(route(a)).rejects.toBeInstanceOf(OfferUnavailableError);
+    const fetches = net.offerFetches.length;
+    at(15);
+    const err = await route(a).catch((e: unknown) => e);
+    expect(net.offerFetches.length).toBeGreaterThan(fetches);
+    expect(err).toBeInstanceOf(OfferUnavailableError);
+    expect(String((err as Error).message)).not.toMatch(/not asked again/);
+  });
+
   it("a failover after a failed connection probes a cooling node when no other is left", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const [a, c] = nodes(2) as [string, string];
