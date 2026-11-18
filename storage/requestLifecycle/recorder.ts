@@ -205,6 +205,12 @@ export async function beginRequestLifecycle(
         });
       });
     },
+    observe(type, data, scope) {
+      if (terminal) return;
+      // Diagnostic events must not block the ordered queue for retries or
+      // finalization. append reserves a sequence when invoked, before I/O.
+      void persist(() => append(type, data, scope));
+    },
     finish(input) {
       if (terminal) return queue;
       terminal = true;
