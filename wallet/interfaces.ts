@@ -87,6 +87,23 @@ export interface XCashuTokenEntry {
   tryCount: number;
 }
 
+export interface RecoveryCredential {
+  mode: "xcashu" | "apikeys";
+  baseUrl: string;
+  token: string;
+}
+
+export interface CachedReceiveToken {
+  token: string;
+  amount: number;
+  unit: "sat" | "msat";
+  createdAt: number;
+  /** Credentials to remove if these proofs are received, even after restart. */
+  cleanup?: RecoveryCredential[];
+}
+
+export type CachedReceiveTokenWrite = Omit<CachedReceiveToken, "createdAt"> & { createdAt?: number };
+
 export interface StorageAdapter {
   /** Wait for API key and token writes to reach storage; rejects if one failed. */
   flush?(): Promise<void>;
@@ -161,23 +178,11 @@ export interface StorageAdapter {
   /** Get all stored child keys */
   getAllChildKeys(): ChildKeyEntry[];
 
-  /** Get cached receive tokens (tokens that failed to receive due to mint errors) */
-  getCachedReceiveTokens(): Array<{
-    token: string;
-    amount: number;
-    unit: "sat" | "msat";
-    createdAt: number;
-  }>;
+  /** Get tokens preserved for wallet recovery. */
+  getCachedReceiveTokens(): CachedReceiveToken[];
 
   /** Set cached receive tokens */
-  setCachedReceiveTokens(
-    tokens: Array<{
-      token: string;
-      amount: number;
-      unit: "sat" | "msat";
-      createdAt?: number;
-    }>
-  ): void;
+  setCachedReceiveTokens(tokens: CachedReceiveTokenWrite[]): void;
 
   // ========== XCashu Tokens (multiple tokens per baseUrl) ==========
 

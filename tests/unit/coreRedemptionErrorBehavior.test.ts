@@ -1,3 +1,4 @@
+import type { StorageAdapter } from "../../wallet/interfaces";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import { BalanceManager } from "../../wallet/BalanceManager";
@@ -39,8 +40,9 @@ const wallet = () =>
     receiveToken: async () => ({ success: true, amount: 100, unit: "sat" }),
   }) as any;
 
-const storage = () =>
-  ({
+const storage = () => {
+  let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
+  return {
     getXcashuTokens: () => ({}),
     getXcashuTokensForBaseUrl: () => [],
     addXcashuToken: () => {},
@@ -61,9 +63,12 @@ const storage = () =>
     updateChildKeyBalance: () => {},
     removeChildKey: () => {},
     getAllChildKeys: () => [],
-    getCachedReceiveTokens: () => [],
-    setCachedReceiveTokens: () => {},
-  }) as any;
+    getCachedReceiveTokens: () => cached,
+    setCachedReceiveTokens: (entries: Parameters<StorageAdapter["setCachedReceiveTokens"]>[0]) => {
+      cached = entries.map(entry => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+    },
+  } as any;
+};
 
 const discovery = () =>
   ({

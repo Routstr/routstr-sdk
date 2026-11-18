@@ -255,9 +255,10 @@ function trackInFlight(key: string, signal?: AbortSignal): () => void {
 
 interface ReservationWaitState { deadline?: number }
 const DEFAULT_RESERVED_BALANCE_WAIT_MS = 120_000;
+const API_KEY_RECOVERY_WAIT_MS = 10_000;
 
-/** Bound both settlement waits and balance reads; expiry retains normal 402 handling. */
-async function withinReservationBudget<T>(
+/** Bound the caller's wait without cancelling the underlying operation. */
+async function awaitUntilDeadline<T>(
   operation: Promise<T>, deadline: number, signal?: AbortSignal
 ): Promise<{ value: T } | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1664,7 +1665,7 @@ export class RoutstrClient {
         throwIfFundingAborted(params.signal);
         // Snapshot BEFORE reading: a hold settling during the read must still wake us.
         const requests = [...(inFlightRequests.get(key) ?? [])];
-        const result = await withinReservationBudget(
+        const result = await awaitUntilDeadline(
           this.balanceManager.getTokenBalance(params.token, params.baseUrl), deadline, params.signal
         );
         if (!result || Date.now() >= deadline) return false;
@@ -1676,7 +1677,7 @@ export class RoutstrClient {
             !Number.isFinite(reserved)) return false;
         if (available >= params.requiredSats) return settled ? "settled" : "sufficient";
         if (!requests.length || reserved <= 0 || available + reserved < params.requiredSats) return false;
-        if (!await withinReservationBudget(Promise.race(requests), deadline, params.signal)) return false;
+        if (!await awaitUntilDeadline(Promise.race(requests), deadline, params.signal)) return false;
         settled = true;
       }
     } catch (error) {
@@ -1731,10 +1732,14 @@ export class RoutstrClient {
     retryCount: number = 0,
     upstream?: UpstreamEnvelope
   ): Promise<Response> {
-    // Refund proofs can be the only recoverable value even after disconnect.
+    const recoveryCredential = { mode: this.mode, baseUrl: params.baseUrl, token: params.token };
+    // Preserve the only recoverable proofs even after disconnect, but don't
+    // make a cancelled request wait for storage. No mint receive starts here.
     if (params.signal?.aborted && xCashuRefundToken) {
-      this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
-      await this.storageAdapter.flush?.();
+      this.cashuSpender.cacheReceiveToken(xCashuRefundToken, recoveryCredential);
+      void Promise.resolve().then(() => this.storageAdapter.flush?.()).catch(() => {
+        this._log("WARN", "[RoutstrClient] Could not flush cached refund proofs after cancellation");
+      });
     }
     throwIfFundingAborted(params.signal);
     const MAX_RETRIES_PER_PROVIDER = 2;
@@ -1865,25 +1870,19 @@ export class RoutstrClient {
       );
       recoveryAttempted = true;
       const receiveResult =
-        await this.cashuSpender.receiveTokenForRecovery(xCashuRefundToken, params.signal, () => {
-          this.storageAdapter.removeXcashuToken(baseUrl, params.token);
-        });
+        await this.cashuSpender.receiveTokenForRecovery(xCashuRefundToken, params.signal, recoveryCredential);
       if (receiveResult.pending) {
         recoveryPending = true;
         tryNextProvider = true;
-      }
-      if (receiveResult.success) {
+      } else if (receiveResult.success) {
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: xcashu refund received, amount=${receiveResult.amount}`
         );
-        // Refund claimed — remove the original spent token from storage so
-        // it isn't left as an orphaned IOU (mirrors _handlePostResponseBalanceUpdate).
         tryNextProvider = true;
         refundReceived = true;
         recoverySucceeded = true;
       } else {
-        this.cashuSpender.cacheReceiveToken(xCashuRefundToken);
         this._log(
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: xcashu refund receive failed${xCashuRefundToken === params.token ? " (same as original; not receiving twice)" : ", falling back to original token"}: ${receiveResult.message}`
@@ -1902,10 +1901,7 @@ export class RoutstrClient {
       (!xCashuRefundToken || xCashuRefundToken !== params.token)
     ) {
       recoveryAttempted = true;
-      const receiveResult = await this.cashuSpender.receiveTokenForRecovery(params.token, params.signal, () => {
-        if (this.mode === "xcashu") this.storageAdapter.removeXcashuToken(baseUrl, params.token);
-        else if (this.storageAdapter.getApiKey(baseUrl)?.key === params.token) this.storageAdapter.removeApiKey(baseUrl);
-      });
+      const receiveResult = await this.cashuSpender.receiveTokenForRecovery(params.token, params.signal, recoveryCredential);
       if (receiveResult.pending) {
         recoveryPending = true;
         tryNextProvider = true;
@@ -2333,17 +2329,26 @@ export class RoutstrClient {
       }
     }
 
+    let apiKeyRecoveryDeadline: number | undefined;
+    let checkedApiKeyBalance: Awaited<ReturnType<BalanceManager["getTokenBalance"]>> | undefined;
     if (status === 401 && this.mode === "apikeys") {
       this._log(
         "DEBUG",
         `[RoutstrClient] _handleErrorResponse: Checking balance for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
       );
-      const latestBalanceInfo = await this.balanceManager.getTokenBalance(
-        token,
-        baseUrl
+      apiKeyRecoveryDeadline = Date.now() + API_KEY_RECOVERY_WAIT_MS;
+      const balance = await awaitUntilDeadline(
+        this.balanceManager.getTokenBalance(token, baseUrl), apiKeyRecoveryDeadline, params.signal
       );
-      if (latestBalanceInfo.isInvalidApiKey) {
-        this.storageAdapter.removeApiKey(baseUrl);
+      throwIfFundingAborted(params.signal);
+      checkedApiKeyBalance = balance?.value;
+      if (!balance || Date.now() >= apiKeyRecoveryDeadline) {
+        this._log("WARN", `[RoutstrClient] API key recovery balance check timed out for ${baseUrl}; continuing failover`);
+        tryNextProvider = true;
+      } else if (balance.value.isInvalidApiKey) {
+        if (this.storageAdapter.getApiKey(baseUrl)?.key === token) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
         tryNextProvider = true;
       }
     }
@@ -2382,29 +2387,50 @@ export class RoutstrClient {
           "DEBUG",
           `[RoutstrClient] _handleErrorResponse: Attempting API key refund for ${baseUrl}, key=${REDACTED_CREDENTIAL}`
         );
-        const latestBalanceInfo = await this.balanceManager.getTokenBalance(
-          token,
-          baseUrl
-        );
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
-        );
-        recoveryAttempted = true;
-        await params.lifecycle?.event("refund_started", undefined, { baseUrl });
-        const refundResult = await this.balanceManager.refundApiKey({
-          mintUrl,
-          baseUrl,
-          apiKey: token,
-          forceRefund: true,
-        });
-        await params.lifecycle?.event(refundResult.success ? "refund_succeeded" : "refund_failed", undefined, { baseUrl });
-        if (refundResult.success) recoverySucceeded = true;
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
-        );
+        throwIfFundingAborted(params.signal);
+        const deadline = apiKeyRecoveryDeadline ?? Date.now() + API_KEY_RECOVERY_WAIT_MS;
+        const prepareRefund = async () => {
+          const latestBalanceInfo = checkedApiKeyBalance ?? await this.balanceManager.getTokenBalance(token, baseUrl);
+          if (params.signal?.aborted || Date.now() >= deadline) return;
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
+          );
+          await params.lifecycle?.event("refund_started", undefined, { baseUrl });
+          return latestBalanceInfo;
+        };
+        const latestBalanceInfo = (await awaitUntilDeadline(prepareRefund(), deadline, params.signal))?.value;
+        throwIfFundingAborted(params.signal);
+        let refundResult: Awaited<ReturnType<BalanceManager["refundApiKey"]>> | undefined;
+        if (latestBalanceInfo && Date.now() < deadline) {
+          recoveryAttempted = true;
+          // Once started, BalanceManager owns redemption and identity-guarded
+          // cleanup. The deadline and abort only stop the caller from awaiting it.
+          const refund = this.balanceManager.refundApiKey({
+            mintUrl,
+            baseUrl,
+            apiKey: token,
+            forceRefund: true,
+          }).then(async result => {
+            await params.lifecycle?.event(result.success ? "refund_succeeded" : "refund_failed", undefined, { baseUrl });
+            return result;
+          });
+          refundResult = (await awaitUntilDeadline(refund, deadline, params.signal))?.value;
+          throwIfFundingAborted(params.signal);
+        }
+        if (!refundResult) {
+          tryNextProvider = true;
+          this._log("WARN", `[RoutstrClient] API key recovery wait timed out for ${baseUrl}; continuing failover`);
+        } else {
+          if (refundResult.success) recoverySucceeded = true;
+          this._log(
+            "DEBUG",
+            `[RoutstrClient] _handleErrorResponse: API key refund result: success=${refundResult.success}, message=${refundResult.message}`
+          );
+        }
         if (
+          latestBalanceInfo &&
+          refundResult &&
           !refundResult.success &&
           latestBalanceInfo.amount > 0 &&
           !latestBalanceInfo.balanceUnknown

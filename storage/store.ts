@@ -1,7 +1,7 @@
 import { CREDENTIAL_KEYS, isCredentialStorageKey } from "./credentialKeys";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
-import type { StorageAdapter } from "../wallet/interfaces";
+import type { CachedReceiveTokenWrite, StorageAdapter } from "../wallet/interfaces";
 import type { ProviderInfo, Model } from "../core";
 import type { ModelIdMappings } from "../core/modelMappings";
 import type { ModelPathWhitelist } from "../core/modelPathWhitelist";
@@ -72,14 +72,7 @@ export interface SdkStorageStore extends SdkStorageState {
   setModelPathWhitelistLastUpdate: (value: number | null) => void;
   setRoutstr21Models: (value: string[]) => void;
   setRoutstr21ModelsLastUpdate: (value: number | null) => void;
-  setCachedReceiveTokens: (
-    value: Array<{
-      token: string;
-      amount: number;
-      unit: "sat" | "msat";
-      createdAt?: number;
-    }>
-  ) => void;
+  setCachedReceiveTokens: (value: CachedReceiveTokenWrite[]) => void;
   setClientIds: (
     value:
       | Array<{
@@ -369,6 +362,7 @@ const createEmptyStore = (
         amount: entry.amount,
         unit: entry.unit || "sat",
         createdAt: entry.createdAt ?? Date.now(),
+        ...(entry.cleanup?.length ? { cleanup: entry.cleanup } : {}),
       }));
       void driver.setItem(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, normalized);
       set({ cachedReceiveTokens: normalized });
@@ -578,14 +572,7 @@ const hydrateStoreFromDriver = async (
       SDK_STORAGE_KEYS.LAST_ROUTSTR21_MODELS_UPDATE,
       null
     ),
-    driver.getItem<
-      Array<{
-        token: string;
-        amount: number;
-        unit: "sat" | "msat";
-        createdAt?: number;
-      }>
-    >(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
+    driver.getItem<CachedReceiveTokenWrite[]>(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, []),
     driver.getItem<
       Array<{
         clientId: string;
@@ -694,6 +681,7 @@ const hydrateStoreFromDriver = async (
     amount: entry.amount,
     unit: entry.unit || "sat",
     createdAt: entry.createdAt ?? Date.now(),
+    ...(entry.cleanup?.length ? { cleanup: entry.cleanup } : {}),
   }));
 
   const clientIds = rawClientIds.map((entry) => ({
@@ -725,7 +713,8 @@ const hydrateStoreFromDriver = async (
     )
   );
   const deduplicatedReceiveTokens = cachedReceiveTokens.filter(
-    (entry) => !ownedTokens.has(entry.token)
+    // A recovery entry with cleanup metadata owns a retry, not just a copy.
+    (entry) => entry.cleanup?.length || !ownedTokens.has(entry.token)
   );
   store.setState({
     nostrQueryLastUpdate,

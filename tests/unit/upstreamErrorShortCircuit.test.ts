@@ -58,9 +58,12 @@ function setup(mode: "apikeys" | "xcashu" = "apikeys", selectedModel: Model = mo
   } as unknown as WalletAdapter;
   const removeApiKey = vi.fn();
   const removeXcashuToken = vi.fn();
+  let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
   const storage = {
-    getCachedReceiveTokens: () => [],
-    setCachedReceiveTokens: () => {},
+    getCachedReceiveTokens: () => cached,
+    setCachedReceiveTokens: (entries: Parameters<StorageAdapter["setCachedReceiveTokens"]>[0]) => {
+      cached = entries.map(entry => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+    },
     getApiKey: () => ({ key: credential, baseUrl, balance: 399, lastUsed: null }),
     removeApiKey,
     removeXcashuToken,
@@ -421,11 +424,11 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     const { client, removeXcashuToken, providerManager } = setup("xcashu");
     providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat", message: "mint unavailable" });
-    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken");
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-refund" } });
     const response = await routeRequest(client);
     expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
-    expect(cache.mock.calls).toEqual([["cashu-refund"], ["cashu-refund"], ["cashu-original"]]);
+    expect(cache.mock.calls.map(([token]) => token)).toEqual(["cashu-refund", "cashu-original"]);
     expect(removeXcashuToken).not.toHaveBeenCalled();
     expect(providerManager.findNextBestProvider).toHaveBeenCalled();
     expect(response.status).toBe(400);
@@ -435,7 +438,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     const { client, removeXcashuToken, providerManager } = setup("xcashu");
     providerManager.findNextBestProvider.mockReturnValue(null);
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat" });
-    vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    vi.spyOn(client.getCashuSpender(), "cacheReceiveToken");
     stubFetch({ status: 400, statusText: "Bad Request", body: webSearchOptionsBody, headers: { "x-cashu": "cashu-original" } });
     await routeRequest(client);
     expect(receive).toHaveBeenCalledExactlyOnceWith("cashu-original");
@@ -445,7 +448,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
   it("fails an X-Cashu unknown-path 404 over without a strike, keeping an unredeemed token", async () => {
     const { client, removeXcashuToken, providerManager, spend } = setup("xcashu");
     const receive = vi.spyOn(client.getCashuSpender(), "receiveToken").mockResolvedValue({ success: false, amount: 100, unit: "sat", message: "mint unavailable" });
-    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken").mockImplementation(() => {});
+    const cache = vi.spyOn(client.getCashuSpender(), "cacheReceiveToken");
     const fetchMock = stubFetch(
       {
         status: 404,
@@ -461,7 +464,7 @@ describe("upstream request errors keep the key, fail over, and aggregate at exha
     expect(response.status).toBe(200);
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([`${baseUrl}v1/messages`, `${nextUrl}v1/messages`]);
     expect(receive.mock.calls).toEqual([["cashu-refund"], ["cashu-original"]]);
-    expect(cache.mock.calls).toEqual([["cashu-refund"], ["cashu-refund"], ["cashu-original"]]);
+    expect(cache.mock.calls.map(([token]) => token)).toEqual(["cashu-refund", "cashu-original"]);
     expect(removeXcashuToken).not.toHaveBeenCalled();
     expect(spend).toHaveBeenCalledTimes(2);
     expect(providerManager.markFailed).not.toHaveBeenCalled();

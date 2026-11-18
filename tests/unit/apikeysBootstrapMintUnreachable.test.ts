@@ -65,6 +65,7 @@ const createStorage = (
   let storedKey: string | null = initialKey;
   const removedApiKeys: string[] = [];
   const removedXcashu: Array<[string, string]> = [];
+  let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
   const setApiKeys: string[] = [];
 
   const storage = {
@@ -100,8 +101,10 @@ const createStorage = (
     updateChildKeyBalance: () => {},
     removeChildKey: () => {},
     getAllChildKeys: () => [],
-    getCachedReceiveTokens: () => [],
-    setCachedReceiveTokens: () => {},
+    getCachedReceiveTokens: () => cached,
+    setCachedReceiveTokens: (entries: Parameters<StorageAdapter["setCachedReceiveTokens"]>[0]) => {
+      cached = entries.map(entry => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+    },
   } as StorageAdapter;
 
   return Object.assign(storage, { removedApiKeys, removedXcashu, setApiKeys });

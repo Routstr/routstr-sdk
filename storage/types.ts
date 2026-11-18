@@ -50,12 +50,7 @@ export interface SdkStorageState {
   lastModelPathWhitelistUpdate: number | null;
   routstr21Models: string[];
   lastRoutstr21ModelsUpdate: number | null;
-  cachedReceiveTokens: Array<{
-    token: string;
-    amount: number;
-    unit: "sat" | "msat";
-    createdAt: number;
-  }>;
+  cachedReceiveTokens: import("../wallet/interfaces").CachedReceiveToken[];
   clientIds: Array<{
     clientId: string;
     name: string;
