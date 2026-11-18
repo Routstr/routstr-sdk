@@ -81,6 +81,8 @@ export interface FetchOptions {
 
   /** Optional: max tokens for the completion */
   maxTokens?: number;
+  /** Optional: thinking level, sent as `reasoning_effort` */
+  reasoningEffort?: string;
   /** Optional: request headers to forward upstream */
   headers?: Record<string, string>;
   /**
@@ -170,6 +172,7 @@ export async function fetchAIResponse(
   const {
     messageHistory,
     maxTokens,
+    reasoningEffort,
     headers,
   } = options;
 
@@ -267,6 +270,10 @@ export async function fetchAIResponse(
 
     if (maxTokens !== undefined) {
       body.max_tokens = maxTokens;
+    }
+
+    if (reasoningEffort !== undefined) {
+      body.reasoning_effort = reasoningEffort;
     }
 
     if (
