@@ -27,4 +27,6 @@ export interface UsageTrackingEntry {
   cacheReadMsats?: number;
   cacheCreationMsats?: number;
   remainingBalanceMsats?: number;
+  /** Images an image endpoint returned and billed (`X-Routstr-Image-Count`). */
+  outputImages?: number;
 }

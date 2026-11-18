@@ -32,6 +32,7 @@ const entry = (overrides: Partial<UsageTrackingEntry> = {}): UsageTrackingEntry 
   cacheReadMsats: overrides.cacheReadMsats,
   cacheCreationMsats: overrides.cacheCreationMsats,
   remainingBalanceMsats: overrides.remainingBalanceMsats,
+  outputImages: overrides.outputImages,
 });
 
 const costFields = {
@@ -46,6 +47,7 @@ const costFields = {
   cacheReadMsats: 0,
   cacheCreationMsats: 0,
   remainingBalanceMsats: 3605659,
+  outputImages: 2,
 } satisfies Partial<UsageTrackingEntry>;
 
 describe("usage tracking drivers", () => {

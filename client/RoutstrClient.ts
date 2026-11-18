@@ -296,6 +296,9 @@ export interface RoutstrResponse extends Response {
   finalize?: () => Promise<number>;
 }
 
+// Image usage is reported in headers; never tee the binary body for accounting.
+const isImageContentType = (contentType: string): boolean => /^image\//i.test(contentType);
+
 /** Rebuild only Fetch state through the constructor and forward SDK metadata.
  * Node 22 Response has enumerable internal symbols: Object.assign(target, source)
  * copies those too, replacing target headers/body with the source's locked body.
@@ -710,7 +713,8 @@ export class RoutstrClient {
       // provider ID is published as `requestId`, which callers read straight
       // away. Accounting reuses the parsed body, so nothing is parsed twice.
       let jsonBody: unknown;
-      if (!isSSE) {
+      const isImage = isImageContentType(contentType);
+      if (!isSSE && !isImage) {
         try {
           jsonBody = await prepared.response.clone().json();
           const bodyResponseId = extractResponseId(jsonBody);
@@ -724,7 +728,7 @@ export class RoutstrClient {
           jsonBody = undefined;
         }
       }
-      const accountingResponse = isSSE
+      const accountingResponse = isSSE || isImage
         ? prepared.response
         : prepared.response.clone();
 
@@ -3318,8 +3322,9 @@ export class RoutstrClient {
           // Reuse the body the router already read when it has one: the caller
           // may have consumed `response` by now, and a second read would throw.
           let body = responseBody;
-          if (body === undefined) {
-            body = await response.clone().json();
+          if (body === undefined && !isImageContentType(contentType)) {
+            // An encrypted or otherwise non-JSON reply can still report usage in headers.
+            body = await response.clone().json().catch(() => undefined);
           }
           usage =
             usage ??
@@ -3356,6 +3361,9 @@ export class RoutstrClient {
           if (headerUsage.inputMsats) usage.inputMsats = headerUsage.inputMsats;
           if (headerUsage.outputMsats) usage.outputMsats = headerUsage.outputMsats;
           if (headerUsage.totalUsd) usage.totalUsd = headerUsage.totalUsd;
+          if (headerUsage.outputImages !== undefined) {
+            usage.outputImages = headerUsage.outputImages;
+          }
         }
       }
 
