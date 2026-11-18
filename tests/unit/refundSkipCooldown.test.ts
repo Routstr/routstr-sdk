@@ -216,36 +216,44 @@ describe("skipped refunds do not arm the provider wallet cooldown", () => {
     });
     const manager = new BalanceManager(createWallet(), storage);
 
-    let topUpResolve!: () => void;
-    const topUpGate = new Promise<void>((resolve) => {
-      topUpResolve = resolve;
+    let signalTopUpStarted!: () => void;
+    const topUpStarted = new Promise<void>((resolve) => {
+      signalTopUpStarted = resolve;
     });
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify({ success: true }), {
+    let releaseTopUp!: () => void;
+    const topUpGate = new Promise<void>((resolve) => {
+      releaseTopUp = resolve;
+    });
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("v1/wallet/topup")) {
+        signalTopUpStarted();
+        await topUpGate;
+      }
+      return new Response(JSON.stringify({ success: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
-      })) as unknown as typeof fetch;
+      });
+    }) as typeof fetch;
 
-    // Hold a top-up in flight so the refund is refused by the guard.
     const pendingTopUp = manager.topUp({
       mintUrl: MINT,
       baseUrl: PROVIDER,
       amount: 130,
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    const refund = await manager.refundApiKey({
-      mintUrl: MINT,
-      baseUrl: PROVIDER,
-      apiKey: "sk-live",
-      forceRefund: true,
-    });
-    expect(refund.skipped).toBe(true);
-    expect(refund.message).toContain("locked");
-
-    topUpResolve();
-    await topUpGate;
-    await pendingTopUp;
+    try {
+      await topUpStarted;
+      const refund = await manager.refundApiKey({
+        mintUrl: MINT,
+        baseUrl: PROVIDER,
+        apiKey: "sk-live",
+        forceRefund: true,
+      });
+      expect(refund.skipped).toBe(true);
+      expect(refund.message).toContain("topup in progress");
+    } finally {
+      releaseTopUp();
+      await pendingTopUp;
+    }
 
     // The refused refund must not have taken ownership of the tracking entry:
     // the top-up's own completion is what stamps the cooldown, so an opposite
