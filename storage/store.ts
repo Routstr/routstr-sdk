@@ -363,6 +363,7 @@ const createEmptyStore = (
         unit: entry.unit || "sat",
         createdAt: entry.createdAt ?? Date.now(),
         ...(entry.cleanup?.length ? { cleanup: entry.cleanup } : {}),
+        ...(entry.received ? { received: entry.received } : {}),
       }));
       void driver.setItem(SDK_STORAGE_KEYS.CACHED_RECEIVE_TOKENS, normalized);
       set({ cachedReceiveTokens: normalized });
@@ -682,6 +683,7 @@ const hydrateStoreFromDriver = async (
     unit: entry.unit || "sat",
     createdAt: entry.createdAt ?? Date.now(),
     ...(entry.cleanup?.length ? { cleanup: entry.cleanup } : {}),
+    ...(entry.received ? { received: entry.received } : {}),
   }));
 
   const clientIds = rawClientIds.map((entry) => ({

@@ -28,6 +28,7 @@ function setup() {
   const storage = {
     getApiKey: vi.fn(() => ({ baseUrl, key: token, balance: 17, lastUsed: null })),
     removeApiKey: vi.fn(),
+    flush: vi.fn(async () => {}),
     getCachedReceiveTokens: () => cached,
     setCachedReceiveTokens: (tokens: typeof cached) => { cached = tokens; },
   } as unknown as StorageAdapter;
@@ -115,6 +116,15 @@ describe("API-key request refund deadline", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(ctx.storage.removeApiKey).toHaveBeenCalledWith(baseUrl);
     expect(ctx.storage.getCachedReceiveTokens()).toEqual([]);
+  });
+
+  it("keeps the key and does not receive when the payout could not be persisted", async () => {
+    const ctx = setup();
+    vi.mocked(ctx.storage.flush!).mockRejectedValueOnce(new Error("storage unavailable"));
+    await expect(ctx.manager.refundApiKey({ mintUrl, baseUrl, apiKey: token, forceRefund: true })).resolves.toMatchObject({ success: false });
+    expect(ctx.receiveToken).not.toHaveBeenCalled();
+    expect(ctx.storage.removeApiKey).not.toHaveBeenCalled();
+    expect(ctx.storage.getCachedReceiveTokens()).toMatchObject([{ token: "cashu-refund" }]);
   });
 
   it("keeps a replacement key when the refund settles after the deadline", async () => {

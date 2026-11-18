@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CashuSpender } from "../../wallet/CashuSpender";
 import { RoutstrClient } from "../../client/RoutstrClient";
-import { createMemoryDriver, createSdkStore } from "../../storage";
+import { SDK_STORAGE_KEYS, createMemoryDriver, createSdkStore } from "../../storage";
 import { createStorageAdapterFromStore } from "../../storage/store";
 import type { RecoveryCredential, WalletAdapter, StorageAdapter } from "../../wallet/interfaces";
 
@@ -158,6 +158,52 @@ describe("payment recovery foreground deadline", () => {
     await spender.recoverCachedReceiveTokens();
     expect(storage.getApiKey(baseUrl)?.key).toBe(replaced ? "canonical-new" : undefined);
     expect(storage.getCachedReceiveTokens()).toEqual([]);
+  });
+
+  it("retries a failed credential write after restart without redeeming twice", async () => {
+    const disk = createMemoryDriver({});
+    let rejectRemoval = false;
+    const driver = {
+      ...disk,
+      async setItem<T>(key: string, data: T) {
+        if (rejectRemoval && key === SDK_STORAGE_KEYS.XCASHU_TOKENS) throw new Error("credential write failed");
+        return disk.setItem(key, data);
+      },
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const initial = createSdkStore({ driver });
+    await initial.hydrate;
+    const storage = createStorageAdapterFromStore(initial.store);
+    storage.addXcashuToken(baseUrl, xcashu.token);
+    const receiveToken = vi.fn(async () => {
+      rejectRemoval = true;
+      return success;
+    });
+    const wallet = { receiveToken } as unknown as WalletAdapter;
+    const spender = new CashuSpender(wallet, storage);
+    await expect(spender.receiveTokenForRecovery(xcashu.token, undefined, xcashu)).rejects.toThrow("credential write failed");
+
+    rejectRemoval = false;
+    const reloaded = createSdkStore({ driver });
+    await reloaded.hydrate;
+    const reloadedStorage = createStorageAdapterFromStore(reloaded.store);
+    expect(reloadedStorage.getXcashuTokensForBaseUrl(baseUrl)).toHaveLength(1);
+    expect(reloadedStorage.getCachedReceiveTokens()).toMatchObject([{ token: xcashu.token, received: true }]);
+    await expect(new CashuSpender(wallet, reloadedStorage).recoverCachedReceiveTokens()).resolves.toEqual([
+      { token: xcashu.token, success: true },
+    ]);
+    expect(receiveToken).toHaveBeenCalledOnce();
+    expect(reloadedStorage.getXcashuTokensForBaseUrl(baseUrl)).toEqual([]);
+    expect(reloadedStorage.getCachedReceiveTokens()).toEqual([]);
+  });
+
+  it.each(["cashu-refund", xcashu.token])("only removes the IOU for known spent refund proofs (%s)", async (token) => {
+    const ctx = setup();
+    ctx.receiveToken.mockResolvedValueOnce({ ...transient, message: "Proofs already spent" });
+    ctx.spender.cacheReceiveToken(token, xcashu);
+    await ctx.spender.recoverCachedReceiveTokens();
+    expect(ctx.storage.removeXcashuToken).toHaveBeenCalledTimes(token === xcashu.token ? 0 : 1);
+    expect(ctx.storage.getCachedReceiveTokens()).toEqual([]);
   });
 
   it("prunes conclusive malformed-token errors but retains ambiguous mint errors", async () => {

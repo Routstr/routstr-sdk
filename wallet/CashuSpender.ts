@@ -138,29 +138,61 @@ export class CashuSpender {
     // Register before flushing, and keep ownership through cache/credential updates.
     const work = Promise.resolve().then(async () => {
       await this.storageAdapter.flush?.();
-      const result = await this.receiveToken(token);
-      const cached = this.storageAdapter.getCachedReceiveTokens();
-      if (result.success) {
-        for (const credential of cached.find(entry => entry.token === token)?.cleanup ?? []) {
-          if (credential.mode === "xcashu") {
-            this.storageAdapter.removeXcashuToken(credential.baseUrl, credential.token);
-          } else if (this.storageAdapter.getApiKey(credential.baseUrl)?.key === credential.token) {
-            this.storageAdapter.removeApiKey(credential.baseUrl);
-          }
-        }
-      }
-      // Don't drop proofs on ambiguous mint/network errors, or after an arbitrary
-      // retry count. Only discard a conclusive spent or malformed-token result.
-      if (result.success || /already spent/i.test(result.message ?? "") ||
-          /^invalid (?:cashu )?token(?:$|:)/i.test(result.message?.trim() ?? "")) {
-        this.storageAdapter.setCachedReceiveTokens(
-          this.storageAdapter.getCachedReceiveTokens().filter(entry => entry.token !== token)
-        );
+      const cached = this.storageAdapter.getCachedReceiveTokens().find(entry => entry.token === token);
+      const result = cached?.received
+        ? { success: true, amount: cached.amount, unit: cached.unit, message: undefined }
+        : await this.receiveToken(token);
+      const spent = /already spent/i.test(result.message ?? "");
+      if (result.success || spent) {
+        await this.finishCachedReceive(token, result, cached?.received === true);
+      } else if (/^invalid (?:cashu )?token(?:$|:)/i.test(result.message?.trim() ?? "")) {
+        // Keep ambiguous errors for retry; discard only conclusively malformed proofs.
+        this.evictCachedReceiveToken(token);
       }
       return result;
     }).finally(() => { this.pendingReceives.delete(token); });
     this.pendingReceives.set(token, work);
     return work;
+  }
+
+  private async finishCachedReceive(token: string, result: ReceiveResult, alreadyRecorded: boolean): Promise<void> {
+    const cleaned = new Set<string>();
+    const identity = ({ mode, baseUrl, token }: RecoveryCredential) => JSON.stringify([mode, baseUrl, token]);
+    // An already-spent original may still be a claim on a provider. A
+    // distinct X-Cashu refund was already issued, so its old IOU is obsolete.
+    const cleanup = () => (this.storageAdapter.getCachedReceiveTokens().find(entry => entry.token === token)?.cleanup ?? [])
+      .filter(credential => result.success || (credential.mode === "xcashu" && credential.token !== token));
+    let owners = cleanup();
+    // Leave a receipt while credential removal is pending, so a restart can
+    // finish cleanup without sending already-received proofs to the mint again.
+    if (owners.length > 0 && result.success && !alreadyRecorded && this.storageAdapter.flush) {
+      this.storageAdapter.setCachedReceiveTokens(this.storageAdapter.getCachedReceiveTokens().map(entry =>
+        entry.token === token ? { ...entry, amount: result.amount, unit: result.unit, received: true } : entry
+      ));
+    }
+    while (owners.length > 0) {
+      for (const credential of owners) {
+        const { mode, baseUrl, token: credentialToken } = credential;
+        if (mode === "xcashu") {
+          this.storageAdapter.removeXcashuToken(baseUrl, credentialToken);
+        } else if (this.storageAdapter.getApiKey(baseUrl)?.key === credentialToken) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
+        cleaned.add(identity(credential));
+      }
+      // Never evict the record before credential removal reaches storage.
+      if (!this.storageAdapter.flush) break;
+      await this.storageAdapter.flush();
+      // A foreground caller may have joined while storage was flushing.
+      owners = cleanup().filter(credential => !cleaned.has(identity(credential)));
+    }
+    this.evictCachedReceiveToken(token);
+  }
+
+  private evictCachedReceiveToken(token: string): void {
+    this.storageAdapter.setCachedReceiveTokens(
+      this.storageAdapter.getCachedReceiveTokens().filter(entry => entry.token !== token)
+    );
   }
 
   /** Preserve a recovery token and merge any credential association. */

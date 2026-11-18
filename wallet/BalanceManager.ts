@@ -476,6 +476,9 @@ export class BalanceManager {
 
       const refundToken = fetchResult.token;
       this.cashuSpender.cacheReceiveToken(refundToken);
+      // The provider has paid out and the token may be the only recoverable
+      // value. Do not receive or delete the key until this copy is durable.
+      await this.storageAdapter.flush?.();
       const receiveResult = await this.cashuSpender.receiveToken(
         refundToken,
         false

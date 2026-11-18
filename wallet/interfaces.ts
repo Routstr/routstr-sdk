@@ -100,6 +100,8 @@ export interface CachedReceiveToken {
   createdAt: number;
   /** Credentials to remove if these proofs are received, even after restart. */
   cleanup?: RecoveryCredential[];
+  /** Wallet receive finished; only credential cleanup may remain. */
+  received?: true;
 }
 
 export type CachedReceiveTokenWrite = Omit<CachedReceiveToken, "createdAt"> & { createdAt?: number };
