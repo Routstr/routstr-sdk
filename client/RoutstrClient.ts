@@ -1411,6 +1411,9 @@ export class RoutstrClient {
           confidentialQualifyFailures.has(error) &&
           current.confidential
         ) {
+          // A probe's own failure replaces the cooldown error that skipped
+          // the node earlier: the probe did ask it.
+          if (current.confidentialOfferProbe === current.baseUrl) firstQualifyError = error;
           firstQualifyError ??= error;
           if (isLocalConfidentialFailure(error)) throw firstQualifyError;
           if (current.confidentialOfferProbe !== current.baseUrl) noteConfidentialCooling(cooling, current.baseUrl, error);
