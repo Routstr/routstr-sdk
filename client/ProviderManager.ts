@@ -1954,7 +1954,7 @@ export class ProviderManager {
       results.push({
         baseUrl,
         model: match,
-        cost: breakdown.total,
+        cost: pictureHoldSats(match, {}) ?? breakdown.total,
         rates: breakdown.rates,
         breakdown,
         basket,
