@@ -97,6 +97,28 @@ describe("non-streaming accounting is not on the response path", () => {
     expect(response.satsSpent).toBe(0.125);
   });
 
+  it("records image usage from headers without cloning or consuming the image", async () => {
+    const { client, read, rows } = makeClient();
+    const bytes = Uint8Array.of(0x89, 0x50, 0x4e, 0x47);
+    const image = new Response(bytes, { headers: {
+      "content-type": "Image/PNG",
+      "x-routstr-cost-msats": "125",
+      "x-routstr-image-count": "1",
+    } });
+    const clone = vi.spyOn(image, "clone");
+    const prepare = client._prepareRoutedRequestWithMintFailover.getMockImplementation()!;
+    client._prepareRoutedRequestWithMintFailover.mockImplementation(async () => ({
+      ...(await prepare()), response: image,
+    }));
+
+    const response = await client.routeRequest(params);
+    read.resolve({ amount: 150_000, reserved: 0, unit: "msat", apiKey: KEY, readSeq: 1 });
+    expect(await response.finalize()).toBe(0.125);
+    expect(rows).toMatchObject([{ outputImages: 1, totalMsats: 125 }]);
+    expect(clone).not.toHaveBeenCalled();
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+  });
+
   it("returns 0, not a shared-wallet delta, when a JSON reply omits cost", async () => {
     const { client, read, rows } = makeClient();
     const prepare = client._prepareRoutedRequestWithMintFailover.getMockImplementation()!;

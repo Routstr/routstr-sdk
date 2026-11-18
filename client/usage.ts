@@ -212,6 +212,9 @@ export function extractUsageFromResponseHeaders(
   const totalMsats = nonnegativeOrUndef(Number(rawTotalMsats));
   if (totalMsats === undefined) return null;
 
+  const rawImages = get("X-Routstr-Image-Count")?.trim();
+  const count = rawImages && /^\d+$/.test(rawImages) ? Number(rawImages) : NaN;
+
   return {
     promptTokens: 0,
     completionTokens: 0,
@@ -223,7 +226,7 @@ export function extractUsageFromResponseHeaders(
     inputMsats: Number(get("X-Routstr-Input-Cost-Msats")) || 0,
     outputMsats: Number(get("X-Routstr-Output-Cost-Msats")) || 0,
     totalUsd: Number(get("X-Routstr-Cost-Usd")) || undefined,
-    outputImages: nonnegativeOrUndef(Number(get("X-Routstr-Image-Count") ?? NaN)),
+    outputImages: Number.isSafeInteger(count) ? count : undefined,
   };
 }
 
