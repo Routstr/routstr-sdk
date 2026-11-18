@@ -2389,21 +2389,18 @@ export class RoutstrClient {
         );
         throwIfFundingAborted(params.signal);
         const deadline = apiKeyRecoveryDeadline ?? Date.now() + API_KEY_RECOVERY_WAIT_MS;
-        const prepareRefund = async () => {
-          const latestBalanceInfo = checkedApiKeyBalance ?? await this.balanceManager.getTokenBalance(token, baseUrl);
-          if (params.signal?.aborted || Date.now() >= deadline) return;
+        const latestBalanceInfo = checkedApiKeyBalance ?? (await awaitUntilDeadline(
+          this.balanceManager.getTokenBalance(token, baseUrl), deadline, params.signal
+        ))?.value;
+        throwIfFundingAborted(params.signal);
+        let refundResult: Awaited<ReturnType<BalanceManager["refundApiKey"]>> | undefined;
+        if (latestBalanceInfo && Date.now() < deadline) {
           this._log(
             "DEBUG",
             `[RoutstrClient] _handleErrorResponse: Initial API key balance: ${latestBalanceInfo.amount}`
           );
-          await params.lifecycle?.event("refund_started", undefined, { baseUrl });
-          return latestBalanceInfo;
-        };
-        const latestBalanceInfo = (await awaitUntilDeadline(prepareRefund(), deadline, params.signal))?.value;
-        throwIfFundingAborted(params.signal);
-        let refundResult: Awaited<ReturnType<BalanceManager["refundApiKey"]>> | undefined;
-        if (latestBalanceInfo && Date.now() < deadline) {
           recoveryAttempted = true;
+          params.lifecycle?.observe?.("refund_started", undefined, { baseUrl });
           // Once started, BalanceManager owns redemption and identity-guarded
           // cleanup. The deadline and abort only stop the caller from awaiting it.
           const refund = this.balanceManager.refundApiKey({
@@ -2411,8 +2408,8 @@ export class RoutstrClient {
             baseUrl,
             apiKey: token,
             forceRefund: true,
-          }).then(async result => {
-            await params.lifecycle?.event(result.success ? "refund_succeeded" : "refund_failed", undefined, { baseUrl });
+          }).then(result => {
+            params.lifecycle?.observe?.(result.success ? "refund_succeeded" : "refund_failed", undefined, { baseUrl });
             return result;
           });
           refundResult = (await awaitUntilDeadline(refund, deadline, params.signal))?.value;

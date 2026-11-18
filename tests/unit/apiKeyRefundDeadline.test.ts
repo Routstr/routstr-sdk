@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
 import type { Model, SdkLogger } from "../../core/types";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
+import { beginRequestLifecycle, createMemoryRequestLifecycleDriver, type RequestLifecycleContext } from "../../storage/requestLifecycle";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
 
 const baseUrl = "https://first.example/";
@@ -48,8 +49,8 @@ function setup() {
   const fetchRefundToken = vi.spyOn(manager, "fetchRefundToken").mockResolvedValue({ success: true, token: "cashu-refund" });
   const spend = vi.spyOn(client as any, "_spendToken").mockResolvedValue({ token: "sk-next", tokenBalance: 10, tokenBalanceUnit: "sat" });
   const dispatch = vi.spyOn(client as any, "_makeRequest").mockResolvedValue(new Response("ok"));
-  const handleError = (status: number, signal?: AbortSignal) => client["_handleErrorResponse"]({
-    baseUrl, mintUrl, token, signal, selectedModel: model, requiredSats: 10,
+  const handleError = (status: number, signal?: AbortSignal, lifecycle?: RequestLifecycleContext) => client["_handleErrorResponse"]({
+    baseUrl, mintUrl, token, signal, lifecycle, selectedModel: model, requiredSats: 10,
     headers: {}, baseHeaders: {}, method: "POST", path: "/v1/messages",
   }, token, status);
   return { manager, balance, readBalance, fetchRefundToken, receiveToken, receive, storage, spend, dispatch, handleError };
@@ -97,6 +98,38 @@ describe("API-key request refund deadline", () => {
     balance.resolve(ctx.balance);
     await vi.advanceTimersByTimeAsync(0);
     expect(ctx.fetchRefundToken).not.toHaveBeenCalled();
+  });
+
+  it.each(["refund_started", "refund_succeeded"])("does not block failover or finalization on a stalled %s event", async (type) => {
+    vi.useFakeTimers();
+    const ctx = setup();
+    const driver = createMemoryRequestLifecycleDriver();
+    const lifecycle = await beginRequestLifecycle({ driver, method: "POST", path: "/v1/messages" });
+    const append = driver.appendEvent.bind(driver);
+    const eventWrite = deferred<void>();
+    const appendEvent = vi.spyOn(driver, "appendEvent").mockImplementation(event =>
+      event.type === type ? eventWrite.promise.then(() => append(event)) : append(event)
+    );
+    ctx.dispatch.mockImplementation(async () => {
+      await lifecycle.event("provider_failover");
+      return new Response("ok");
+    });
+    const pending = ctx.handleError(429, undefined, lifecycle);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.receiveToken).toHaveBeenCalledOnce();
+    if (type === "refund_succeeded") ctx.receive.resolve(received);
+    await vi.advanceTimersByTimeAsync(type === "refund_started" ? 10_000 : 0);
+    expect(appendEvent).toHaveBeenCalledWith(expect.objectContaining({ type }));
+    expect(ctx.dispatch).toHaveBeenCalledOnce();
+    await expect(pending).resolves.toMatchObject({ status: 200 });
+    await lifecycle.finish({ outcome: "succeeded" });
+    const stored = await driver.getTrace(lifecycle.requestId);
+    expect(stored?.events.map(event => event.type)).toContain("request_finished");
+    expect(stored?.events.map(event => event.type)).not.toContain(type);
+    eventWrite.resolve();
+    ctx.receive.resolve(received);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await driver.getTrace(lifecycle.requestId))?.events.map(event => event.type)).toContain(type);
   });
 
   it("stops routing on abort while leaving the started refund to settle", async () => {
