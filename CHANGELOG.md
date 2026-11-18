@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Caller system messages (PR #151)
+
+- `fetchAIResponse` now sends the caller's `system` messages instead of
+  dropping them, wherever they sit in `messageHistory`. The SDK's own notes
+  from `onMessageAppend` ("Generation stopped.", "Uncaught Error: ...") are
+  `system` messages too, so leave them out of the history you pass back.
+
 ## 0.5.1
 
 ### Exhausted upstream errors (PR #141 and follow-up)

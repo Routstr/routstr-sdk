@@ -47,7 +47,7 @@ export interface FetchOptions {
   requestLifecycleDriver?: RequestLifecycleDriver;
   lifecycle?: RequestLifecycleContext;
   trackLifecycle?: boolean;
-  /** Message history for the conversation */
+  /** Message history for the conversation, system messages included */
   messageHistory: Message[];
 
   // ── Pre-resolved path (use selectModel/baseUrl/mintUrl) ──────────
