@@ -167,6 +167,12 @@ const queuedTopUps = new WeakMap<WalletAdapter, Map<string, QueuedTopUp>>();
 // have independent queues; only actual sends use the existing wallet-wide queue.
 const balanceEnsures = new WeakMap<WalletAdapter, Map<string, Promise<unknown>>>();
 
+// Match the HTTP wallet endpoints: add a missing slash, but preserve
+// repeated slashes because the server may route those paths differently.
+function walletEndpointBaseUrl(baseUrl: string): string {
+  return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+}
+
 type ProviderWalletOperation = {
   type: "topup" | "refund";
   /** Last non-skipped completion, even if other calls are still active. */
@@ -232,7 +238,8 @@ export class BalanceManager {
     baseUrl: string,
     type: "topup" | "refund"
   ): { allowed: boolean; reason?: string } {
-    const existing = this.providerWalletOps.get(baseUrl);
+    const key = walletEndpointBaseUrl(baseUrl);
+    const existing = this.providerWalletOps.get(key);
     if (!existing) {
       return { allowed: true };
     }
@@ -256,7 +263,7 @@ export class BalanceManager {
       }
     }
     // Cooldown expired — clean up stale entry
-    this.providerWalletOps.delete(baseUrl);
+    this.providerWalletOps.delete(key);
     return { allowed: true };
   }
 
@@ -265,13 +272,14 @@ export class BalanceManager {
     type: "topup" | "refund"
   ): number {
     const id = ++nextProviderWalletOperationId;
-    const existing = this.providerWalletOps.get(baseUrl);
+    const key = walletEndpointBaseUrl(baseUrl);
+    const existing = this.providerWalletOps.get(key);
     if (existing?.type === type) {
       // Keep earlier live callers and any real completion timestamp. A later
       // no-op must not erase either one's protection.
       existing.activeIds.add(id);
     } else {
-      this.providerWalletOps.set(baseUrl, {
+      this.providerWalletOps.set(key, {
         type,
         activeIds: new Set([id]),
       });
@@ -285,7 +293,8 @@ export class BalanceManager {
     id: number,
     skipped = false
   ): void {
-    const existing = this.providerWalletOps.get(baseUrl);
+    const key = walletEndpointBaseUrl(baseUrl);
+    const existing = this.providerWalletOps.get(key);
     if (!existing || existing.type !== type || !existing.activeIds.delete(id)) {
       return;
     }
@@ -293,7 +302,7 @@ export class BalanceManager {
     // A skip neither starts a new cooldown nor extends an existing one.
     if (!skipped) existing.lastEndTime = Date.now();
     if (existing.activeIds.size === 0 && existing.lastEndTime === undefined) {
-      this.providerWalletOps.delete(baseUrl);
+      this.providerWalletOps.delete(key);
     }
   }
 
@@ -576,8 +585,7 @@ export class BalanceManager {
       };
     }
 
-    const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-    const url = `${normalizedBaseUrl}v1/wallet/refund`;
+    const url = `${walletEndpointBaseUrl(baseUrl)}v1/wallet/refund`;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
@@ -1378,8 +1386,7 @@ export class BalanceManager {
       };
     }
 
-    const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-    const url = `${normalizedBaseUrl}v1/wallet/topup`;
+    const url = `${walletEndpointBaseUrl(baseUrl)}v1/wallet/topup`;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
