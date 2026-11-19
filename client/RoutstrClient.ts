@@ -102,6 +102,18 @@ export type DebugLevel = "DEBUG" | "WARN" | "ERROR";
 
 const TOPUP_MARGIN = 1.4;
 
+// Inference headers the caller intends the provider to see. Payment and
+// attribution credentials are handled separately and never copied from here.
+const FORWARDED_INFERENCE_HEADERS = new Set([
+  "anthropic-beta",
+  "x-session-id",
+  "session-id",
+  "session_id",
+  "x-session-affinity",
+  "x-opencode-session",
+  "x-client-request-id",
+]);
+
 /**
  * Same-provider attempts allowed for safe HTTP methods after a transient
  * socket failure, before failing over to the next provider.
@@ -996,11 +1008,11 @@ export class RoutstrClient {
     if (modelPathSelector) {
       baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
     }
-    // anthropic-beta describes the body, not the caller: without it a node's
-    // native Anthropic upstream rejects beta fields (context_management,
-    // safeguards, thinking.display "updates", ...) with a 400.
+    // Anthropic needs the beta opt-ins for beta body fields. Session hints
+    // also belong in baseHeaders so they survive a retry with fresh auth.
     for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() === "anthropic-beta") baseHeaders[name] = value;
+      const lower = name.toLowerCase();
+      if (FORWARDED_INFERENCE_HEADERS.has(lower)) baseHeaders[lower] = value;
     }
 
     // Forward the provider-native model id when selection resolved through a

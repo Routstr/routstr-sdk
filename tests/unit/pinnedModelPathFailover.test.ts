@@ -464,13 +464,13 @@ describe("RoutstrClient pinned model-path failover", () => {
     // The xcashu recovery preamble only reclaims tokens with a `cashu`
     // prefix (RoutstrClient._handleErrorResponse), so the mocked spend must
     // return one — like the real _spendToken does.
-    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
-      token: "cashu_fresh_token",
+    vi.spyOn(client as any, "_spendToken").mockImplementation(async (params) => ({
+      token: params.baseUrl === BASE_URL ? "cashu_first_token" : "cashu_fresh_token",
       selectedMintUrl: MINT_URL,
       tokenBalance: 500,
       tokenBalanceUnit: "sat",
       tokenBalanceUnknown: false,
-    });
+    }));
     vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(
       0
     );
@@ -509,7 +509,13 @@ describe("RoutstrClient pinned model-path failover", () => {
       path: "/v1/chat/completions",
       method: "POST",
       body: { messages: [] },
-      headers: { "x-routstr-model-path": SELECTOR },
+      headers: {
+        "x-routstr-model-path": SELECTOR,
+        "X-Session-Id": "stable-session",
+        "X-Client-Request-Id": "caller-request-id",
+        Authorization: "Bearer caller-key",
+        "X-Cashu": "caller-token",
+      },
       baseUrl: BASE_URL,
       mintUrl: MINT_URL,
       modelId: "deepseek-v4.1-flash",
@@ -527,13 +533,19 @@ describe("RoutstrClient pinned model-path failover", () => {
     // First attempt failed on BASE_URL; the retry went to the next node.
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[1][0])).toContain(NEXT_BASE_URL);
+    const [firstHeaders, secondHeaders] = fetchMock.mock.calls.map(
+      ([, init]) => new Headers(init?.headers)
+    );
+    for (const headers of [firstHeaders, secondHeaders]) {
+      expect(headers.get("x-session-id")).toBe("stable-session");
+      expect(headers.get("x-client-request-id")).toBe("caller-request-id");
+      expect(headers.has("authorization")).toBe(false);
+    }
+    expect(firstHeaders.get("x-cashu")).toBe("cashu_first_token");
+    expect(secondHeaders.get("x-cashu")).toBe("cashu_fresh_token");
     // The failed node's selector is never forwarded; the retry pins the new
     // node's own selector.
-    expect(
-      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
-        "x-routstr-model-path"
-      )
-    ).toBe(NEXT_SELECTOR);
+    expect(secondHeaders.get("x-routstr-model-path")).toBe(NEXT_SELECTOR);
   });
 
   it("aligns the outbound body's model with the pinned selector's spelling", async () => {
