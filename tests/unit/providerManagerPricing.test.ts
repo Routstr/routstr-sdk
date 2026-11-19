@@ -738,6 +738,42 @@ describe("ProviderManager", () => {
       ).toEqual(["https://b-tiered.example.com/", "https://a-flat.example.com/"]);
     });
 
+    it("ranks a picture route priced the old way by its picture price, and an unpriced one last", () => {
+      const painter = (sats_pricing: object, image_pricing?: object) =>
+        makeModel({
+          architecture: { output_modalities: ["image"] },
+          sats_pricing: { prompt: 0, completion: 0, ...sats_pricing },
+          image_pricing,
+        } as unknown as Partial<Model>);
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://a-unpriced.example.com/": [painter({})],
+          "https://b-legacy.example.com/": [painter({ image: 1013 })],
+          "https://c-tiered.example.com/": [
+            painter(
+              { image_output: 1525, max_cost: 1525 },
+              {
+                max_usd: 0.98,
+                tiers: [{ resolution: "1K", quality: null, usd: 0.12 }],
+                default_resolution: "1K",
+                resolutions: ["1K", "2K", "4K"],
+                unit: "image",
+              }
+            ),
+          ],
+        }),
+      });
+
+      const manager = new ProviderManager(registry);
+      expect(
+        manager.getProviderPriceRankingForModel("gpt-4o-mini").map((r) => r.baseUrl)
+      ).toEqual([
+        "https://c-tiered.example.com/",
+        "https://b-legacy.example.com/",
+        "https://a-unpriced.example.com/",
+      ]);
+    });
+
     it("picks the same provider the price ranking puts first", () => {
       const registry = createRegistry({
         getCachedModels: () => ({

@@ -872,6 +872,20 @@ function pictureHoldSats(
 }
 
 /**
+ * What one picture from a model that only makes pictures costs on a route,
+ * for ranking: its default step, else, on a route with no `image_output`, the
+ * per-picture price nodes listed as `sats_pricing.image` before image books.
+ * An unpriced route ranks last, not as free. Undefined for any other model.
+ */
+function pictureQuoteSats(model: Model): number | undefined {
+  const outputs = model.architecture?.output_modalities;
+  if (outputs?.length !== 1 || outputs[0] !== "image") return undefined;
+  const pricing = model.sats_pricing as any;
+  const listed = pricing?.image_output > 0 ? undefined : pricing?.image;
+  return pictureHoldSats(model, {}) ?? (listed > 0 ? listed : Infinity);
+}
+
+/**
  * Port of the node's minimum-balance gate
  * (`routstr/payment/helpers.py:calculate_discounted_max_cost`), in sats.
  *
@@ -1954,7 +1968,7 @@ export class ProviderManager {
       results.push({
         baseUrl,
         model: match,
-        cost: pictureHoldSats(match, {}) ?? breakdown.total,
+        cost: pictureQuoteSats(match) ?? breakdown.total,
         rates: breakdown.rates,
         breakdown,
         basket,
