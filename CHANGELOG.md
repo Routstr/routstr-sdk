@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Caller system messages (PR #151)
+
+- `fetchAIResponse` now sends the caller's `system` messages instead of
+  dropping them, wherever they sit in `messageHistory`. The SDK's own notes
+  from `onMessageAppend` ("Generation stopped.", "Uncaught Error: ...") are
+  `system` messages too, so leave them out of the history you pass back.
+
+### Anthropic usage tracking (PR #153)
+
 - Fix `/v1/messages` usage tracking for raw Anthropic and Routstr-normalized
   responses. Count cache reads and writes once and keep streamed token totals
   consistent across usage deltas and terminal cost events. Billing is unchanged.
