@@ -284,4 +284,36 @@ describe("confidential failover", () => {
       { baseUrl: C, amount: want },
     ]);
   });
+
+  it("a cancelled request does not fail over after its connection failed", async () => {
+    const controller = new AbortController();
+    const { client, spent, sessions } = setup({
+      errorOnA: () => {
+        // The caller gives up while node A's connection is failing.
+        controller.abort();
+        return new ConfidentialTimeoutError("2PC timed out");
+      },
+    });
+    await expect(route(client, { signal: controller.signal })).rejects.toThrow();
+    expect(sessions).toEqual([A]);
+    expect(spent.map((s) => s.baseUrl)).toEqual([A]);
+  });
+
+  it("a request cancelled while a failover node qualifies spends nothing more", async () => {
+    const controller = new AbortController();
+    const { client, spent, sessions, qualified } = setup({
+      errorOnA: () => new ConfidentialTimeoutError("2PC timed out"),
+      qualify: (baseUrl) => {
+        if (baseUrl === C) {
+          controller.abort();
+          throw new Error("offer unavailable");
+        }
+      },
+    });
+    await expect(route(client, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    // C is not probed again once the caller cancelled.
+    expect(qualified).toEqual([A, C]);
+    expect(sessions).toEqual([A]);
+    expect(spent.map((s) => s.baseUrl)).toEqual([A]);
+  });
 });
