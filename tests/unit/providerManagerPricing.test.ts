@@ -765,13 +765,14 @@ describe("ProviderManager", () => {
       });
 
       const manager = new ProviderManager(registry);
-      expect(
-        manager.getProviderPriceRankingForModel("gpt-4o-mini").map((r) => r.baseUrl)
-      ).toEqual([
+      const ranking = manager.getProviderPriceRankingForModel("gpt-4o-mini");
+      expect(ranking.map((r) => r.baseUrl)).toEqual([
         "https://c-tiered.example.com/",
         "https://b-legacy.example.com/",
         "https://a-unpriced.example.com/",
       ]);
+      expect(ranking.map((r) => r.pictureSats)).toEqual([1525 * (0.12 / 0.98), 1013, Infinity]);
+      expect(ranking.map((r) => r.cost)).toEqual(ranking.map((r) => r.pictureSats));
     });
 
     it("picks the same provider the price ranking puts first", () => {

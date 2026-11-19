@@ -245,8 +245,13 @@ const fetchProviderInfo = async (
 export interface ModelProviderPrice {
   baseUrl: string;
   model: Model;
-  /** Sats the node would settle for the whole basket. */
+  /** Sats the node would settle for the whole basket, or for one picture
+   *  where `pictureSats` is set. */
   cost: number;
+  /** For a model that only makes pictures: sats for one picture at its
+   *  default size and quality, which is then `cost`. The basket fields still
+   *  describe tokens. */
+  pictureSats?: number;
   /** The rates the cost was computed from, with provenance. */
   rates: CostRates;
   /** Per-class sats for the basket, plus the same `rates` it used. */
@@ -1964,11 +1969,13 @@ export class ProviderManager {
       if (!hasUsableTokenRates(match.sats_pricing)) continue;
 
       const breakdown = estimateCost(match.sats_pricing, basket);
+      const pictureSats = pictureQuoteSats(match);
 
       results.push({
         baseUrl,
         model: match,
-        cost: pictureQuoteSats(match) ?? breakdown.total,
+        cost: pictureSats ?? breakdown.total,
+        pictureSats,
         rates: breakdown.rates,
         breakdown,
         basket,
@@ -1986,7 +1993,7 @@ export class ProviderManager {
       const ranking = results
         .map(
           (r, i) =>
-            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats ` +
+            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats${r.pictureSats !== undefined ? " for one picture" : ""} ` +
             `(fresh=${r.breakdown.freshInputSats.toFixed(2)} ` +
             `cache-read=${r.breakdown.cacheReadSats.toFixed(2)} ` +
             `cache-write=${r.breakdown.cacheWriteSats.toFixed(2)} ` +
