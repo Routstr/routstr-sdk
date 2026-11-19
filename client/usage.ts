@@ -33,6 +33,12 @@ const nonnegativeOrUndef = (value: unknown): number | undefined => {
   return number !== undefined && number >= 0 ? number : undefined;
 };
 
+// Some upstream adapters serialize token counts as strings.
+const tokenCount = (value: unknown): number | undefined =>
+  nonnegativeOrUndef(
+    typeof value === "string" && value.trim() !== "" ? Number(value) : value
+  );
+
 /**
  * Extract the detailed cost breakdown from an upstream `cost` object.
  * Returns the camelCased fields we persist on a UsageTrackingData/entry.
@@ -47,8 +53,8 @@ function extractCostBreakdown(
     outputMsats: numOrUndef(costObj.output_msats),
     totalMsats: nonnegativeOrUndef(costObj.total_msats),
     totalUsd: numOrUndef(costObj.total_usd),
-    cacheReadInputTokens: numOrUndef(costObj.cache_read_input_tokens),
-    cacheCreationInputTokens: numOrUndef(costObj.cache_creation_input_tokens),
+    cacheReadInputTokens: tokenCount(costObj.cache_read_input_tokens),
+    cacheCreationInputTokens: tokenCount(costObj.cache_creation_input_tokens),
     cacheReadMsats: numOrUndef(costObj.cache_read_msats),
     cacheCreationMsats: numOrUndef(costObj.cache_creation_msats),
     remainingBalanceMsats: numOrUndef(costObj.remaining_balance_msats),
@@ -63,13 +69,6 @@ export function extractUsageFromResponseBody(
   const usage = (body as { usage?: Record<string, unknown> }).usage;
   if (!usage || typeof usage !== "object") return null;
 
-  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
-  const completionTokens = Number(
-    usage.completion_tokens ?? usage.output_tokens ?? 0
-  );
-  const totalTokens = Number(
-    usage.total_tokens ?? promptTokens + completionTokens
-  );
   const costValue = usage.cost;
   const response = body as {
     cost?: unknown;
@@ -90,6 +89,41 @@ export function extractUsageFromResponseBody(
       : undefined;
   const breakdownCost = metadataCost ?? topLevelCost ?? usageCost;
   const breakdown = extractCostBreakdown(breakdownCost);
+
+  const cacheCreation = usage.cache_creation && typeof usage.cache_creation === "object"
+    ? (usage.cache_creation as Record<string, unknown>)
+    : undefined;
+  const cacheWrite5m = tokenCount(cacheCreation?.ephemeral_5m_input_tokens);
+  const cacheWrite1h = tokenCount(cacheCreation?.ephemeral_1h_input_tokens);
+  const anthropicCacheCreation = tokenCount(usage.cache_creation_input_tokens) ??
+    (cacheWrite5m === undefined && cacheWrite1h === undefined
+      ? undefined
+      : (cacheWrite5m ?? 0) + (cacheWrite1h ?? 0));
+  const anthropicCacheRead = tokenCount(usage.cache_read_input_tokens);
+  const anthropicShaped = usage.prompt_tokens == null && (
+    usage.input_tokens != null || anthropicCacheRead !== undefined ||
+    anthropicCacheCreation !== undefined
+  );
+
+  let promptTokens = Number(usage.prompt_tokens ?? 0);
+  if (anthropicShaped) {
+    const wireInput = tokenCount(usage.input_tokens);
+    const freshInput = tokenCount(breakdownCost?.input_tokens);
+    const cached = (anthropicCacheRead ?? breakdown.cacheReadInputTokens ?? 0) +
+      (anthropicCacheCreation ?? breakdown.cacheCreationInputTokens ?? 0);
+    // Raw Anthropic input excludes cache. Routstr publishes inclusive input
+    // alongside the fresh count in its cost summary. A matching fresh count
+    // indicates an unfolded (legacy) response. If the counts differ and the
+    // wire total can fit the cache, preserve it; the cost count can be a zero
+    // placeholder. Without a fresh count, assume raw usage: size alone cannot
+    // distinguish a folded total from fresh input with a small cache.
+    const isFolded =
+      wireInput !== undefined && freshInput !== undefined &&
+      wireInput !== freshInput && wireInput >= cached;
+    promptTokens = isFolded ? wireInput : (wireInput ?? freshInput ?? 0) + cached;
+  }
+  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+  const totalTokens = Number(usage.total_tokens ?? promptTokens + completionTokens);
 
   // OpenAI-style prompt cache details (e.g. Tinfoil/vLLM). These live on
   // `usage.prompt_tokens_details` rather than in a Routstr `cost` object.
@@ -136,11 +170,10 @@ export function extractUsageFromResponseBody(
     ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
     provider,
     ...breakdown,
-    cacheReadInputTokens:
-      breakdown.cacheReadInputTokens ?? numOrUndef(details?.cached_tokens),
-    cacheCreationInputTokens:
-      breakdown.cacheCreationInputTokens ??
-      numOrUndef(details?.created_cache_tokens),
+    cacheReadInputTokens: breakdown.cacheReadInputTokens ??
+      tokenCount(details?.cached_tokens) ?? anthropicCacheRead,
+    cacheCreationInputTokens: breakdown.cacheCreationInputTokens ??
+      tokenCount(details?.created_cache_tokens) ?? anthropicCacheCreation,
   };
 }
 
@@ -163,27 +196,39 @@ export function extractUsageFromSSEJson(
   const provider =
     typeof parsed.provider === "string" ? parsed.provider : undefined;
 
-  // Handle standalone cost chunk: {"cost":{"base_msats":...,"input_msats":...,"output_msats":...,"total_msats":2,...}}
-  if (!parsed.usage && parsed.cost && typeof parsed.cost === "object") {
+  // Anthropic message_start nests usage; normalize it before looking for a
+  // standalone cost summary (which uses a different token-count convention).
+  const usage = parsed.usage ?? parsed.message?.usage;
+  if (!usage && parsed.cost && typeof parsed.cost === "object") {
     const costObj = parsed.cost;
     const msats = nonnegativeOrUndef(costObj.total_msats);
     const reportedSatsCost = msats !== undefined ? msats / 1000 : undefined;
     const cost = numOrUndef(costObj.total_usd) ?? 0;
     const satsCost = reportedSatsCost ?? fallbackSatsCost;
-    if (reportedSatsCost === undefined && satsCost === 0 && cost === 0) return null;
+    const breakdown = extractCostBreakdown(costObj);
+    // Routstr's cost contract always separates fresh input from cache tokens.
+    const promptTokens = (tokenCount(costObj.input_tokens) ?? 0) +
+      (breakdown.cacheReadInputTokens ?? 0) +
+      (breakdown.cacheCreationInputTokens ?? 0);
+    const completionTokens = tokenCount(costObj.output_tokens) ?? 0;
+    if (reportedSatsCost === undefined && satsCost === 0 && cost === 0 &&
+      promptTokens === 0 && completionTokens === 0) return null;
     return {
-      promptTokens: Number(costObj.input_tokens ?? 0),
-      completionTokens: Number(costObj.output_tokens ?? 0),
-      totalTokens: Number((costObj.input_tokens ?? 0) + (costObj.output_tokens ?? 0)),
-      cost: Number(cost),
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      cost,
       satsCost,
       ...(reportedSatsCost !== undefined ? { reportedSatsCost } : {}),
       provider,
-      ...extractCostBreakdown(costObj),
+      ...breakdown,
     };
   }
 
-  return extractUsageFromResponseBody(parsed, fallbackSatsCost);
+  return extractUsageFromResponseBody(
+    parsed.usage || !usage ? parsed : { ...parsed, usage },
+    fallbackSatsCost
+  );
 }
 
 /**
