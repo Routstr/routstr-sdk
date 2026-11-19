@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix `/v1/messages` usage tracking for raw Anthropic and Routstr-normalized
+  responses. Count cache reads and writes once and keep streamed token totals
+  consistent across usage deltas and terminal cost events. Billing is unchanged.
+
 ## 0.5.1
 
 ### Exhausted upstream errors (PR #141 and follow-up)

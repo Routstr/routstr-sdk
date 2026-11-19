@@ -2,13 +2,20 @@ import { Transform } from "stream";
 import { StringDecoder } from "string_decoder";
 import { extractUsageFromSSEJson, type UsageTrackingData } from "./usage";
 
+type TokenUsageEvent = {
+  type?: string;
+  usage?: Record<string, unknown>;
+  message?: { usage?: Record<string, unknown> };
+};
+
 /**
  * Merge previously captured usage with a newly seen usage payload, preferring
  * non-zero fields from the new payload, except explicit cost (where zero is valid).
  */
 function mergeUsage(
   previous: UsageTrackingData | null,
-  next: UsageTrackingData
+  next: UsageTrackingData,
+  event: TokenUsageEvent
 ): UsageTrackingData {
   if (!previous) return next;
   const pickNum = (
@@ -16,15 +23,28 @@ function mergeUsage(
     p: number | undefined
   ): number | undefined => (typeof n === "number" && n > 0 ? n : p ?? n);
   const reportedSatsCost = next.reportedSatsCost ?? previous.reportedSatsCost;
+  const rawUsage = event.usage ?? event.message?.usage;
+  // A delta can repeat cache counts without reporting fresh input again.
+  const hasPrompt =
+    event.type !== "message_delta" ||
+    rawUsage?.input_tokens != null ||
+    rawUsage?.prompt_tokens != null;
+  const promptTokens =
+    hasPrompt && next.promptTokens > 0 ? next.promptTokens : previous.promptTokens;
+  const completionTokens = next.completionTokens > 0
+    ? next.completionTokens
+    : previous.completionTokens;
+  const countsChanged = promptTokens !== previous.promptTokens ||
+    completionTokens !== previous.completionTokens;
+  // A missing total was synthesized from this event alone. Recompute it from
+  // the merged counts, but leave an explicit total alone on a cost-only update.
+  const totalTokens = rawUsage?.total_tokens != null
+    ? next.totalTokens
+    : countsChanged ? promptTokens + completionTokens : previous.totalTokens;
   return {
-    promptTokens:
-      next.promptTokens > 0 ? next.promptTokens : previous.promptTokens,
-    completionTokens:
-      next.completionTokens > 0
-        ? next.completionTokens
-        : previous.completionTokens,
-    totalTokens:
-      next.totalTokens > 0 ? next.totalTokens : previous.totalTokens,
+    promptTokens,
+    completionTokens,
+    totalTokens,
     cost: next.cost > 0 ? next.cost : previous.cost,
     satsCost: reportedSatsCost ??
       (next.satsCost > 0 ? next.satsCost : previous.satsCost),
@@ -140,7 +160,7 @@ export async function inspectSSEWebStream(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
-        const merged = mergeUsage(capturedUsage, usage);
+        const merged = mergeUsage(capturedUsage, usage, data);
         if (hasUsageChanged(capturedUsage, merged)) {
           capturedUsage = merged;
           onUsage(merged);
@@ -262,7 +282,7 @@ export function createSSEParserTransform(
 
       const usage = extractUsageFromSSEJson(data);
       if (usage) {
-        const mergedUsage = mergeUsage(capturedUsage, usage);
+        const mergedUsage = mergeUsage(capturedUsage, usage, data);
         if (hasUsageChanged(capturedUsage, mergedUsage)) {
           capturedUsage = mergedUsage;
           onUsage(mergedUsage);

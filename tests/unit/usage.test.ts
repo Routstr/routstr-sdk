@@ -5,7 +5,7 @@ import {
   extractUsageFromResponseHeaders,
   extractUsageFromSSEJson,
 } from "../../client/usage";
-import { createSSEParserTransform } from "../../client/sse";
+import { createSSEParserTransform, inspectSSEWebStream } from "../../client/sse";
 
 const costBreakdown = {
   base_msats: 0,
@@ -179,7 +179,23 @@ describe("usage extraction", () => {
 });
 
 
+const messagesCost = {
+  ...costBreakdown,
+  input_tokens: 2,
+  output_tokens: 8,
+  cache_read_input_tokens: 63226,
+  cache_creation_input_tokens: 0,
+  total_msats: 1932,
+};
+const nodeMessagesUsage = {
+  input_tokens: 63228,
+  output_tokens: 8,
+  cache_read_input_tokens: 63226,
+  cache_creation_input_tokens: 0,
+};
+
 describe("Anthropic-shaped usage", () => {
+
   it("maps /v1/messages cache tokens into the total prompt count", () => {
     const response = {
       id: "msg_01ABC",
@@ -200,6 +216,43 @@ describe("Anthropic-shaped usage", () => {
       cacheReadInputTokens: 63226,
     });
     expect(extractUsageFromSSEJson(response)).toEqual(body);
+  });
+
+  it.each([
+    [63228, 2], // current node: folded input and a fresh cost count
+    [2, 2], // legacy node: unfolded input despite publishing a fresh count
+    [63226, 0], // cache-only prompt: zero fresh tokens is valid
+    [63228, 0], // retain visible input if settlement has placeholder counts
+  ])("normalizes node input %i with cost input %i", (input, fresh) => {
+    const cost = {
+      ...messagesCost,
+      input_tokens: fresh,
+      ...(input === 63228 && fresh === 0 ? { cache_read_input_tokens: 0 } : {}),
+    };
+    const response = {
+      usage: { ...nodeMessagesUsage, input_tokens: input },
+      metadata: { routstr: { cost } },
+    };
+    const expected = input === 63226 ? 63226 : 63228;
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: expected,
+      totalTokens: expected + 8,
+      reportedSatsCost: 1.932,
+    });
+  });
+
+  it("does not infer folding from the size of the raw input or cache", () => {
+    const response = {
+      usage: { input_tokens: "100", output_tokens: "3", cache_read_input_tokens: "20" },
+    };
+    expect(extractUsageFromResponseBody(response)).toMatchObject({
+      promptTokens: 120, completionTokens: 3, totalTokens: 123, cacheReadInputTokens: 20,
+    });
+  });
+
+  it("leaves a missing cache-creation count undefined when buckets are empty", () => {
+    expect(extractUsageFromResponseBody({ usage: { input_tokens: 1, cache_creation: {} } }))
+      .toMatchObject({ cacheCreationInputTokens: undefined });
   });
 
   it("sums cache_creation ephemeral 5m/1h buckets when the aggregate is absent", () => {
@@ -253,7 +306,7 @@ describe("Anthropic-shaped usage", () => {
     });
   });
 
-  it("keeps the OpenAI shape byte-for-byte: prompt_tokens already includes cached subsets", () => {
+  it("keeps inclusive OpenAI totals and picks up the mixed-shape cache read", () => {
     const response = {
       usage: {
         prompt_tokens: 100,
@@ -268,6 +321,7 @@ describe("Anthropic-shaped usage", () => {
       promptTokens: 100, // NOT 100 + 98
       completionTokens: 10,
       totalTokens: 110,
+      cacheReadInputTokens: 98,
     });
   });
 
@@ -275,40 +329,60 @@ describe("Anthropic-shaped usage", () => {
     expect(extractUsageFromResponseBody({ usage: {} })).toBeNull();
   });
 
-  it("extracts usage across Anthropic message_start/message_delta SSE events", async () => {
-    const events = [
-      {
-        type: "message_start",
-        message: {
-          id: "msg_01ABC",
-          type: "message",
-          usage: {
-            input_tokens: 2,
-            cache_read_input_tokens: 63226,
-            output_tokens: 1,
-          },
-        },
+  it.each([
+    { name: "output-only delta", deltaUsage: { output_tokens: 8 } },
+    { name: "delta that repeats cache counts", deltaUsage: { output_tokens: 8, cache_read_input_tokens: 63226 } },
+    { name: "standalone cost", terminal: { cost: { ...messagesCost, input_tokens: 3 } } },
+    { name: "folded usage and cost", terminal: {
+      usage: { ...nodeMessagesUsage, input_tokens: 63229 },
+      cost: { ...messagesCost, input_tokens: 3 },
+    } },
+  ])("merges message_start and message_delta with $name", async ({ deltaUsage, terminal }) => {
+    const start = {
+      type: "message_start",
+      message: {
+        id: "msg_01ABC",
+        usage: { ...nodeMessagesUsage, input_tokens: 2, output_tokens: 1 },
       },
-      { type: "message_delta", usage: { output_tokens: 8 } },
+    };
+    const delta = { type: "message_delta", usage: deltaUsage ?? { output_tokens: 8 } };
+    const chunks = [
+      `event: message_start\ndata: ${JSON.stringify(start)}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify(delta)}\n\n`,
+      ...(terminal ? [`event: cost\ndata: ${JSON.stringify(terminal)}\n\n`] : []),
     ];
+    // The terminal summaries correct the fresh count to 3, so this also checks
+    // that normalization doesn't accidentally ignore a valid correction.
+    const expected = {
+      promptTokens: terminal ? 63229 : 63228,
+      completionTokens: 8,
+      totalTokens: terminal ? 63237 : 63236,
+      cacheReadInputTokens: 63226,
+      ...(terminal ? { reportedSatsCost: 1.932 } : {}),
+    };
+
+    const webStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    });
+    expect((await inspectSSEWebStream(webStream, () => {})).capturedUsage)
+      .toMatchObject(expected);
 
     const captured: Array<Record<string, unknown>> = [];
-    const transform = createSSEParserTransform(usage => {
+    const transform = Readable.from(chunks).pipe(createSSEParserTransform(usage => {
       captured.push({ ...usage });
-    });
-    const source = Readable.from(
-      events.map(event => `data: ${JSON.stringify(event)}\n\n`)
-    );
-    const merged = await new Promise<Record<string, unknown>>(resolve => {
-      source.pipe(transform);
-      transform.on("data", () => {});
-      transform.on("end", () => resolve(captured.at(-1) ?? {}));
-    });
+    }));
+    for await (const _ of transform) { /* Drain the passthrough stream. */ }
+    expect(captured.at(-1)).toMatchObject(expected);
+  });
 
-    expect(merged).toMatchObject({
-      promptTokens: 63228,
-      completionTokens: 8,
-      cacheReadInputTokens: 63226,
+  it("sums both cache buckets in a standalone cost summary with no usage events", () => {
+    expect(extractUsageFromSSEJson({ cost: {
+      ...messagesCost, input_tokens: "2", cache_creation_input_tokens: "12",
+    } })).toMatchObject({
+      promptTokens: 63240, totalTokens: 63248, cacheCreationInputTokens: 12,
     });
   });
 });
