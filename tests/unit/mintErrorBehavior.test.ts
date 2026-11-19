@@ -64,6 +64,7 @@ const createWallet = (overrides?: Partial<WalletAdapter>): WalletAdapter => ({
 
 const createStorage = (overrides?: Partial<StorageAdapter>) => {
   const removedXcashu: Array<[string, string]> = [];
+  let cached: ReturnType<StorageAdapter["getCachedReceiveTokens"]> = [];
   const removedApiKeys: string[] = [];
   return {
     storage: {
@@ -94,8 +95,10 @@ const createStorage = (overrides?: Partial<StorageAdapter>) => {
       updateChildKeyBalance: () => {},
       removeChildKey: () => {},
       getAllChildKeys: () => [],
-      getCachedReceiveTokens: () => [],
-      setCachedReceiveTokens: () => {},
+      getCachedReceiveTokens: () => cached,
+      setCachedReceiveTokens: (entries: Parameters<StorageAdapter["setCachedReceiveTokens"]>[0]) => {
+        cached = entries.map(entry => ({ ...entry, createdAt: entry.createdAt ?? Date.now() }));
+      },
       ...overrides,
     },
     removedXcashu,

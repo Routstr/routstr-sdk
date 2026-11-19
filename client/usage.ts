@@ -21,6 +21,8 @@ export interface UsageTrackingData {
   cacheReadMsats?: number;
   cacheCreationMsats?: number;
   remainingBalanceMsats?: number;
+  /** Images an image endpoint returned and billed (`X-Routstr-Image-Count`). */
+  outputImages?: number;
 }
 
 const numOrUndef = (value: unknown): number | undefined =>
@@ -221,11 +223,11 @@ export function extractUsageFromSSEJson(
 }
 
 /**
- * Extract cost/usage from EHBP/Tinfoil response headers.
+ * Extract cost/usage from response headers.
  *
  * For EHBP requests the proxy cannot inject cost into the JSON/SSE body
- * (the body is opaque encrypted). Instead it returns cost as response
- * headers. This parses those headers into the same UsageTrackingData
+ * (the body is opaque encrypted), and image endpoints may relay raw image
+ * bytes. Instead it returns cost as response headers. This parses those headers into the same UsageTrackingData
  * shape used for SSE/body extraction, so callers can merge or fall back.
  */
 export function extractUsageFromResponseHeaders(
@@ -246,6 +248,9 @@ export function extractUsageFromResponseHeaders(
   const totalMsats = nonnegativeOrUndef(Number(rawTotalMsats));
   if (totalMsats === undefined) return null;
 
+  const rawImages = get("X-Routstr-Image-Count")?.trim();
+  const count = rawImages && /^\d+$/.test(rawImages) ? Number(rawImages) : NaN;
+
   return {
     promptTokens: 0,
     completionTokens: 0,
@@ -257,6 +262,7 @@ export function extractUsageFromResponseHeaders(
     inputMsats: Number(get("X-Routstr-Input-Cost-Msats")) || 0,
     outputMsats: Number(get("X-Routstr-Output-Cost-Msats")) || 0,
     totalUsd: Number(get("X-Routstr-Cost-Usd")) || undefined,
+    outputImages: Number.isSafeInteger(count) ? count : undefined,
   };
 }
 

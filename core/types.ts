@@ -200,6 +200,15 @@ export interface RefundResult {
   message?: string;
   requestId?: string;
   /**
+   * True when the refund bailed out before touching the provider, so no
+   * wallet mutation happened: no API key to refund, a refused provider-wallet
+   * guard, or the recent-use guard. Distinct from a refund that reached the
+   * provider and failed. Callers must not treat a skip as a refund attempt —
+   * in particular it must not arm or refresh the provider wallet cooldown,
+   * which would block the top-up a 402 recovery needs.
+   */
+  skipped?: boolean;
+  /**
    * HTTP status from the provider's refund endpoint when the refund itself
    * failed (e.g. a 500/502/503 from `/v1/wallet/refund`). Undefined when the
    * refund never reached the provider (network/mint errors) or succeeded.

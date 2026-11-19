@@ -157,5 +157,11 @@ export interface RequestLifecycleContext {
     data?: Record<string, unknown>,
     scope?: { attemptId?: string; baseUrl?: string },
   ): Promise<void>;
+  /** Best-effort event only. Its write does not gate ordered lifecycle updates. */
+  observe?(
+    type: string,
+    data?: Record<string, unknown>,
+    scope?: { attemptId?: string; baseUrl?: string },
+  ): void;
   finish(input: FinishRequestLifecycleInput): Promise<void>;
 }

@@ -1,3 +1,4 @@
+import { awaitWithAbort } from "../client/abortable";
 import { throwIfFundingAborted } from "./fundingCancellation";
 /**
  * CashuSpender - Core spending logic for Cashu tokens
@@ -11,7 +12,7 @@ import { throwIfFundingAborted } from "./fundingCancellation";
  * Extracted from hooks/useCashuWithXYZ.ts
  */
 
-import type { WalletAdapter, StorageAdapter } from "./interfaces";
+import type { RecoveryCredential, WalletAdapter, StorageAdapter } from "./interfaces";
 import type { SpendResult, SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
 import { InsufficientBalanceError, ProviderMintBalanceError } from "../core/errors";
@@ -52,6 +53,8 @@ export interface SpendOptions {
 }
 
 type DebugLevel = "DEBUG" | "WARN" | "ERROR";
+type ReceiveResult = Awaited<ReturnType<WalletAdapter["receiveToken"]>>;
+type RecoveryResult = ReceiveResult & { pending?: boolean };
 
 /**
  * CashuSpender manages the spending of Cashu tokens
@@ -82,12 +85,7 @@ export class CashuSpender {
   }
 
   /** Disable failure caching when a durable xcashu record already owns recovery. */
-  async receiveToken(token: string, cacheOnFailure = true): Promise<{
-    success: boolean;
-    amount: number;
-    unit: "sat" | "msat";
-    message?: string;
-  }> {
+  async receiveToken(token: string, cacheOnFailure = true): Promise<ReceiveResult> {
     try {
       const result = await this.walletAdapter.receiveToken(token);
       return result;
@@ -104,36 +102,128 @@ export class CashuSpender {
     }
   }
 
-  /** Preserve an unrecovered token without adding duplicate entries. */
-  cacheReceiveToken(token: string): void {
+  /** Bound only the foreground wait. Shared recovery is independent of callers. */
+  async receiveTokenForRecovery(
+    token: string,
+    signal?: AbortSignal,
+    credential?: RecoveryCredential,
+    timeoutMs = 10_000,
+  ): Promise<RecoveryResult> {
+    throwIfFundingAborted(signal);
+    this.cacheReceiveToken(token, credential);
+    const operation = this.startCachedReceive(token);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await awaitWithAbort(Promise.race([
+        operation,
+        new Promise<RecoveryResult>(resolve => {
+          timer = setTimeout(() => resolve({
+            success: false,
+            pending: true,
+            ...this._decodeTokenAmount(token),
+            message: "Payment recovery timed out; recovery remains pending",
+          }), timeoutMs);
+        }),
+      ]), signal);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private readonly pendingReceives = new Map<string, Promise<ReceiveResult>>();
+
+  private startCachedReceive(token: string): Promise<ReceiveResult> {
+    const pending = this.pendingReceives.get(token);
+    if (pending) return pending;
+    // Register before flushing, and keep ownership through cache/credential updates.
+    const work = Promise.resolve().then(async () => {
+      await this.storageAdapter.flush?.();
+      const cached = this.storageAdapter.getCachedReceiveTokens().find(entry => entry.token === token);
+      const result = cached?.received
+        ? { success: true, amount: cached.amount, unit: cached.unit, message: undefined }
+        : await this.receiveToken(token);
+      const spent = /already spent/i.test(result.message ?? "");
+      if (result.success || spent) {
+        await this.finishCachedReceive(token, result, cached?.received === true);
+      } else if (/^invalid (?:cashu )?token(?:$|:)/i.test(result.message?.trim() ?? "")) {
+        // Keep ambiguous errors for retry; discard only conclusively malformed proofs.
+        this.evictCachedReceiveToken(token);
+      }
+      return result;
+    }).finally(() => { this.pendingReceives.delete(token); });
+    this.pendingReceives.set(token, work);
+    return work;
+  }
+
+  private async finishCachedReceive(token: string, result: ReceiveResult, alreadyRecorded: boolean): Promise<void> {
+    const cleaned = new Set<string>();
+    const identity = ({ mode, baseUrl, token }: RecoveryCredential) => JSON.stringify([mode, baseUrl, token]);
+    // An already-spent original may still be a claim on a provider. A
+    // distinct X-Cashu refund was already issued, so its old IOU is obsolete.
+    const cleanup = () => (this.storageAdapter.getCachedReceiveTokens().find(entry => entry.token === token)?.cleanup ?? [])
+      .filter(credential => result.success || (credential.mode === "xcashu" && credential.token !== token));
+    let owners = cleanup();
+    // Leave a receipt while credential removal is pending, so a restart can
+    // finish cleanup without sending already-received proofs to the mint again.
+    if (owners.length > 0 && result.success && !alreadyRecorded && this.storageAdapter.flush) {
+      this.storageAdapter.setCachedReceiveTokens(this.storageAdapter.getCachedReceiveTokens().map(entry =>
+        entry.token === token ? { ...entry, amount: result.amount, unit: result.unit, received: true } : entry
+      ));
+    }
+    while (owners.length > 0) {
+      for (const credential of owners) {
+        const { mode, baseUrl, token: credentialToken } = credential;
+        if (mode === "xcashu") {
+          this.storageAdapter.removeXcashuToken(baseUrl, credentialToken);
+        } else if (this.storageAdapter.getApiKey(baseUrl)?.key === credentialToken) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
+        cleaned.add(identity(credential));
+      }
+      // Never evict the record before credential removal reaches storage.
+      if (!this.storageAdapter.flush) break;
+      await this.storageAdapter.flush();
+      // A foreground caller may have joined while storage was flushing.
+      owners = cleanup().filter(credential => !cleaned.has(identity(credential)));
+    }
+    this.evictCachedReceiveToken(token);
+  }
+
+  private evictCachedReceiveToken(token: string): void {
+    this.storageAdapter.setCachedReceiveTokens(
+      this.storageAdapter.getCachedReceiveTokens().filter(entry => entry.token !== token)
+    );
+  }
+
+  /** Preserve a recovery token and merge any credential association. */
+  cacheReceiveToken(token: string, credential?: RecoveryCredential): void {
     const cached = this.storageAdapter.getCachedReceiveTokens();
-    if (cached.some((entry) => entry.token === token)) return;
+    const existing = cached.find(entry => entry.token === token);
+    if (existing) {
+      if (!credential || existing.cleanup?.some(candidate =>
+        candidate.mode === credential.mode && candidate.baseUrl === credential.baseUrl &&
+        candidate.token === credential.token
+      )) return;
+      this.storageAdapter.setCachedReceiveTokens(cached.map(entry => entry === existing
+        ? { ...entry, cleanup: [...(entry.cleanup ?? []), credential] }
+        : entry));
+      return;
+    }
     const { amount, unit } = this._decodeTokenAmount(token);
     this.storageAdapter.setCachedReceiveTokens([
       ...cached,
-      { token, amount, unit, createdAt: Date.now() },
+      { token, amount, unit, createdAt: Date.now(), ...(credential ? { cleanup: [credential] } : {}) },
     ]);
   }
 
-  /**
-   * Retry cached tokens; remove each once received or once the mint reports
-   * it already spent.
-   */
-  async recoverCachedReceiveTokens(): Promise<
-    { token: string; success: boolean }[]
-  > {
+  /** Retry cached tokens not already owned by another receive. */
+  async recoverCachedReceiveTokens(): Promise<{ token: string; success: boolean }[]> {
     const results: { token: string; success: boolean }[] = [];
-    for (const entry of this.storageAdapter.getCachedReceiveTokens()) {
-      const result = await this.receiveToken(entry.token);
-      if (result.success || /already spent/i.test(result.message ?? "")) {
-        // Re-read so tokens cached during the receive are not overwritten.
-        this.storageAdapter.setCachedReceiveTokens(
-          this.storageAdapter
-            .getCachedReceiveTokens()
-            .filter((t) => t.token !== entry.token)
-        );
-      }
-      results.push({ token: entry.token, success: result.success });
+    for (const { token } of this.storageAdapter.getCachedReceiveTokens()) {
+      if (this.pendingReceives.has(token) ||
+          !this.storageAdapter.getCachedReceiveTokens().some(entry => entry.token === token)) continue;
+      const result = await this.startCachedReceive(token);
+      results.push({ token, success: result.success });
     }
     return results;
   }

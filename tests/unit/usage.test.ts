@@ -313,6 +313,17 @@ describe("Anthropic-shaped usage", () => {
   });
 });
 
+describe("output image counts", () => {
+  it.each([
+    ["0", 0], ["2", 2], ["", undefined], ["  ", undefined], ["1.5", undefined],
+    ["-1", undefined], ["invalid", undefined], ["9007199254740992", undefined],
+  ] as const)("parses %j as %s", (value, expected) => {
+    expect(extractUsageFromResponseHeaders(new Headers({
+      "X-Routstr-Cost-Msats": "125", "X-Routstr-Image-Count": value,
+    }))?.outputImages).toBe(expected);
+  });
+});
+
 describe("reported sats-cost provenance", () => {
   it("distinguishes missing cost from an explicitly free response", () => {
     const missing = extractUsageFromResponseBody({ usage: { total_tokens: 1 } }, 7);
