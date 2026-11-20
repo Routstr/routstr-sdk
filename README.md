@@ -231,6 +231,12 @@ Only supply identifiers you intend providers to see. This does not enable
 arbitrary header forwarding: caller credentials and cookies are not forwarded,
 and the SDK still attaches the selected provider's own payment credential.
 
+A value that cannot be sent as an HTTP header — non-Latin-1 characters,
+CR/LF/NUL, or empty — is dropped with a warning rather than failing the request.
+Zero-length and unusable hints carry no affinity, and a rejected value must not
+fail a request that is otherwise valid. Distinct spellings are sent as distinct
+headers: the caller chose the spelling and the node applies its own precedence.
+
 ### Request lifecycle diagnostics
 
 Inference routing now exposes an SDK lifecycle UUID separately from node and

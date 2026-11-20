@@ -104,6 +104,12 @@ const TOPUP_MARGIN = 1.4;
 
 // Inference headers the caller intends the provider to see. Payment and
 // attribution credentials are handled separately and never copied from here.
+//
+// `session_id`, `session-id` and `x-session-id` are distinct header names that
+// several clients all use for the same affinity hint. They are forwarded as
+// separate headers on purpose: the caller chose the spelling, and the node
+// reads them in its own precedence order (routstrd ranks `x-session-id` first).
+// Collapsing aliases here would silently overrule that order.
 const FORWARDED_INFERENCE_HEADERS = new Set([
   "anthropic-beta",
   "x-session-id",
@@ -113,6 +119,27 @@ const FORWARDED_INFERENCE_HEADERS = new Set([
   "x-opencode-session",
   "x-client-request-id",
 ]);
+
+/**
+ * Is this a value the runtime and a node will both accept as a header?
+ *
+ * Values are copied from caller input, so an `x-session-id` can contain
+ * anything. Passing a non-Latin-1 value to `fetch` throws `TypeError: Cannot
+ * convert argument to a ByteString`, and NUL/CR/LF throw "invalid header
+ * value". Neither is a network error, so they would escape the failover path
+ * and surface as a raw transport failure for a request that succeeded before
+ * these headers were forwarded. Dropping the hint is the graceful outcome: the
+ * request is valid without it, and the value is untrustworthy anyway.
+ *
+ * Exactly what the transport rejects — not a stricter charset — so a caller
+ * hint that would have been sent is never silently discarded, and an empty
+ * value is dropped because it carries no affinity. Header *names* need no
+ * check: the allowlist above is all ASCII.
+ */
+const isForwardableHeaderValue = (value: string): boolean =>
+  value.length > 0 &&
+  /^[\u0000-\u00ff]*$/.test(value) &&
+  !/[\u0000\u000a\u000d]/.test(value);
 
 /**
  * Same-provider attempts allowed for safe HTTP methods after a transient
@@ -1008,11 +1035,23 @@ export class RoutstrClient {
     if (modelPathSelector) {
       baseHeaders[MODEL_PATH_HEADER] = modelPathSelector;
     }
-    // Anthropic needs the beta opt-ins for beta body fields. Session hints
-    // also belong in baseHeaders so they survive a retry with fresh auth.
+    // anthropic-beta describes the body, not the caller: without it a node's
+    // native Anthropic upstream rejects beta fields (context_management,
+    // safeguards, thinking.display "updates", ...) with a 400.
+    // Session hints also belong in baseHeaders (not just final headers) so the
+    // same values survive a retry or failover that rebuilds payment auth.
     for (const [name, value] of Object.entries(headers)) {
       const lower = name.toLowerCase();
-      if (FORWARDED_INFERENCE_HEADERS.has(lower)) baseHeaders[lower] = value;
+      if (!FORWARDED_INFERENCE_HEADERS.has(lower)) continue;
+      const text = String(value);
+      if (!isForwardableHeaderValue(text)) {
+        this._log(
+          "WARN",
+          `[RoutstrClient] dropping ${lower}: not a forwardable header value`
+        );
+        continue;
+      }
+      baseHeaders[lower] = text;
     }
 
     // Forward the provider-native model id when selection resolved through a

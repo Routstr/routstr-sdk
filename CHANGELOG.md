@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Provider session headers
+
+- `routeRequest`/`routeRequests` now forward the caller's session and request
+  correlation headers (`x-session-id`, `session-id`, `session_id`,
+  `x-session-affinity`, `x-opencode-session`, `x-client-request-id`) to the
+  selected provider, alongside the existing `anthropic-beta` pass-through.
+  Names are matched case-insensitively and the values are kept on same-provider
+  retries and provider failover, so prompt-cache affinity survives a re-send.
+- Still not forwarded: `Authorization`, `x-api-key`, `X-Cashu`, cookies, and any
+  header outside that allowlist. The SDK keeps attaching the selected provider's
+  own payment credential. These identifiers are visible to the provider — send
+  only what you intend it to see.
+- A hint whose value cannot be sent as an HTTP header (non-Latin-1 characters,
+  CR/LF/NUL, or empty) is dropped with a warning instead of failing the request.
+  A CJK or emoji session id previously reached `fetch` and threw a `TypeError`
+  that escaped failover.
+
 ### Caller system messages (PR #151)
 
 - `fetchAIResponse` now sends the caller's `system` messages instead of
