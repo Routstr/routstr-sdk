@@ -383,8 +383,8 @@ export interface RouteRequestParams {
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
   /**
-   * Local budgets for THIS inference attempt. Defaults: 60 s for response
-   * headers (time to first byte) and 120 s of silence between stream chunks.
+   * Local budgets for THIS inference attempt. Defaults: 180 s for response
+   * headers (time to first byte) and 180 s of silence between stream chunks.
    * A response body that is not a stream gets `bodyMs` (disabled by default)
    * instead of the inter-chunk budget. Set a value to 0 to disable that budget.
    *

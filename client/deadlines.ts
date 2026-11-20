@@ -103,9 +103,9 @@ export function isInferenceTimeoutError(
 
 /** Per-request deadline configuration. Zero or negative disables a budget. */
 export interface InferenceDeadlines {
-  /** Response headers (time to first byte). Defaults to 60 s; 0 disables. */
+  /** Response headers (time to first byte). Defaults to 180 s; 0 disables. */
   ttfbMs?: number;
-  /** Silence allowed between stream chunks. Defaults to 120 s; 0 disables. */
+  /** Silence allowed between stream chunks. Defaults to 180 s; 0 disables. */
   idleMs?: number;
   /** Overall budget for a non-streaming body. Disabled by default. */
   bodyMs?: number;

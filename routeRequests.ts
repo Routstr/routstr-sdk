@@ -48,9 +48,9 @@ export interface RouteRequestOptions {
   /** Reservation-wait budget after automatic funding fails (default 120s; 0 disables). */
   reservedBalanceWaitMs?: number;
   /**
-   * Local budgets for each inference attempt: response headers (60 s) and
-   * silence between stream chunks (120 s). See RouteRequestParams.deadlines.
-   * A local deadline cools the provider down and fails over; it is not a
+   * Local budgets for each inference attempt: response headers (180 s) and
+   * silence between stream chunks (180 s). See RouteRequestParams.deadlines.
+   * A timeout before headers takes the provider failover path; it is not a
    * caller abort.
    */
   deadlines?: InferenceDeadlines;
