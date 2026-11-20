@@ -330,3 +330,38 @@ describe("config version comparator", () => {
     expect(JSON.parse(published!.content).models).toEqual(selected);
   });
 });
+
+describe("kind 38426 mappings are not identity-widened", () => {
+  beforeEach(() => { relay.events = []; relay.filters = []; relay.published = []; });
+  afterEach(() => { relay.events = []; relay.filters = []; relay.published = []; vi.restoreAllMocks(); });
+
+  const mappingsEvent = (mappings: Record<string, string>, sk = external, created_at = now()) =>
+    finalizeEvent({
+      kind: 38426,
+      created_at,
+      tags: [["d", "model-id-mappings"]],
+      content: JSON.stringify({ mappings }),
+    }, sk);
+
+  /**
+   * `identitySigner` is only used for kind 38427, so a local 38426 event cannot
+   * be written through the public API. Widening would also let a hand-written
+   * one pin the table against every later advertiser update, because identity
+   * precedence outranks newness.
+   */
+  it("keeps the advertised mappings when an identity is configured", async () => {
+    relay.events = [mappingsEvent({ "variant-a": "canonical-a" })];
+    const { manager } = await open({ identityPubkey });
+    expect(await manager.fetchModelIdMappings(true)).toEqual({ "variant-a": "canonical-a" });
+  });
+
+  it("does not let an identity-authored mapping outrank the advertiser", async () => {
+    relay.events = [mappingsEvent({ "variant-a": "canonical-a" }, external, now())];
+    const { manager } = await open({ identityPubkey });
+    // Newest by the advertiser; a stale local document must not win.
+    (await manager.getEventStore())?.add(
+      mappingsEvent({ "variant-a": "canonical-local" }, identity, now() - 100)
+    );
+    expect(await manager.fetchModelIdMappings(true)).toEqual({ "variant-a": "canonical-a" });
+  });
+});

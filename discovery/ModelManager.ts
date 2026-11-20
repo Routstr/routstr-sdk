@@ -156,12 +156,15 @@ const DISCOVERY_KINDS = [38421, 38423, 38425, 38426, 38427];
  * provider signs its own announcement, so "ours versus the configured one"
  * does not exist.
  *
- * Kind 38423 (curated models) is absent because nothing can write a local
- * version of it: `identitySigner` is only ever used to sign kind 38427. Until
- * a writer exists, listing it here would describe a precedence that no code
- * path could exercise.
+ * Kind 38423 (curated models) and kind 38426 (id mappings) are absent because
+ * nothing can write a local version of them: `identitySigner` is only ever used
+ * to sign kind 38427, and `setModelPathWhitelistFromIdentity` is the only
+ * setter. Until writers exist, listing them here would describe a precedence
+ * that no code path could exercise — and a hand-written local 38426 event would
+ * pin the variant->canonical table against every later advertiser update,
+ * because identity precedence outranks newness.
  */
-const IDENTITY_PRECEDENCE_KINDS: ReadonlySet<number> = new Set([38426, 38427]);
+const IDENTITY_PRECEDENCE_KINDS: ReadonlySet<number> = new Set([38427]);
 
 /** Address of the authoritative replaceable model mapping snapshot. */
 const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";

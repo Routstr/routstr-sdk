@@ -252,10 +252,11 @@ const manager = new ModelManager(adapter, {
 }, { eventStore });
 ```
 
-Applies to kinds `38427` (model-path whitelist) and `38426` (model-id mappings).
-Kind `38425` is excluded because provider enable/disable already has a first-class
-local override, and `38423` (curated models) is excluded because nothing can write
-a local version of it — see the note below.
+Applies to kind `38427` (model-path whitelist) only — the one kind with both a
+writer and a reader. Kind `38425` is excluded because provider enable/disable
+already has a first-class local override. Kinds `38423` (curated models) and
+`38426` (model-id mappings) are excluded because nothing can write a local
+version of them — see the note below.
 
 - **Precedence outranks newness.** Your local document wins even when the
   advertiser publishes a newer one; within each tier the usual newest-wins rule
@@ -280,9 +281,12 @@ document with the same parser the advertiser's event goes through, and rejects a
 signer whose event does not verify against `identityPubkey` before anything
 reaches the store.
 
-**Kind `38423` (curated models) is not identity-widened.** There is no writer for a
-local 38423 document, so the advertised list is always authoritative for that kind.
-Precedence there lands with a writer in a separate change.
+**Kinds `38423` (curated models) and `38426` (model-id mappings) are not
+identity-widened.** `identitySigner` only signs 38427, so no local document of
+those kinds can be written through the public API, and the advertised version is
+always authoritative. This also avoids a hand-written local document pinning the
+table against every later advertiser update, since precedence outranks newness.
+Precedence for both lands with writers in a separate change.
 
 ### Request lifecycle diagnostics
 
