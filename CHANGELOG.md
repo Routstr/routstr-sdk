@@ -74,6 +74,30 @@
   failover, so an opt-in `bodyMs` budget cannot fire during the failover chain
   and be misread as a new provider stall.
 
+### Local identity precedence for discovery policy
+
+- Add `identityPubkey` / `identitySigner` to `ModelManagerConfig`. When an
+  identity is configured, signed events authored by it outrank the configured
+  discovery author for `38427` (model-path whitelist). Precedence outranks
+  newness, so an advertiser publishing later does not silently undo an explicit
+  local choice; within each tier the existing newest-wins rule still applies.
+  Unset by default, and with no identity the filters, cache keys and behaviour
+  are unchanged.
+- Add `setModelPathWhitelistFromIdentity`, `publishModelPathWhitelist`,
+  `getLocalModelPathWhitelist` and `getIdentityPubkey`. Writing is local only;
+  broadcasting is a separate explicit call. `setModelPathWhitelistFromIdentity({})`
+  clears the local document and falls back to the configured author.
+- Only the store read is widened. Relay queries stay author-scoped, so a local
+  preference neither depends on relay availability nor gets published by setting
+  it. An unknown author is still rejected, and stored events must verify.
+- Kinds `38423` (curated models) and `38426` (model-id mappings) are **not**
+  identity-widened: `identitySigner` only signs 38427, so no local document of
+  those kinds can be written through the public API. The advertised version
+  remains authoritative for both.
+- Fix `compareConfigVersions` to use the same `created_at`-then-`id` ordering as
+  the rest of discovery, so the version a reader selects is the version
+  `publishModelPathWhitelist` broadcasts on a same-second tie.
+
 ## 0.5.1
 
 ### Exhausted upstream errors (PR #141 and follow-up)
