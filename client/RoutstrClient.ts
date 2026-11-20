@@ -121,6 +121,8 @@ const REDACTED_CREDENTIAL = "[REDACTED]";
 
 interface RequestFailures {
   attemptedProviders: Set<string>;
+  /** Nodes whose ingress rejected this body before choosing a model path. */
+  providerWideExclusions: Set<string>;
   statuses: number[];
   /** Earliest valid Retry-After deadline across rate-limited attempts. */
   retryAfterAt?: number;
@@ -1957,7 +1959,12 @@ export class RoutstrClient {
     let tryNextProvider: boolean = false;
 
     // Request-local history is shared by retries, never by concurrent requests.
-    const failures: RequestFailures = params.failures ?? { attemptedProviders: new Set<string>(), statuses: [], errors: [] };
+    const failures: RequestFailures = params.failures ?? {
+      attemptedProviders: new Set<string>(),
+      providerWideExclusions: new Set<string>(),
+      statuses: [],
+      errors: [],
+    };
     params = { ...params, failures };
     failures.attemptedProviders.add(baseUrl);
     failures.statuses.push(status);
@@ -2002,8 +2009,21 @@ export class RoutstrClient {
       (status === 404 &&
         hasImageInput(body) &&
         !selectedModel?.architecture?.input_modalities?.includes("image"));
+    // Balance shortfalls use 402. Retrying a 413 on the same route cannot
+    // shrink the request. Core's ingress cap applies to all paths on a node;
+    // a 413 from an upstream can be specific to just one path.
+    const requestPayloadTooLarge = status === 413;
+    if (
+      requestPayloadTooLarge &&
+      upstream?.headers["x-routstr-error-scope"] !== "upstream" &&
+      parsedError.type === "invalid_request" &&
+      /^Request body exceeds the \d+ byte limit$/.test(parsedError.message ?? "")
+    ) {
+      failures.providerWideExclusions.add(baseUrl);
+    }
     const unknownPathError = isUnknownPathError(status, parsedError);
-    const aggregateFailure = upstreamRequestError || status >= 500 ||
+    const aggregateFailure = upstreamRequestError || requestPayloadTooLarge ||
+      status >= 500 ||
       status === 424 || status === 429 || status === -1 ||
       ([401, 402, 403].includes(status) &&
         !isNodeAccountError(parsedError, upstream?.headers["x-routstr-error-scope"]));
@@ -2209,6 +2229,16 @@ export class RoutstrClient {
       this._log(
         "WARN",
         `[RoutstrClient] _handleErrorResponse: recovery failed for retryable error type=${parsedError.type} code=${parsedError.code}; preserving token and trying provider failover`
+      );
+      tryNextProvider = true;
+    }
+
+    // A body rejection may be specific to this route. Try another candidate
+    // after attempting token recovery above.
+    if (requestPayloadTooLarge && !tryNextProvider) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] _handleErrorResponse: ${baseUrl} rejected the request body as too large; failing over without cooling the provider down`
       );
       tryNextProvider = true;
     }
@@ -2465,80 +2495,6 @@ export class RoutstrClient {
       }
     }
 
-    if (
-      status === 413 &&
-      !tryNextProvider &&
-      this.mode === "apikeys"
-    ) {
-      let retryToken = params.token;
-
-      try {
-        const latestBalanceInfo = await this.balanceManager.getTokenBalance(
-          params.token,
-          baseUrl
-        );
-
-        // Handle invalid/expired API key - delete and fail over
-        if (latestBalanceInfo.isInvalidApiKey) {
-          this._log(
-            "DEBUG",
-            `[RoutstrClient] _handleErrorResponse: Invalid API key (proofs already spent), removing for ${baseUrl}`
-          );
-          this.storageAdapter.removeApiKey(baseUrl);
-          tryNextProvider = true;
-        } else {
-          if (latestBalanceInfo.apiKey) {
-            const storedApiKeyEntry = this.storageAdapter.getApiKey(baseUrl);
-            if (storedApiKeyEntry?.key !== latestBalanceInfo.apiKey) {
-              this._replaceApiKey(baseUrl, latestBalanceInfo.apiKey);
-            }
-            retryToken = latestBalanceInfo.apiKey;
-          }
-
-          if (
-            persistApiKeyBalance(
-              this.storageAdapter,
-              baseUrl,
-              latestBalanceInfo.apiKey ?? params.token,
-              latestBalanceInfo
-            )
-          ) {
-            this.storageAdapter.touchApiKeyLastUsed(baseUrl);
-          }
-        }
-      } catch (error) {
-        this._log(
-          "WARN",
-          `[RoutstrClient] _handleErrorResponse: Failed to refresh API key after 413 insufficient balance for ${baseUrl}`,
-          error
-        );
-      }
-
-      if (retryCount < MAX_RETRIES_PER_PROVIDER) {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: Retrying 413 (attempt ${retryCount + 1}/${MAX_RETRIES_PER_PROVIDER})`
-        );
-        return this._makeRequest({
-          ...params,
-          token: retryToken,
-          headers: this._withAuthAndTinfoilHeaders(
-            params.baseHeaders,
-            retryToken,
-            params.tinfoilEnabled,
-            params.selectedModel?.id
-          ),
-          retryCount: retryCount + 1,
-        });
-      } else {
-        this._log(
-          "DEBUG",
-          `[RoutstrClient] _handleErrorResponse: 413 retry limit reached (${retryCount}/${MAX_RETRIES_PER_PROVIDER}), failing over to next provider`
-        );
-        tryNextProvider = true;
-      }
-    }
-
     let apiKeyRecoveryDeadline: number | undefined;
     let checkedApiKeyBalance: Awaited<ReturnType<BalanceManager["getTokenBalance"]>> | undefined;
     if (status === 401 && this.mode === "apikeys") {
@@ -2567,7 +2523,6 @@ export class RoutstrClient {
       (status === 401 ||
         status === 403 ||
         status === 404 ||
-        status === 413 ||
         status === 400 ||
         status === 422 ||
         status === 429 ||
@@ -2738,7 +2693,12 @@ export class RoutstrClient {
       pinnedModelPath,
       params.requestedModelId
     );
-    if (!upstreamRequestError && !unknownPathError && !localWalletShortfall) {
+    if (
+      !upstreamRequestError &&
+      !requestPayloadTooLarge &&
+      !unknownPathError &&
+      !localWalletShortfall
+    ) {
       this.providerManager.markFailed(
         baseUrl,
         failReason,
@@ -2860,6 +2820,7 @@ export class RoutstrClient {
             failoverModelId,
             {
               excludeModelPaths: triedModelPaths,
+              excludeBaseUrls: failures.providerWideExclusions,
               ...((providerWideFailure || providerMintBalance)
                 ? { excludeBaseUrl: baseUrl } : {}),
               acceptableMintUrls: fundedMintUrlsForFailover,
@@ -3222,6 +3183,10 @@ export class RoutstrClient {
           ? statuses[0]
           : uniform && (statuses[0] === 429 || statuses[0] === 424)
             ? statuses[0]
+          // Every candidate rejected the body itself: the caller can act on a
+          // 413 (compact the prompt), but not on a generic 502.
+          : uniform && statuses[0] === 413
+            ? 413
             : 502;
       // Correlation is useful, but auth, cookies, URLs and per-node rate budgets
       // do not describe the chain. Only a uniform 429 gets a retry deadline.
