@@ -221,6 +221,22 @@ Missing required methods cause an explicit `ModelManager` initialization error. 
 built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
 resolver wrappers remain explicit-selector compatibility APIs, not runtime policy accessors.
 
+### Provider session headers
+
+`routeRequest` and `routeRequests` forward caller-supplied `x-session-id`,
+`session-id`, `session_id`, `x-session-affinity`, `x-opencode-session`, and
+`x-client-request-id` to the selected Routstr provider. Header names are matched
+case-insensitively, and the same values are sent on retry and provider failover.
+Only supply identifiers you intend providers to see. This does not enable
+arbitrary header forwarding: caller credentials and cookies are not forwarded,
+and the SDK still attaches the selected provider's own payment credential.
+
+A value that cannot be sent as an HTTP header — non-Latin-1 characters,
+CR/LF/NUL, or empty — is dropped with a warning rather than failing the request.
+Zero-length and unusable hints carry no affinity, and a rejected value must not
+fail a request that is otherwise valid. Distinct spellings are sent as distinct
+headers: the caller chose the spelling and the node applies its own precedence.
+
 ### Request lifecycle diagnostics
 
 Inference routing now exposes an SDK lifecycle UUID separately from node and

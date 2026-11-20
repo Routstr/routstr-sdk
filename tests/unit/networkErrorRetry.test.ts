@@ -141,7 +141,11 @@ describe("RoutstrClient transient socket retry", () => {
       "findNextBestProvider"
     );
 
-    const response = await (client as any)._makeRequest(requestParams({ method }));
+    const request = requestParams({ method });
+    const response = await (client as any)._makeRequest({
+      ...request,
+      headers: { ...request.headers, "x-session-id": "stable-session" },
+    });
 
     expect(response).toBeInstanceOf(Response);
     expect(response.status).toBe(200);
@@ -152,6 +156,7 @@ describe("RoutstrClient transient socket retry", () => {
     expect(firstUrl).toBe(`${BASE_URL}v1/chat/completions`);
     expect(secondUrl).toBe(firstUrl);
     // Same credentials and body: the retry is a byte-identical re-send.
+    expect(new Headers(firstInit.headers).get("x-session-id")).toBe("stable-session");
     expect(secondInit.headers).toEqual(firstInit.headers);
     expect(secondInit.body).toBe(firstInit.body);
     // No failover, no cooldown walk.

@@ -206,19 +206,36 @@ describe("client attribution for Anthropic-transport requests", () => {
     expect(JSON.stringify(sent.headers)).not.toContain(CLIENT_KEY);
   });
 
-  it("forwards anthropic-beta but no other inbound header", async () => {
+  it("forwards only allowlisted inference headers, case-insensitively", async () => {
     const client = makeClient();
     const beta = "context-management-2025-06-27,thinking-display-updates-2026-08-18";
 
     const sent = await routeToTransportBoundary(client, {
+      Authorization: `Bearer ${CLIENT_KEY}`,
       "x-api-key": CLIENT_KEY,
+      "X-Cashu": "caller-payment-token",
       cookie: "session=secret",
-      "anthropic-beta": beta,
+      "x-unrelated": "not-forwarded",
+      "Anthropic-Beta": beta,
+      "X-Session-ID": "session-a",
+      "Session-Id": "session-b",
+      SESSION_ID: "session-c",
+      "X-Session-Affinity": "affinity",
+      "X-OpenCode-Session": "opencode",
+      "X-Client-Request-ID": "request-id",
     });
 
-    expect(sent.headers["anthropic-beta"]).toBe(beta);
-    expect(JSON.stringify(sent.headers)).not.toContain(CLIENT_KEY);
-    expect(JSON.stringify(sent.headers)).not.toContain("session=secret");
+    expect(sent.headers).toEqual({
+      "Content-Type": "application/json",
+      Authorization: "Bearer sdk-payment-key",
+      "anthropic-beta": beta,
+      "x-session-id": "session-a",
+      "session-id": "session-b",
+      session_id: "session-c",
+      "x-session-affinity": "affinity",
+      "x-opencode-session": "opencode",
+      "x-client-request-id": "request-id",
+    });
   });
 
   /** Record one usage row through the real tracking path and return it. */
