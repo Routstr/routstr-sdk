@@ -710,6 +710,34 @@ describe("ProviderManager", () => {
       ).toBe("https://output-heavy.example.com/");
     });
 
+    it("ranks a model that only makes pictures by what one picture costs", () => {
+      const painter = (image_output: number, image_pricing?: object) =>
+        makeModel({
+          architecture: { output_modalities: ["image"] },
+          sats_pricing: { prompt: 0, completion: 0, image_output, max_cost: image_output },
+          image_pricing,
+        } as unknown as Partial<Model>);
+      const registry = createRegistry({
+        getCachedModels: () => ({
+          "https://a-flat.example.com/": [painter(1013)],
+          "https://b-tiered.example.com/": [
+            painter(1525, {
+              max_usd: 0.98,
+              tiers: [{ resolution: "1K", quality: null, usd: 0.12 }],
+              default_resolution: "1K",
+              resolutions: ["1K", "2K", "4K"],
+              unit: "image",
+            }),
+          ],
+        }),
+      });
+
+      const manager = new ProviderManager(registry);
+      expect(
+        manager.getProviderPriceRankingForModel("gpt-4o-mini").map((r) => r.baseUrl)
+      ).toEqual(["https://b-tiered.example.com/", "https://a-flat.example.com/"]);
+    });
+
     it("picks the same provider the price ranking puts first", () => {
       const registry = createRegistry({
         getCachedModels: () => ({
@@ -2771,6 +2799,28 @@ describe("ProviderManager", () => {
       max_completion_cost: 161.6,
       max_cost: 161.6,
     });
+    const gptImageTokens = picture(
+      {
+        prompt: 0.0187,
+        completion: 0.0187,
+        image_output: 1974,
+        max_completion_cost: 7896,
+        max_cost: 7896,
+      },
+      {
+        max_usd: 0.844,
+        tiers: [
+          { resolution: "1K", quality: "low", usd: 0.006 },
+          { resolution: "1K", quality: "auto", usd: 0.211 },
+        ],
+        default_resolution: "1K",
+        default_quality: "auto",
+        resolutions: ["1K"],
+        qualities: ["low", "medium", "high", "auto"],
+        unit: "token",
+        input_text_token_usd: 8e-6,
+      }
+    );
 
     it.each([
       ["the default tier", nanoBanana, {}, 249.7 * (0.1 / 0.19)],
@@ -2792,6 +2842,12 @@ describe("ProviderManager", () => {
         157.7 * ((0.262144 * 0.03) / 0.12),
       ],
       ["the listed price without a book", flat, {}, 40.4],
+      [
+        "a per-token book's tier and the most its prompt can meter",
+        gptImageTokens,
+        { quality: "low" },
+        1974 * (0.006 / 0.844) + (1974 / 0.844) * 13 * 8e-6,
+      ],
       [
         "the envelope when reference images make it unbounded",
         nanoBanana,

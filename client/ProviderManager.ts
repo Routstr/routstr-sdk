@@ -835,11 +835,21 @@ function pictureHoldSats(
   if (PICTURE_REFERENCE_FIELDS.some((field) => body[field])) return undefined;
 
   let perPicture = ceiling;
+  let inputs = 0;
   const book = (model as any).image_pricing;
   if (book?.max_usd > 0) {
     const satsPerUsd = ceiling / book.max_usd;
-    if (book.unit === "image") {
+    if (book.unit === "image" || book.unit === "token") {
       perPicture = satsPerUsd * pictureTierUsd(book, body);
+      if (book.unit === "token") {
+        const text = ["prompt", "negative_prompt"]
+          .map((field) => (typeof body[field] === "string" ? body[field] : ""))
+          .join("");
+        inputs =
+          satsPerUsd *
+          new TextEncoder().encode(text).length *
+          (book.input_text_token_usd ?? 0);
+      }
     } else if (
       book.unit === "megapixel" &&
       book.megapixel_usd > 0 &&
@@ -856,7 +866,8 @@ function pictureHoldSats(
     }
   }
   return (
-    Math.max(1, Number(body.n) || 1, Number(body.variants) || 1) * perPicture
+    Math.max(1, Number(body.n) || 1, Number(body.variants) || 1) * perPicture +
+    inputs
   );
 }
 
@@ -1943,7 +1954,7 @@ export class ProviderManager {
       results.push({
         baseUrl,
         model: match,
-        cost: breakdown.total,
+        cost: pictureHoldSats(match, {}) ?? breakdown.total,
         rates: breakdown.rates,
         breakdown,
         basket,
