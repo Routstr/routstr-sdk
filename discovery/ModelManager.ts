@@ -168,7 +168,6 @@ const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";
  */
 const WHITELIST_QUERY_KEY = "identity-precedence:38427:model-path-whitelist";
 const MAPPINGS_QUERY_KEY = "identity-precedence:38426:model-id-mappings";
-const MODELS_QUERY_KEY = "identity-precedence:38423:routstr-21-models";
 
 // Deletes are chunked so one pruning pass never builds an unbounded SQL
 // statement; the store read itself is never limited.
@@ -2123,19 +2122,43 @@ export class ModelManager {
       undefined,
       undefined,
       extraAuthors,
-      extraAuthors.length > 0 ? MODELS_QUERY_KEY : undefined
+      // Derived from the widened filter, not a fixed literal: the query cache is
+      // keyed by this string and persisted via `setNostrQueryLastUpdate`, so a
+      // constant would let any other caller with a different filter share (and
+      // revive across restarts) this entry.
+      extraAuthors.length > 0
+        ? JSON.stringify({
+            kinds: [38423],
+            "#d": ["routstr-21-models"],
+            authors: [...new Set([this.routstrModelsPubkey, ...extraAuthors])].sort(),
+          })
+        : undefined
     );
 
-    // One curated list per author: newest version within each tier.
-    const newestFor = (rank: number): NostrEvent | null => {
-      const tier = events.filter((candidate) => this.authorRank(candidate.pubkey) === rank);
-      return tier.reduce<NostrEvent | null>(
-        (latest, event) => !latest || event.created_at > latest.created_at ? event : latest,
+    // Two tiers, selected by *author identity* rather than by rank number.
+    // Deriving the external tier from `localEvent`'s presence was the bug: an
+    // operator who configured an identity but had published no local list
+    // dropped the advertised catalog entirely, and no public API writes a kind
+    // 38423 event, so that state is permanent rather than transient. Ranking by
+    // predicate keeps both tiers independent, so an absent local list simply
+    // leaves the advertised one in force.
+    const newest = (rows: NostrEvent[]): NostrEvent | null =>
+      rows.reduce<NostrEvent | null>(
+        (latest, event) =>
+          !latest || event.created_at > latest.created_at ||
+            (event.created_at === latest.created_at && event.id < latest.id)
+            ? event
+            : latest,
         null
       );
-    };
-    const localEvent = this.identityPubkey ? newestFor(0) : null;
-    const externalEvent = newestFor(localEvent ? 1 : 0);
+    const isLocalAuthor = (event: NostrEvent): boolean =>
+      this.identityPubkey !== undefined && event.pubkey === this.identityPubkey;
+    const localEvent = this.identityPubkey ? newest(events.filter(isLocalAuthor)) : null;
+    // Everything else is the advertised tier. Written as a predicate rather than
+    // `rank === 1` so an operator whose own pubkey *is* `routstrModelsPubkey`
+    // (self-hosted advertiser) still gets a usable advertised tier instead of
+    // every event collapsing into the local one.
+    const externalEvent = newest(events.filter((event) => !isLocalAuthor(event)));
     const isDistinctLocal = localEvent !== null && localEvent !== externalEvent;
 
     if (!externalEvent && !localEvent) {
@@ -2147,24 +2170,28 @@ export class ModelManager {
     // operator did not restate. Identity entries come first so a local
     // preference is visible at the head of the list, mirroring how
     // `includeProviderUrls` supplements announced providers.
-    try {
-      const parseModels = (event: NostrEvent): string[] => {
+    const parseModels = (event: NostrEvent): string[] | null => {
+      try {
         const content = JSON.parse(event.content);
         const list = Array.isArray(content?.models) ? content.models : [];
         return list.filter((model: unknown): model is string => typeof model === "string");
-      };
-      const localModels = isDistinctLocal && localEvent ? parseModels(localEvent) : [];
-      const externalModels = externalEvent ? parseModels(externalEvent) : [];
-      const models = [...new Set([...localModels, ...externalModels])];
-      this.adapter.setRoutstr21Models(models);
-      this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
-      return models;
-    } catch {
-      this.logger.warn(
-        "Routstr21Models: failed to parse Nostr event content:",
-        localEvent?.id ?? externalEvent?.id
-      );
+      } catch (error) {
+        // Tiers are parsed independently: one corrupt document must not discard
+        // the other, which is what a single try/catch around both did.
+        this.logger.warn("Routstr21Models: failed to parse Nostr event content:", event.id, error);
+        return null;
+      }
+    };
+    const localModels = (isDistinctLocal && localEvent ? parseModels(localEvent) : null) ?? [];
+    const externalModels = (externalEvent ? parseModels(externalEvent) : null) ?? [];
+    const models = [...new Set([...localModels, ...externalModels])];
+    if (models.length === 0) {
+      // Nothing usable parsed; keep the last good projection rather than
+      // replacing it with an empty list.
       return cachedModels.length > 0 ? cachedModels : [];
     }
+    this.adapter.setRoutstr21Models(models);
+    this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
+    return models;
   }
 }
