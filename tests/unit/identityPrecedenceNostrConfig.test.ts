@@ -228,7 +228,8 @@ describe("writing the local policy through the identity", () => {
   });
 });
 
-describe("kind 38423 curated models", () => {
+
+describe("kind 38423 curated models are not identity-widened", () => {
   beforeEach(() => { relay.events = []; relay.filters = []; relay.published = []; });
   afterEach(() => { relay.events = []; relay.filters = []; relay.published = []; vi.restoreAllMocks(); });
 
@@ -240,78 +241,92 @@ describe("kind 38423 curated models", () => {
       content: JSON.stringify({ models }),
     }, sk);
 
-  /** Seed events straight into the store, the only way a local list can exist. */
-  async function openWithStore(options: {
-    identityPubkey?: string;
-    routstrModelsPubkey?: string;
-    stored?: NostrEvent[];
-  } = {}) {
-    const { store, hydrate } = createSdkStore({ driver: createMemoryDriver() });
-    await hydrate;
-    const eventStore = new EventStore();
-    for (const row of options.stored ?? []) eventStore.add(row);
-    const manager = new ModelManager(createDiscoveryAdapterFromStore(store), {
-      eventStore,
-      routstrModelsPubkey: options.routstrModelsPubkey ?? externalPubkey,
-      identityPubkey: options.identityPubkey,
-      logger: quiet,
-    });
-    return manager;
-  }
-
-  it("keeps the advertised catalog when an identity is set but has no local list", async () => {
-    // Regression: configuring identityPubkey alone returned [] because the
-    // external tier was selected by rank, and rank 1 requires an absent local
-    // event. No public API writes kind 38423, so this is not a transient state.
+  /**
+   * No public API writes a kind 38423 event, so a local curated list is not a
+   * reachable state. These tests pin that: the advertised tier must keep working
+   * for every caller, and a stray identity-authored 38423 must not be merged in.
+   */
+  it("returns the advertised catalog on a cold store", async () => {
     relay.events = [modelsEvent(["ext-1", "ext-2"])];
-    const manager = await openWithStore({ identityPubkey });
+    const { manager } = await open();
     expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1", "ext-2"]);
   });
 
-  it("leaves a default install unchanged", async () => {
+  it("returns the advertised catalog when an identity is configured", async () => {
     relay.events = [modelsEvent(["ext-1", "ext-2"])];
-    const manager = await openWithStore();
+    const { manager } = await open({ identityPubkey });
     expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1", "ext-2"]);
   });
 
-  it("unions a local list ahead of the advertised catalog", async () => {
-    relay.events = [modelsEvent(["ext-1", "ext-2"])];
-    const manager = await openWithStore({
-      identityPubkey,
-      stored: [modelsEvent(["mine-1"], identity, now() - 100)],
-    });
-    expect(await manager.fetchRoutstr21Models(true)).toEqual(["mine-1", "ext-1", "ext-2"]);
-  });
-
-  it("does not lose the advertised tier when the identity is the advertiser", async () => {
-    // Self-hosted advertiser: identityPubkey === routstrModelsPubkey. Ranking by
-    // number collapsed both tiers into rank 0 and dropped the catalog.
-    // The advertiser *is* the identity, so the event must be signed by it.
-    relay.events = [modelsEvent(["ext-1"], identity)];
-    const manager = await openWithStore({ identityPubkey, routstrModelsPubkey: identityPubkey });
-    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
-  });
-
-  it("ignores a local list when no identity is configured", async () => {
+  it("does not merge an identity-authored 38423 into the advertised list", async () => {
     relay.events = [modelsEvent(["ext-1"])];
-    const manager = await openWithStore({
-      stored: [modelsEvent(["mine-1"], identity, now())],
-    });
+    const { manager } = await open({ identityPubkey });
+    const mine = modelsEvent(["mine-1"], identity, now() - 100);
+    (await manager.getEventStore())?.add(mine);
     expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
   });
 
-  it("keeps the advertised list when the local document is unparseable", async () => {
+  it("never asks relays for the identity's author", async () => {
     relay.events = [modelsEvent(["ext-1"])];
-    const manager = await openWithStore({
-      identityPubkey,
-      // Stored but invalid for the reader: it must not erase the other tier.
-      stored: [finalizeEvent({
-        kind: 38423,
-        created_at: now() - 10,
-        tags: [["d", "routstr-21-models"]],
-        content: "{not json",
-      }, identity)],
+    const { manager } = await open({ identityPubkey });
+    await manager.fetchRoutstr21Models(true);
+    const filters = relay.filters.filter(f => f.kinds.includes(38423));
+    expect(filters.length).toBeGreaterThan(0);
+    for (const filter of filters) expect(filter.authors).toEqual([externalPubkey]);
+  });
+
+  it("keeps the newest advertised version when two compete", async () => {
+    relay.events = [
+      modelsEvent(["old"], external, now() - 100),
+      modelsEvent(["new"], external, now() - 10),
+    ];
+    const { manager } = await open({ identityPubkey });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["new"]);
+  });
+});
+
+describe("config version comparator", () => {
+  beforeEach(() => { relay.events = []; relay.filters = []; relay.published = []; });
+  afterEach(() => { relay.events = []; relay.filters = []; relay.published = []; vi.restoreAllMocks(); });
+
+  it("publishes the version a same-second reader selects", async () => {
+    // Two local versions sharing created_at, so only the id tie-break separates
+    // them. The tie survives the store's own collapse only with
+    // keepOldVersions, which is what the whitelist path sets internally.
+    const first = await open({ identityPubkey, identitySigner: signer(identity) });
+    const eventStore = await first.manager.getEventStore();
+    expect(eventStore).not.toBeNull();
+
+    const stamp = now();
+    const [a, b] = [
+      whitelistEvent({ "model-a": policy("https://a.example/v1") }, identity, stamp),
+      whitelistEvent({ "model-a": policy("https://b.example/v1") }, identity, stamp),
+    ];
+    eventStore!.keepOldVersions = true;
+    try {
+      eventStore!.add(a);
+      eventStore!.add(b);
+    } finally {
+      eventStore!.keepOldVersions = false;
+    }
+
+    // Both versions survive at an identical timestamp with distinct ids.
+    const versions = eventStore!.getTimeline({
+      kinds: [38427], authors: [identityPubkey], "#d": ["model-path-whitelist"],
     });
-    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
+    expect(versions).toHaveLength(2);
+    expect(versions[0]!.created_at).toBe(versions[1]!.created_at);
+    expect(versions[0]!.id).not.toBe(versions[1]!.id);
+
+    // The adapter's copy joins the candidates separately, which is what makes a
+    // same-timestamp tie reachable in the reader.
+    first.adapter.setModelPathWhitelistEvent(b);
+
+    const selected = await first.manager.fetchModelPathWhitelist(true);
+    await first.manager.publishModelPathWhitelist();
+    const published = relay.published.at(-1);
+    expect(published).toBeDefined();
+    // What gets broadcast must be the document the reader selected.
+    expect(JSON.parse(published!.content).models).toEqual(selected);
   });
 });

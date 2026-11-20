@@ -221,6 +221,53 @@ Missing required methods cause an explicit `ModelManager` initialization error. 
 built-in adapters implement this persistence. Legacy `DEEPSEEK_*` exports and DeepSeek
 resolver wrappers remain explicit-selector compatibility APIs, not runtime policy accessors.
 
+### Local identity precedence for discovery policy
+
+A client that holds an nsec can publish and prefer its **own** signed discovery
+policy instead of only reading the advertiser's. This is opt-in: leave
+`identityPubkey` unset and every read, filter and cache key is unchanged.
+
+```ts
+const manager = new ModelManager(adapter, {
+  eventStore,
+  routstrModelsPubkey,           // the advertiser you normally trust
+  identityPubkey: myPubkey,      // your own npub
+  identitySigner: template => finalizeEvent(template, mySecretKey),
+}, { eventStore });
+```
+
+Applies to kinds `38427` (model-path whitelist) and `38426` (model-id mappings).
+Kind `38425` is excluded because provider enable/disable already has a first-class
+local override, and `38423` (curated models) is excluded because nothing can write
+a local version of it — see the note below.
+
+- **Precedence outranks newness.** Your local document wins even when the
+  advertiser publishes a newer one; within each tier the usual newest-wins rule
+  still applies, so a stale local document does not shadow a newer local one.
+  `setModelPathWhitelistFromIdentity({})` clears the local document and falls back
+  to the advertiser.
+- **The widening is store-read only.** Relay queries stay author-scoped, so a local
+  preference never depends on relay availability and is not published by the act
+  of setting it.
+- **Trust is explicit, not inferred.** An unknown author is still rejected. Naming
+  a pubkey you hold no key for grants nothing, because stored events must verify.
+
+```ts
+await manager.setModelPathWhitelistFromIdentity({ /* models */ }); // local only
+await manager.publishModelPathWhitelist();                         // separate, explicit
+manager.getLocalModelPathWhitelist();  // only your tier
+manager.getModelPathWhitelist();       // effective merged view
+```
+
+`setModelPathWhitelistFromIdentity` signs with `identitySigner`, validates the
+document with the same parser the advertiser's event goes through, and rejects a
+signer whose event does not verify against `identityPubkey` before anything
+reaches the store.
+
+**Kind `38423` (curated models) is not identity-widened.** There is no writer for a
+local 38423 document, so the advertised list is always authoritative for that kind.
+Precedence there lands with a writer in a separate change.
+
 ### Request lifecycle diagnostics
 
 Inference routing now exposes an SDK lifecycle UUID separately from node and

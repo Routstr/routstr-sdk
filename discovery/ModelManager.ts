@@ -143,17 +143,25 @@ const DISCOVERY_KINDS = [38421, 38423, 38425, 38426, 38427];
  * Kinds where the operator's own identity may outrank the configured author.
  *
  * These are the discovery kinds whose content is *client policy* — the
- * whitelist of routes, the id-mapping table, the curated model list — so a
- * local operator can legitimately want a different answer than the
- * advertiser's. Kind 38425 (reviews) is deliberately absent: provider
- * enable/disable already has a first-class local-override mechanism in
- * `manuallyEnabledProviders` / `manuallyDisabledProviders`, which the router
- * unions into the effective disabled set. Folding identity precedence in here
- * would give that one decision two competing sources of truth. Kind 38421 is
- * absent because it is multi-author by construction: every provider signs its
- * own announcement, so "ours versus the configured one" does not exist.
+ * whitelist of routes, the id-mapping table — so a local operator can
+ * legitimately want a different answer than the advertiser's.
+ *
+ * Kind 38425 (reviews) is deliberately absent: provider enable/disable already
+ * has a first-class local-override mechanism in `manuallyEnabledProviders` /
+ * `manuallyDisabledProviders`, which the router unions into the effective
+ * disabled set. Folding identity precedence in here would give that one
+ * decision two competing sources of truth.
+ *
+ * Kind 38421 is absent because it is multi-author by construction: every
+ * provider signs its own announcement, so "ours versus the configured one"
+ * does not exist.
+ *
+ * Kind 38423 (curated models) is absent because nothing can write a local
+ * version of it: `identitySigner` is only ever used to sign kind 38427. Until
+ * a writer exists, listing it here would describe a precedence that no code
+ * path could exercise.
  */
-const IDENTITY_PRECEDENCE_KINDS: ReadonlySet<number> = new Set([38423, 38426, 38427]);
+const IDENTITY_PRECEDENCE_KINDS: ReadonlySet<number> = new Set([38426, 38427]);
 
 /** Address of the authoritative replaceable model mapping snapshot. */
 const MODEL_ID_MAPPINGS_D_TAG = "model-id-mappings";
@@ -602,11 +610,19 @@ export class ModelManager {
    * Trade-off, accepted: because a local document wins regardless of age, an
    * external author can no longer shadow it merely by publishing later. That is
    * intended, and `reset` is the way back to the external document.
+   *
+   * Sort ascending and take `[0]`. The `id` tie-break matches the convention
+   * this file used before identity precedence (`main`'s
+   * `a.id.localeCompare(b.id)`), so every reader of one replaceable address —
+   * including `publishModelPathWhitelist`, which must publish the version the
+   * reader selected — agrees on which version wins a same-`created_at` tie.
+   * Inverting the direction here made the reader pick the highest id while
+   * publish still picked the lowest.
    */
   private compareConfigVersions(a: NostrEvent, b: NostrEvent): number {
     return this.authorRank(a.pubkey) - this.authorRank(b.pubkey) ||
       b.created_at - a.created_at ||
-      (a.id === b.id ? 0 : a.id < b.id ? 1 : -1);
+      a.id.localeCompare(b.id);
   }
 
   /**
@@ -1997,10 +2013,12 @@ export class ModelManager {
     const pubkey = this.identityPubkey;
     if (!pubkey) throw new Error("Identity config requires identityPubkey");
     const store = (await this.ensureEventStore()) ?? this.memoryEventStore;
-    // getTimeline makes no ordering promise; pick the newest version explicitly.
+    // getTimeline makes no ordering promise; pick the newest version with the
+    // same comparator the reader uses, so the event published is the one the
+    // reader selected.
     const event = store
       .getTimeline({ kinds: [38427], authors: [pubkey], "#d": ["model-path-whitelist"] })
-      .sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))[0];
+      .sort((a, b) => this.compareConfigVersions(a, b))[0];
     if (!event) throw new Error("No local model-path whitelist to publish");
     await this.relayPoolForPublish().publish(this.getNostrRelays(), event);
   }
@@ -2112,86 +2130,39 @@ export class ModelManager {
       }
     }
 
-    // The identity tier is read only when it exists: without an identity the
-    // query stays exactly as it was (one author, one relay filter, and the
-    // original cache key), so nothing changes for existing installs.
-    const extraAuthors = this.identityPubkey ? [this.identityPubkey] : [];
+    // Kind 38423 is intentionally *not* widened by `identityPubkey`.
+    //
+    // Identity precedence exists so an operator can override a policy document
+    // they disagree with. There is no public API that writes a 38423 event
+    // (`setModelPathWhitelistFromIdentity` signs 38427 only), so a local
+    // curated list can never exist: widening the read added an unreachable
+    // branch, and the tier-selection it required regressed every caller. A
+    // writer plus the union belongs in its own change, tested together.
     const events = await this.getNostrEvents(
       { kinds: [38423], "#d": ["routstr-21-models"], authors: [this.routstrModelsPubkey] },
-      forceRefresh,
-      undefined,
-      undefined,
-      extraAuthors,
-      // Derived from the widened filter, not a fixed literal: the query cache is
-      // keyed by this string and persisted via `setNostrQueryLastUpdate`, so a
-      // constant would let any other caller with a different filter share (and
-      // revive across restarts) this entry.
-      extraAuthors.length > 0
-        ? JSON.stringify({
-            kinds: [38423],
-            "#d": ["routstr-21-models"],
-            authors: [...new Set([this.routstrModelsPubkey, ...extraAuthors])].sort(),
-          })
-        : undefined
+      forceRefresh
+    );
+    const event = events.reduce<NostrEvent | null>(
+      (latest, event) => !latest || event.created_at > latest.created_at ? event : latest,
+      null
     );
 
-    // Two tiers, selected by *author identity* rather than by rank number.
-    // Deriving the external tier from `localEvent`'s presence was the bug: an
-    // operator who configured an identity but had published no local list
-    // dropped the advertised catalog entirely, and no public API writes a kind
-    // 38423 event, so that state is permanent rather than transient. Ranking by
-    // predicate keeps both tiers independent, so an absent local list simply
-    // leaves the advertised one in force.
-    const newest = (rows: NostrEvent[]): NostrEvent | null =>
-      rows.reduce<NostrEvent | null>(
-        (latest, event) =>
-          !latest || event.created_at > latest.created_at ||
-            (event.created_at === latest.created_at && event.id < latest.id)
-            ? event
-            : latest,
-        null
+    if (!event) {
+      return cachedModels.length > 0 ? cachedModels : [];
+    }
+
+    try {
+      const content = JSON.parse(event.content);
+      const models = Array.isArray(content?.models) ? content.models : [];
+      this.adapter.setRoutstr21Models(models);
+      this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
+      return models;
+    } catch {
+      this.logger.warn(
+        "Routstr21Models: failed to parse Nostr event content:",
+        event.id
       );
-    const isLocalAuthor = (event: NostrEvent): boolean =>
-      this.identityPubkey !== undefined && event.pubkey === this.identityPubkey;
-    const localEvent = this.identityPubkey ? newest(events.filter(isLocalAuthor)) : null;
-    // Everything else is the advertised tier. Written as a predicate rather than
-    // `rank === 1` so an operator whose own pubkey *is* `routstrModelsPubkey`
-    // (self-hosted advertiser) still gets a usable advertised tier instead of
-    // every event collapsing into the local one.
-    const externalEvent = newest(events.filter((event) => !isLocalAuthor(event)));
-    const isDistinctLocal = localEvent !== null && localEvent !== externalEvent;
-
-    if (!externalEvent && !localEvent) {
       return cachedModels.length > 0 ? cachedModels : [];
     }
-
-    // A locally-curated list is an *addition* to the advertised catalog, not a
-    // replacement for it: replacing would silently drop every model the
-    // operator did not restate. Identity entries come first so a local
-    // preference is visible at the head of the list, mirroring how
-    // `includeProviderUrls` supplements announced providers.
-    const parseModels = (event: NostrEvent): string[] | null => {
-      try {
-        const content = JSON.parse(event.content);
-        const list = Array.isArray(content?.models) ? content.models : [];
-        return list.filter((model: unknown): model is string => typeof model === "string");
-      } catch (error) {
-        // Tiers are parsed independently: one corrupt document must not discard
-        // the other, which is what a single try/catch around both did.
-        this.logger.warn("Routstr21Models: failed to parse Nostr event content:", event.id, error);
-        return null;
-      }
-    };
-    const localModels = (isDistinctLocal && localEvent ? parseModels(localEvent) : null) ?? [];
-    const externalModels = (externalEvent ? parseModels(externalEvent) : null) ?? [];
-    const models = [...new Set([...localModels, ...externalModels])];
-    if (models.length === 0) {
-      // Nothing usable parsed; keep the last good projection rather than
-      // replacing it with an empty list.
-      return cachedModels.length > 0 ? cachedModels : [];
-    }
-    this.adapter.setRoutstr21Models(models);
-    this.adapter.setRoutstr21ModelsLastUpdate(Date.now());
-    return models;
   }
 }
