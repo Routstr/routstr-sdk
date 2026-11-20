@@ -84,6 +84,7 @@ import {
   type UsageTrackingData,
 } from "./usage";
 import { inspectSSEWebStream } from "./sse";
+import { createDeadlineHandle, withProgress, type InferenceDeadlines } from "./deadlines";
 import {
   isTinfoilModel,
   getTinfoilUpstreamModelId,
@@ -300,6 +301,29 @@ export interface RoutstrResponse extends Response {
 // Image usage is reported in headers; never tee the binary body for accounting.
 const isImageContentType = (contentType: string): boolean => /^image\//i.test(contentType);
 
+/** Replace a response body while keeping everything else (status, headers,
+ * SDK metadata) intact. Used to attach a progress-reading wrapper to a live
+ * stream without changing the bytes the caller sees. */
+function rewrapBody(response: Response, body: ReadableStream<Uint8Array>): Response {
+  const target = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  for (const key of Object.keys(response)) {
+    const value = (response as any)[key];
+    if (value !== undefined) (target as any)[key] = value;
+  }
+  const source = response as any;
+  for (const key of [
+    "lifecycleAttemptId", "baseUrl", "token", "selectedMintUrl",
+    "requestResponseLogId", "releaseHold", "releaseDeadline", "deadlineExpired",
+  ]) {
+    if (source[key] !== undefined) (target as any)[key] = source[key];
+  }
+  return target;
+}
+
 /** Rebuild only Fetch state through the constructor and forward SDK metadata.
  * Node 22 Response has enumerable internal symbols: Object.assign(target, source)
  * copies those too, replacing target headers/body with the source's locked body.
@@ -358,6 +382,17 @@ export interface RouteRequestParams {
   userCacheSecret?: string;
   /** Optional: abort the in-flight request and stream consumption. */
   signal?: AbortSignal;
+  /**
+   * Local budgets for THIS inference attempt. Defaults: 180 s for response
+   * headers (time to first byte) and 180 s of silence between stream chunks.
+   * A response body that is not a stream gets `bodyMs` (disabled by default)
+   * instead of the inter-chunk budget. Set a value to 0 to disable that budget.
+   *
+   * Expiry aborts the attempt as an `InferenceTimeoutError`
+   * (`name === "TimeoutError"`), which the network-error path already handles
+   * by cooling the provider down and failing over to the next one.
+   */
+  deadlines?: InferenceDeadlines;
   /** Total reservation-wait budget after automatic funding fails. Defaults to 120s;
    *  0 disables waiting. Expiry uses the existing 402/failover path. */
   reservedBalanceWaitMs?: number;
@@ -622,6 +657,8 @@ export class RoutstrClient {
       };
       if (!original.ok || !original.headers.get("content-type")?.includes("text/event-stream") || !original.body) {
         await finish(params.signal?.aborted ? "aborted" : original.ok ? "succeeded" : "failed");
+        // No stream to release it later, and no per-chunk re-arm to drive it.
+        (original as any).releaseDeadline?.();
         return response;
       }
       const reader = response.body!.getReader();
@@ -638,6 +675,9 @@ export class RoutstrClient {
               // Deliver EOF before the wallet read / usage persistence. Keep the
               // settlement observable through finalize(), even if it is ignored.
               controller.close();
+              // The stream ended: stop the idle clock so its timer cannot fire
+              // while accounting settles behind the response.
+              (original as any).releaseDeadline?.();
               settlement = accounting().then(
                 () => finish((original as any).streamError ? "failed" : "succeeded"),
                 async error => { await finish("failed", error); throw error; },
@@ -646,10 +686,16 @@ export class RoutstrClient {
             } else controller.enqueue(result.value);
           } catch (error) {
             await finish(params.signal?.aborted ? "aborted" : "failed", error);
+            (original as any).releaseDeadline?.();
             controller.error(error);
           }
         },
-        async cancel(reason) { controller.abort(reason); await finish("aborted"); void reader.cancel(reason).catch(() => {}); },
+        async cancel(reason) {
+          controller.abort(reason);
+          (original as any).releaseDeadline?.();
+          await finish("aborted");
+          void reader.cancel(reason).catch(() => {});
+        },
       }, { highWaterMark: 0 });
       response = rewrapRoutstrResponse(original, stream, headers);
       response.finalize = async () => {
@@ -687,7 +733,7 @@ export class RoutstrClient {
       prepared = await awaitWithAbort(preparing, params.signal);
     } catch (error) {
       // An abort can win the race even if a transport ignores cancellation.
-      void preparing.then(result => result.releaseHold?.(), () => {});
+      void preparing.then(result => { result.releaseHold?.(); result.releaseDeadline?.(); }, () => {});
       throw error;
     }
     try {
@@ -723,7 +769,12 @@ export class RoutstrClient {
             (prepared.response as RoutstrResponse).upstreamResponseId =
               bodyResponseId;
           }
-        } catch {
+        } catch (error) {
+          // An expired body budget must not be swallowed with the other
+          // legitimate read failures (EHBP/encrypted payloads, non-JSON
+          // bodies). Handing back a response whose body is already dead would
+          // report success for a request that failed, and record no fault.
+          if (prepared.deadlineExpired?.()) throw error;
           // Encrypted (EHBP/Tinfoil) or non-JSON body: usage then comes from the
           // response headers, exactly as when accounting read the body itself.
           jsonBody = undefined;
@@ -779,12 +830,18 @@ export class RoutstrClient {
           this._log("ERROR", "[RoutstrClient] response finalize failed:", error);
           return 0;
         })
-        .finally(() => prepared.releaseHold?.());
+        .finally(() => {
+          // Accounting settles behind the body, but the deadline must outlive the
+          // stream: its idle timer is re-armed per read and released by the
+          // consumer at stream end/cancel (see releaseDeadline in _makeRequest).
+          prepared.releaseHold?.();
+        });
       (prepared.response as any).finalize = () => finalizePromise;
       return prepared.response;
     } catch (error) {
       // Includes failures before the eager finalizer has taken ownership.
       prepared.releaseHold?.();
+      prepared.releaseDeadline?.();
       throw error;
     }
   }
@@ -908,6 +965,10 @@ export class RoutstrClient {
       capturedResponseId?: string;
     }>;
     releaseHold?: () => void;
+    /** Stops the per-attempt inference deadline. Must outlive the stream. */
+    releaseDeadline?: () => void;
+    /** True when a local budget (not the caller) ended this attempt. */
+    deadlineExpired?: () => boolean;
   }> {
     const {
       path: requestPath,
@@ -1119,6 +1180,7 @@ export class RoutstrClient {
       tinfoilCacheSecretPath: this.tinfoilCacheSecretPath,
       signal: params.signal,
       reservedBalanceWaitMs: params.reservedBalanceWaitMs,
+      deadlines: params.deadlines,
       lifecycle: params.lifecycle,
       transportState: params.transportState,
       // The SDK auto-pin marker must reach _handleErrorResponse to
@@ -1181,6 +1243,8 @@ export class RoutstrClient {
         (processedResponse as any).lifecycleAttemptId = (response as any).lifecycleAttemptId;
         (processedResponse as any).baseUrl = (response as any).baseUrl;
         (processedResponse as any).token = (response as any).token;
+        (processedResponse as any).releaseDeadline = (response as any).releaseDeadline;
+        (processedResponse as any).deadlineExpired = (response as any).deadlineExpired;
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
@@ -1228,6 +1292,8 @@ export class RoutstrClient {
         clientApiKey,
         usagePromise,
         releaseHold: (response as any).releaseHold,
+        releaseDeadline: (response as any).releaseDeadline,
+        deadlineExpired: (response as any).deadlineExpired,
       };
     } catch (error) {
       (response as any).releaseHold?.();
@@ -1299,6 +1365,8 @@ export class RoutstrClient {
     tinfoilCacheSecretPath?: string;
     /** Optional: abort the in-flight request. */
     signal?: AbortSignal;
+    /** Local per-attempt budgets; see RouteRequestParams.deadlines. */
+    deadlines?: InferenceDeadlines;
     /** SDK-pinned model path for this request, if any. */
     autoModelPath?: ModelPathPin;
     /** Caller forced a provider: never fail over to another node. */
@@ -1323,6 +1391,22 @@ export class RoutstrClient {
     if (signal?.aborted) {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
+
+    // Local budgets for this attempt. `signal` from here on is the composed
+    // one, so the fetch AND the body read are both bounded: a provider that
+    // accepts the connection and then goes quiet no longer holds the request
+    // until the runtime's ~300 s network timeout.
+    const deadline = createDeadlineHandle({
+      signal,
+      deadlines: params.deadlines,
+      baseUrl,
+      // Only a streaming request has a meaningful "first byte" of its own: for
+      // `stream: false` the headers do not arrive until generation finishes, so
+      // the short headers budget would kill a legitimately slow answer. Those
+      // get the (disabled by default) body budget instead.
+      streaming: (body as { stream?: unknown } | undefined)?.stream === true,
+    });
+    const attemptSignal = deadline.signal;
 
       // EHBP seals the body end to end, so the proxy cannot translate a
       // reasoning effort for us: map the caller's level onto the exact value
@@ -1374,28 +1458,104 @@ export class RoutstrClient {
       // Request headers contain bearer credentials / x-cashu tokens. The
       // request-response sink has its own header redaction; do not log raw headers.
 
-      const response = tinfoilEnabled
-        ? await fetchTinfoilPreservingPlaintextErrors(
-            {
-              baseUrl,
-              userCacheSecret: params.userCacheSecret,
-              tinfoilCacheSecretPath: params.tinfoilCacheSecretPath,
-            },
-            url,
-            {
+      let response: Response;
+      try {
+        response = tinfoilEnabled
+          ? await fetchTinfoilPreservingPlaintextErrors(
+              {
+                baseUrl,
+                userCacheSecret: params.userCacheSecret,
+                tinfoilCacheSecretPath: params.tinfoilCacheSecretPath,
+              },
+              url,
+              {
+                method,
+                headers,
+                body: requestBodyText,
+                signal: attemptSignal,
+              }
+            )
+          : await fetch(url, {
               method,
               headers,
               body: requestBodyText,
-              signal,
-            }
-          )
-        : await fetch(url, {
-            method,
-            headers,
-            body: requestBodyText,
-            signal,
-          });
+              signal: attemptSignal,
+            });
+      } catch (error) {
+        // A local deadline that expires before headers must not be mistaken
+        // for a caller abort: the caller did not cancel, the provider stalled.
+        if (deadline.timedOut()) throw deadline.reason();
+        throw error;
+      }
       headersReceived = true;
+
+      // Headers are in, so the bytes are moving. Switch to the budget that fits
+      // the response: bounded silence for a stream (re-armed per chunk below),
+      // or an optional overall budget for a non-streaming body, where silence
+      // until the complete body is expected.
+      if (deadline.timedOut()) throw deadline.reason();
+      const isEventStream = (response.headers.get("content-type") || "").includes("text/event-stream");
+
+      // Bound only the window in which the upstream is actually being waited on
+      // (see withProgress): a consumer that stops reading is backpressure, not a
+      // stall, and must not trip the budget.
+      //
+      // A stall here is past the point of failover: headers and possibly some
+      // tokens already reached the caller, so re-sending would duplicate the
+      // answer. It is still a provider fault, so it cools the same scope a
+      // network failure would, protecting the NEXT request.
+      if (response.body && isEventStream && deadline.hasBudget("idle")) {
+        // A stall after headers proves the node host is reachable and serving
+        // (it answered), so the fault is scoped to this model/path rather than
+        // cooling the whole provider and hiding its other working models.
+        const scope = {
+          modelId: params.selectedModel
+            ? this._canonicalRequestModelId(params.selectedModel, params.requestedModelId)
+            : undefined,
+          modelPath: (() => {
+            const pinned = this._findModelPathHeader(params.baseHeaders);
+            return pinned ? canonicalModelPath(pinned) ?? undefined : undefined;
+          })(),
+        };
+        response = rewrapBody(
+          response,
+          withProgress(response.body, {
+            onWaitStart: () => deadline.armIdle(),
+            onWaitEnd: () => deadline.suspend(),
+            onStalled: () => {
+              // `withProgress` classifies by error name, but only OUR deadline
+              // is a provider fault. A caller's own timeout (e.g.
+              // `AbortSignal.timeout`) surfaces as a `TimeoutError` too, and
+              // must never cool a healthy provider down.
+              if (!deadline.timedOut()) return;
+              const reason = deadline.reason();
+              this._log("ERROR", "[RoutstrClient] Stream stalled after headers; cooling down provider", {
+                baseUrl,
+                path,
+                timeoutMs: (reason as { timeoutMs?: number })?.timeoutMs,
+              });
+              this.providerManager.markFailed(
+                baseUrl,
+                "Inference stream stalled",
+                scope.modelId,
+                scope.modelPath
+              );
+              if (attempt) {
+                void params.lifecycle?.updateAttempt(attempt.attemptId, {
+                  endedAt: Date.now(),
+                  outcome: "failed",
+                  failurePhase: "stream",
+                  errorType: "TimeoutError",
+                });
+              }
+            },
+          })
+        );
+      } else if (response.body && !isEventStream) {
+        deadline.armBody();
+      } else {
+        deadline.suspend();
+      }
       if (!response.ok) releaseHold();
       if (params.transportState) params.transportState.nodeRequestId = response.headers.get("x-routstr-request-id") ?? undefined;
       if (attempt) {
@@ -1452,6 +1612,11 @@ export class RoutstrClient {
           body: bodyText ?? "<unable to read response body>",
         });
 
+        // The response body has been read; this attempt's deadline has nothing
+        // left to bound. Dispose before handing off, otherwise a failover chain
+        // that outlasts `bodyMs` would fire this attempt's timer mid-handoff and
+        // be misread in the outer catch as a fresh provider stall.
+        deadline.dispose();
         const handled = await this._handleErrorResponse(
           params,
           token,
@@ -1496,6 +1661,13 @@ export class RoutstrClient {
       }
 
       (response as any).releaseHold = releaseHold;
+      // The response may still be streaming, so the deadline handle (and its
+      // composed signal) must outlive this call: the per-chunk re-arm and the
+      // abort that stops an idle body depend on it. Released with the response.
+      (response as any).releaseDeadline = () => deadline.dispose();
+      // Lets a caller that reads (or clones) the body distinguish an expired
+      // local budget from an ordinary body read failure after the fact.
+      (response as any).deadlineExpired = () => deadline.timedOut();
       return response;
     } catch (error: any) {
       releaseHold();
@@ -1511,6 +1683,40 @@ export class RoutstrClient {
       const transportCode =
         (error as { code?: unknown })?.code ??
         (error as { cause?: { code?: unknown } })?.cause?.code;
+      // A local deadline is a provider stall, not a caller abort: it must reach
+      // the failover path even though the composed signal is now aborted.
+      const localTimeout = deadline.timedOut();
+      if (localTimeout) {
+        const timedOutPhase = deadline.timedOutPhase();
+        this._log("ERROR", "[RoutstrClient] Inference deadline expired", {
+          baseUrl,
+          url: `${baseUrl.replace(/\/$/, "")}${path}`,
+          path,
+          phase: timedOutPhase,
+          timeoutMs: (deadline.reason() as { timeoutMs?: number })?.timeoutMs,
+          headersReceived,
+        });
+        if (attempt) await params.lifecycle?.updateAttempt(attempt.attemptId, {
+          endedAt: Date.now(), outcome: "failed",
+          failurePhase: headersReceived ? "stream" : "network",
+          errorType: "TimeoutError",
+        });
+        deadline.dispose();
+        // Deliberately the same status -1 path as a network failure, so the
+        // existing recovery semantics apply unchanged: in xcashu mode that
+        // includes trying to reclaim the token, exactly as a socket reset
+        // already did. A local deadline is a transport failure, not a new
+        // failure class, so it must not invent new financial handling.
+        return await this._handleErrorResponse(
+          params,
+          token,
+          -1, // same as a network failure: no HTTP status was produced
+          undefined,
+          undefined,
+          transportMessage,
+          params.retryCount ?? 0
+        );
+      }
       if (
         !headersReceived &&
         !signal?.aborted &&

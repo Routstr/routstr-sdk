@@ -4,6 +4,7 @@ export * from "./ProviderManager";
 export * from "./costEstimate";
 export * from "./StreamProcessor";
 export * from "./sse";
+export * from "./deadlines";
 export * from "./TinfoilSecure";
 export * from "./TinfoilCacheSecret";
 export * from "./TinfoilReasoning";

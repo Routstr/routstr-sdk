@@ -29,6 +29,7 @@ import {
   type ResolvedContext,
 } from "./client/resolveRequestContext";
 import { InsufficientBalanceError } from "./core/errors";
+import type { InferenceDeadlines } from "./client/deadlines";
 import { MODEL_PATH_HEADER } from "./utils/modelPaths";
 
 // Re-export for consumers that want access to the shared resolver
@@ -46,6 +47,13 @@ export interface RouteRequestOptions {
   trackLifecycle?: boolean;
   /** Reservation-wait budget after automatic funding fails (default 120s; 0 disables). */
   reservedBalanceWaitMs?: number;
+  /**
+   * Local budgets for each inference attempt: response headers (180 s) and
+   * silence between stream chunks (180 s). See RouteRequestParams.deadlines.
+   * A timeout before headers takes the provider failover path; it is not a
+   * caller abort.
+   */
+  deadlines?: InferenceDeadlines;
   /** The model ID to route (e.g., "gpt-4o") */
   modelId: string;
   /** The request body to proxy to the provider */
@@ -275,6 +283,7 @@ export async function routeRequests(
       trackLifecycle: options.trackLifecycle,
       signal: options.signal,
       reservedBalanceWaitMs: options.reservedBalanceWaitMs,
+      deadlines: options.deadlines,
       path,
       method: "POST",
       body: proxiedBody,
