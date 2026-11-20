@@ -1,25 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoutstrClient } from "../../client/RoutstrClient";
-import {
-  isRequestPayloadTooLargeError,
-  parseCoreError,
-} from "../../core/errorTypes";
 import type { DiscoveryAdapter } from "../../discovery/interfaces";
 import type { Model } from "../../core/types";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
-
-/**
- * A 413 has two meanings in the routstr fleet and they need opposite handling.
- *
- * routstr-core answers 413 for an API-key balance shortfall, which is
- * repairable: refresh the key and retry. Every other 413 is the conventional
- * "request entity too large" — routstr-core's `max_request_body_bytes` cap,
- * nginx in front of a provider, or an OpenAI-style `Payload Too Large`. Those
- * cannot be repaired by retrying: the same bytes are re-sent to the same node.
- * Before this split the SDK re-sent the body twice per provider and cooled the
- * model path down, so one oversized prompt walked the whole fleet in 285 s and
- * left healthy routes on a 210 s cooldown.
- */
 
 const BASE_URL = "https://provider.example.com/";
 const OTHER_URL = "https://other.example.com/";
@@ -123,14 +106,6 @@ const NGINX_BODY =
   "<body>\r\n<center><h1>413 Request Entity Too Large</h1></center>\r\n" +
   "<hr><center>nginx/1.24.0 (Ubuntu)</center>\r\n</body>\r\n</html>\r\n";
 
-const CORE_BALANCE_BODY = JSON.stringify({
-  error: {
-    type: "insufficient_quota",
-    code: "insufficient_balance",
-    message: "Insufficient balance: 100 sats required; 20 sats available.",
-  },
-});
-
 function createClient(nextProvider: string | null = null) {
   const providerManager = {
     markFailed: vi.fn(),
@@ -152,8 +127,7 @@ function createClient(nextProvider: string | null = null) {
 
 async function handle413(
   client: RoutstrClient,
-  body: string,
-  retryCount = 0
+  body: string
 ) {
   return (client as any)._handleErrorResponse(
     params,
@@ -161,65 +135,13 @@ async function handle413(
     413,
     "req-413",
     undefined,
-    body,
-    retryCount
+    body
   );
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-});
-
-describe("isRequestPayloadTooLargeError", () => {
-  const classify = (body: string, status = 413) =>
-    isRequestPayloadTooLargeError(status, parseCoreError(body, status));
-
-  it("recognizes a routstr-core byte-limit rejection", () => {
-    expect(classify(CORE_BYTE_LIMIT_BODY)).toBe(true);
-  });
-
-  it("recognizes an HTML 413 from a provider's own proxy", () => {
-    expect(classify(NGINX_BODY)).toBe(true);
-  });
-
-  it.each([
-    JSON.stringify({ error: { message: "Payload Too Large" } }),
-    JSON.stringify({ error: { message: "Content Too Large" } }),
-    JSON.stringify({ error: { type: "invalid_request", message: "request entity too large" } }),
-    // A bare 413 with no envelope at all is still a rejected body: nothing in
-    // it describes a balance, so retrying the same bytes cannot help.
-    "",
-  ])("recognizes a generic oversized-body surface %s", (body) => {
-    expect(classify(body)).toBe(true);
-  });
-
-  it("does not claim the routstr-core insufficient-balance 413", () => {
-    expect(classify(CORE_BALANCE_BODY)).toBe(false);
-  });
-
-  it("does not claim a legacy 413 that only says 'Insufficient balance'", () => {
-    expect(classify("Insufficient balance: 5 sats required")).toBe(false);
-  });
-
-  it("keeps a minimum-balance 413 out of the payload class", () => {
-    expect(
-      classify(
-        JSON.stringify({
-          error: { type: "minimum_balance_required", code: "minimum_balance_required" },
-        })
-      )
-    ).toBe(false);
-  });
-
-  it.each([400, 402, 422, 500])("is limited to 413 (not %i)", (status) => {
-    expect(
-      isRequestPayloadTooLargeError(
-        status,
-        parseCoreError(CORE_BYTE_LIMIT_BODY, status)
-      )
-    ).toBe(false);
-  });
 });
 
 describe("_handleErrorResponse with an oversized body", () => {
@@ -272,34 +194,57 @@ describe("_handleErrorResponse with an oversized body", () => {
     expect(providerManager.markFailed).not.toHaveBeenCalled();
   });
 
-  it("surfaces a uniform payload rejection as 413, not a generic 502", async () => {
-    const { client } = createClient();
+  it.each([
+    { name: "a Core ingress cap", scope: undefined, expectAlternatePath: false },
+    { name: "an upstream cap", scope: "upstream", expectAlternatePath: true },
+  ])("keeps the correct node exclusion across failover after $name", async ({
+    scope,
+    expectAlternatePath,
+  }) => {
+    const { client, providerManager } = createClient();
+    const initial = { baseUrl: BASE_URL, selector: "openai:gpt-test" };
+    const alternate = { baseUrl: BASE_URL, selector: "anthropic:gpt-test" };
+    const other = { baseUrl: OTHER_URL, selector: "openai:gpt-test" };
+    providerManager.getModelPathProviderRanking = vi.fn(async (_modelId, options) =>
+      [other, alternate].filter(candidate =>
+        !options.excludeBaseUrls?.has(candidate.baseUrl) &&
+        !new Set(options.excludeModelPaths).has(`${candidate.baseUrl}|${candidate.selector}`)
+      )
+    );
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: "sk-next",
+      tokenBalance: 50,
+      tokenBalanceUnit: "sat",
+    });
+    const makeRequest = vi.spyOn(client as any, "_makeRequest").mockImplementation(
+      async (next: any) => next.baseUrl === OTHER_URL
+        ? (client as any)._handleErrorResponse(
+            next, next.token, 413, undefined, undefined, NGINX_BODY
+          )
+        : new Response("{}", { status: 200 })
+    );
 
-    const response = await handle413(client, CORE_BYTE_LIMIT_BODY);
+    const response = await (client as any)._handleErrorResponse(
+      { ...params, autoModelPath: initial, baseHeaders: { "x-routstr-model-path": initial.selector } },
+      API_KEY, 413, undefined, undefined, CORE_BYTE_LIMIT_BODY, 0,
+      { status: 413, headers: scope ? { "x-routstr-error-scope": scope } : {} }
+    );
 
-    expect(response.status).toBe(413);
-    const body = await response.json();
-    expect(body.error.type).toBe("all_providers_failed");
-    expect(JSON.stringify(body)).toContain("20971520 byte limit");
+    expect(makeRequest.mock.calls.map(([next]: any[]) => next.baseUrl)).toEqual(
+      expectAlternatePath ? [OTHER_URL, BASE_URL] : [OTHER_URL]
+    );
+    expect(response.status).toBe(expectAlternatePath ? 200 : 413);
+    expect(providerManager.markFailed).not.toHaveBeenCalled();
   });
 
-  it("keeps the refresh-and-retry path for the balance 413", async () => {
+  it.each([CORE_BYTE_LIMIT_BODY, NGINX_BODY, ""])("surfaces a 413 as a payload rejection (%s)", async (body) => {
     const { client } = createClient();
-    vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
-      amount: 20_000,
-      reserved: 0,
-      unit: "msat",
-      apiKey: API_KEY,
-    });
-    const retry = vi
-      .spyOn(client as any, "_makeRequest")
-      .mockResolvedValue(new Response("ok", { status: 200 }));
 
-    const response = await handle413(client, CORE_BALANCE_BODY);
+    const response = await handle413(client, body);
 
-    expect(response.status).toBe(200);
-    expect(retry).toHaveBeenCalledWith(
-      expect.objectContaining({ baseUrl: BASE_URL, retryCount: 1 })
-    );
+    expect(response.status).toBe(413);
+    const aggregate = await response.json();
+    expect(aggregate.error.type).toBe("all_providers_failed");
+    expect(aggregate.error.errors[0].status).toBe(413);
   });
 });

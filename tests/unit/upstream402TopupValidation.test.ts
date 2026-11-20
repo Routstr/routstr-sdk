@@ -133,7 +133,7 @@ async function handle402(client: RoutstrClient, body: string, retryCount = 0) {
 }
 
 describe("RoutstrClient 402 top-up validation", () => {
-  it.each([402, 413])("tracks actual %i same-provider retry recursion", async (status) => {
+  it("tracks actual 402 same-provider retry recursion", async () => {
     const { client, providerManager } = createClient();
     providerManager.recordSuccess = vi.fn();
     const driver = createMemoryRequestLifecycleDriver();
@@ -144,7 +144,7 @@ describe("RoutstrClient 402 top-up validation", () => {
     vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({ amount: 20, reserved: 0, unit: "sat", apiKey: API_KEY });
     vi.spyOn(client.getBalanceManager(), "topUp").mockResolvedValue({ success: true, toppedUpAmount: 112, message: "ok" });
     vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
-    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(localInsufficientBalanceBody, { status })).mockResolvedValueOnce(new Response('{}'));
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(localInsufficientBalanceBody, { status: 402 })).mockResolvedValueOnce(new Response('{}'));
     vi.stubGlobal("fetch", fetchMock);
     const response = await client.routeRequest({ ...params, modelId: model.id });
     const trace = await driver.getTrace(response.requestId!);

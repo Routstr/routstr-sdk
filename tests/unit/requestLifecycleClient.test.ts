@@ -309,7 +309,7 @@ describe("transport attempt lifecycle", () => {
     }
   });
   it("records same-provider retries and network failures without synthetic statuses", async () => {
-    for (const status of [402, 413, "network"] as const) {
+    for (const status of [402, "network"] as const) {
       const driver = createMemoryRequestLifecycleDriver();
       const lifecycle = await beginRequestLifecycle({
         driver,
