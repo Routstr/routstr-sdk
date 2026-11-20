@@ -227,3 +227,91 @@ describe("writing the local policy through the identity", () => {
     expect(relay.published[0]?.pubkey).toBe(identityPubkey);
   });
 });
+
+describe("kind 38423 curated models", () => {
+  beforeEach(() => { relay.events = []; relay.filters = []; relay.published = []; });
+  afterEach(() => { relay.events = []; relay.filters = []; relay.published = []; vi.restoreAllMocks(); });
+
+  const modelsEvent = (models: string[], sk = external, created_at = now()) =>
+    finalizeEvent({
+      kind: 38423,
+      created_at,
+      tags: [["d", "routstr-21-models"]],
+      content: JSON.stringify({ models }),
+    }, sk);
+
+  /** Seed events straight into the store, the only way a local list can exist. */
+  async function openWithStore(options: {
+    identityPubkey?: string;
+    routstrModelsPubkey?: string;
+    stored?: NostrEvent[];
+  } = {}) {
+    const { store, hydrate } = createSdkStore({ driver: createMemoryDriver() });
+    await hydrate;
+    const eventStore = new EventStore();
+    for (const row of options.stored ?? []) eventStore.add(row);
+    const manager = new ModelManager(createDiscoveryAdapterFromStore(store), {
+      eventStore,
+      routstrModelsPubkey: options.routstrModelsPubkey ?? externalPubkey,
+      identityPubkey: options.identityPubkey,
+      logger: quiet,
+    });
+    return manager;
+  }
+
+  it("keeps the advertised catalog when an identity is set but has no local list", async () => {
+    // Regression: configuring identityPubkey alone returned [] because the
+    // external tier was selected by rank, and rank 1 requires an absent local
+    // event. No public API writes kind 38423, so this is not a transient state.
+    relay.events = [modelsEvent(["ext-1", "ext-2"])];
+    const manager = await openWithStore({ identityPubkey });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1", "ext-2"]);
+  });
+
+  it("leaves a default install unchanged", async () => {
+    relay.events = [modelsEvent(["ext-1", "ext-2"])];
+    const manager = await openWithStore();
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1", "ext-2"]);
+  });
+
+  it("unions a local list ahead of the advertised catalog", async () => {
+    relay.events = [modelsEvent(["ext-1", "ext-2"])];
+    const manager = await openWithStore({
+      identityPubkey,
+      stored: [modelsEvent(["mine-1"], identity, now() - 100)],
+    });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["mine-1", "ext-1", "ext-2"]);
+  });
+
+  it("does not lose the advertised tier when the identity is the advertiser", async () => {
+    // Self-hosted advertiser: identityPubkey === routstrModelsPubkey. Ranking by
+    // number collapsed both tiers into rank 0 and dropped the catalog.
+    // The advertiser *is* the identity, so the event must be signed by it.
+    relay.events = [modelsEvent(["ext-1"], identity)];
+    const manager = await openWithStore({ identityPubkey, routstrModelsPubkey: identityPubkey });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
+  });
+
+  it("ignores a local list when no identity is configured", async () => {
+    relay.events = [modelsEvent(["ext-1"])];
+    const manager = await openWithStore({
+      stored: [modelsEvent(["mine-1"], identity, now())],
+    });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
+  });
+
+  it("keeps the advertised list when the local document is unparseable", async () => {
+    relay.events = [modelsEvent(["ext-1"])];
+    const manager = await openWithStore({
+      identityPubkey,
+      // Stored but invalid for the reader: it must not erase the other tier.
+      stored: [finalizeEvent({
+        kind: 38423,
+        created_at: now() - 10,
+        tags: [["d", "routstr-21-models"]],
+        content: "{not json",
+      }, identity)],
+    });
+    expect(await manager.fetchRoutstr21Models(true)).toEqual(["ext-1"]);
+  });
+});
