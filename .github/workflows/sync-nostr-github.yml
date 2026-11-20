@@ -16,6 +16,10 @@ name: Sync nostr and GitHub
 on:
   push:
     branches: ["**"]
+    # A release tag must reach GitHub promptly: publish.yml is triggered by the
+    # tag push this workflow makes, so waiting for the cron would delay a release
+    # by up to 30 minutes.
+    tags: ["v*"]
   schedule:
     # Away from :00 and :30, when GitHub delays and drops scheduled runs.
     - cron: "17,47 * * * *"
