@@ -35,7 +35,7 @@ export const CONFIDENTIAL_VERSION = 3;
 export const CONFIDENTIAL_VERSION_MIN = CONFIDENTIAL_VERSION;
 export const CONFIDENTIAL_VERSION_MAX = CONFIDENTIAL_VERSION;
 /** The two-party key schedule this client implements (§4). */
-export const CONFIDENTIAL_TWOPC = "split-public-1";
+export const CONFIDENTIAL_TWOPC = "split-public-2";
 /** A connection's framing towards the provider. */
 export type ConfidentialFraming = "2" | "1.1";
 export const CONFIDENTIAL_FRAMINGS: readonly ConfidentialFraming[] = ["2", "1.1"];
@@ -153,7 +153,7 @@ export interface ConfidentialOffer {
   http?: string[];
   /** Terms of framing `"2"`, present when `http` lists it. */
   h2?: ConfidentialH2Offer;
-  /** The two-party key schedule (`split-public-1`). */
+  /** The two-party key schedule (`split-public-2`). */
   twopc?: string;
   /**
    * The deposit (msat) the node reserves at a connection's `setup`. It is

@@ -51,7 +51,7 @@ export const IMAGE_BODY = JSON.stringify({ id: "x", images: ["aGVsbG8="], reques
 export function v3OfferFields(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     v: 3,
-    twopc: "split-public-1",
+    twopc: "split-public-2",
     upstream_host: "api.venice.ai",
     notary_pubkey: NODE_PUB,
     max_tokens_cap: 4096,

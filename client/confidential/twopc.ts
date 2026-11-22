@@ -26,7 +26,7 @@ export const TWOPC_MAX_FRAME = 16 << 20;
 /** What a 2PC version mismatch means for the operator of this client. */
 const TWOPC_MISMATCH_TEXT =
   "twopc_version_mismatch: cu-2pc and the node's sidecar run different versions of the two-party key schedule " +
-  "(this client speaks split-public-1); update the helper binaries or use another node";
+  "(this client speaks split-public-2); update the helper binaries or use another node";
 
 export const TWOPC_CHANNEL_NET = 0;
 export const TWOPC_CHANNEL_CONTROL = 1;

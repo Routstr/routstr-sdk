@@ -286,7 +286,7 @@ describe("http 2: the offer's h2 block", () => {
     const pubHex = bytesToHex(schnorr.getPublicKey(priv));
     const o: Record<string, unknown> = {
       v: 3,
-      twopc: "split-public-1",
+      twopc: "split-public-2",
       upstream_host: "api.venice.ai",
       notary_pubkey: pubHex,
       max_tokens_cap: 4096,

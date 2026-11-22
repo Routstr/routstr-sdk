@@ -33,7 +33,7 @@ const pubHex = bytesToHex(schnorr.getPublicKey(priv));
 function offer(signed = true): Record<string, unknown> {
   const o: Record<string, unknown> = {
     v: 3,
-    twopc: "split-public-1",
+    twopc: "split-public-2",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
