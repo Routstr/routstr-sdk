@@ -45,6 +45,12 @@ export function parseServerCertificateVerify(data) {
         throw new Error(`Unsupported signature algorithm '${algorithmBytes}'`);
     }
     const signature = readWLength(2);
+    // FORK PATCH (TLS-17): nothing after the signature (RFC 8446 §4.4.3).
+    // CertificateVerify is not under the signature it carries, only under
+    // the Finished MAC, whose key the node holds in protocol v2 and later.
+    if (data.length) {
+        throw new Error('trailing bytes in CertificateVerify');
+    }
     return { algorithm, signature };
     function read(bytes) {
         const result = data.slice(0, bytes);
@@ -70,6 +76,10 @@ export async function verifyCertificateSignature({ signature, algorithm, publicK
         // @ts-expect-error
         cryptoAlg = cryptoAlg.replace('SECP256R1', 'SECP384R1');
     }
+    // FORK PATCH (TLS-17)
+    if (cryptoAlg.startsWith('ECDSA')) {
+        assertDerEcdsaSignature(signature);
+    }
     const pubKey = await crypto.importKey(cryptoAlg, publicKey.buffer, 'public');
     const verified = await crypto.verify(cryptoAlg, {
         data: signatureData,
@@ -78,6 +88,50 @@ export async function verifyCertificateSignature({ signature, algorithm, publicK
     });
     if (!verified) {
         throw new Error(`${algorithm} signature verification failed`);
+    }
+}
+// FORK PATCH (TLS-17): an ECDSA signature must be the DER encoding of
+// ECDSA-Sig-Value (RFC 8446 §4.2.3): SEQUENCE { INTEGER r, INTEGER s } with
+// definite minimal lengths, positive minimal INTEGERs and no other byte. The
+// conversion to r‖s for WebCrypto read BER and dropped what it did not need
+// (bytes after the SEQUENCE, further elements, long-form lengths, a missing
+// or doubled sign byte), so one signature had many accepted encodings, each
+// a different transcript. What stays is the pair (r, s) and (r, n − s).
+function assertDerEcdsaSignature(sig) {
+    const bad = () => new Error('ECDSA signature is not DER encoded');
+    let off = 0;
+    if (sig[off++] !== 0x30) {
+        throw bad();
+    }
+    let len = sig[off++];
+    if (len === 0x81) {
+        len = sig[off++];
+        if (!(len >= 0x80)) {
+            throw bad();
+        }
+    }
+    else if (!(len < 0x80)) {
+        throw bad();
+    }
+    if (sig.length !== off + len) {
+        throw bad();
+    }
+    for (let i = 0; i < 2; i++) {
+        if (sig[off++] !== 0x02) {
+            throw bad();
+        }
+        const n = sig[off++];
+        if (!(n >= 1 && n < 0x80) || off + n > sig.length) {
+            throw bad();
+        }
+        // positive, and no leading zero byte that the sign does not need
+        if ((sig[off] & 0x80) || (n > 1 && sig[off] === 0 && !(sig[off + 1] & 0x80))) {
+            throw bad();
+        }
+        off += n;
+    }
+    if (off !== sig.length) {
+        throw bad();
     }
 }
 export async function getSignatureDataTls13(hellos, cipherSuite) {

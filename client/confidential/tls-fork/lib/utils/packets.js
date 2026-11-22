@@ -28,9 +28,14 @@ export function packWith3ByteLength(data) {
 }
 export function readWithLength(data, lengthBytes = 2) {
     const dataView = uint8ArrayToDataView(data);
+    // FORK PATCH (TLS-17): a 3-byte length is read in full. The top byte
+    // was skipped, so a handshake message header with any top byte parsed
+    // as the same message while its bytes entered the transcript.
     const length = lengthBytes === 1
         ? dataView.getUint8(0)
-        : dataView.getUint16(lengthBytes === 3 ? 1 : 0);
+        : lengthBytes === 3
+            ? dataView.getUint8(0) * 0x10000 + dataView.getUint16(1)
+            : dataView.getUint16(0);
     if (data.length < lengthBytes + length) {
         return undefined;
     }

@@ -104,7 +104,7 @@ terminal path. Best effort only: JavaScript cannot erase copies the runtime
 or the caller made (WebCrypto's key material, garbage-collected buffers, the
 hex strings passed to `cu-2pc`/`cu-prover`).
 
-## Security patches (TLS-01 … TLS-16)
+## Security patches (TLS-01 … TLS-17)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -206,6 +206,36 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   accepted (RFC 8446 §5). A plaintext KeyUpdate after the handshake rotated
   the read key, and a plaintext close_notify ended the connection as if the
   server had closed it.
+- **TLS-17, one accepted server flight per signature** (`make-tls-client.js`
+  `processRecord`; `utils/parse-certificate.js` `parseServerCertificateVerify`,
+  `assertDerEcdsaSignature`; `utils/packets.js` `readWithLength`). The node
+  holds s_hs (a public output of the two-party key schedule), so it can open
+  the provider's flight, change it and recompute the Finished. The provider's
+  signature covers the transcript up to Certificate. What the client accepts
+  after that, and in how many encodings, is the node's choice of transcript,
+  hence of `th_SF`, an input of the two-party key schedule's last stages
+  that the node then picks with the challenge known. Before this patch the
+  choice was unbounded. Now:
+  - CertificateVerify ends with its signature (bytes after it were ignored);
+  - an ECDSA signature must be the DER encoding of `SEQUENCE { INTEGER r,
+    INTEGER s }` and nothing else (the conversion to r‖s read BER and
+    dropped bytes after the SEQUENCE, further elements, long-form lengths
+    and a missing or doubled sign byte);
+  - Finished follows CertificateVerify directly, and a TLS 1.3 server flight
+    holds only ServerHello, EncryptedExtensions, Certificate,
+    CertificateRequest, CertificateVerify and Finished (a NewSessionTicket
+    or an unknown type was skipped but stayed in the transcript);
+  - all three bytes of a handshake message length are read (the top byte
+    was skipped, so the headers of CertificateVerify and Finished had 256
+    accepted forms each);
+  - the record that carries the server Finished ends with it (a KeyUpdate
+    after it, under the handshake key, rotated the read key).
+
+  What is left: an ECDSA signature `(r, s)` also verifies as `(r, n − s)`,
+  so the node has two transcripts per flight; an RSA signature has one.
+  Parsers of what the signature covers (ServerHello, EncryptedExtensions,
+  Certificate) still ignore bytes after the fields they read; the node
+  cannot change those messages without the provider's signing key.
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider

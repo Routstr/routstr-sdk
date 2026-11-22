@@ -497,13 +497,21 @@ class FakeServer {
     return msg;
   }
 
-  async certificateVerify(signer: Issued): Promise<Uint8Array> {
+  /** The signer's ECDSA signature (r‖s) over the transcript so far. */
+  async signature(signer: Issued): Promise<Uint8Array> {
     const data = await getSignatureDataTls13(this.transcript, SUITE);
-    const raw = new Uint8Array(
+    return new Uint8Array(
       await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signer.keys.privateKey, data),
     );
-    const sig = derEcdsaSig(raw);
-    const msg = hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...Array.from(sig)]);
+  }
+
+  async certificateVerify(signer: Issued): Promise<Uint8Array> {
+    const sig = derEcdsaSig(await this.signature(signer));
+    return this.add(hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...Array.from(sig)]));
+  }
+
+  /** Any handshake message, as given, into the transcript. */
+  add(msg: Uint8Array): Uint8Array {
     this.transcript.push(msg);
     return msg;
   }
@@ -701,6 +709,172 @@ describe("tls-fork server flight (TLS-11, TLS-12)", () => {
     await expect(
       client.handleReceivedBytes(new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext])),
     ).rejects.toThrow(/without a content type/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One accepted server flight per signature (TLS-17).
+//
+// The node holds s_hs, so it can open the provider's flight, change it, seal
+// it again and recompute the Finished. Everything up to Certificate is under
+// the provider's signature. Whatever the client accepts after that point, or
+// in the encoding of the signature, gives the node as many transcripts, hence
+// values of th_SF, as it likes, with the two-party key schedule's challenge
+// already known to it. Each test builds such a flight with a Finished that is
+// correct for the changed transcript, so only the rule under test refuses it.
+
+describe("tls-fork accepts one server flight per signature (TLS-17)", () => {
+  let root: Issued;
+  let leaf: Issued;
+
+  beforeAll(async () => {
+    root = await issue({ subject: "CN=Test Root", ca: true, keyUsage: keyCertSign | cRLSign });
+    leaf = await issue({
+      subject: `CN=${HOST}`,
+      issuer: root,
+      ca: false,
+      keyUsage: digitalSignature,
+      eku: [SERVER_AUTH],
+      san: [HOST],
+    });
+  });
+
+  /** The flight up to Certificate, then what `rest` adds, then the Finished. */
+  async function flight(rest: (server: FakeServer) => Promise<Uint8Array[]>, finished = true) {
+    const c = await externalClient(root);
+    const { client, server } = c;
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    const run = async () => {
+      for (const msg of await rest(server)) {
+        await client.handleReceivedBytes(await server.seal(msg));
+      }
+      if (finished) {
+        await client.handleReceivedBytes(await server.seal(await server.finished()));
+      }
+    };
+    return { ...c, run };
+  }
+
+  const cv = (sig: Uint8Array, trailing: number[] = []) =>
+    hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...Array.from(sig), ...trailing]);
+
+  async function refused(rest: (server: FakeServer) => Promise<Uint8Array[]>, why: RegExp, finished = true) {
+    const { client, run, handshakes } = await flight(rest, finished);
+    await expect(run()).rejects.toThrow(why);
+    expect(client.hasEnded()).toBe(true);
+    expect(handshakes()).toBe(0);
+  }
+
+  it("completes the unchanged flight (positive control)", async () => {
+    const { client, run, handshakes } = await flight(async (s) => [await s.certificateVerify(leaf)]);
+    await run();
+    expect(client.hasEnded()).toBe(false);
+    expect(handshakes()).toBe(1);
+  });
+
+  it("rejects bytes after the signature in CertificateVerify", async () => {
+    await refused(
+      async (s) => [s.add(cv(derEcdsaSig(await s.signature(leaf)), [0xaa, 0xbb, 0xcc]))],
+      /trailing bytes in CertificateVerify/,
+    );
+  });
+
+  it("rejects an ECDSA signature that is not the DER encoding of (r, s)", async () => {
+    const variants: ((der: number[]) => number[])[] = [
+      // a byte after the SEQUENCE, inside the signature field
+      (der) => [...der, 0x00],
+      // the SEQUENCE length in long form
+      (der) => [0x30, 0x81, der[1], ...der.slice(2)],
+      // r with one more leading zero byte
+      (der) => [0x30, der[1] + 1, 0x02, der[3] + 1, 0x00, ...der.slice(4)],
+      // an empty third element
+      (der) => [0x30, der[1] + 2, ...der.slice(2), 0x05, 0x00],
+    ];
+    for (const variant of variants) {
+      await refused(
+        async (s) => [s.add(cv(new Uint8Array(variant(Array.from(derEcdsaSig(await s.signature(leaf)))))))],
+        /not DER encoded/,
+        false,
+      );
+    }
+  });
+
+  it("rejects an INTEGER of the signature without its sign byte", async () => {
+    // Sign until r has its top bit set, then drop the zero byte DER puts in
+    // front of it (a negative INTEGER, read as the same unsigned r).
+    await refused(
+      async (s) => {
+        for (;;) {
+          const der = Array.from(derEcdsaSig(await s.signature(leaf)));
+          if (der[3] === 33) {
+            return [s.add(cv(new Uint8Array([0x30, der[1] - 1, 0x02, 32, ...der.slice(5)])))];
+          }
+        }
+      },
+      /not DER encoded/,
+      false,
+    );
+  });
+
+  it("rejects a message between CertificateVerify and Finished", async () => {
+    // an unknown type, a NewSessionTicket, a CertificateRequest
+    const ticket = [0, 0, 0, 60, 0, 0, 0, 0, 1, 0, ...u16(4), 1, 2, 3, 4, 0, 0];
+    for (const extra of [hsMsg(0xfe, [1, 2, 3]), hsMsg(0x04, ticket), hsMsg(0x0d, [0, 0, 0])]) {
+      await refused(
+        async (s) => [await s.certificateVerify(leaf), s.add(extra)],
+        /between CertificateVerify and Finished/,
+        false,
+      );
+    }
+  });
+
+  it("rejects a handshake message of a type that is not part of the server flight", async () => {
+    const c = await externalClient(root);
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()));
+    await expect(c.client.handleReceivedBytes(await c.server.seal(c.server.add(hsMsg(0xfe, []))))).rejects.toThrow(
+      /unexpected handshake message/,
+    );
+    expect(c.client.hasEnded()).toBe(true);
+  });
+
+  it("reads all three bytes of a handshake message length", async () => {
+    // A message with its top length byte set, and a Finished that is correct
+    // for the transcript that contains it. A parser that reads two length
+    // bytes takes it for the unchanged message; read in full it is 64 kB
+    // long and does not end here.
+    const high = (msg: Uint8Array) => {
+      const m = msg.slice();
+      m[1] = 0x01;
+      return m;
+    };
+    {
+      // CertificateVerify: its header is in the transcript the Finished covers.
+      const { run, handshakes } = await flight(async (s) => [
+        s.add(high(cv(derEcdsaSig(await s.signature(leaf))))),
+      ]);
+      await run();
+      expect(handshakes()).toBe(0);
+    }
+    {
+      // Finished: its own header is in th_SF and under no MAC.
+      const { client, server, run, handshakes } = await flight(async (s) => [await s.certificateVerify(leaf)], false);
+      await run();
+      await client.handleReceivedBytes(await server.seal(high(await server.finished())));
+      expect(handshakes()).toBe(0);
+    }
+  });
+
+  it("rejects handshake bytes after the Finished in its record", async () => {
+    const { client, server, run, handshakes } = await flight(async (s) => [await s.certificateVerify(leaf)], false);
+    await run();
+    const fin = await server.finished();
+    const keyUpdate = hsMsg(0x18, [0x00]);
+    await expect(
+      client.handleReceivedBytes(await server.seal(concatenateUint8Arrays([fin, keyUpdate]))),
+    ).rejects.toThrow(/after the server Finished/);
+    expect(handshakes()).toBe(0);
+    expect(client.hasEnded()).toBe(true);
   });
 });
 
