@@ -135,6 +135,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 if (!contentType) {
                     throw new Error(`unknown TLS 1.3 inner content type ${contentTypeNum}`);
                 }
+                // FORK PATCH (TLS-19): a ChangeCipherSpec is never protected
+                // (RFC 8446 §5). It was logged and skipped.
+                if (contentType === 'CHANGE_CIPHER_SPEC') {
+                    throw new Error('ChangeCipherSpec inside a TLS 1.3 protected record');
+                }
                 innerEnd -= 1;
             }
             ctx = {
@@ -201,6 +206,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
     async function processRecord({ content: record, contentType, header, }) {
         contentType ??= header[0];
         if (contentType === CONTENT_TYPE_MAP.HANDSHAKE) {
+            // FORK PATCH (TLS-19): no zero-length handshake fragment
+            // (RFC 8446 §5.1). It was skipped.
+            if (!record.length && connTlsVersion !== 'TLS1_2') {
+                throw new Error('empty handshake record');
+            }
             handshakePacketStream = concatenateUint8Arrays([handshakePacketStream, record]);
             let data;
             while (data = readPacket()) {
@@ -228,6 +238,14 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         throw new Error(`unexpected handshake message ${type} in the server flight`);
                     }
                 }
+                // FORK PATCH (TLS-18): the server's first handshake message
+                // is the ServerHello. A message of a known type before it
+                // (a NewSessionTicket, EncryptedExtensions, a Certificate)
+                // was processed as if the version were not TLS 1.3 and
+                // entered the transcript, so th_SH covered it.
+                if (!connTlsVersion && type !== SUPPORTED_RECORD_TYPE_MAP.SERVER_HELLO) {
+                    throw new Error(`handshake message ${type} before the ServerHello`);
+                }
                 switch (type) {
                     case SUPPORTED_RECORD_TYPE_MAP.SERVER_HELLO:
                         logger.trace('received server hello');
@@ -250,6 +268,16 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         connTlsVersion = hello.serverTlsVersion;
                         serverRandom = hello.serverRandom;
                         setAlpn(hello.extensions?.ALPN);
+                        // FORK PATCH (TLS-18): the read key changes after the
+                        // ServerHello, so its record ends with it (RFC 8446
+                        // §5.1). Bytes after it were read as the next
+                        // messages of the flight although they came in
+                        // plaintext: the check for plaintext records
+                        // (TLS-16) looks at a record when it arrives, and
+                        // this one arrived before the keys were installed.
+                        if (connTlsVersion === 'TLS1_3' && handshakePacketStream.length) {
+                            throw new Error('handshake bytes after the ServerHello in its record');
+                        }
                         const cipherSuiteData = SUPPORTED_CIPHER_SUITE_MAP[cipherSuite];
                         logger.debug({ cipherSuite, connTlsVersion, selectedAlpn }, 'processed server hello');
                         if (external) {
@@ -306,6 +334,12 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         logger.debug({ len: content.length }, 'received certificate verify');
                         const signature = parseServerCertificateVerify(content);
                         logger.debug({ alg: signature.algorithm }, 'parsed certificate verify');
+                        // FORK PATCH (TLS-19): no RSASSA-PKCS1-v1_5 in
+                        // CertificateVerify (RFC 8446 §4.4.3); those code
+                        // points are for signatures inside certificates.
+                        if (signature.algorithm.startsWith('RSA_PKCS1')) {
+                            throw new Error(`${signature.algorithm} is not allowed in CertificateVerify`);
+                        }
                         if (!certificates?.length) {
                             throw new Error('No certificates received');
                         }

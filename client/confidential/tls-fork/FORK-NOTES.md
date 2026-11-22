@@ -104,7 +104,7 @@ terminal path. Best effort only: JavaScript cannot erase copies the runtime
 or the caller made (WebCrypto's key material, garbage-collected buffers, the
 hex strings passed to `cu-2pc`/`cu-prover`).
 
-## Security patches (TLS-01 … TLS-17)
+## Security patches (TLS-01 … TLS-19)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -236,6 +236,39 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   Parsers of what the signature covers (ServerHello, EncryptedExtensions,
   Certificate) still ignore bytes after the fields they read; the node
   cannot change those messages without the provider's signing key.
+- **TLS-18, the ServerHello starts the flight and ends its record**
+  (`make-tls-client.js` `processRecord`). The read key changes after the
+  ServerHello, and handshake messages do not span a key change (RFC 8446
+  §5.1). The check for plaintext records (TLS-16) looks at a record when it
+  arrives, so handshake bytes behind the ServerHello in its own plaintext
+  record were read as the next messages of the flight: a whole flight in
+  plaintext completed the handshake, and a message could start in plaintext
+  and continue under the handshake key. A message of a known type in front
+  of the ServerHello (a NewSessionTicket, EncryptedExtensions, a
+  CertificateRequest) was processed with the version still unknown and
+  entered the transcript, so `th_SH` covered it. Now the first handshake
+  message must be the ServerHello, and nothing may follow it in its record;
+  both are refused before the external key schedule is asked for the
+  handshake secrets. Neither case gave the node a transcript the provider
+  had signed (CertificateVerify covers every byte up to Certificate, and the
+  node can choose `th_SH` freely anyway by changing the ServerHello), so
+  this is conformance, not a closed attack.
+- **TLS-19, TLS 1.3 strictness and P-384 signatures** (`make-tls-client.js`;
+  `crypto/webcrypto.js` `convertASN1toRS`). Refused now: a ChangeCipherSpec
+  inside a protected record (RFC 8446 §5; it was logged and skipped), a
+  zero-length handshake record (§5.1; skipped), an RSASSA-PKCS1-v1_5
+  signature in CertificateVerify (§4.4.3; verified like any other). None of
+  the three changed the transcript. Fixed: the conversion of an ECDSA
+  signature to r‖s used 32 bytes per integer for every curve, so a P-384
+  signature whose r or s is below 2^376 (about one in 128) became 95 bytes
+  and failed to verify, in CertificateVerify and in a certificate signed by
+  a P-384 issuer. A provider with a P-384 key failed that share of its
+  handshakes, and a certificate with such a signature was refused always.
+
+  Left as it is: a warning-level alert under the handshake key is logged
+  and ignored (RFC 8446 §6 treats it as fatal), and the compatibility
+  ChangeCipherSpec is accepted with any body and at any time. Neither is in
+  the transcript.
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider

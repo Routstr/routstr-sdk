@@ -246,7 +246,9 @@ export const webcryptoCrypto = {
             case 'ECDSA-SECP256R1-SHA384':
             case 'ECDSA-SECP384R1-SHA256':
             case 'ECDSA-SECP384R1-SHA384':
-                signature = convertASN1toRS(signature);
+                // FORK PATCH (TLS-19): r and s have the width of the
+                // curve's order (48 bytes for P-384, where 32 was used).
+                signature = convertASN1toRS(signature, alg.includes('SECP384R1') ? 48 : 32);
                 verifyArgs = { name: 'ECDSA', hash: getHashAlgorithm(alg) };
                 break;
             default:
@@ -275,19 +277,19 @@ function toUint8Array(buffer) {
     return new Uint8Array(buffer);
 }
 // mostly from ChatGPT
-function convertASN1toRS(signatureBytes) {
+function convertASN1toRS(signatureBytes, size) {
     const data = AsnParser.parse(signatureBytes, ECDSASigValue);
-    const r = cleanBigNum(new Uint8Array(data.r));
-    const s = cleanBigNum(new Uint8Array(data.s));
+    const r = cleanBigNum(new Uint8Array(data.r), size);
+    const s = cleanBigNum(new Uint8Array(data.s), size);
     return concatenateUint8Arrays([r, s]);
 }
-function cleanBigNum(bn) {
-    if (bn.length > 32 && bn[0] === 0) {
+function cleanBigNum(bn, size) {
+    if (bn.length > size && bn[0] === 0) {
         bn = bn.slice(1);
     }
-    else if (bn.length < 32) {
+    else if (bn.length < size) {
         bn = concatenateUint8Arrays([
-            new Uint8Array(32 - bn.length).fill(0),
+            new Uint8Array(size - bn.length).fill(0),
             bn
         ]);
     }
