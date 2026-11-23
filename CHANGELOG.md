@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Enclava confidential-computing attestation
+
+- New `client/EnclavaAttest.ts` (exported from `@routstr/sdk/client`) appraises an
+  Enclava-hosted provider's AMD SEV-SNP proof bundle against a caller-pinned
+  trust policy before a request is sent: fresh 32-byte challenge nonce, bundle
+  fetch and integrity checks, appraisal caching and in-flight de-duplication, and
+  fail-closed verdict handling via `EnclavaAttestationError`.
+- `attestEnclavaProvider`, `attestEnclavaProviderIfNeeded`, `isEnclavaProvider`,
+  `getCachedEnclavaAttestation`, `clearEnclavaAttestationCache`,
+  `spkiSha256FromPeerCertificate`.
+- Cryptographic appraisal is delegated to a pluggable `EnclavaAppraiser`.
+  `createWasmEnclavaAppraiser()` loads `enclava-verifier-wasm` lazily through a
+  non-static import (so bundlers without it are unaffected);
+  `createModuleEnclavaAppraiser(module)` accepts an already-loaded verifier.
+- Browser-safe: no Node builtins, no new dependencies. A successful attestation
+  exposes `bundleSha256` and `policySha256` for the caller's usage record.
+
+
 ## 0.5.2
 
 ### Provider session headers
