@@ -169,6 +169,66 @@ const DEPOSIT_RELEASED_REASONS = new Set([
   "provider_refused",
 ]);
 
+/** What the client knows of the connection when its last frame arrives. */
+export interface DepositContext {
+  /** The connection's sid; "" before `ready`. */
+  sid: string;
+  /** The signed offer's deposit (msat). */
+  depositMsat: number;
+  /** A receipt of this connection released the deposit. */
+  releasedByReceipt: boolean;
+  /** A request was sent and has been neither refused nor settled. */
+  requestOutstanding: boolean;
+  /** The node accepted a request of this connection (`request_ok`). */
+  requestAccepted: boolean;
+}
+
+/**
+ * Why the deposit outcome in the node's last frame (`closed` or `error`)
+ * deviates from its signed terms and the table of §12.10, one entry per rule
+ * (none: it does not). `d` is the outcome the frame carries, undefined when it
+ * carries none that parses with an outcome of `released` or `charged`;
+ * `signed` says whether the node's signature over it verified for this
+ * connection. Detection only: the client cannot undo a charge.
+ */
+export function depositProblems(
+  frame: { type?: unknown; reason?: unknown; fault?: unknown; after_client_frames?: unknown },
+  d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown } | undefined,
+  signed: boolean,
+  c: DepositContext,
+): string[] {
+  if (d === undefined) {
+    // The setup reserved a deposit (`ready`) and nothing says what became of it.
+    return c.sid !== "" && c.depositMsat > 0 && !c.releasedByReceipt
+      ? [`no deposit outcome for a deposit of ${c.depositMsat} msat`]
+      : [];
+  }
+  const problems: string[] = [];
+  if (d.msat !== c.depositMsat) {
+    problems.push(`a deposit of ${String(d.msat).slice(0, 32)} msat, the signed offer's is ${c.depositMsat} msat`);
+  }
+  if (d.outcome === "charged") {
+    if (!signed) problems.push("charged without a valid signature");
+    if (c.releasedByReceipt) problems.push("charged, though a receipt of this connection released it");
+    if (frame.type === "error" && (frame.fault === "node" || frame.fault === "upstream")) {
+      problems.push(`charged after a fault of the ${frame.fault === "node" ? "node" : "provider"} (released by §12.10 rows 3 and 4)`);
+    }
+    if (
+      frame.type === "closed" &&
+      frame.reason === "upstream_closed" &&
+      frame.after_client_frames !== true &&
+      !c.requestOutstanding &&
+      !c.requestAccepted
+    ) {
+      problems.push("charged though the provider closed the idle connection (§12.10 row 5 releases it)");
+    }
+    if (typeof d.reason === "string" && DEPOSIT_RELEASED_REASONS.has(d.reason)) {
+      problems.push(`charged with reason ${JSON.stringify(d.reason.slice(0, 64))}, which releases it`);
+    }
+  }
+  return problems;
+}
+
 /** Control frames of one kind the node may send ahead of the wait for them. */
 const INBOX_MAX_PER_KEY = 16;
 const INBOX_MAX = 256;
@@ -995,38 +1055,41 @@ export class ConfidentialConnection {
    * `error`): `deposit`, with the node's signature over `deposit_json`.
    */
   private noteDeposit(m: any): void {
-    if (m.deposit === undefined || m.deposit === null) return;
-    const json = typeof m.deposit_json === "string" ? m.deposit_json : JSON.stringify(m.deposit);
+    const ctx: DepositContext = {
+      sid: this.sid,
+      depositMsat: this.depositMsat,
+      releasedByReceipt: this.deposit?.outcome === "released",
+      requestOutstanding: this.cur !== undefined,
+      requestAccepted: this.requests > 0,
+    };
     let d: any;
-    try {
-      d = JSON.parse(json);
-    } catch {
+    let json = "";
+    if (m.deposit !== undefined && m.deposit !== null) {
+      json = typeof m.deposit_json === "string" ? m.deposit_json : JSON.stringify(m.deposit);
+      try {
+        d = JSON.parse(json);
+      } catch {
+        d = undefined;
+      }
+    }
+    if (d === null || typeof d !== "object" || (d.outcome !== "released" && d.outcome !== "charged")) {
+      // Detection only: a reserved deposit whose outcome the node does not report.
+      const missing = depositProblems(m, undefined, false, ctx);
+      if (missing.length) {
+        this.onWarning(`connection ${this.sid.slice(0, 8)}: the node's last frame carries ${missing.join("; ")}`);
+      }
       return;
     }
-    if (d === null || typeof d !== "object" || (d.outcome !== "released" && d.outcome !== "charged")) return;
     const pubkey = this.ready?.pubkey ?? this.expectedPubkey;
     const signed =
       typeof m.deposit_sig === "string" &&
       typeof pubkey === "string" &&
       verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
       (d.sid === this.sid || (d.sid === null && !this.sid));
-    const released = this.deposit?.outcome === "released";
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
     this.event({ ev: "deposit", ...this.deposit });
     // Detection only: the node's own word against its signed terms (§12.10).
-    const problems: string[] = [];
-    if (this.deposit.msat !== this.depositMsat) {
-      problems.push(`a deposit of ${String(d.msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat} msat`);
-    }
-    if (this.deposit.outcome === "charged") {
-      if (released) problems.push("charged, though a receipt of this connection released it");
-      if (m.type === "error" && (m.fault === "node" || m.fault === "upstream")) {
-        problems.push(`charged after a fault of the ${m.fault === "node" ? "node" : "provider"} (released by §12.10 rows 3 and 4)`);
-      }
-      if (DEPOSIT_RELEASED_REASONS.has(this.deposit.reason)) {
-        problems.push(`charged with reason ${JSON.stringify(this.deposit.reason)}, which releases it`);
-      }
-    }
+    const problems = depositProblems(m, { ...d, msat: this.deposit.msat, reason: this.deposit.reason }, signed, ctx);
     if (problems.length) {
       this.onWarning(
         `connection ${this.sid.slice(0, 8)}: the node's ${signed ? "signed " : "unsigned "}deposit outcome names ${problems.join("; ")}`,

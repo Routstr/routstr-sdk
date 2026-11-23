@@ -91,7 +91,7 @@ vi.mock("../../client/confidential/params", async (orig) => ({
   checkPiC3SParams: () => {},
 }));
 
-import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
+import { ConfidentialConnection, depositProblems, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
 import {
@@ -945,6 +945,136 @@ describe("the deposit outcome in the connection's last frame", () => {
     const warnings: string[] = [];
     fresh(warnings).onText(lastFrame("closed", { msat: DEPOSIT, outcome: "charged", reason: "provider_closed" }));
     expect(warnings.join("\n")).toMatch(/provider_closed/);
+  });
+
+  it("a release, and a signed charge after the client left, are recorded quietly", () => {
+    for (const [type, deposit, extra] of [
+      ["closed", { msat: DEPOSIT, outcome: "released", reason: "provider_closed" }, { reason: "upstream_closed" }],
+      ["error", { msat: DEPOSIT, outcome: "released", reason: "sidecar_failure" }, { fault: "node" }],
+      ["closed", { msat: DEPOSIT, outcome: "charged", reason: "unused" }, { reason: "client_closed" }],
+      ["error", { msat: DEPOSIT, outcome: "charged", reason: "unused" }, { status: 400 }],
+    ] as const) {
+      const warnings: string[] = [];
+      const conn = fresh(warnings);
+      conn.onText(lastFrame(type, deposit, extra));
+      expect(conn.deposit).toMatchObject({ outcome: deposit.outcome, signed: true });
+      expect(warnings, JSON.stringify(deposit)).toEqual([]);
+    }
+  });
+
+  it("is logged when a charge carries no valid signature", () => {
+    const frame = JSON.parse(lastFrame("closed", { msat: DEPOSIT, outcome: "charged", reason: "unused" }));
+    for (const bad of [{ deposit_sig: "00".repeat(64) }, { deposit_sig: undefined }]) {
+      const warnings: string[] = [];
+      const conn = fresh(warnings);
+      conn.onText(JSON.stringify({ ...frame, ...bad }));
+      expect(conn.deposit).toMatchObject({ outcome: "charged", signed: false });
+      expect(warnings.join("\n")).toMatch(/unsigned deposit outcome names charged without a valid signature/);
+    }
+    // A signature over another connection's outcome is none for this one.
+    const warnings: string[] = [];
+    const other = JSON.stringify({ sid: "cd".repeat(32), msat: DEPOSIT, outcome: "charged", reason: "unused" });
+    fresh(warnings).onText(JSON.stringify({ type: "closed", reason: "x", deposit: JSON.parse(other), deposit_json: other, deposit_sig: sign(other) }));
+    expect(warnings.join("\n")).toMatch(/charged without a valid signature/);
+    // An unsigned release costs nothing: recorded as unsigned, not reported.
+    const quiet: string[] = [];
+    const released = JSON.parse(lastFrame("closed", { msat: DEPOSIT, outcome: "released", reason: "not_started" }));
+    fresh(quiet).onText(JSON.stringify({ ...released, deposit_sig: "00".repeat(64) }));
+    expect(quiet).toEqual([]);
+  });
+
+  it("is logged when the deposit is charged though the provider closed the idle connection", () => {
+    const charged = { msat: DEPOSIT, outcome: "charged", reason: "unused" };
+    const warnings: string[] = [];
+    fresh(warnings).onText(lastFrame("closed", charged, { reason: "upstream_closed" }));
+    expect(warnings.join("\n")).toMatch(/charged though the provider closed the idle connection \(§12\.10 row 5 releases it\)/);
+    // Not after the client's own control frames, nor with a request of ours outstanding or accepted before.
+    for (const [extra, state] of [
+      [{ reason: "upstream_closed", after_client_frames: true }, {}],
+      [{ reason: "upstream_closed" }, { cur: { n: 1 } }],
+      [{ reason: "upstream_closed" }, { requests: 1 }],
+      [{ reason: "idle" }, {}],
+    ] as const) {
+      const quiet: string[] = [];
+      const conn = Object.assign(fresh(quiet), state);
+      conn.onText(lastFrame("closed", charged, extra));
+      expect(quiet, JSON.stringify([extra, state])).toEqual([]);
+    }
+  });
+
+  it("is logged when the last frame carries no outcome for a deposit the setup reserved", () => {
+    for (const frame of [
+      { type: "closed", reason: "idle" },
+      { type: "error", status: 500, reason: "x" },
+      { type: "closed", reason: "idle", deposit: null },
+      { type: "closed", reason: "idle", deposit: { msat: DEPOSIT, outcome: "kept" } },
+      { type: "closed", reason: "idle", deposit: { msat: DEPOSIT, outcome: "released" }, deposit_json: "{" },
+    ]) {
+      const warnings: string[] = [];
+      const conn = fresh(warnings);
+      conn.onText(JSON.stringify(frame));
+      expect(conn.deposit).toBeUndefined();
+      expect(warnings, JSON.stringify(frame)).toHaveLength(1);
+      expect(warnings[0]).toMatch(/the node's last frame carries no deposit outcome for a deposit of 1000 msat/);
+    }
+  });
+
+  it("no outcome is expected once a receipt released the deposit, before ready, or without a deposit", () => {
+    const released: string[] = [];
+    const settled = fresh(released);
+    settled.deposit = { msat: DEPOSIT, outcome: "released", reason: "request_settled", signed: true };
+    settled.onText(JSON.stringify({ type: "closed", reason: "idle" }));
+    expect(settled.deposit).toMatchObject({ outcome: "released", reason: "request_settled" });
+    expect(released).toEqual([]);
+
+    const early: string[] = [];
+    const unready = newConnection("2") as any;
+    unready.onWarning = (m: string) => early.push(m);
+    unready.onText(JSON.stringify({ type: "error", status: 503, reason: "no session slot" }));
+    expect(early).toEqual([]);
+
+    const free: string[] = [];
+    const none = fresh(free);
+    none.depositMsat = 0;
+    none.onText(JSON.stringify({ type: "closed", reason: "idle" }));
+    expect(free).toEqual([]);
+  });
+
+  it("a whole connection: the first receipt releases the deposit and the end raises nothing", async () => {
+    const warnings: string[] = [];
+    const conn = await connection("1.1");
+    (conn as any).onWarning = (m: string) => warnings.push(m);
+    await conn.request(chatRequest()).done;
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "released", reason: "request_settled", signed: true });
+    expect(warnings).toEqual([]);
+  });
+});
+
+describe("depositProblems", () => {
+  const ctx = { sid: SID, depositMsat: DEPOSIT, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+  const charged = { msat: DEPOSIT, outcome: "charged", reason: "unused" } as const;
+  const released = { msat: DEPOSIT, outcome: "released", reason: "provider_closed" } as const;
+
+  it("honest outcomes have none", () => {
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, released, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "client_closed" }, charged, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed", after_client_frames: true }, charged, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "done" }, undefined, false, { ...ctx, releasedByReceipt: true })).toEqual([]);
+    expect(depositProblems({ type: "error" }, undefined, false, { ...ctx, sid: "" })).toEqual([]);
+    expect(depositProblems({ type: "closed" }, undefined, false, { ...ctx, depositMsat: 0 })).toEqual([]);
+  });
+
+  it("names each deviation", () => {
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, false, ctx)).toEqual(["charged without a valid signature"]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, ctx)).toEqual([
+      "charged though the provider closed the idle connection (§12.10 row 5 releases it)",
+    ]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, { ...ctx, requestOutstanding: true })).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, { ...ctx, requestAccepted: true })).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, undefined, false, ctx)).toEqual(["no deposit outcome for a deposit of 1000 msat"]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, releasedByReceipt: true })).toEqual([
+      "charged, though a receipt of this connection released it",
+    ]);
   });
 });
 
