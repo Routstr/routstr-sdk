@@ -98,7 +98,7 @@ function signedOffer(overrides: Record<string, unknown> = {}) {
   const { priv, pubHex } = makeKey();
   const offer: Record<string, unknown> = {
     v: 3,
-    twopc: "split-public-2",
+    twopc: "split-public-3",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,

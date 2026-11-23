@@ -42,7 +42,7 @@ const IMAGES: ConfidentialImagesOffer = {
 function offer(): Record<string, unknown> {
   const o: Record<string, unknown> = {
     v: 3,
-    twopc: "split-public-2",
+    twopc: "split-public-3",
     upstream_host: "api.venice.ai",
     notary_pubkey: pubHex,
     max_tokens_cap: 4096,

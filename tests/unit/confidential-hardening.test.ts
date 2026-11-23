@@ -40,7 +40,7 @@ const { min_v: _minV, max_v: _maxV, ...V2_TERMS } = SIGNED_V2;
 const SIGNED: Record<string, unknown> = {
   ...V2_TERMS,
   v: 3,
-  twopc: "split-public-2",
+  twopc: "split-public-3",
   http: ["2", "1.1"],
   h2: { probe_path: "/api/v1/models", max_requests: 100, max_lifetime_s: 3600, idle_secs: 300, kinds: ["chat", "images"] },
   connection_deposit_msat: 2000,

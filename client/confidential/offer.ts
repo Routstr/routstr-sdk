@@ -35,7 +35,9 @@ export const CONFIDENTIAL_VERSION = 3;
 export const CONFIDENTIAL_VERSION_MIN = CONFIDENTIAL_VERSION;
 export const CONFIDENTIAL_VERSION_MAX = CONFIDENTIAL_VERSION;
 /** The two-party key schedule this client implements (§4). */
-export const CONFIDENTIAL_TWOPC = "split-public-2";
+export const CONFIDENTIAL_TWOPC = "split-public-3";
+/** Earlier key schedules of protocol v3: a node that offers one is outdated. */
+export const CONFIDENTIAL_TWOPC_RETIRED: readonly string[] = ["split-public-2", "split-public-1"];
 /** A connection's framing towards the provider. */
 export type ConfidentialFraming = "2" | "1.1";
 export const CONFIDENTIAL_FRAMINGS: readonly ConfidentialFraming[] = ["2", "1.1"];
@@ -153,7 +155,7 @@ export interface ConfidentialOffer {
   http?: string[];
   /** Terms of framing `"2"`, present when `http` lists it. */
   h2?: ConfidentialH2Offer;
-  /** The two-party key schedule (`split-public-2`). */
+  /** The two-party key schedule (`split-public-3`). */
   twopc?: string;
   /**
    * The deposit (msat) the node reserves at a connection's `setup`. It is
@@ -693,6 +695,13 @@ export function verifyConfidentialOffer(
   if (!supportedVersion(offer)) {
     throw new OfferUnsupportedVersionError(
       `offer version v=${offer.v} is not supported: this client speaks only protocol v${CONFIDENTIAL_VERSION} (update the client)`,
+    );
+  }
+  if (typeof offer.twopc === "string" && CONFIDENTIAL_TWOPC_RETIRED.includes(offer.twopc)) {
+    throw new NodeProtocolOutdatedError(
+      `node_protocol_outdated: the node runs the two-party key schedule ${offer.twopc}, this client implements ${CONFIDENTIAL_TWOPC}; ` +
+        "the node must be updated before it can serve confidential requests",
+      offer.v,
     );
   }
   if (offer.twopc !== CONFIDENTIAL_TWOPC) {

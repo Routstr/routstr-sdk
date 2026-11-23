@@ -520,7 +520,7 @@ describe("cu-2pc bridge", () => {
     const exit = await ks.catch((e) => e);
     expect(exit).toBeInstanceOf(TwoPcVersionMismatchError);
     expect(exit.code).toBe("twopc_version_mismatch");
-    expect(exit.message).toMatch(/twopc_version_mismatch.*split-public-2/);
+    expect(exit.message).toMatch(/twopc_version_mismatch.*split-public-3/);
 
     const u = fakeBridge();
     u.session.start("ws://x");

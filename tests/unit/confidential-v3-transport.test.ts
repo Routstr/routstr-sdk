@@ -118,9 +118,15 @@ describe("v3 offer", () => {
     const check = (extra: Record<string, unknown>) => () => verified(extra);
     expect(check({ v: 4 })).toThrow(/update the client/);
     expect(check({ twopc: "split-proven-1" })).toThrow(/two-party key schedule/);
-    expect(check({ twopc: "split-public-1" })).toThrow(OfferUnsupportedVersionError);
-    expect(check({ twopc: "split-public-1" })).toThrow(/two-party key schedule "split-public-1", this client implements split-public-2/);
-    expect(check({ twopc: "split-public-2" })).not.toThrow();
+    expect(check({ twopc: "split-proven-1" })).toThrow(OfferUnsupportedVersionError);
+    // The earlier variants of protocol v3: the node is outdated, not unknown.
+    for (const old of ["split-public-2", "split-public-1"]) {
+      expect(check({ twopc: old })).toThrow(NodeProtocolOutdatedError);
+      expect(check({ twopc: old })).toThrow(
+        new RegExp(`node_protocol_outdated: the node runs the two-party key schedule ${old}, this client implements split-public-3`),
+      );
+    }
+    expect(check({ twopc: "split-public-3" })).not.toThrow();
     expect(check({ twopc: undefined })).toThrow(/two-party key schedule/);
     expect(check({ http: [] })).toThrow(/offer.http/);
     expect(check({ http: ["3"] })).toThrow(/offer.http/);

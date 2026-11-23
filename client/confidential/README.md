@@ -97,7 +97,8 @@ rate-limit counters, cookies, a provider's own headers) is dropped. The
 The client speaks routstr-confidential **protocol v3** only
 (`PROTOCOL-V3.md` in routstr-confidential is normative). Offers are fetched
 as `/v1/confidential/offer?v=3` and must name `v: 3` and
-`twopc: "split-public-2"`. An offer with `v < 3` is refused with
+`twopc: "split-public-3"`. An offer with `v < 3`, or one that names an
+earlier key schedule of v3 (`split-public-2`, `split-public-1`), is refused with
 `NodeProtocolOutdatedError` (`code: "node_protocol_outdated"`): the node is
 not used for confidential requests (`onNodeProtocolOutdated` tells the
 caller, routstrd logs it once per node per day). A node that speaks a newer
