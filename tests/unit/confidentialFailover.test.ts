@@ -316,4 +316,28 @@ describe("confidential failover", () => {
     expect(sessions).toEqual([A]);
     expect(spent.map((s) => s.baseUrl)).toEqual([A]);
   });
+
+  it("the local inference deadlines do not apply to a confidential attempt", async () => {
+    const { client, spent } = setup();
+    const sessions: string[] = [];
+    // Slower than the caller's headers budget: a plaintext attempt would time
+    // out and fail over; a confidential one keeps its own limits.
+    setConfidentialTransport(async ({ baseUrl }) => {
+      sessions.push(baseUrl);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return new Response("data: [DONE]\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    const response = await route(client, {
+      body: { model: MODEL, max_tokens: 10, stream: true, messages: [{ role: "user", content: "hi" }] },
+      deadlines: { ttfbMs: 10, idleMs: 10 },
+    });
+    expect(response.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(await response.text()).toBe("data: [DONE]\n\n");
+    expect(sessions).toEqual([A]);
+    expect(spent.map((s) => s.baseUrl)).toEqual([A]);
+  });
 });

@@ -2070,9 +2070,17 @@ export class RoutstrClient {
     // one, so the fetch AND the body read are both bounded: a provider that
     // accepts the connection and then goes quiet no longer holds the request
     // until the runtime's ~300 s network timeout.
+    //
+    // Not for a confidential attempt: its transport has its own limits for
+    // every phase and takes the caller's signal, and a local timeout would
+    // send the request down the network-failure path, which fails over. Once
+    // the body was released to the provider, a failover would run (and pay
+    // for) the request a second time on another node.
     const deadline = createDeadlineHandle({
       signal,
-      deadlines: params.deadlines,
+      deadlines: params.confidential
+        ? { ttfbMs: 0, idleMs: 0, bodyMs: 0 }
+        : params.deadlines,
       baseUrl,
       // Only a streaming request has a meaningful "first byte" of its own: for
       // `stream: false` the headers do not arrive until generation finishes, so
