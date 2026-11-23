@@ -179,6 +179,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             // do nothing -- pass through
         }
         else if (type === PACKET_TYPE.CHANGE_CIPHER_SPEC) {
+            // FORK PATCH (TLS-20): the compatibility ChangeCipherSpec comes
+            // before the peer's Finished only (RFC 8446 §5).
+            if (handshakeDone && connTlsVersion === 'TLS1_3') {
+                throw new Error('ChangeCipherSpec after the TLS 1.3 handshake');
+            }
             logger.debug('received change cipher spec');
             cipherSpecChanged = true;
             return;
@@ -552,7 +557,10 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         }
     }
     function setAlpn(alpn) {
-        selectedAlpn = alpn || applicationLayerProtocols?.[0];
+        // FORK PATCH (TLS-20): what the server selected, or nothing. (The
+        // original reported the first protocol offered when the server
+        // selected none.)
+        selectedAlpn = alpn;
         if (selectedAlpn && !applicationLayerProtocols?.includes(selectedAlpn)) {
             throw new Error(`Server selected unsupported ALPN: "${selectedAlpn}"`);
         }
@@ -1051,7 +1059,7 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                 });
             }
         },
-        // FORK PATCH (v3, SDK only): best-effort erasure when the connection
+        // FORK PATCH (v3): best-effort erasure when the connection
         // ends. Zero the traffic secrets and IVs this client holds (the
         // current keys and the handshake secrets), drop every key reference
         // (the AES keys are CryptoKey objects, which cannot be zeroed), and end

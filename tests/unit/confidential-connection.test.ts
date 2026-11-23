@@ -91,7 +91,7 @@ vi.mock("../../client/confidential/params", async (orig) => ({
   checkPiC3SParams: () => {},
 }));
 
-import { ConfidentialConnection, depositProblems, type ConnectionRequestOptions } from "../../client/confidential/connection";
+import { ConfidentialConnection, depositProblems, missingLastFrameProblem, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
 import {
@@ -1146,6 +1146,33 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
     const none: string[] = [];
     fresh(none, { deposit: open.deposit }).onText(JSON.stringify({ type: "closed", reason: "idle" }));
     expect(none).toEqual([]);
+  });
+});
+
+describe("missingLastFrameProblem", () => {
+  const base = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false };
+  it("names what the node holds when its last frame never came", () => {
+    expect(missingLastFrameProblem(base)).toMatch(/no signed outcome for the deposit of 1000 msat/);
+    expect(missingLastFrameProblem({ ...base, releasedByReceipt: true, openAccepted: 3 })).toMatch(
+      /no signed outcome for the reservation of request 3/,
+    );
+    expect(missingLastFrameProblem({ ...base, openAccepted: 1 })).toMatch(/deposit of 1000 msat and the reservation of request 1/);
+  });
+  it("is silent when nothing is held", () => {
+    expect(missingLastFrameProblem({ ...base, releasedByReceipt: true })).toBeNull();
+    expect(missingLastFrameProblem({ ...base, depositMsat: 0 })).toBeNull();
+    expect(missingLastFrameProblem({ ...base, sid: "", openAccepted: 1 })).toBeNull();
+  });
+});
+
+describe("a threshold of 1 for the eviction charge", () => {
+  it("is a deviation: a lone unused connection is never charged for its eviction", () => {
+    const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+    const frame = { type: "closed", reason: "evicted", unused: true };
+    const out = (n: number, k: number) =>
+      ({ msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: n, charge_from: k } }) as const;
+    expect(depositProblems(frame, out(1, 1), true, ctx).join()).toMatch(/threshold of 1/);
+    expect(depositProblems(frame, out(2, 2), true, ctx)).toEqual([]);
   });
 });
 

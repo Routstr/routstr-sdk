@@ -195,6 +195,30 @@ export interface DepositContext {
 }
 
 /**
+ * The control socket ended under a connection that had not ended itself and
+ * no last frame (`closed` or `error`) arrived, though the node holds money
+ * of it: a deposit no receipt released, or a request it accepted and did
+ * not settle. Whatever the node did with them, it said nothing signed
+ * (§12.9: the outcomes travel on the last frame). Null when nothing is
+ * held. Detection only; a lost network path looks the same.
+ */
+export function missingLastFrameProblem(c: {
+  sid: string;
+  depositMsat: number;
+  releasedByReceipt: boolean;
+  /** The request the node accepted and did not settle, if any. */
+  openAccepted?: number;
+}): string | null {
+  if (c.sid === "") return null;
+  const held: string[] = [];
+  if (c.depositMsat > 0 && !c.releasedByReceipt) held.push(`the deposit of ${c.depositMsat} msat`);
+  if (c.openAccepted !== undefined) held.push(`the reservation of request ${c.openAccepted}`);
+  return held.length
+    ? `the socket ended without the node's last frame: no signed outcome for ${held.join(" and ")} (check the balance)`
+    : null;
+}
+
+/**
  * Why the deposit outcome in the node's last frame (`closed` or `error`)
  * deviates from its signed terms and the table of §12.10, one entry per rule
  * (none: it does not). `d` is the outcome the frame carries, undefined when it
@@ -254,6 +278,8 @@ export function depositProblems(
         problems.push("charged as evicted without the signed count of the address's unused connections");
       } else if ((n as number) < (k as number)) {
         problems.push(`charged as evicted, though its address held ${n} unused connection(s), below the ${k} that charge (a lone spare is released)`);
+      } else if ((k as number) < 2) {
+        problems.push(`charged as evicted at a threshold of ${k}: a lone unused connection is never charged for its eviction (the threshold is at least 2)`);
       }
       if (c.openAccepted === true) problems.push("charged as evicted, though the node had accepted a request of it (never evicted)");
     }
@@ -664,6 +690,8 @@ export class ConfidentialConnection {
   /** What the control channel showed of the requests, in order (the request flow reads its frames later). */
   private seenOk?: { n: number; reservedMsats?: number };
   private seenReceiptN?: number;
+  /** The node's last frame (`closed` or `error`) arrived. */
+  private sawLastFrame = false;
   private connectStarted = false;
   private opened = false;
   private ready: any = null;
@@ -979,6 +1007,17 @@ export class ConfidentialConnection {
     });
     ws.onerror = () => this.fail(new SessionRejectedError("control websocket error"));
     ws.onclose = (ev: CloseEvent) => {
+      if (!this.failure && !this.sawLastFrame) {
+        // Not this client's close, and the node's last frame never came.
+        const cur = this.cur && this.cur.n !== this.seenReceiptN ? this.cur : undefined;
+        const missing = missingLastFrameProblem({
+          sid: this.sid,
+          depositMsat: this.depositMsat,
+          releasedByReceipt: this.deposit?.outcome === "released",
+          openAccepted: cur && (cur.accepted || this.seenOk?.n === cur.n) ? cur.n : undefined,
+        });
+        if (missing) this.onWarning(`connection ${this.sid.slice(0, 8)}: ${missing}`);
+      }
       const reason = (ev as CloseEvent & { reason?: string })?.reason;
       this.fail(
         new SessionRejectedError(
@@ -1128,6 +1167,7 @@ export class ConfidentialConnection {
    * `error`): `deposit`, with the node's signature over `deposit_json`.
    */
   private noteDeposit(m: any): void {
+    this.sawLastFrame = true;
     this.noteRequestOutcome(m);
     const ctx: DepositContext = {
       sid: this.sid,

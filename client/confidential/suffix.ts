@@ -346,7 +346,7 @@ function parseChunks(b: Uint8Array): Chunk[] | null {
  * `provider`, `service_tier`, `system_fingerprint` (null or at most 128
  * characters of `[A-Za-z0-9 ._:/@+-]`) and `created` (an unsigned integer).
  * `cost` (Venice) is null, a number or a numeric object like `usage`.
- * `usage` holds only numbers, booleans, nulls and nested objects of such
+ * `usage` holds only numbers (of magnitude below 2^53), booleans, nulls and nested objects of such
  * (keys `[A-Za-z0-9_]{1,64}`, at most 3 levels counting `usage`). Any other
  * field could carry prompt- or output-derived data to the node.
  * Vectors: usage-event-vectors.json (shared with the sidecar).
@@ -357,13 +357,16 @@ const EMPTY_TEXT_FIELDS = ["content", "reasoning", "reasoning_content", "refusal
 const LABEL_FIELDS = ["id", "object", "model", "provider", "service_tier", "system_fingerprint"];
 const LABEL_RE = /^[A-Za-z0-9 ._:/@+-]{0,128}$/;
 const USAGE_KEY_RE = /^[A-Za-z0-9_]{1,64}$/;
+/** A number every implementation reads the same: magnitude below 2^53. */
+const plainNumber = (x: unknown): boolean => typeof x === "number" && Number.isFinite(x) && Math.abs(x) < 2 ** 53
+
 /** `depth` counts `usage` itself as 1; at most 3. */
 function numericObject(v: unknown, depth: number): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v) || depth > 3) return false;
   return Object.entries(v as Record<string, unknown>).every(
     ([k, x]) =>
       USAGE_KEY_RE.test(k) &&
-      (x === null || typeof x === "boolean" || (typeof x === "number" && Number.isFinite(x)) || numericObject(x, depth + 1)),
+      (x === null || typeof x === "boolean" || plainNumber(x) || numericObject(x, depth + 1)),
   );
 }
 
@@ -379,7 +382,7 @@ export function usageEventProblem(ev: unknown): string | null {
         : k === "created"
           ? uint(x)
           : k === "cost"
-            ? x === null || (typeof x === "number" && Number.isFinite(x)) || numericObject(x, 1)
+            ? x === null || plainNumber(x) || numericObject(x, 1)
             : LABEL_FIELDS.includes(k)
               ? x === null || (typeof x === "string" && LABEL_RE.test(x))
               : false;

@@ -1066,6 +1066,55 @@ describe("tls-fork ServerHello boundary and TLS 1.3 strictness (TLS-18, TLS-19)"
     }
   });
 
+  it("accepts an RSA-PSS signature at the length of the modulus only", async () => {
+    // One RSA signature in 256 begins with a zero byte, and WebCrypto on
+    // OpenSSL also verifies it with that byte dropped: a second encoding of
+    // the same signature, so a second transcript the node could present.
+    const pss = await crypto.subtle.importKey(
+      "pkcs8",
+      await crypto.subtle.exportKey("pkcs8", leafRsa.keys.privateKey),
+      { name: "RSA-PSS", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    for (const strip of [false, true]) {
+      const { client, server, handshakes } = await externalClient(root);
+      await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+      await client.handleReceivedBytes(await server.seal(server.certificate([leafRsa])));
+      const data = await getSignatureDataTls13(server.transcript, SUITE);
+      let sig: Uint8Array;
+      do {
+        sig = new Uint8Array(await crypto.subtle.sign({ name: "RSA-PSS", saltLength: 32 }, pss, data));
+      } while (sig[0] !== 0);
+      if (strip) sig = sig.slice(1);
+      // rsa_pss_rsae_sha256
+      const cv = server.add(hsMsg(0x0f, [0x08, 0x04, ...u16(sig.length), ...Array.from(sig)]));
+      if (strip) {
+        await expect(client.handleReceivedBytes(await server.seal(cv))).rejects.toThrow(/length of the modulus/);
+        expect(client.hasEnded()).toBe(true);
+        expect(handshakes()).toBe(0);
+      } else {
+        await client.handleReceivedBytes(await server.seal(cv));
+        await client.handleReceivedBytes(await server.seal(await server.finished()));
+        expect(handshakes()).toBe(1);
+      }
+    }
+  }, 60_000);
+
+  it("reports no ALPN protocol when the server selected none, and refuses a ChangeCipherSpec after the handshake", async () => {
+    const { client, server, handshakes } = await externalClient(root);
+    await client.handleReceivedBytes(await server.seal(server.encryptedExtensions()));
+    await client.handleReceivedBytes(await server.seal(server.certificate([leaf])));
+    await client.handleReceivedBytes(await server.seal(await server.certificateVerify(leaf)));
+    await client.handleReceivedBytes(await server.seal(await server.finished()));
+    expect(handshakes()).toBe(1);
+    expect(client.getMetadata().selectedAlpn).toBeUndefined();
+    await expect(client.handleReceivedBytes(new Uint8Array([0x14, 0x03, 0x03, 0x00, 0x01, 0x01]))).rejects.toThrow(
+      /ChangeCipherSpec after the TLS 1.3 handshake/,
+    );
+    expect(client.hasEnded()).toBe(true);
+  });
+
   it("validates a path whose P-384 issuer signed with an r or s shorter than 48 bytes", async () => {
     const ca = await issue({
       subject: "CN=Test Root P-384",

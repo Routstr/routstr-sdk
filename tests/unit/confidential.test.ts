@@ -1103,10 +1103,22 @@ describe("security regressions", () => {
   it("accepts only an attestation naming this session and handshake", () => {
     const thSH = new Uint8Array(32).fill(7);
     const thSF = new Uint8Array(32).fill(9);
-    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) };
+    const chain = new Uint8Array(32).fill(3);
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32), certChainHash: chain };
     const att = (o: Record<string, unknown>) =>
-      canonicalJson({ sid: "s1", th_sh: bytesToHex(thSH), th_sf: bytesToHex(thSF), c_commit: "ab".repeat(32), ...o });
+      canonicalJson({
+        sid: "s1",
+        th_sh: bytesToHex(thSH),
+        th_sf: bytesToHex(thSF),
+        c_commit: "ab".repeat(32),
+        cert_chain_hash: bytesToHex(chain),
+        ...o,
+      });
     expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    // The certificate chain is always checked: without ours there is nothing to compare.
+    expect(() => checkAttestationBinding(att({}), { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) })).toThrow(
+      /certificate chain hash/,
+    );
     // The commitment is always checked: without ours there is nothing to compare.
     expect(() => checkAttestationBinding(att({}), { sid: "s1", thSH, thSF })).toThrow(/commitment/);
     expect(() => checkAttestationBinding(att({ c_commit: null }), own)).toThrow(/commitment/);

@@ -81,6 +81,17 @@ export async function verifyCertificateSignature({ signature, algorithm, publicK
         assertDerEcdsaSignature(signature);
     }
     const pubKey = await crypto.importKey(cryptoAlg, publicKey.buffer, 'public');
+    // FORK PATCH (TLS-20): an RSA signature has exactly the length of the
+    // modulus (RFC 8017 §8.1.2 step 1). WebCrypto on OpenSSL also accepts one
+    // whose leading zero bytes were dropped (one signature in 256 begins with
+    // one), which is a second encoding of the same signature and so a second
+    // accepted transcript. A key whose modulus length cannot be read is refused.
+    if (cryptoAlg.startsWith('RSA-')) {
+        const bits = pubKey?.algorithm?.modulusLength;
+        if (!Number.isInteger(bits) || signature.length !== Math.ceil(bits / 8)) {
+            throw new Error('RSA signature does not have the length of the modulus');
+        }
+    }
     const verified = await crypto.verify(cryptoAlg, {
         data: signatureData,
         signature,

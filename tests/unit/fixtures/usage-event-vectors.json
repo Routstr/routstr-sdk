@@ -104,6 +104,12 @@
     {"name": "top level: cost is an array", "ok": false,
      "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": [1]}},
     {"name": "top level: cost holds a string", "ok": false,
-     "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": {"note": "x"}}}
+     "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": {"note": "x"}}},
+    {"name": "usage: a nested count of 2^53 - 1", "ok": true, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "prompt_tokens_details": {"cache_creation_input_tokens": 9007199254740991}}}},
+    {"name": "usage: a nested count of 2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "prompt_tokens_details": {"cache_creation_input_tokens": 9007199254740992}}}},
+    {"name": "usage: a count of 2^53 next to the token counts", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "cache_creation_input_tokens": 9007199254740992}}},
+    {"name": "usage: a float of 1e300", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "cost": 1e+300}}},
+    {"name": "top level: cost of 2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": 9007199254740992}},
+    {"name": "top level: a cost object holding -2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": {"total": -9007199254740992}}}
   ]
 }
