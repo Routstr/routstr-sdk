@@ -173,9 +173,17 @@ not fall back. After a body was released nothing is retried. `"2"` or
   node could not write) is stated in the last frame, signed:
   `request_outcome` (`sid`, `http`, `n`, `outcome`, `reason`, `cost_msats`,
   `reserved_msats`, `balance_msats`; `conn.requestOutcome`). A charge above
-  the announced reservation, above the published fee for a request never
-  written in full, for another request, unsigned, or missing where the
-  node accepted the request and settled nothing is reported the same way.
+  the announced reservation or above the ceiling of its reason
+  (`REQUEST_OUTCOME_RULES` in `receipt.ts`: nothing for the reasons that
+  release, the session fee for a provider refusal, the abandon fee for an
+  abandoned request, the reservation only after `body_released` or the
+  client's own disclosure; the cases are `tests/unit/fixtures/request-outcome-vectors.json`,
+  shared with routstr-confidential), a charge beside a charged deposit, the
+  abandon fee after a fault of the node or the provider, an outcome for
+  another request, unsigned, or missing where the node accepted the request
+  and settled nothing is reported the same way, and so is a control socket
+  that ends without the node's last frame while the node holds money of the
+  connection (also after a socket error or a malformed frame).
 - A node whose deposit exceeds `maxConnectionDepositMsat` (default 100 000
   msat; also read from `http2.maxConnectionDepositMsat`) is not used: the
   check runs when the node is qualified, before any token is spent.
@@ -235,15 +243,20 @@ what must not be linked: a scope never shares a connection with another.
   (`unusedDepositMsats`). A failed arm backs the key off (`backoffBaseMs`
   doubling to `backoffMaxMs`); a deposit the balance does not cover waits
   `backoffBaseMs` without escalating. A node that is full may close an
-  unused connection older than its minimum age (60 s by default) for a newer
-  setup (`closed` `evicted`, `unused: true`, PROTOCOL-V3.md §8.4;
-  `conn.evictedUnused`): the deposit is released (`evicted_released`) when
-  the address held fewer unused connections than the node's threshold
-  (default 5) and charged (`evicted`) otherwise, with the count and the
-  threshold signed (`conn.deposit.evicted`). The pool then arms no spare for
-  that node for 10 minutes (`NODE_FULL_MS`, `pool.isFull(node)`). A charge
-  whose signed count is below its signed threshold, or with a request the
-  node had accepted, is reported.
+  unused connection older than its minimum age (the signed offer's
+  `evict_unused_after_s`, 60 s by default) for a newer setup (`closed`
+  `evicted`, `unused: true`, PROTOCOL-V3.md §8.4; `conn.evictedUnused`): the
+  deposit is charged (`evicted`), with the count of unused connections its
+  address held signed (`conn.deposit.evicted`). The node closes the spares
+  of the address holding the most first, and the asking address's own when
+  it holds as many as any, so a spare behind an address shared with other
+  clients (a NAT, a VPN, a Tor exit) can be the one charged. The pool then
+  arms no spare for that node for 10 minutes (`NODE_FULL_MS`,
+  `pool.isFull(node)`). A charge without the signed count, earlier than
+  `evict_unused_after_s` after the setup, or with a request the node had
+  accepted (except a framing-"1.1" request 1 before the ClientHello), is
+  reported. An older node's `evicted_released` (a lone spare released) is
+  accepted.
 - The proof channel (`cu-prover --channel`) holds correlations for π_NK and
   the first π_WIN and π_C3S. On a kept framing-"2" connection it is **topped
   up while idle** (after the head and after each settled 2xx; PROTOCOL-V3.md
