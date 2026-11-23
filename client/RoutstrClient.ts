@@ -92,6 +92,7 @@ import {
   fetchTinfoilPreservingPlaintextErrors,
 } from "./TinfoilSecure";
 import { applyTinfoilReasoningEffort } from "./TinfoilReasoning";
+import { applyAttemptReasoningReplay } from "./ReasoningReplay";
 import { isOpenAiJsonBodyPath } from "../utils/openAiEndpoints";
 
 /**
@@ -1461,17 +1462,18 @@ export class RoutstrClient {
     });
     const attemptSignal = deadline.signal;
 
-      // EHBP seals the body end to end, so the proxy cannot translate a
-      // reasoning effort for us: map the caller's level onto the exact value
-      // the target model accepts before the request is encrypted. Applied per
-      // attempt, because a failover target publishes its own effort map.
-      const attemptBody = tinfoilEnabled
-        ? applyTinfoilReasoningEffort(body, params.selectedModel?.reasoning)
+    // Wire-only transforms belong here: params.body stays intact for retries.
+    // EHBP attempts use their enclave's advertised effort map. Ordinary chat
+    // attempts adapt replay only for an explicitly identified upstream.
+    const attemptBody = tinfoilEnabled
+      ? applyTinfoilReasoningEffort(body, params.selectedModel?.reasoning)
+      : method === "POST"
+        ? applyAttemptReasoningReplay(body, path, this._findModelPathHeader(params.baseHeaders))
         : body;
-      const requestBodyText =
-        attemptBody === undefined || method === "GET"
-          ? undefined
-          : JSON.stringify(attemptBody);
+    const requestBodyText =
+      attemptBody === undefined || method === "GET"
+        ? undefined
+        : JSON.stringify(attemptBody);
     const previousUrl = params.transportState?.baseUrl;
     if (previousUrl) await params.lifecycle?.event(previousUrl !== baseUrl ? "provider_failover" : "retry_decision", {
       from: previousUrl, to: baseUrl, reason: params.attemptKind ?? (previousUrl !== baseUrl ? "provider_error" : "same_provider_retry"),

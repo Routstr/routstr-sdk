@@ -863,6 +863,52 @@ describe("RoutstrClient pinned model-path failover", () => {
     ]);
   });
 
+  it("adapts DeepSeek replay for OpenCode without leaking the rewrite into a Cloudflare retry", async () => {
+    const opencode = "url=https%3A%2F%2Fopencode.ai%2Finference%2Fopenai%2Fv1&model-id=deepseek-v4.1-flash-1017";
+    const cloudflare = "url=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1&model-id=deepseek-v4.1-flash-1017&endpoint=cloudflare";
+    const modelId = "deepseek-v4.1-flash-1017";
+    const model = { ...makeModel(), id: modelId };
+    const nextUrl = "https://retry.example/";
+    const client = makeClient();
+    (client as any).walletAdapter.getBalances = async () => ({ [MINT_URL]: 500 });
+    vi.spyOn((client as any).providerManager, "getModelPathProviderRanking").mockResolvedValue([
+      { baseUrl: nextUrl, selector: cloudflare, satsPricing: null, model },
+    ]);
+    vi.spyOn((client as any).providerManager, "getModelForProvider").mockResolvedValue(model);
+    vi.spyOn(client as any, "_spendToken").mockResolvedValue({
+      token: TOKEN, selectedMintUrl: MINT_URL, tokenBalance: 500, tokenBalanceUnit: "sat",
+      tokenBalanceUnknown: false,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
+    const original = {
+      model: modelId,
+      stream: false,
+      messages: [{ role: "assistant", content: "answer", reasoning_details: [{
+        type: "reasoning.text", text: "previous reasoning", format: "unknown", index: 0,
+      }] }],
+    };
+    const attempts: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      attempts.push({ url, selector: new Headers(init.headers).get("x-routstr-model-path"),
+        body: JSON.parse(init.body as string) });
+      if (attempts.length === 1) {
+        return new Response(INVALID_MODEL_PATH_BODY, { status: 404, headers: { "content-type": "application/json" } });
+      }
+      return new Response("ok");
+    }));
+    const response = await client.routeRequest({
+      ...errorParams({}), body: structuredClone(original), modelId,
+      headers: { "x-routstr-model-path": opencode }, autoModelPath: { selector: opencode },
+    });
+    expect(response.status).toBe(200);
+    expect(attempts).toEqual([
+      { url: `${BASE_URL}v1/chat/completions`, selector: opencode, body: {
+        ...original, messages: [{ role: "assistant", content: "answer", reasoning_content: "previous reasoning" }],
+      } },
+      { url: `${nextUrl}v1/chat/completions`, selector: cloudflare, body: original },
+    ]);
+  });
+
   it("never fails a caller-pinned request over through the real request seam", async () => {
     const client = makeClient();
     (client as any).walletAdapter.getBalances = async () => ({
