@@ -68,6 +68,61 @@ const client = new RoutstrClient(
 await client.fetchAIResponse(fetchOptions, streamingCallbacks);
 ```
 
+## Attesting Enclava (SEV-SNP) providers
+
+Providers hosted on [Enclava](https://enclava.dev) run in AMD SEV-SNP enclaves
+and serve an attestation bundle at
+`/.well-known/confidential/proof-bundle`. `client/EnclavaAttest.ts` verifies one
+against a trust policy **you pin**, so a request can be gated on "the host runs
+the image I admit" rather than on trust in the operator.
+
+```ts
+import {
+  attestEnclavaProvider,
+  /* or */ attestEnclavaProviderIfNeeded,
+} from "@routstr/sdk/client";
+import ENCLAVA_POLICY from "./policies/routstr-core.json"; // bundled, never fetched
+
+const attestation = await attestEnclavaProvider({
+  baseUrl: providerUrl,          // https://<app>.<org>.enclava.run
+  policy: JSON.stringify(ENCLAVA_POLICY),
+  // Node only: SHA-256 of the SPKI of the socket that actually served the
+  // request. Required when the policy sets transport.require_tls_channel_spki.
+  channelSpkiSha256: await spkiSha256FromPeerCertificate(peerX509),
+});
+// attestation.bundleSha256 / .policySha256 are the audit trail for the request.
+```
+
+What the module does, and does not, do:
+
+- It builds a fresh 32-byte challenge nonce, fetches the bundle, memoises a
+  `PASS` per `(origin, policy)` for `ttlMs` (default 5 min, in-flight
+  de-duplicated), and throws `EnclavaAttestationError` for every verdict that is
+  not `PASS` (`FAIL` → `ENCLAVA_ATTESTATION_REJECTED`, `INCONCLUSIVE` →
+  `ENCLAVA_ATTESTATION_INCONCLUSIVE`).
+- It refuses to attest a plaintext-`http` origin, an oversized or wrong-media-type
+  bundle, an appraisal whose `bundle_sha256` / `policy_sha256` do not match what
+  was actually fetched, and a policy that requires TLS channel binding when the
+  runtime cannot observe the socket (`ENCLAVA_TLS_CHANNEL_UNVERIFIED`).
+- It does **not** implement the cryptography. Pass an `appraiser`; by default it
+  loads Enclava's own wasm verifier (`enclava-verifier-wasm`, shipped as the
+  `enclava-verifier-web` release asset of `enclava-labs/cap`) lazily, and never
+  requires it at import time. `createModuleEnclavaAppraiser(module)` takes an
+  already-loaded module for bundlers that reject runtime imports, and any
+  function matching `EnclavaAppraiser` works — for example a Node wrapper around
+  `enclava verify --policy <file> --json <origin>`.
+- It does **not** choose the failure policy for you: attesting before a request
+  and on failure (marking a provider unusable, failing over, or aborting) is the
+  caller's decision. `attestEnclavaProviderIfNeeded(info, baseUrl, options)` is a
+  no-op returning `undefined` for providers that are not Enclava-hosted.
+
+Policies are the security boundary: pin `target.image_digests`,
+`amd.allowed_measurements`, `target.deployment_ids`, the Sigstore identity and
+`transport.require_tls_channel_spki`. A policy fetched from the provider makes
+the check circular. See `enclava-labs/cap`
+`docs/verification/contracts-v1.md` for the policy, bundle and appraisal
+contracts.
+
 ## Client Modes
 
 The `RoutstrClient` supports two modes via the constructor `mode` parameter (defaults to `"xcashu"` if unspecified):
