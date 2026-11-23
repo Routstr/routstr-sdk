@@ -1070,15 +1070,34 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
     return Object.assign(conn, state);
   };
   const evicted = { type: "closed", reason: "evicted", unused: true };
-  const chargedEvicted = { msat: DEPOSIT, outcome: "charged", reason: "evicted" };
+  const chargedEvicted = { msat: DEPOSIT, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 5, charge_from: 5 } };
+  const releasedSpare = { msat: DEPOSIT, outcome: "released", reason: "evicted_released", evicted: { unused_at_address: 1, charge_from: 5 } };
 
   it("a signed charge for an unused connection closed for a newer setup is legitimate", () => {
     const warnings: string[] = [];
     const conn = fresh(warnings);
     conn.onText(signedFrame(evicted, chargedEvicted));
-    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "evicted", signed: true });
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5, chargeFrom: 5 } });
     expect(conn.evictedUnused).toBe(true);
     expect(warnings).toEqual([]);
+    // A lone spare: evicted, its deposit released.
+    const w2: string[] = [];
+    const spare = fresh(w2);
+    spare.onText(signedFrame(evicted, releasedSpare));
+    expect(spare.deposit).toMatchObject({ outcome: "released", reason: "evicted_released", evicted: { unusedAtAddress: 1, chargeFrom: 5 } });
+    expect(w2).toEqual([]);
+  });
+
+  it("a charge for a lone spare (the node's own count below its threshold) is logged", () => {
+    const warnings: string[] = [];
+    fresh(warnings).onText(signedFrame(evicted, { ...chargedEvicted, evicted: { unused_at_address: 1, charge_from: 5 } }));
+    expect(warnings.join("\n")).toMatch(/below the 5 that charge/);
+    const w2: string[] = [];
+    fresh(w2).onText(signedFrame(evicted, { msat: DEPOSIT, outcome: "charged", reason: "evicted" }));
+    expect(w2.join("\n")).toMatch(/without the signed count/);
+    const w3: string[] = [];
+    fresh(w3, { cur: { n: 1, accepted: true, released: false, first: true } }).onText(signedFrame(evicted, chargedEvicted));
+    expect(w3.join("\n")).toMatch(/had accepted a request/);
   });
 
   it("is logged after a settled request, unsigned, or on another frame", () => {
@@ -1096,14 +1115,6 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
     const w4: string[] = [];
     fresh(w4).onText(signedFrame({ type: "closed", reason: "evicted" }, { msat: DEPOSIT, outcome: "charged", reason: "unused" }));
     expect(w4.join("\n")).toMatch(/eviction of a used connection/);
-  });
-
-  it("a first request stalled before body_released: deposit charged, request released, both signed", () => {
-    const warnings: string[] = [];
-    const conn = fresh(warnings, { cur: { n: 1, accepted: true, reservedMsat: 9000, released: false, first: true } });
-    conn.onText(signedFrame(evicted, chargedEvicted, { n: 1, outcome: "released", reason: "evicted", cost_msats: 0, reserved_msats: 9000 }));
-    expect(conn.requestOutcome).toEqual({ n: 1, outcome: "released", reason: "evicted", costMsats: 0, signed: true });
-    expect(warnings).toEqual([]);
   });
 
   it("checks the request outcome: missing, unsigned, above the reservation, another request", () => {

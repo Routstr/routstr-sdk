@@ -235,10 +235,14 @@ what must not be linked: a scope never shares a connection with another.
   doubling to `backoffMaxMs`); a deposit the balance does not cover waits
   `backoffBaseMs` without escalating. A node that is full may close an
   unused connection older than its minimum age (60 s by default) for a newer
-  setup and charge its deposit (`closed` `evicted`, `unused: true`,
-  PROTOCOL-V3.md §8.4; `conn.evictedUnused`): the pool then arms no spare
-  for that node for 10 minutes (`NODE_FULL_MS`, `pool.isFull(node)`). That
-  charge is legitimate and is not reported as a deviation.
+  setup (`closed` `evicted`, `unused: true`, PROTOCOL-V3.md §8.4;
+  `conn.evictedUnused`): the deposit is released (`evicted_released`) when
+  the address held fewer unused connections than the node's threshold
+  (default 5) and charged (`evicted`) otherwise, with the count and the
+  threshold signed (`conn.deposit.evicted`). The pool then arms no spare for
+  that node for 10 minutes (`NODE_FULL_MS`, `pool.isFull(node)`). A charge
+  whose signed count is below its signed threshold, or with a request the
+  node had accepted, is reported.
 - The proof channel (`cu-prover --channel`) holds correlations for π_NK and
   the first π_WIN and π_C3S. On a kept framing-"2" connection it is **topped
   up while idle** (after the head and after each settled 2xx; PROTOCOL-V3.md

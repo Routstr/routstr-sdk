@@ -175,6 +175,7 @@ const DEPOSIT_RELEASED_REASONS = new Set([
   "node_failure",
   "request_received",
   "provider_refused",
+  "evicted_released",
 ]);
 
 /** What the client knows of the connection when its last frame arrives. */
@@ -189,8 +190,8 @@ export interface DepositContext {
   requestOutstanding: boolean;
   /** The node accepted a request of this connection (`request_ok`). */
   requestAccepted: boolean;
-  /** The open request reached `body_released`. */
-  requestReleased?: boolean;
+  /** The node accepted the open request (`request_ok`). */
+  openAccepted?: boolean;
 }
 
 /**
@@ -203,7 +204,7 @@ export interface DepositContext {
  */
 export function depositProblems(
   frame: { type?: unknown; reason?: unknown; fault?: unknown; after_client_frames?: unknown; unused?: unknown },
-  d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown } | undefined,
+  d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown; evicted?: unknown } | undefined,
   signed: boolean,
   c: DepositContext,
 ): string[] {
@@ -236,15 +237,26 @@ export function depositProblems(
       problems.push(`charged with reason ${JSON.stringify(d.reason.slice(0, 64))}, which releases it`);
     }
     // Row 13: closed for a newer setup while the connection held its slot
-    // unused (§8.4). Legitimate only on that frame, never for a connection
-    // whose request the provider had in full.
+    // unused (§8.4). Charged only on that frame, only when the node's signed
+    // count of its address's unused connections reached the signed
+    // threshold, and never with a request the node had accepted.
     const evictedUnused = frame.type === "closed" && frame.reason === "evicted" && frame.unused === true;
     if (d.reason === "evicted" && !evictedUnused) problems.push("charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`");
     if (evictedUnused && d.reason !== "evicted") problems.push(`charged with reason ${JSON.stringify(String(d.reason).slice(0, 64))} on an eviction (row 13 names "evicted")`);
     if (frame.type === "closed" && frame.reason === "evicted" && frame.unused !== true) {
       problems.push("charged on the eviction of a used connection (it holds no deposit)");
     }
-    if (d.reason === "evicted" && c.requestReleased === true) problems.push("charged as evicted, though the open request was written in full (never evicted)");
+    if (d.reason === "evicted") {
+      const e = d.evicted as { unused_at_address?: unknown; charge_from?: unknown } | undefined;
+      const n = e?.unused_at_address;
+      const k = e?.charge_from;
+      if (!(Number.isSafeInteger(n) && Number.isSafeInteger(k) && (n as number) >= 0 && (k as number) >= 1)) {
+        problems.push("charged as evicted without the signed count of the address's unused connections");
+      } else if ((n as number) < (k as number)) {
+        problems.push(`charged as evicted, though its address held ${n} unused connection(s), below the ${k} that charge (a lone spare is released)`);
+      }
+      if (c.openAccepted === true) problems.push("charged as evicted, though the node had accepted a request of it (never evicted)");
+    }
   }
   return problems;
 }
@@ -315,6 +327,8 @@ export interface DepositOutcome {
   reason: string;
   /** True when the report carried the node's signature (a receipt, or a signed last frame). */
   signed: boolean;
+  /** An eviction under slot pressure (§8.4): the address's evictable unused connections, and the count that charges. */
+  evicted?: { unusedAtAddress: number; chargeFrom: number };
 }
 
 export interface ConnectionRequestOptions {
@@ -1121,7 +1135,7 @@ export class ConfidentialConnection {
       releasedByReceipt: this.deposit?.outcome === "released",
       requestOutstanding: this.cur !== undefined,
       requestAccepted: this.requests > 0,
-      requestReleased: this.cur?.released === true,
+      openAccepted: this.cur !== undefined && (this.cur.accepted || this.seenOk?.n === this.cur.n),
     };
     let d: any;
     let json = "";
@@ -1148,6 +1162,9 @@ export class ConfidentialConnection {
       verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
       (d.sid === this.sid || (d.sid === null && !this.sid));
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
+    if (d.evicted && typeof d.evicted === "object") {
+      this.deposit.evicted = { unusedAtAddress: Number(d.evicted.unused_at_address), chargeFrom: Number(d.evicted.charge_from) };
+    }
     this.event({ ev: "deposit", ...this.deposit });
     // Detection only: the node's own word against its signed terms (§12.10).
     const problems = depositProblems(m, { ...d, msat: this.deposit.msat, reason: this.deposit.reason }, signed, ctx);

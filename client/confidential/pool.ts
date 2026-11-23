@@ -28,8 +28,9 @@
  *   when its key had no request for `activityWindowMs` or it reaches
  *   `maxAgeMs` (the node ends an armed connection after 600 s). A node that
  *   is full may close an unused connection older than its minimum age for a
- *   newer setup and charge its deposit (`closed` `evicted`, `unused: true`,
- *   §8.4): the pool then arms no spare for that node for `NODE_FULL_MS`.
+ *   newer setup (`closed` `evicted`, `unused: true`, §8.4; its deposit is
+ *   released for a lone spare, charged for an address holding many): the
+ *   pool then arms no spare for that node for `NODE_FULL_MS`.
  * - **Bad marks** (§2.3). A node whose framing-`"2"` connection failed to
  *   open is marked for 10 minutes; its requests use `"1.1"` meanwhile.
  *
@@ -608,9 +609,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
   private noteFull(entry: Entry<C>): void {
     if (entry.conn.evictedUnused !== true) return;
     this.full.set(entry.node, Date.now() + NODE_FULL_MS);
+    const dep = (entry.conn as { deposit?: { outcome?: string } }).deposit;
     this.log(
-      `node closed unused sid=${entry.conn.sid.slice(0, 8)} for a newer setup (it is full; the deposit of ` +
-        `${entry.conn.depositMsat} msat is charged): no spares for it for ${NODE_FULL_MS / 60_000} min`,
+      `node closed unused sid=${entry.conn.sid.slice(0, 8)} for a newer setup (it is full; its deposit of ` +
+        `${entry.conn.depositMsat} msat: ${dep?.outcome ?? "unknown"}): no spares for it for ${NODE_FULL_MS / 60_000} min`,
     );
   }
 
