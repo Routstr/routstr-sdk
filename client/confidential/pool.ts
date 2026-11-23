@@ -26,7 +26,10 @@
  *   keys are armed only after one of their requests settled, only for nodes
  *   whose deposit is at most `prewarm.maxDepositMsat`, and a spare is retired
  *   when its key had no request for `activityWindowMs` or it reaches
- *   `maxAgeMs` (the node ends an armed connection after 600 s).
+ *   `maxAgeMs` (the node ends an armed connection after 600 s). A node that
+ *   is full may close an unused connection older than its minimum age for a
+ *   newer setup and charge its deposit (`closed` `evicted`, `unused: true`,
+ *   §8.4): the pool then arms no spare for that node for `NODE_FULL_MS`.
  * - **Bad marks** (§2.3). A node whose framing-`"2"` connection failed to
  *   open is marked for 10 minutes; its requests use `"1.1"` meanwhile.
  *
@@ -162,6 +165,8 @@ export const PREWARM_DEFAULTS = {
 
 /** The shortest `maxAgeMs` the pool accepts (each retired spare costs its 2PC traffic and the deposit). */
 export const PREWARM_MIN_MAX_AGE_MS = 60_000;
+/** How long the pool arms no spare for a node that closed an unused spare of ours for a newer setup (§8.4). */
+export const NODE_FULL_MS = 10 * 60_000;
 /** How long a node's framing "2" stays marked bad after a failed open (§2.3). */
 export const FRAMING_BAD_MS = 10 * 60_000;
 /** Retire a connection this long before the offer's `h2.max_lifetime_s`. */
@@ -216,6 +221,7 @@ type ConnLike = Pick<
   | "h2"
   | "depositMsat"
   | "failureReason"
+  | "evictedUnused"
 >;
 
 interface Entry<C extends ConnLike> {
@@ -263,6 +269,8 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
   private waiters: (() => void)[] = [];
   private keys = new Map<string, KeyState>();
   private bad = new Map<string, number>();
+  /** Nodes that closed an unused spare for a newer setup (they were full): no spares until then. */
+  private full = new Map<string, number>();
   private http2: Http2Options;
   private prewarm: PrewarmOptions | undefined;
   private tick?: ReturnType<typeof setInterval>;
@@ -472,6 +480,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     void entry.conn.ended.then((e) => {
       if (!this.entries.includes(entry)) return;
       if (entry.state === "idle") this.log(`sid=${entry.conn.sid.slice(0, 8)} ended while idle: ${e.message}`);
+      if (entry.state === "armed" || entry.state === "arming") this.noteFull(entry);
       if (entry.state === "armed") {
         // A spare that died unused: its deposit may be gone; do not arm again at once.
         this.log(`armed sid=${entry.conn.sid.slice(0, 8)} ended unused: ${e.message}`);
@@ -592,6 +601,28 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     };
   }
 
+  /**
+   * The node closed this unused connection for a newer setup (§8.4): it is
+   * full, and every spare armed for it now could cost a deposit the same way.
+   */
+  private noteFull(entry: Entry<C>): void {
+    if (entry.conn.evictedUnused !== true) return;
+    this.full.set(entry.node, Date.now() + NODE_FULL_MS);
+    this.log(
+      `node closed unused sid=${entry.conn.sid.slice(0, 8)} for a newer setup (it is full; the deposit of ` +
+        `${entry.conn.depositMsat} msat is charged): no spares for it for ${NODE_FULL_MS / 60_000} min`,
+    );
+  }
+
+  /** The node closed an unused spare of ours for a newer setup less than `NODE_FULL_MS` ago. */
+  isFull(node: string): boolean {
+    const until = this.full.get(node.replace(/\/$/, ""));
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    this.full.delete(node.replace(/\/$/, ""));
+    return false;
+  }
+
   private backoff(key: string): void {
     const k = this.keys.get(key);
     if (!k) return;
@@ -645,6 +676,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
       (error) => {
         // Claimed meanwhile: the claimer sees the failure itself.
         if (entry.state === "arming") {
+          this.noteFull(entry);
           this.remove(entry);
           // Never armed: the backoff decides when to try again, not a new request.
           if (k.armedAt === k.requests) k.armedAt = undefined;
@@ -663,6 +695,7 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
     if (!k.open || !k.framing || k.settled < 1 || !this.active(k, now) || now < k.backoffUntil) return false;
     if (k.depositMsat > this.pre("maxDepositMsat")) return false;
     if (k.framing === "2" && this.isBad(k.node)) return false;
+    if (this.isFull(k.node)) return false;
     // A spare that aged out or died unused is not replaced until the key has
     // a request again: each replacement that is never used costs a deposit.
     if (k.armedAt === k.requests) return false;

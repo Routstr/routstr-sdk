@@ -96,7 +96,15 @@ import {
 } from "./offer";
 import { checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params";
 import { CuProverBackend } from "./prover";
-import { checkAnnouncedReservation, checkRefusalReceipt, checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
+import {
+  checkAnnouncedReservation,
+  checkRefusalReceipt,
+  checkUpstreamErrorReceipt,
+  parseSignedReceipt,
+  requestOutcomeProblems,
+  verifyFlatReceipt,
+  verifyReceipt,
+} from "./receipt";
 import {
   countKeyUpdates,
   cryptoRandom,
@@ -181,6 +189,8 @@ export interface DepositContext {
   requestOutstanding: boolean;
   /** The node accepted a request of this connection (`request_ok`). */
   requestAccepted: boolean;
+  /** The open request reached `body_released`. */
+  requestReleased?: boolean;
 }
 
 /**
@@ -192,7 +202,7 @@ export interface DepositContext {
  * connection. Detection only: the client cannot undo a charge.
  */
 export function depositProblems(
-  frame: { type?: unknown; reason?: unknown; fault?: unknown; after_client_frames?: unknown },
+  frame: { type?: unknown; reason?: unknown; fault?: unknown; after_client_frames?: unknown; unused?: unknown },
   d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown } | undefined,
   signed: boolean,
   c: DepositContext,
@@ -225,6 +235,16 @@ export function depositProblems(
     if (typeof d.reason === "string" && DEPOSIT_RELEASED_REASONS.has(d.reason)) {
       problems.push(`charged with reason ${JSON.stringify(d.reason.slice(0, 64))}, which releases it`);
     }
+    // Row 13: closed for a newer setup while the connection held its slot
+    // unused (§8.4). Legitimate only on that frame, never for a connection
+    // whose request the provider had in full.
+    const evictedUnused = frame.type === "closed" && frame.reason === "evicted" && frame.unused === true;
+    if (d.reason === "evicted" && !evictedUnused) problems.push("charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`");
+    if (evictedUnused && d.reason !== "evicted") problems.push(`charged with reason ${JSON.stringify(String(d.reason).slice(0, 64))} on an eviction (row 13 names "evicted")`);
+    if (frame.type === "closed" && frame.reason === "evicted" && frame.unused !== true) {
+      problems.push("charged on the eviction of a used connection (it holds no deposit)");
+    }
+    if (d.reason === "evicted" && c.requestReleased === true) problems.push("charged as evicted, though the open request was written in full (never evicted)");
   }
   return problems;
 }
@@ -276,6 +296,16 @@ export interface ConfidentialConnectionOptions {
 
 /** The largest connection deposit a client accepts unless told otherwise (100 sat). */
 export const DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT = 100_000;
+
+/** The node's signed outcome of a request it finalized without a receipt (§12.9, §12.10). */
+export interface RequestOutcome {
+  n: number;
+  outcome: "charged" | "released";
+  reason: string;
+  costMsats: number;
+  /** The node's signature over it verified for this connection. */
+  signed: boolean;
+}
 
 /** What became of a connection's deposit, as the node reported it. */
 export interface DepositOutcome {
@@ -578,6 +608,15 @@ export class ConfidentialConnection {
    */
   readonly depositMsat: number;
   deposit?: DepositOutcome;
+  /** A request the node finalized without a receipt, as its last frame stated it. */
+  requestOutcome?: RequestOutcome;
+  /**
+   * The node closed the connection for a newer setup while it had no settled
+   * request (`closed` `evicted`, `unused: true`; §8.4): the node or the
+   * address was full, and the deposit is the price of the held slot. Not a
+   * failure of the node.
+   */
+  evictedUnused = false;
 
   private readonly auth: string;
   private readonly prover: CuProverBackend;
@@ -608,6 +647,9 @@ export class ConfidentialConnection {
   /** Resolves (never rejects) with the reason once the connection has ended. */
   readonly ended: Promise<Error> = new Promise<Error>((res) => (this.endedRes = res));
   private closedReason?: string;
+  /** What the control channel showed of the requests, in order (the request flow reads its frames later). */
+  private seenOk?: { n: number; reservedMsats?: number };
+  private seenReceiptN?: number;
   private connectStarted = false;
   private opened = false;
   private ready: any = null;
@@ -986,6 +1028,7 @@ export class ConfidentialConnection {
         return;
       }
       case "closed":
+        if (m.reason === "evicted" && m.unused === true) this.evictedUnused = true;
         this.noteDeposit(m);
         // An orderly end with no request in flight; the socket closes next.
         this.closedReason = String(m.reason ?? "closed").slice(0, 64);
@@ -1013,6 +1056,22 @@ export class ConfidentialConnection {
         this.inbox.push(key, m);
         return;
       }
+      case "request_ok":
+        this.seenOk = {
+          n: Number(m.n),
+          reservedMsats: Number.isSafeInteger(m.reserved_msats) && m.reserved_msats >= 0 ? m.reserved_msats : undefined,
+        };
+        this.inbox.push(m.type, m);
+        return;
+      case "receipt":
+        try {
+          const r = typeof m.receipt_json === "string" ? JSON.parse(m.receipt_json) : m.receipt;
+          if (Number.isSafeInteger(r?.n)) this.seenReceiptN = r.n;
+        } catch {
+          // The request flow judges the receipt itself.
+        }
+        this.inbox.push(m.type, m);
+        return;
       default:
         this.inbox.push(m.type, m);
     }
@@ -1055,12 +1114,14 @@ export class ConfidentialConnection {
    * `error`): `deposit`, with the node's signature over `deposit_json`.
    */
   private noteDeposit(m: any): void {
+    this.noteRequestOutcome(m);
     const ctx: DepositContext = {
       sid: this.sid,
       depositMsat: this.depositMsat,
       releasedByReceipt: this.deposit?.outcome === "released",
       requestOutstanding: this.cur !== undefined,
       requestAccepted: this.requests > 0,
+      requestReleased: this.cur?.released === true,
     };
     let d: any;
     let json = "";
@@ -1094,6 +1155,45 @@ export class ConfidentialConnection {
       this.onWarning(
         `connection ${this.sid.slice(0, 8)}: the node's ${signed ? "signed " : "unsigned "}deposit outcome names ${problems.join("; ")}`,
       );
+    }
+  }
+
+  /**
+   * The signed outcome of a request the node finalized without a receipt, in
+   * the connection's last frame (`request_outcome`, §12.9): checked against
+   * what this connection saw of the request. Detection only.
+   */
+  private noteRequestOutcome(m: any): void {
+    const cur = this.cur && this.cur.n !== this.seenReceiptN ? this.cur : undefined;
+    const ok = cur && this.seenOk?.n === cur.n ? this.seenOk : undefined;
+    const open = cur
+      ? { n: cur.n, accepted: cur.accepted || ok !== undefined, reservedMsats: cur.reservedMsat ?? ok?.reservedMsats, bodyReleased: cur.released }
+      : undefined;
+    let o: any;
+    let signed = false;
+    if (m.request_outcome !== undefined && m.request_outcome !== null) {
+      const json = typeof m.request_outcome_json === "string" ? m.request_outcome_json : JSON.stringify(m.request_outcome);
+      const pubkey = this.ready?.pubkey ?? this.expectedPubkey;
+      try {
+        o = JSON.parse(json);
+        if (o === null || typeof o !== "object") o = {};
+      } catch {
+        o = {};
+      }
+      signed = typeof m.request_outcome_sig === "string" && typeof pubkey === "string" && verifySchnorrSignature(json, m.request_outcome_sig, pubkey);
+      this.requestOutcome = {
+        n: Number(o.n),
+        outcome: o.outcome === "charged" ? "charged" : "released",
+        reason: String(o.reason ?? "").slice(0, 64),
+        costMsats: Number(o.cost_msats),
+        signed,
+      };
+      this.event({ ev: "request_outcome", ...this.requestOutcome });
+    }
+    const fee = cur?.offer ? Math.max(cur.first ? offerSessionFeeMsat(cur.offer) : 0, offerAbandonFeeMsat(cur.offer)) : 0;
+    const problems = requestOutcomeProblems(o, signed, { sid: this.sid, framing: this.framing, open, feeMsat: fee });
+    if (problems.length) {
+      this.onWarning(`connection ${this.sid.slice(0, 8)}: the node's request outcome names ${problems.join("; ")}`);
     }
   }
 

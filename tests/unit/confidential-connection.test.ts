@@ -1050,6 +1050,94 @@ describe("the deposit outcome in the connection's last frame", () => {
   });
 });
 
+describe("an eviction under slot pressure and the signed request outcome", () => {
+  const signedFrame = (frame: Record<string, unknown>, deposit?: Record<string, unknown>, outcome?: Record<string, unknown>) => {
+    const out: Record<string, unknown> = { ...frame };
+    if (deposit) {
+      const json = JSON.stringify({ sid: SID, ...deposit });
+      Object.assign(out, { deposit: JSON.parse(json), deposit_json: json, deposit_sig: sign(json) });
+    }
+    if (outcome) {
+      const json = JSON.stringify({ v: 1, sid: SID, http: "2", balance_msats: 1, time: 1, ...outcome });
+      Object.assign(out, { request_outcome: JSON.parse(json), request_outcome_json: json, request_outcome_sig: sign(json) });
+    }
+    return JSON.stringify(out);
+  };
+  const fresh = (warnings: string[], state: Record<string, unknown> = {}) => {
+    const conn = newConnection("2") as any;
+    conn.sid = SID;
+    conn.onWarning = (m: string) => warnings.push(m);
+    return Object.assign(conn, state);
+  };
+  const evicted = { type: "closed", reason: "evicted", unused: true };
+  const chargedEvicted = { msat: DEPOSIT, outcome: "charged", reason: "evicted" };
+
+  it("a signed charge for an unused connection closed for a newer setup is legitimate", () => {
+    const warnings: string[] = [];
+    const conn = fresh(warnings);
+    conn.onText(signedFrame(evicted, chargedEvicted));
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "evicted", signed: true });
+    expect(conn.evictedUnused).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("is logged after a settled request, unsigned, or on another frame", () => {
+    const w1: string[] = [];
+    const settled = fresh(w1, { deposit: { msat: DEPOSIT, outcome: "released", reason: "request_settled", signed: true } });
+    settled.onText(signedFrame(evicted, chargedEvicted));
+    expect(w1.join("\n")).toMatch(/receipt of this connection released it/);
+    const w2: string[] = [];
+    const frame = JSON.parse(signedFrame(evicted, chargedEvicted));
+    fresh(w2).onText(JSON.stringify({ ...frame, deposit_sig: "00".repeat(64) }));
+    expect(w2.join("\n")).toMatch(/without a valid signature/);
+    const w3: string[] = [];
+    fresh(w3).onText(signedFrame({ type: "closed", reason: "idle" }, chargedEvicted));
+    expect(w3.join("\n")).toMatch(/not `closed` `evicted`/);
+    const w4: string[] = [];
+    fresh(w4).onText(signedFrame({ type: "closed", reason: "evicted" }, { msat: DEPOSIT, outcome: "charged", reason: "unused" }));
+    expect(w4.join("\n")).toMatch(/eviction of a used connection/);
+  });
+
+  it("a first request stalled before body_released: deposit charged, request released, both signed", () => {
+    const warnings: string[] = [];
+    const conn = fresh(warnings, { cur: { n: 1, accepted: true, reservedMsat: 9000, released: false, first: true } });
+    conn.onText(signedFrame(evicted, chargedEvicted, { n: 1, outcome: "released", reason: "evicted", cost_msats: 0, reserved_msats: 9000 }));
+    expect(conn.requestOutcome).toEqual({ n: 1, outcome: "released", reason: "evicted", costMsats: 0, signed: true });
+    expect(warnings).toEqual([]);
+  });
+
+  it("checks the request outcome: missing, unsigned, above the reservation, another request", () => {
+    // Request 1 settled (its receipt released the deposit); request 2 is open.
+    const open = {
+      cur: { n: 2, accepted: true, reservedMsat: 9000, released: true, first: false },
+      deposit: { msat: DEPOSIT, outcome: "released", reason: "request_settled", signed: true },
+    };
+    const ok = { n: 2, outcome: "charged", reason: "request_received", cost_msats: 9000, reserved_msats: 9000 };
+    const quiet: string[] = [];
+    fresh(quiet, open).onText(signedFrame({ type: "error", reason: "x" }, undefined, ok));
+    expect(quiet).toEqual([]);
+    const cases: [Record<string, unknown> | undefined, RegExp][] = [
+      [undefined, /no signed outcome for request 2/],
+      [{ ...ok, cost_msats: 9001 }, /above the announced reservation/],
+      [{ ...ok, n: 3 }, /names request 3/],
+      [{ ...ok, reserved_msats: 9100 }, /request_ok announced 9000/],
+    ];
+    for (const [o, re] of cases) {
+      const warnings: string[] = [];
+      fresh(warnings, open).onText(signedFrame({ type: "error", reason: "x" }, undefined, o));
+      expect(warnings.join("\n"), JSON.stringify(o)).toMatch(re);
+    }
+    const unsigned: string[] = [];
+    const f = JSON.parse(signedFrame({ type: "error", reason: "x" }, undefined, ok));
+    fresh(unsigned, open).onText(JSON.stringify({ ...f, request_outcome_sig: "00".repeat(64) }));
+    expect(unsigned.join("\n")).toMatch(/without a valid signature/);
+    // No request open, no outcome: nothing to say.
+    const none: string[] = [];
+    fresh(none, { deposit: open.deposit }).onText(JSON.stringify({ type: "closed", reason: "idle" }));
+    expect(none).toEqual([]);
+  });
+});
+
 describe("depositProblems", () => {
   const ctx = { sid: SID, depositMsat: DEPOSIT, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
   const charged = { msat: DEPOSIT, outcome: "charged", reason: "unused" } as const;

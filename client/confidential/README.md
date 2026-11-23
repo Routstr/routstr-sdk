@@ -167,6 +167,14 @@ not fall back. After a body was released nothing is retried. `"2"` or
   offer or with how the connection ended is reported as one line to the
   `confidential.onWarning` option (default `console.warn`), on every
   connection the transport opens.
+- A request the node finalized without a receipt (written in full and
+  never disclosed, abandoned before `body_released`, or a settlement the
+  node could not write) is stated in the last frame, signed:
+  `request_outcome` (`sid`, `http`, `n`, `outcome`, `reason`, `cost_msats`,
+  `reserved_msats`, `balance_msats`; `conn.requestOutcome`). A charge above
+  the announced reservation, above the published fee for a request never
+  written in full, for another request, unsigned, or missing where the
+  node accepted the request and settled nothing is reported the same way.
 - A node whose deposit exceeds `maxConnectionDepositMsat` (default 100 000
   msat; also read from `http2.maxConnectionDepositMsat`) is not used: the
   check runs when the node is qualified, before any token is spent.
@@ -225,7 +233,12 @@ what must not be linked: a scope never shares a connection with another.
   it is `maxAgeMs` (480 s) old, and that costs its deposit
   (`unusedDepositMsats`). A failed arm backs the key off (`backoffBaseMs`
   doubling to `backoffMaxMs`); a deposit the balance does not cover waits
-  `backoffBaseMs` without escalating.
+  `backoffBaseMs` without escalating. A node that is full may close an
+  unused connection older than its minimum age (60 s by default) for a newer
+  setup and charge its deposit (`closed` `evicted`, `unused: true`,
+  PROTOCOL-V3.md §8.4; `conn.evictedUnused`): the pool then arms no spare
+  for that node for 10 minutes (`NODE_FULL_MS`, `pool.isFull(node)`). That
+  charge is legitimate and is not reported as a deviation.
 - The proof channel (`cu-prover --channel`) holds correlations for π_NK and
   the first π_WIN and π_C3S. On a kept framing-"2" connection it is **topped
   up while idle** (after the head and after each settled 2xx; PROTOCOL-V3.md
