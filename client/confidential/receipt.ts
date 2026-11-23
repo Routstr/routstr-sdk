@@ -65,11 +65,13 @@ export interface ReceiptVerificationResult {
  * cache_creation_tokens}` or the top-level `cache_creation_input_tokens`
  * (at most prompt−cached).
  *
- * The bound is that formula, computed in the same order, or the same formula
- * with the writes billed at `in` when that is larger (a node that did not
- * read a write count bills them so). It is never the uncached price for a
- * usage that reports cached reads: the node reads the same usage, so a
- * charge that ignores the cache discount is an overcharge.
+ * The bound is exactly that formula, computed in the same order from our own
+ * decrypted usage, whether `cache_write` is above `in` or below it. It is
+ * never the uncached price for a usage that reports cached reads, nor the
+ * price at `in` for writes the offer prices lower: the node reads the same
+ * usage, so a charge that ignores either rate is an overcharge. A rate that
+ * is not a finite number is not applied (its tokens are priced at `in`),
+ * which never raises the bound above the formula without it.
  */
 export function maxChargeMsats(
   priceEntry: { in: number; out: number; cached_in?: number; cache_write?: number },
@@ -105,8 +107,9 @@ export function maxChargeMsats(
             1000,
         )
       : withCached;
-  // `withCached` is the uncached price when no cached reads are reported.
-  return Math.max(withCached, withWrites) + Math.max(0, sessionFeeMsat);
+  // `withWrites` is `withCached` when no writes are reported, and that the
+  // uncached price when no cached reads are.
+  return withWrites + Math.max(0, sessionFeeMsat);
 }
 
 /** Prompt-cache writes as the node reads them: nested names first, then
@@ -389,10 +392,12 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
   };
   const cachedTokens = (u: Record<string, unknown> | undefined) =>
     tokenCount((u?.prompt_tokens_details as { cached_tokens?: unknown } | undefined)?.cached_tokens);
+  const cacheWrites = (u: Record<string, unknown> | undefined) => cacheWriteTokens(u ?? {}, u?.prompt_tokens_details);
   const usageMatch =
     rUsage?.usage?.prompt_tokens === ownUsage.usage.prompt_tokens &&
     rUsage?.usage?.completion_tokens === ownUsage.usage.completion_tokens &&
     cachedTokens(rUsage?.usage as Record<string, unknown> | undefined) === cachedTokens(ownUsage.usage) &&
+    cacheWrites(rUsage?.usage as Record<string, unknown> | undefined) === cacheWrites(ownUsage.usage) &&
     (receipt.model === ownUsage.model || (input.pinnedModel !== undefined && receipt.model === input.pinnedModel));
 
   // The node may charge less than its signed terms (cached input), never more.

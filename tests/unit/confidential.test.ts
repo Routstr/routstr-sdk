@@ -568,15 +568,58 @@ describe("receipt verification", () => {
     expect(maxChargeMsats(dear, writes)).toBe(
       Math.ceil((1900 * 500 + 380 * 48_000 + 2375 * 1500 + 7500 * 200) / 1000),
     );
-    // Writes cheaper than `in`: a node that did not read the write count bills
-    // them at `in`, which stays within the bound (still below the uncached price).
+    // Writes cheaper than `in` lower the bound the same way: the node bills
+    // them at the signed rate, so the price at `in` is an overcharge.
     const cheap = { ...priceEntry, cache_write: 950 };
-    expect(maxChargeMsats(cheap, writes)).toBe(honest);
+    expect(maxChargeMsats(cheap, writes)).toBe(Math.ceil((1900 * 500 + 380 * 48_000 + 950 * 1500 + 7500 * 200) / 1000));
+    expect(maxChargeMsats(cheap, writes)).toBeLessThan(honest);
     // A usage without cached reads is bounded by the uncached price, as before.
     expect(maxChargeMsats(priceEntry, { prompt_tokens: 50_000, completion_tokens: 200 })).toBe(uncached);
   });
 
-  it("the bound is the node's own charge for any plain usage (cache_write ≥ in)", () => {
+  it("bounds prompt-cache writes at the signed cache_write rate, below `in` and above it", () => {
+    const usage = {
+      prompt_tokens: 1000,
+      completion_tokens: 10,
+      prompt_tokens_details: { cached_tokens: 600, cache_creation_input_tokens: 400 },
+    };
+    const own = { model: "m", usage } as never;
+    const within = (priceEntry: { in: number; cached_in: number; cache_write: number; out: number }, cost_msats: number) =>
+      verifyReceipt({ receipt: { sid: "s", model: "m", usage: { usage }, cost_msats } as never, ownUsage: own, priceEntry });
+    // 0 at `in`, 600 cached at 100, 400 written at 500, 10 out at 2000.
+    const cheap = { in: 1000, cached_in: 100, cache_write: 500, out: 2000 };
+    expect(maxChargeMsats(cheap, usage)).toBe(280);
+    expect(within(cheap, 280)).toMatchObject({ usageMatch: true, costWithinOffer: true });
+    expect(within(cheap, 281).costWithinOffer).toBe(false);
+    // The same writes at `in` (480) are not what the node's formula gives.
+    expect(within(cheap, 480).costWithinOffer).toBe(false);
+    // Writes dearer than `in`: the same formula.
+    const dear = { ...cheap, cache_write: 1250 };
+    expect(maxChargeMsats(dear, usage)).toBe(Math.ceil((1000 * 0 + 100 * 600 + 1250 * 400 + 2000 * 10) / 1000));
+    expect(maxChargeMsats(dear, usage)).toBe(580);
+    expect(within(dear, 580).costWithinOffer).toBe(true);
+    expect(within(dear, 581).costWithinOffer).toBe(false);
+    // The session fee on top, as for any usage.
+    expect(maxChargeMsats(cheap, usage, 2000)).toBe(2280);
+    // A rate that is no number never widens the bound.
+    expect(maxChargeMsats({ ...cheap, cache_write: Number.NaN }, usage)).toBe(Math.ceil((1000 * 400 + 100 * 600 + 2000 * 10) / 1000));
+  });
+
+  it("matches the cache-write count of the usage we saw", () => {
+    const usage = { prompt_tokens: 1000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 400 } };
+    const own = { model: "m", usage } as never;
+    const priceEntry = { in: 1000, cached_in: 100, cache_write: 500, out: 2000 };
+    const match = (receiptUsage: Record<string, unknown>) =>
+      verifyReceipt({ receipt: { sid: "s", model: "m", usage: { usage: receiptUsage }, cost_msats: 1 } as never, ownUsage: own, priceEntry }).usageMatch;
+    expect(match(usage)).toBe(true);
+    // The same count under another of the names the node reads.
+    expect(match({ ...usage, prompt_tokens_details: { cached_tokens: 600, cache_creation_input_tokens: 400 } })).toBe(true);
+    expect(match({ ...usage, prompt_tokens_details: { cached_tokens: 600 }, cache_creation_input_tokens: 400 })).toBe(true);
+    expect(match({ ...usage, prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 399 } })).toBe(false);
+    expect(match({ ...usage, prompt_tokens_details: { cached_tokens: 600 } })).toBe(false);
+  });
+
+  it("the bound is the node's own charge for any plain usage (cache_write below `in` or above it)", () => {
     // routstr-core frozen_cost_msats, same operation order.
     const node = (
       r: { in: number; cached_in: number; cache_write?: number; out: number },
@@ -601,7 +644,7 @@ describe("receipt verification", () => {
       const rates = {
         in: inRate,
         cached_in: inRate * (rnd(13) / 10),
-        cache_write: inRate * (1 + rnd(6) / 4),
+        cache_write: inRate * (rnd(10) / 4),
         out: (1 + rnd(200_000)) / 3,
       };
       const prompt = rnd(200_000);
