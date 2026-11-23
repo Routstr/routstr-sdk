@@ -12,7 +12,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { VENICE_CHAT } from "./fixtures/chat";
 import { canonicalJson } from "../../client/confidential/canonical";
 import { canonicalSuffix, chatSuffixKeys } from "../../client/confidential/suffix";
-import { checkUpstreamErrorReceipt } from "../../client/confidential/receipt";
+import { checkAnnouncedReservation, checkUpstreamErrorReceipt } from "../../client/confidential/receipt";
 import { requestStream } from "../../client/confidential/h2";
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../../client/confidential/connection";
 import {
@@ -124,6 +124,35 @@ describe("error receipts for a status billed at the reservation", () => {
       checkUpstreamErrorReceipt(err(500, { ...ok, cost_msats: 26_001, reserved_msats: 26_001 }), 500, 0, announced(26_001)),
     ).toThrow(/price × count/);
   });
+});
+
+describe("a receipt against the reservation announced in request_ok", () => {
+  const R = 30_000;
+  const receipts: Record<string, Record<string, unknown>> = {
+    usage: { sid: "s", model: "cheap", usage: { model: "cheap", usage: { prompt_tokens: 10, completion_tokens: 5 } } },
+    images: { sid: "s", kind: "images", model: "z", variant: "webp", count: 2, msat_per_image: 12_000, usage: { flat: true } },
+    "error head": { sid: "s", model: "cheap", usage: { error_status: 500 } },
+    refusal: { sid: "s", model: "cheap", usage: { refused: "rst_stream", error_code: 7, choices: [] } },
+  };
+
+  for (const [kind, fields] of Object.entries(receipts)) {
+    const r = (extra: Record<string, unknown>) => ({ ...fields, ...extra }) as never;
+    it(`${kind}: names exactly that reservation and costs at most it`, () => {
+      expect(() => checkAnnouncedReservation(r({ cost_msats: 0, reserved_msats: R }), R)).not.toThrow();
+      expect(() => checkAnnouncedReservation(r({ cost_msats: R, reserved_msats: R }), R)).not.toThrow();
+      expect(() => checkAnnouncedReservation(r({ cost_msats: R + 1, reserved_msats: R }), R)).toThrow(/more than the 30000 msats the node announced/);
+      expect(() => checkAnnouncedReservation(r({ cost_msats: 1, reserved_msats: R + 1 }), R)).toThrow(/announced 30000/);
+      expect(() => checkAnnouncedReservation(r({ cost_msats: 1, reserved_msats: String(R) }), R)).toThrow(/announced 30000/);
+      expect(() => checkAnnouncedReservation(r({ cost_msats: 1 }), R)).toThrow(/names no reservation/);
+      for (const cost_msats of [undefined, -1, 1.5, Number.NaN, "1"]) {
+        expect(() => checkAnnouncedReservation(r({ cost_msats, reserved_msats: R }), R), String(cost_msats)).toThrow(ReceiptVerificationError);
+      }
+    });
+    it(`${kind}: a node that announced none is not held to one`, () => {
+      expect(() => checkAnnouncedReservation(r({ cost_msats: R + 1 }), undefined)).not.toThrow();
+      expect(() => checkAnnouncedReservation(r({ cost_msats: R + 1, reserved_msats: 1 }), undefined)).not.toThrow();
+    });
+  }
 });
 
 describe("the reservation announced in request_ok", () => {

@@ -386,6 +386,7 @@ class FakeNode {
       usage = { error_status: s.status };
     }
     const honest: Receipt = { cost_msats: cost, usage };
+    if (this.script.reservedMsats !== undefined) honest.reserved_msats = this.script.reservedMsats;
     if (s.first) honest.deposit_released_msat = DEPOSIT;
     const fields = this.script.receipt ? this.script.receipt(s, honest) : honest;
     const receipt = {
@@ -775,6 +776,37 @@ describe("framing 2: requests on one connection", () => {
     const conn = await connection("2", { reservedMsats: 5000, receipt: (_s, honest) => ({ ...honest, reserved_msats: 5000 }) });
     expect((await conn.request(chatRequest()).done).status).toBe(200);
     conn.close();
+  });
+
+  it("refuses a receipt that does not name the reservation request_ok announced", async () => {
+    const conn = await connection("2", {
+      reservedMsats: 5000,
+      receipt: (_s, honest) => {
+        const { reserved_msats: _, ...rest } = honest;
+        return rest;
+      },
+    });
+    await expect(conn.request(chatRequest()).done).rejects.toThrow(/names no reservation, the node announced 5000/);
+  });
+
+  it("accepts a charge of exactly the announced reservation, refuses one msat more", async () => {
+    // The usage and the session fee: what the first request of a connection costs.
+    const cost = USAGE_MSAT + FEE;
+    const at = await connection("2", { reservedMsats: cost });
+    expect((await at.request(chatRequest()).done).receipt?.cost_msats).toBe(cost);
+    at.close();
+    const above = await connection("2", { reservedMsats: cost - 1 });
+    const err = await above.request(chatRequest()).done.catch((e) => e);
+    expect(err).toBeInstanceOf(ReceiptVerificationError);
+    expect(err.message).toMatch(/more than the 514 msats the node announced/);
+  });
+
+  it("holds a refusal receipt and an error receipt to the announced reservation", async () => {
+    // The session fee is due on both; the node announced less.
+    const refused = await connection("2", { reservedMsats: FEE - 1, respond2: (_n, s) => [rst(s, 7)] });
+    await expect(refused.request(chatRequest()).done).rejects.toThrow(/more than the 499 msats the node announced/);
+    const failed = await connection("1.1", { reservedMsats: ABANDON - 1, respond11: () => ["HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}"] });
+    await expect(failed.request(chatRequest()).done).rejects.toThrow(/more than the 799 msats the node announced/);
   });
 
   it("a reset without an error head still fails the request", async () => {

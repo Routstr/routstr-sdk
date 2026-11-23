@@ -96,7 +96,7 @@ import {
 } from "./offer";
 import { checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params";
 import { CuProverBackend } from "./prover";
-import { checkRefusalReceipt, checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
+import { checkAnnouncedReservation, checkRefusalReceipt, checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt";
 import {
   countKeyUpdates,
   cryptoRandom,
@@ -2879,12 +2879,9 @@ export class ConfidentialConnection {
         `receipt is for http ${JSON.stringify(receipt.http ?? null).slice(0, 16)} request ${String(receipt.n).slice(0, 16)}, not "${this.framing}" request ${cur.n}`,
       );
     }
-    // §12.4: every receipt names the reservation `request_ok` announced.
-    if (cur.reservedMsat !== undefined && receipt.reserved_msats !== undefined && receipt.reserved_msats !== cur.reservedMsat) {
-      throw new ReceiptVerificationError(
-        `receipt names a reservation of ${String(receipt.reserved_msats).slice(0, 32)} msats, the node announced ${cur.reservedMsat} msats`,
-      );
-    }
+    // §12.4: every receipt names the reservation `request_ok` announced, and
+    // no settlement of the request costs more than it.
+    checkAnnouncedReservation(receipt, cur.reservedMsat);
     // The connection's first settled request returns the deposit: its
     // (signed) receipt says so, once, with the offer's amount (§12.8, §12.10).
     const back = receipt.deposit_released_msat;
