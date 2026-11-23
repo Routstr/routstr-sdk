@@ -83,6 +83,7 @@ import {
   imagesOfferProblem,
   offerAbandonFeeMsat,
   offerConnectionDepositMsat,
+  offerEvictUnusedAfterS,
   offerFramings,
   offerIdleTimeoutS,
   offerSessionFeeMsat,
@@ -175,6 +176,8 @@ const DEPOSIT_RELEASED_REASONS = new Set([
   "node_failure",
   "request_received",
   "provider_refused",
+  // An older node released the deposit of an evicted lone spare under this
+  // reason; the current one always charges an evicted unused connection.
   "evicted_released",
 ]);
 
@@ -192,6 +195,14 @@ export interface DepositContext {
   requestAccepted: boolean;
   /** The node accepted the open request (`request_ok`). */
   openAccepted?: boolean;
+  /** The connection's framing (default: not judged). */
+  framing?: string;
+  /** The client wrote its ClientHello (default: not judged). */
+  helloSent?: boolean;
+  /** The signed offer's `evict_unused_after_s` (undefined: the offer has none, an older node). */
+  evictAfterS?: number;
+  /** Seconds from the client's `setup` to the last frame (default: not judged). */
+  ageS?: number;
 }
 
 /**
@@ -261,9 +272,10 @@ export function depositProblems(
       problems.push(`charged with reason ${JSON.stringify(d.reason.slice(0, 64))}, which releases it`);
     }
     // Row 13: closed for a newer setup while the connection held its slot
-    // unused (§8.4). Charged only on that frame, only when the node's signed
-    // count of its address's unused connections reached the signed
-    // threshold, and never with a request the node had accepted.
+    // unused (§8.4), always charged. Only on that frame, only past the signed
+    // offer's `evict_unused_after_s`, and never with a request the node had
+    // accepted, except a framing-"1.1" request 1 whose ClientHello the client
+    // had not written.
     const evictedUnused = frame.type === "closed" && frame.reason === "evicted" && frame.unused === true;
     if (d.reason === "evicted" && !evictedUnused) problems.push("charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`");
     if (evictedUnused && d.reason !== "evicted") problems.push(`charged with reason ${JSON.stringify(String(d.reason).slice(0, 64))} on an eviction (row 13 names "evicted")`);
@@ -271,17 +283,19 @@ export function depositProblems(
       problems.push("charged on the eviction of a used connection (it holds no deposit)");
     }
     if (d.reason === "evicted") {
-      const e = d.evicted as { unused_at_address?: unknown; charge_from?: unknown } | undefined;
-      const n = e?.unused_at_address;
-      const k = e?.charge_from;
-      if (!(Number.isSafeInteger(n) && Number.isSafeInteger(k) && (n as number) >= 0 && (k as number) >= 1)) {
+      // An older node also sent `charge_from`: ignored.
+      const n = (d.evicted as { unused_at_address?: unknown } | undefined)?.unused_at_address;
+      if (!(Number.isSafeInteger(n) && (n as number) >= 1)) {
         problems.push("charged as evicted without the signed count of the address's unused connections");
-      } else if ((n as number) < (k as number)) {
-        problems.push(`charged as evicted, though its address held ${n} unused connection(s), below the ${k} that charge (a lone spare is released)`);
-      } else if ((k as number) < 2) {
-        problems.push(`charged as evicted at a threshold of ${k}: a lone unused connection is never charged for its eviction (the threshold is at least 2)`);
       }
-      if (c.openAccepted === true) problems.push("charged as evicted, though the node had accepted a request of it (never evicted)");
+      if (c.evictAfterS === 0) {
+        problems.push("charged as evicted, though the signed offer says unused connections are never evicted (evict_unused_after_s 0)");
+      } else if (c.evictAfterS !== undefined && c.ageS !== undefined && c.ageS < c.evictAfterS) {
+        problems.push(`charged as evicted ${Math.floor(c.ageS)} s after the setup, before the signed offer's evict_unused_after_s of ${c.evictAfterS} s`);
+      }
+      if (c.openAccepted === true && !(c.framing === "1.1" && c.helloSent === false)) {
+        problems.push("charged as evicted, though the node had accepted a request of it (never evicted)");
+      }
     }
   }
   return problems;
@@ -353,8 +367,8 @@ export interface DepositOutcome {
   reason: string;
   /** True when the report carried the node's signature (a receipt, or a signed last frame). */
   signed: boolean;
-  /** An eviction under slot pressure (§8.4): the address's evictable unused connections, and the count that charges. */
-  evicted?: { unusedAtAddress: number; chargeFrom: number };
+  /** An eviction under slot pressure (§8.4): the evictable unused connections its address held (always charged). */
+  evicted?: { unusedAtAddress: number };
 }
 
 export interface ConnectionRequestOptions {
@@ -535,6 +549,8 @@ interface Cur {
   releaseSent: boolean;
   /** `body_released`: every record of the request was written to the provider. */
   released: boolean;
+  /** We sent a disclosure (`disclose`, `disclose_head`, `disclose_reset`) or `accept` for it. */
+  disclosed?: boolean;
   tReleased?: number;
   tFirstData?: number;
   tLastData: number;
@@ -692,6 +708,10 @@ export class ConfidentialConnection {
   private seenReceiptN?: number;
   /** The node's last frame (`closed` or `error`) arrived. */
   private sawLastFrame = false;
+  /** The control socket failed under the connection (an error, a malformed frame): its close is not the client's. */
+  private socketFault = false;
+  /** A TLS record of the client (its ClientHello first) was relayed. */
+  private helloSent = false;
   private connectStarted = false;
   private opened = false;
   private ready: any = null;
@@ -770,6 +790,10 @@ export class ConfidentialConnection {
   private initialWindow = 65535;
   private connCredit = 65535;
   private unackedSettings = 0;
+  /** A SETTINGS ACK was written (the sidecar exempts only the connection's first inside a request). */
+  private settingsAckSent = false;
+  /** SETTINGS ACKs held until the open request's body is released. */
+  private acksAfterRelease = 0;
   private requestOpen = false;
   private goaway = false;
   /** The last-stream-id of the provider's GOAWAY: a stream above it is never processed (RFC 9113 §6.8). */
@@ -974,6 +998,10 @@ export class ConfidentialConnection {
   }
 
   private sendText(obj: unknown): void {
+    const type = (obj as { type?: unknown } | null)?.type;
+    if (this.cur && (type === "disclose" || type === "disclose_head" || type === "disclose_reset" || type === "accept")) {
+      this.cur.disclosed = true;
+    }
     const text = JSON.stringify(obj);
     this.bytes.controlSent += text.length;
     if (this.wsOpen && this.ws) this.ws.send(text);
@@ -988,6 +1016,7 @@ export class ConfidentialConnection {
   }
 
   private sendBytes(b: Uint8Array): void {
+    this.helloSent = true;
     this.bytes.relaySent += b.length;
     if (this.wsOpen && this.ws) this.ws.send(b);
     else this.outbox.push(b);
@@ -1005,10 +1034,14 @@ export class ConfidentialConnection {
         res();
       };
     });
-    ws.onerror = () => this.fail(new SessionRejectedError("control websocket error"));
+    ws.onerror = () => {
+      this.socketFault = true;
+      this.fail(new SessionRejectedError("control websocket error"));
+    };
     ws.onclose = (ev: CloseEvent) => {
-      if (!this.failure && !this.sawLastFrame) {
-        // Not this client's close, and the node's last frame never came.
+      if ((!this.failure || this.socketFault) && !this.sawLastFrame) {
+        // Not this client's close (or one after a socket error or a malformed
+        // frame of the node), and the node's last frame never came.
         const cur = this.cur && this.cur.n !== this.seenReceiptN ? this.cur : undefined;
         const missing = missingLastFrameProblem({
           sid: this.sid,
@@ -1066,10 +1099,12 @@ export class ConfidentialConnection {
     try {
       m = JSON.parse(d);
     } catch {
+      this.socketFault = true;
       this.fail(new SessionProtocolError("non-JSON control frame"));
       return;
     }
     if (typeof m !== "object" || m === null || typeof m.type !== "string") {
+      this.socketFault = true;
       this.fail(new SessionProtocolError("control frame without a type"));
       return;
     }
@@ -1092,6 +1127,7 @@ export class ConfidentialConnection {
         if (this.cur && m.n === this.cur.n) {
           this.cur.released = true;
           this.cur.tReleased = Date.now();
+          this.flushHeldAcks();
           this.kick();
         }
         return;
@@ -1176,6 +1212,10 @@ export class ConfidentialConnection {
       requestOutstanding: this.cur !== undefined,
       requestAccepted: this.requests > 0,
       openAccepted: this.cur !== undefined && (this.cur.accepted || this.seenOk?.n === this.cur.n),
+      framing: this.framing,
+      helloSent: this.helloSent,
+      evictAfterS: offerEvictUnusedAfterS(this.offer),
+      ageS: this.tSetup ? (Date.now() - this.tSetup) / 1000 : undefined,
     };
     let d: any;
     let json = "";
@@ -1203,7 +1243,7 @@ export class ConfidentialConnection {
       (d.sid === this.sid || (d.sid === null && !this.sid));
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
     if (d.evicted && typeof d.evicted === "object") {
-      this.deposit.evicted = { unusedAtAddress: Number(d.evicted.unused_at_address), chargeFrom: Number(d.evicted.charge_from) };
+      this.deposit.evicted = { unusedAtAddress: Number(d.evicted.unused_at_address) };
     }
     this.event({ ev: "deposit", ...this.deposit });
     // Detection only: the node's own word against its signed terms (§12.10).
@@ -1224,7 +1264,13 @@ export class ConfidentialConnection {
     const cur = this.cur && this.cur.n !== this.seenReceiptN ? this.cur : undefined;
     const ok = cur && this.seenOk?.n === cur.n ? this.seenOk : undefined;
     const open = cur
-      ? { n: cur.n, accepted: cur.accepted || ok !== undefined, reservedMsats: cur.reservedMsat ?? ok?.reservedMsats, bodyReleased: cur.released }
+      ? {
+          n: cur.n,
+          accepted: cur.accepted || ok !== undefined,
+          reservedMsats: cur.reservedMsat ?? ok?.reservedMsats,
+          bodyReleased: cur.released,
+          disclosed: cur.disclosed === true,
+        }
       : undefined;
     let o: any;
     let signed = false;
@@ -1247,8 +1293,28 @@ export class ConfidentialConnection {
       };
       this.event({ ev: "request_outcome", ...this.requestOutcome });
     }
-    const fee = cur?.offer ? Math.max(cur.first ? offerSessionFeeMsat(cur.offer) : 0, offerAbandonFeeMsat(cur.offer)) : 0;
-    const problems = requestOutcomeProblems(o, signed, { sid: this.sid, framing: this.framing, open, feeMsat: fee });
+    const sessionFee = cur?.offer && cur.first ? offerSessionFeeMsat(cur.offer) : 0;
+    // The node's abandon ceiling is max(the abandon fee, the session fee if
+    // still due); an offer's abandon fee is never below its session fee.
+    const abandonFee = cur?.offer ? Math.max(sessionFee, offerAbandonFeeMsat(cur.offer)) : 0;
+    let deposit: any;
+    try {
+      deposit =
+        m.deposit === undefined || m.deposit === null
+          ? undefined
+          : JSON.parse(typeof m.deposit_json === "string" ? m.deposit_json : JSON.stringify(m.deposit));
+    } catch {
+      deposit = undefined;
+    }
+    const problems = requestOutcomeProblems(o, signed, {
+      sid: this.sid,
+      framing: this.framing,
+      open,
+      sessionFeeMsat: sessionFee,
+      abandonFeeMsat: abandonFee,
+      frame: m,
+      deposit: deposit !== null && typeof deposit === "object" ? deposit : undefined,
+    });
     if (problems.length) {
       this.onWarning(`connection ${this.sid.slice(0, 8)}: the node's request outcome names ${problems.join("; ")}`);
     }
@@ -1762,10 +1828,21 @@ export class ConfidentialConnection {
         this.gotSettings = true;
         this.updateRelease();
         if (carried && this.settingsSeenSent) this.sendSettingsSeen();
-        // Acknowledged with the next request's records (one π_WIN for both)
-        // when none is open, else at once.
-        if (this.requestOpen) void this.sendCtl("settings_ack", new Uint8Array(0));
-        else this.unackedSettings++;
+        // The connection's first SETTINGS is acknowledged with the next
+        // request's records (one π_WIN for both; the sidecar exempts that
+        // one). A later one is acknowledged at once while no request is open,
+        // else once the open request's body is released: a control record
+        // inside a request marks it (a later provider close then counts
+        // against the client).
+        if (this.requestOpen) {
+          if (cur?.released) this.ackSettings(1);
+          else this.acksAfterRelease++;
+        } else if (!this.settingsAckSent && this.unackedSettings === 0) {
+          this.unackedSettings = 1;
+        } else {
+          this.ackSettings(this.unackedSettings + 1);
+          this.unackedSettings = 0;
+        }
         break;
       }
       case FRAME.PING:
@@ -1872,6 +1949,21 @@ export class ConfidentialConnection {
       (e) => this.fail(e instanceof Error ? e : new SessionProtocolError(String(e))),
     );
     return p;
+  }
+
+  /** Send `k` SETTINGS ACKs. */
+  private ackSettings(k: number): void {
+    for (; k > 0; k--) {
+      this.settingsAckSent = true;
+      void this.sendCtl("settings_ack", new Uint8Array(0));
+    }
+  }
+
+  /** The SETTINGS ACKs held while a request's records were written. */
+  private flushHeldAcks(): void {
+    const k = this.acksAfterRelease;
+    this.acksAfterRelease = 0;
+    this.ackSettings(k);
   }
 
   private sendCtl(name: "settings_ack" | "ping_ack", payload: Uint8Array): Promise<number> {
@@ -2179,10 +2271,8 @@ export class ConfidentialConnection {
     if (ok.stream !== stream) throw new SessionProtocolError("request_ok names another stream");
     // Any SETTINGS acknowledgement and the records go as one π_WIN batch.
     this.requestOpen = true;
-    while (this.unackedSettings > 0) {
-      this.unackedSettings--;
-      void this.sendCtl("settings_ack", new Uint8Array(0));
-    }
+    this.ackSettings(this.unackedSettings);
+    this.unackedSettings = 0;
     for (const p of plan) cur.seqs.push(await this.orFail(this.sendRecord(p.content, p.pub)));
     cur.dataLens = plan.slice(1).map((p) => p.data);
     this.event({ ev: "request_sent", n, records: plan.length, body_len: bodyLen });
@@ -2279,6 +2369,7 @@ export class ConfidentialConnection {
     this.plain.clear();
     this.cur = undefined;
     this.requestOpen = false;
+    this.flushHeldAcks();
     this.tLastSettled = tEnd;
     this.settled++;
     this.kick();

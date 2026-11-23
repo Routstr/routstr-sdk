@@ -1070,34 +1070,63 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
     return Object.assign(conn, state);
   };
   const evicted = { type: "closed", reason: "evicted", unused: true };
-  const chargedEvicted = { msat: DEPOSIT, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 5, charge_from: 5 } };
-  const releasedSpare = { msat: DEPOSIT, outcome: "released", reason: "evicted_released", evicted: { unused_at_address: 1, charge_from: 5 } };
+  const chargedEvicted = { msat: DEPOSIT, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 5 } };
 
-  it("a signed charge for an unused connection closed for a newer setup is legitimate", () => {
+  it("a signed charge for an unused connection closed for a newer setup is legitimate, also for a lone spare", () => {
     const warnings: string[] = [];
     const conn = fresh(warnings);
     conn.onText(signedFrame(evicted, chargedEvicted));
-    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5, chargeFrom: 5 } });
+    expect(conn.deposit).toEqual({ msat: DEPOSIT, outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5 } });
     expect(conn.evictedUnused).toBe(true);
     expect(warnings).toEqual([]);
-    // A lone spare: evicted, its deposit released.
     const w2: string[] = [];
     const spare = fresh(w2);
-    spare.onText(signedFrame(evicted, releasedSpare));
-    expect(spare.deposit).toMatchObject({ outcome: "released", reason: "evicted_released", evicted: { unusedAtAddress: 1, chargeFrom: 5 } });
+    spare.onText(signedFrame(evicted, { ...chargedEvicted, evicted: { unused_at_address: 1 } }));
+    expect(spare.deposit).toMatchObject({ outcome: "charged", reason: "evicted", evicted: { unusedAtAddress: 1 } });
     expect(w2).toEqual([]);
   });
 
-  it("a charge for a lone spare (the node's own count below its threshold) is logged", () => {
-    const warnings: string[] = [];
-    fresh(warnings).onText(signedFrame(evicted, { ...chargedEvicted, evicted: { unused_at_address: 1, charge_from: 5 } }));
-    expect(warnings.join("\n")).toMatch(/below the 5 that charge/);
+  it("an older node's eviction fields are accepted", () => {
+    const w1: string[] = [];
+    fresh(w1).onText(signedFrame(evicted, { ...chargedEvicted, evicted: { unused_at_address: 5, charge_from: 5 } }));
+    expect(w1).toEqual([]);
+    const w2: string[] = [];
+    const spare = fresh(w2);
+    spare.onText(signedFrame(evicted, { msat: DEPOSIT, outcome: "released", reason: "evicted_released", evicted: { unused_at_address: 1, charge_from: 5 } }));
+    expect(spare.deposit).toMatchObject({ outcome: "released", reason: "evicted_released" });
+    expect(w2).toEqual([]);
+  });
+
+  it("an eviction charge without the count, with an accepted request, or before the signed age is logged", () => {
     const w2: string[] = [];
     fresh(w2).onText(signedFrame(evicted, { msat: DEPOSIT, outcome: "charged", reason: "evicted" }));
     expect(w2.join("\n")).toMatch(/without the signed count/);
     const w3: string[] = [];
     fresh(w3, { cur: { n: 1, accepted: true, released: false, first: true } }).onText(signedFrame(evicted, chargedEvicted));
     expect(w3.join("\n")).toMatch(/had accepted a request/);
+    const w4: string[] = [];
+    const young = fresh(w4, { tSetup: Date.now() - 5000 });
+    young.offer = { ...young.offer, evict_unused_after_s: 60 };
+    young.onText(signedFrame(evicted, chargedEvicted));
+    expect(w4.join("\n")).toMatch(/before the signed offer's evict_unused_after_s of 60 s/);
+    const w5: string[] = [];
+    const old = fresh(w5, { tSetup: Date.now() - 61_000 });
+    old.offer = { ...old.offer, evict_unused_after_s: 60 };
+    old.onText(signedFrame(evicted, chargedEvicted));
+    expect(w5).toEqual([]);
+  });
+
+  it("a framing-1.1 request without a ClientHello may be evicted with it", () => {
+    const deps = { msat: DEPOSIT, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 1 } };
+    const out = { n: 1, outcome: "released", reason: "evicted", cost_msats: 0, reserved_msats: 9000 };
+    const w1: string[] = [];
+    const c11 = fresh(w1, { framing: "1.1", helloSent: false, cur: { n: 1, accepted: true, released: false, first: true, reservedMsat: 9000 } });
+    c11.onText(signedFrame(evicted, deps, { ...out, http: "1.1" }));
+    expect(w1).toEqual([]);
+    const w2: string[] = [];
+    const sent = fresh(w2, { framing: "1.1", helloSent: true, cur: { n: 1, accepted: true, released: false, first: true, reservedMsat: 9000 } });
+    sent.onText(signedFrame(evicted, deps, { ...out, http: "1.1" }));
+    expect(w2.join("\n")).toMatch(/had accepted a request/);
   });
 
   it("is logged after a settled request, unsigned, or on another frame", () => {
@@ -1165,14 +1194,17 @@ describe("missingLastFrameProblem", () => {
   });
 });
 
-describe("a threshold of 1 for the eviction charge", () => {
-  it("is a deviation: a lone unused connection is never charged for its eviction", () => {
-    const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
-    const frame = { type: "closed", reason: "evicted", unused: true };
-    const out = (n: number, k: number) =>
-      ({ msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: n, charge_from: k } }) as const;
-    expect(depositProblems(frame, out(1, 1), true, ctx).join()).toMatch(/threshold of 1/);
-    expect(depositProblems(frame, out(2, 2), true, ctx)).toEqual([]);
+describe("the eviction of an unused connection", () => {
+  const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+  const frame = { type: "closed", reason: "evicted", unused: true };
+  const out = { msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 1 } } as const;
+  it("is always charged, also for a lone spare", () => {
+    expect(depositProblems(frame, out, true, ctx)).toEqual([]);
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 60 })).toEqual([]);
+  });
+  it("is a deviation before the signed minimum age, or when the offer says never", () => {
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 59 }).join()).toMatch(/before the signed offer/);
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 0, ageS: 900 }).join()).toMatch(/never evicted/);
   });
 });
 
@@ -1331,4 +1363,64 @@ describe("the certificate chain an attestation names", () => {
       await expect(conn.request(chatRequest()).done).rejects.toThrow(/certificate chain/);
     });
   }
+});
+
+describe("the node's last frame never came", () => {
+  const warned = (conn: ConfidentialConnection) => {
+    const w: string[] = [];
+    (conn as any).onWarning = (m: string) => w.push(m);
+    return w;
+  };
+  it("is reported after a socket error or a malformed frame, not after the client's own close", async () => {
+    for (const cause of ["error", "malformed", "client"] as const) {
+      const conn = await connection("2");
+      const w = warned(conn);
+      const ws = node.ws as FakeWs;
+      if (cause === "error") ws.onerror?.();
+      else if (cause === "malformed") ws.onmessage?.({ data: "x" });
+      else conn.close();
+      ws.onclose?.({ reason: "" });
+      await new Promise((r) => setTimeout(r, 5));
+      if (cause === "client") expect(w.join("\n")).not.toMatch(/without the node's last frame/);
+      else expect(w.join("\n"), cause).toMatch(/without the node's last frame: no signed outcome for the deposit/);
+    }
+  });
+});
+
+describe("SETTINGS acknowledgements", () => {
+  const SETTINGS = 0x4;
+  const PING = 0x6;
+  const acks = (conn: any) => {
+    const sent: string[] = [];
+    conn.sendCtl = (name: string) => {
+      sent.push(name);
+      return Promise.resolve(0);
+    };
+    return sent;
+  };
+  const settings = { type: SETTINGS, flags: 0, stream: 0, payload: new Uint8Array(0), off: 0 };
+  it("the first waits for the next request, a later one goes at once while idle", () => {
+    const conn = newConnection("2") as any;
+    const sent = acks(conn);
+    conn.onFrame(settings);
+    expect(sent).toEqual([]);
+    conn.onFrame(settings);
+    expect(sent).toEqual(["settings_ack", "settings_ack"]);
+    conn.onFrame(settings);
+    expect(sent).toHaveLength(3);
+  });
+  it("inside a request it waits for body_released; a PING is answered at once", () => {
+    const conn = newConnection("2") as any;
+    const sent = acks(conn);
+    conn.settingsAckSent = true;
+    conn.requestOpen = true;
+    conn.cur = { n: 1, stream: 3, released: false, accepted: true, first: true, dataLens: [] };
+    conn.onFrame(settings);
+    conn.onFrame({ type: PING, flags: 0, stream: 0, payload: new Uint8Array(8), off: 0 });
+    expect(sent).toEqual(["ping_ack"]);
+    conn.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    expect(sent).toEqual(["ping_ack", "settings_ack"]);
+    conn.onFrame(settings);
+    expect(sent).toEqual(["ping_ack", "settings_ack", "settings_ack"]);
+  });
 });

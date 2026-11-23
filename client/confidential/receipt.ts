@@ -532,22 +532,34 @@ export function checkAttestationBinding(
   }
 }
 
-/** The reasons a node names in a `request_outcome` (PROTOCOL-V3.md §12.10). */
-export const REQUEST_OUTCOME_REASONS = new Set([
-  "request_received",
-  "settlement_failed",
-  "settled_without_receipt",
-  "provider_refused",
-  "provider_unreachable",
-  "sidecar_failure",
-  "request_abandoned",
-  "evicted",
-  "unattested",
-  "not_started",
-]);
+/**
+ * The most a request outcome may cost under each reason, as the node computes
+ * it (routstr-core `confidential_ws.py`: `_finalize_unsettled`, `_settle`,
+ * `_refuse_unattested`). `before`: no `body_released` arrived for the request;
+ * `after`: one did. `null`: the node never names that reason then.
+ * `zero` nothing; `session_fee` the offer's session fee if still due (none
+ * once the connection settled a request); `abandon_fee` max(the abandon fee,
+ * the session fee if still due); `reservation` the announced reservation.
+ * `disclosed`: only after the client disclosed (or accepted) the request's
+ * answer. The same table is in `tests/unit/fixtures/request-outcome-vectors.json`
+ * (a copy of routstr-confidential `crypto/conformance`).
+ */
+export type Ceiling = "zero" | "session_fee" | "abandon_fee" | "reservation" | null;
+export const REQUEST_OUTCOME_RULES: Record<string, { before: Ceiling; after: Ceiling; disclosed?: boolean }> = {
+  request_received: { before: null, after: "reservation" },
+  settlement_failed: { before: "zero", after: "reservation" },
+  settled_without_receipt: { before: "reservation", after: "reservation", disclosed: true },
+  unattested: { before: "zero", after: "zero" },
+  provider_refused: { before: "session_fee", after: null },
+  provider_unreachable: { before: "zero", after: null },
+  sidecar_failure: { before: "zero", after: null },
+  evicted: { before: "zero", after: null },
+  request_abandoned: { before: "abandon_fee", after: null },
+  not_started: { before: "zero", after: null },
+};
 
-/** Reasons that charge as if the provider had the request in full. */
-const AFTER_RELEASE_REASONS = new Set(["request_received", "settlement_failed"]);
+/** The reasons a node names in a `request_outcome` (PROTOCOL-V3.md §12.10). */
+export const REQUEST_OUTCOME_REASONS = new Set(Object.keys(REQUEST_OUTCOME_RULES));
 
 /** The request a client had open (neither refused nor settled) when the connection's last frame arrived. */
 export interface OpenRequestView {
@@ -558,14 +570,22 @@ export interface OpenRequestView {
   reservedMsats?: number;
   /** A `body_released` for it arrived. */
   bodyReleased: boolean;
+  /** The client sent `disclose`, `disclose_head`, `disclose_reset` or `accept` for it (undefined: not tracked). */
+  disclosed?: boolean;
 }
 
 export interface RequestOutcomeContext {
   sid: string;
   framing: string;
   open?: OpenRequestView;
-  /** The most a request never written in full may cost: max(session fee if still due, abandon fee). */
-  feeMsat: number;
+  /** The session fee if still due for this request (0 once the connection settled one). */
+  sessionFeeMsat: number;
+  /** max(the offer's abandon fee, the session fee if still due). */
+  abandonFeeMsat: number;
+  /** The last frame that carries the outcome (`closed` or `error`), when judged. */
+  frame?: { type?: unknown; reason?: unknown; fault?: unknown };
+  /** The deposit outcome on the same frame (parsed), when there is one. */
+  deposit?: { outcome?: unknown; reason?: unknown };
 }
 
 /**
@@ -588,24 +608,49 @@ export function requestOutcomeProblems(o: any, signed: boolean, c: RequestOutcom
   if (!open) p.push(`an outcome for request ${shown(o.n)}, though no request was open`);
   else if (o.n !== open.n) p.push(`it names request ${shown(o.n)}, the open one is ${open.n}`);
   if (o.outcome !== "charged" && o.outcome !== "released") p.push(`an outcome ${shown(o.outcome)}`);
-  if (typeof o.reason !== "string" || !REQUEST_OUTCOME_REASONS.has(o.reason)) p.push(`a reason ${shown(o.reason)}`);
+  const rule =
+    typeof o.reason === "string" && Object.prototype.hasOwnProperty.call(REQUEST_OUTCOME_RULES, o.reason)
+      ? REQUEST_OUTCOME_RULES[o.reason]
+      : undefined;
+  if (!rule) p.push(`a reason ${shown(o.reason)}`);
   const cost = o.cost_msats;
   if (!(Number.isSafeInteger(cost) && cost >= 0)) {
     p.push(`a cost of ${shown(cost)}`);
     return p;
   }
   if ((o.outcome === "charged") !== cost > 0) p.push(`outcome ${shown(o.outcome)} with a cost of ${cost} msat`);
+  let reserved: number | undefined;
   if (open?.reservedMsats !== undefined) {
+    reserved = open.reservedMsats;
     if (o.reserved_msats !== open.reservedMsats) p.push(`reserved_msats ${shown(o.reserved_msats)}, request_ok announced ${open.reservedMsats}`);
     if (cost > open.reservedMsats) p.push(`a cost of ${cost} msat above the announced reservation of ${open.reservedMsats}`);
-  } else if (Number.isSafeInteger(o.reserved_msats) && cost > o.reserved_msats) {
-    p.push(`a cost of ${cost} msat above its own reservation of ${o.reserved_msats}`);
+  } else if (Number.isSafeInteger(o.reserved_msats) && o.reserved_msats >= 0) {
+    reserved = o.reserved_msats;
+    if (cost > o.reserved_msats) p.push(`a cost of ${cost} msat above its own reservation of ${o.reserved_msats}`);
   }
-  if (open && !open.bodyReleased && cost > c.feeMsat) {
-    p.push(`a cost of ${cost} msat for a request never written in full (at most the published fee, ${c.feeMsat} msat)`);
+  if (open && rule) {
+    const ceiling = open.bodyReleased ? rule.after : rule.before;
+    if (ceiling === null) {
+      p.push(open.bodyReleased ? `reason ${shown(o.reason)} after body_released` : `reason ${shown(o.reason)}, though no body_released arrived`);
+    } else {
+      const max =
+        ceiling === "zero" ? 0 : ceiling === "session_fee" ? c.sessionFeeMsat : ceiling === "abandon_fee" ? c.abandonFeeMsat : reserved;
+      if (max !== undefined && cost > max) p.push(`a cost of ${cost} msat with reason ${shown(o.reason)} (at most ${max} msat)`);
+    }
+    if (rule.disclosed && open.disclosed === false) p.push(`reason ${shown(o.reason)}, though the client disclosed nothing for request ${open.n}`);
   }
-  if (open && !open.bodyReleased && typeof o.reason === "string" && AFTER_RELEASE_REASONS.has(o.reason)) {
-    p.push(`reason ${shown(o.reason)}, though no body_released arrived`);
+  // The outcome against the frame that carries it.
+  if (cost > 0 && c.deposit?.outcome === "charged") {
+    p.push("a charge on the same frame as a charged deposit (the deposit is the price of the request it abandoned)");
+  }
+  const f = c.frame;
+  if (f && cost > 0 && o.reason === "request_abandoned" && f.type === "error" && (f.fault === "node" || f.fault === "upstream")) {
+    p.push(`the abandon fee after a fault of the ${f.fault === "node" ? "node" : "provider"}`);
+  }
+  if (f) {
+    const evictedFrame = f.type === "closed" && f.reason === "evicted";
+    if (evictedFrame && o.reason !== "evicted") p.push(`reason ${shown(o.reason)} on an eviction (the request of an evicted connection is released as "evicted")`);
+    if (!evictedFrame && o.reason === "evicted") p.push('reason "evicted", but the last frame is not `closed` `evicted`');
   }
   return p;
 }

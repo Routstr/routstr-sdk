@@ -135,6 +135,11 @@ describe("v3 offer", () => {
     expect(check({ connection_deposit_msat: -1 })).toThrow(/connection_deposit_msat/);
     expect(check({ connection_deposit_msat: 1.5 })).toThrow(/connection_deposit_msat/);
     expect(check({ idle_timeout_s: 5 })).toThrow(/idle_timeout_s/);
+    // The eviction age: optional (an older node's offer has none), else a non-negative integer.
+    expect(check({ evict_unused_after_s: 60 })).not.toThrow();
+    expect(check({ evict_unused_after_s: 0 })).not.toThrow();
+    expect(check({ evict_unused_after_s: -1 })).toThrow(/evict_unused_after_s/);
+    expect(check({ evict_unused_after_s: "60" })).toThrow(/evict_unused_after_s/);
   });
 
   it("keeps the operator's order of framings, and drops a refused h2 block when 1.1 is offered", () => {

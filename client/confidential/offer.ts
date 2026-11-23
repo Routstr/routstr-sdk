@@ -166,6 +166,12 @@ export interface ConfidentialOffer {
   connection_deposit_msat?: number;
   /** The node closes a connection that had no request in flight for this long (seconds). */
   idle_timeout_s?: number;
+  /**
+   * How old (seconds from its setup) an unused connection must be before a
+   * newer setup may close it under slot pressure, its deposit then charged;
+   * 0: never. Absent from an older node's offer.
+   */
+  evict_unused_after_s?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
@@ -200,6 +206,12 @@ export function offerFramings(offer: ConfidentialOffer): ConfidentialFraming[] {
 export function offerConnectionDepositMsat(offer: Pick<ConfidentialOffer, "connection_deposit_msat">): number {
   const d = offer.connection_deposit_msat;
   return typeof d === "number" && Number.isSafeInteger(d) && d > 0 ? d : 0;
+}
+
+/** The signed offer's minimum age of an unused connection before an eviction (seconds; undefined: an older node's offer). */
+export function offerEvictUnusedAfterS(offer: Pick<ConfidentialOffer, "evict_unused_after_s">): number | undefined {
+  const t = offer.evict_unused_after_s;
+  return typeof t === "number" && Number.isSafeInteger(t) && t >= 0 ? t : undefined;
 }
 
 /** How long the node keeps a connection with no request in flight (seconds). */
@@ -725,6 +737,10 @@ export function verifyConfidentialOffer(
   const idleS = offer.idle_timeout_s;
   if (idleS !== undefined && (typeof idleS !== "number" || !Number.isSafeInteger(idleS) || idleS < 10)) {
     throw new OfferMalformedError("offer.idle_timeout_s is not an integer of at least 10");
+  }
+  const evictS = offer.evict_unused_after_s;
+  if (evictS !== undefined && (typeof evictS !== "number" || !Number.isSafeInteger(evictS) || evictS < 0)) {
+    throw new OfferMalformedError("offer.evict_unused_after_s is not a non-negative integer");
   }
 
   const pinsConfigured = Boolean(options.pinnedPubkey) || (options.pinnedPubkeys?.length ?? 0) > 0;
