@@ -154,11 +154,14 @@ export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 
  * for the node's own key or account (401, 402, 403) costs the session fee; any
  * other 4xx is a request the provider refused for its own content, so the
  * client pays the abandon fee (the node ran the 2PC for it); any other error
- * the session's reservation.
+ * the session's reservation, unless it came before `body_released` (the
+ * provider never had the whole request, so no inference ran): then the
+ * abandon fee.
  */
-export function errorStatusCharge(status: number): "abandon_fee" | "session_fee" | "reservation" {
+export function errorStatusCharge(status: number, bodyReleased = true): "abandon_fee" | "session_fee" | "reservation" {
   if ([401, 402, 403, 429, 503].includes(status)) return "session_fee";
   if (status >= 400 && status < 500) return "abandon_fee";
+  if (!bodyReleased) return "abandon_fee";
   return "reservation";
 }
 
@@ -192,6 +195,8 @@ export function checkUpstreamErrorReceipt(
      * a charge above the session fee; any other number (a caller's ceiling) does not.
      */
     reservationAnnounced?: boolean;
+    /** The node reported `body_released` for the request (default: it did). */
+    bodyReleased?: boolean;
   } = {},
 ): boolean {
   const ru = receipt.usage as unknown as { error_status?: unknown } | undefined;
@@ -228,7 +233,7 @@ export function checkUpstreamErrorReceipt(
   if (known !== undefined && !isMsatAmount(known)) {
     throw new ReceiptVerificationError(`the request's reservation bound ${String(known)} is not a valid amount`);
   }
-  const charge = errorStatusCharge(status);
+  const charge = errorStatusCharge(status, options.bodyReleased ?? true);
   if (charge !== "reservation") {
     const bound = charge === "abandon_fee" ? abandon : fee;
     if (cost > bound) {
@@ -548,7 +553,7 @@ export type Ceiling = "zero" | "session_fee" | "abandon_fee" | "reservation" | n
 export const REQUEST_OUTCOME_RULES: Record<string, { before: Ceiling; after: Ceiling; disclosed?: boolean }> = {
   request_received: { before: null, after: "reservation" },
   settlement_failed: { before: "zero", after: "reservation" },
-  settled_without_receipt: { before: "reservation", after: "reservation", disclosed: true },
+  settled_without_receipt: { before: "abandon_fee", after: "reservation", disclosed: true },
   unattested: { before: "zero", after: "zero" },
   provider_refused: { before: "session_fee", after: null },
   provider_unreachable: { before: "zero", after: null },

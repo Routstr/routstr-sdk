@@ -1,5 +1,5 @@
 {
-  "about": "The usage event rule of PROTOCOL-V3.md §5.4: which last event before data: [DONE] is a usage event. Shared by the sidecar (both framings), the reference driver, the SDK and the browser library; copies live in routstr-sdk tests/unit/fixtures and routstr-confidential-web test/fixtures. `ok` false: the event is refused.",
+  "about": "The usage event rule of PROTOCOL-V3.md §5.4: which last event before data: [DONE] is a usage event. Shared by the sidecar (both framings), the reference driver, the SDK and the browser library; copies live in routstr-sdk tests/unit/fixtures and routstr-confidential-web test/fixtures. `ok` false: the event is refused. A vector with `raw` instead of `event` is the event's JSON text: a key repeated in any object refuses it (the parsed object keeps one value, but the text is what the node receives).",
   "vectors": [
     {"name": "venice: choices []", "ok": true,
      "event": {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}}},
@@ -110,6 +110,11 @@
     {"name": "usage: a count of 2^53 next to the token counts", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "cache_creation_input_tokens": 9007199254740992}}},
     {"name": "usage: a float of 1e300", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "cost": 1e+300}}},
     {"name": "top level: cost of 2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": 9007199254740992}},
-    {"name": "top level: a cost object holding -2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": {"total": -9007199254740992}}}
+    {"name": "top level: a cost object holding -2^53", "ok": false, "event": {"model": "m", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}, "cost": {"total": -9007199254740992}}},
+    {"name": "raw: a repeated top-level key, the first choices carrying content", "ok": false, "raw": "{\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"secret\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2},\"choices\":[]}"},
+    {"name": "raw: a repeated key inside usage", "ok": false, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"prompt_tokens\":2,\"completion_tokens\":2}}"},
+    {"name": "raw: a repeated key spelled with an escape", "ok": false, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2},\"mod\\u0065l\":\"x\"}"},
+    {"name": "raw: a repeated key in a choice's delta", "ok": false, "raw": "{\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"secret\",\"content\":\"\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}"},
+    {"name": "raw: one key in two objects is no repeat", "ok": true, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2},\"cost\":{\"prompt_tokens\":0}}"}
   ]
 }

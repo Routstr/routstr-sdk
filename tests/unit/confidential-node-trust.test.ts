@@ -41,6 +41,19 @@ describe("provider error charges", () => {
     expect(checkUpstreamErrorReceipt(err(503, { cost_msats: 0 }), 503, 0, { abandonFeeMsat: 2000 })).toBe(true);
   });
 
+  it("bills a 5xx before body_released the abandon fee, not the reservation", () => {
+    expect(errorStatusCharge(502, false)).toBe("abandon_fee");
+    expect(errorStatusCharge(502, true)).toBe("reservation");
+    expect(errorStatusCharge(503, false)).toBe("session_fee");
+    const announced = { abandonFeeMsat: 2000, reservationMsat: 9000, reservationAnnounced: true };
+    const early = { ...announced, bodyReleased: false };
+    expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 2000, reserved_msats: 9000 }), 502, 0, early)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(502, { cost_msats: 9000, reserved_msats: 9000 }), 502, 0, early)).toThrow(
+      /abandon fee/,
+    );
+    expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 9000, reserved_msats: 9000 }), 502, 0, announced)).toBe(true);
+  });
+
   it("holds an image error receipt to the session's terms", () => {
     const image = { model: "z", variant: "webp", count: 2, msatPerImage: 12000 };
     const ok = { kind: "images", model: "z", variant: "webp", count: 2 };

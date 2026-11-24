@@ -104,7 +104,7 @@ terminal path. Best effort only: JavaScript cannot erase copies the runtime
 or the caller made (WebCrypto's key material, garbage-collected buffers, the
 hex strings passed to `cu-2pc`/`cu-prover`).
 
-## Security patches (TLS-01 … TLS-20)
+## Security patches (TLS-01 … TLS-21)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -283,6 +283,15 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   is what the server selected, or undefined (it was the first protocol
   offered when the server selected none; no caller relied on it). A
   ChangeCipherSpec after the handshake is refused (RFC 8446 §5).
+- **TLS-21, the outer type of a protected record** (`make-tls-client.js`
+  `processPacketInner`). Under TLS 1.3 a protected record has the outer
+  type application_data (23), always (RFC 8446 §5.2). Once the server's
+  ChangeCipherSpec had arrived, the fork opened a record of any outer type
+  (handshake, alert); the sidecar counts records of outer type 23 only, so a
+  KeyUpdate sent with outer type 22 shifted every record index the client
+  names in a disclosure (`server_records`, `epoch_start`, the error head's
+  record) and the request could not be settled. Such a record now fails the
+  connection, as OpenSSL refuses it.
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider

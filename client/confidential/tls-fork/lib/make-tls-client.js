@@ -104,6 +104,14 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         // the data will be encrypted, so
         // we need to decrypt the packet
         if (cipherSpecChanged || type === PACKET_TYPE.WRAPPED_RECORD) {
+            // FORK PATCH (TLS-21): the outer type of a TLS 1.3 protected
+            // record is always application_data (RFC 8446 §5.2). Another one
+            // was opened all the same once the server's ChangeCipherSpec had
+            // arrived, so the client counted records that the relay (which
+            // counts records of outer type 23) does not.
+            if (connTlsVersion === 'TLS1_3' && type !== PACKET_TYPE.WRAPPED_RECORD) {
+                throw new Error(`TLS 1.3 protected record of outer type ${type}`);
+            }
             logger.trace('recv wrapped record');
             const macKey = 'serverMacKey' in keys
                 ? keys.serverMacKey

@@ -543,7 +543,7 @@ class FakeServer {
    * One encrypted record (a handshake record unless `type` says otherwise);
    * `padding` zero bytes after the type.
    */
-  async seal(msg: Uint8Array, padding = 0, type = 0x16): Promise<Uint8Array> {
+  async seal(msg: Uint8Array, padding = 0, type = 0x16, outer = 0x17): Promise<Uint8Array> {
     const { encKey, iv } = await deriveTrafficKeysForSide(this.sHs, SUITE);
     const plaintext = concatenateUint8Arrays([msg, new Uint8Array([type]), new Uint8Array(padding)]);
     const { ciphertext } = (await encryptWrappedRecord(plaintext, {
@@ -552,9 +552,9 @@ class FakeServer {
       recordNumber: this.seq++,
       cipherSuite: SUITE,
       version: "TLS1_3",
-      recordHeaderOpts: { type: "WRAPPED_RECORD", version: "TLS1_2" },
+      recordHeaderOpts: { type: outer === 0x16 ? "HELLO" : "WRAPPED_RECORD", version: "TLS1_2" },
     } as never)) as { ciphertext: Uint8Array };
-    return new Uint8Array([0x17, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext]);
+    return new Uint8Array([outer, 0x03, 0x03, ...u16(ciphertext.length), ...ciphertext]);
   }
 }
 
@@ -1253,6 +1253,24 @@ describe("tls-fork application data and plaintext records (TLS-15, TLS-16)", () 
     await expect(client.handleReceivedBytes(plain(0x15, [0x01, 0x00]))).rejects.toThrow(/plaintext record/);
     expect(ended.length).toBe(1);
     expect(ended[0]).toBeInstanceOf(Error);
+  });
+
+  it("refuses a protected record whose outer type is not application_data", async () => {
+    // TLS-21: after the server's ChangeCipherSpec every record is opened; an
+    // outer type other than 23 (RFC 8446 §5.2) is refused, not counted.
+    const c = await externalClient(root);
+    await c.client.handleReceivedBytes(plain(0x14, [0x01]));
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()));
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leaf])));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.certificateVerify(leaf)));
+    await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()));
+    expect(c.handshakes()).toBe(1);
+    const sAp0 = (c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret;
+    const post = new FakeServer(sAp0, new Uint8Array());
+    await expect(c.client.handleReceivedBytes(await post.seal(hsMsg(24, [0]), 0, 0x16, 0x16))).rejects.toThrow(
+      /protected record of outer type/,
+    );
+    expect(c.client.hasEnded()).toBe(true);
   });
 
   it("still accepts the compatibility ChangeCipherSpec and an encrypted KeyUpdate", async () => {

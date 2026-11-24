@@ -10,7 +10,7 @@
    "after": "reservation"
   },
   "settled_without_receipt": {
-   "before": "reservation",
+   "before": "abandon_fee",
    "after": "reservation",
    "disclosed": true
   },
@@ -189,7 +189,7 @@
     "n": 2,
     "outcome": "charged",
     "reason": "settled_without_receipt",
-    "cost_msats": 9000,
+    "cost_msats": 500,
     "reserved_msats": 9000,
     "balance_msats": 1,
     "time": 1
@@ -213,6 +213,41 @@
     }
    },
    "ok": true
+  },
+  {
+   "name": "settled without receipt before release above the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 9000,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": false,
+     "disclosed": true
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 500 msat"
   },
   {
    "name": "unattested costs nothing",

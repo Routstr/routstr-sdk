@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { extractUsageDisclosure, usageEventFromDisclosure, usageEventProblem } from "../../client/confidential/suffix";
+import { extractUsageDisclosure, parseUsageEvent, usageEventFromDisclosure, usageEventProblem } from "../../client/confidential/suffix";
 
 const vectors = JSON.parse(readFileSync(new URL("./fixtures/usage-event-vectors.json", import.meta.url), "utf8")) as {
-  vectors: { name: string; ok: boolean; event: unknown }[];
+  vectors: { name: string; ok: boolean; event?: unknown; raw?: string }[];
 };
 
 /**
@@ -12,9 +12,18 @@ const vectors = JSON.parse(readFileSync(new URL("./fixtures/usage-event-vectors.
  * locator with usage on every chunk (Cloudflare): R starts at the last event.
  */
 describe("usage event rule", () => {
-  for (const t of vectors.vectors) {
+  // A `raw` vector is the event's text: a key repeated in any object refuses it.
+  const verdict = (t: { event?: unknown; raw?: string }): boolean => {
+    if (t.raw === undefined) return usageEventProblem(t.event) === null;
+    try {
+      return usageEventProblem(parseUsageEvent(t.raw)) === null;
+    } catch {
+      return false;
+    }
+  };
+  for (const t of vectors.vectors as { name: string; ok: boolean; event?: unknown; raw?: string }[]) {
     it(`${t.ok ? "accepts" : "refuses"}: ${t.name}`, () => {
-      expect(usageEventProblem(t.event) === null).toBe(t.ok);
+      expect(verdict(t)).toBe(t.ok);
     });
   }
 
