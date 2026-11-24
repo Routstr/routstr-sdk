@@ -150,6 +150,8 @@ interface Script {
   respond2?: (n: number, stream: number) => Uint8Array[];
   /** Framing "1.1": the provider's response bytes, one entry per record. */
   respond11?: () => string[];
+  /** Framing "1.1": the provider answers the first body record with these records and closes (`upstream_closed_early`). */
+  early11?: () => string[];
   /** The receipt's fields beyond the binding (sid, http, n, model, attestation_hash). */
   receipt?: (s: Settle, honest: Receipt) => Receipt;
   /** The provider's SETTINGS payload after the head. */
@@ -194,6 +196,7 @@ class FakeNode {
   private serverRecs: Uint8Array[] = [];
   private sentBytes = createHash("sha256");
   private settledCount = 0;
+  private closedEarly = false;
   private cur?: { n: number; model: string; maxTokens: number; suffix: string; recs: Uint8Array[]; sK?: number; released: boolean };
 
   constructor(readonly script: Script = {}) {}
@@ -264,6 +267,8 @@ class FakeNode {
         const cur = this.cur!;
         if (cur.released) return;
         if (m.upto < cur.recs.length) {
+          // The released records are written: the interval starts.
+          if (m.upto > 0) cur.sK ??= this.serverRecs.length;
           for (const c of this.script.partialRelease?.() ?? []) this.record(c);
           this.script.partialRelease = undefined;
           return;
@@ -429,6 +434,27 @@ class FakeNode {
         this.text({ type: "zk_params", proof: "pi_win", purpose: "records", first_seq: this.proven, count: this.seqs - this.proven, params: {} });
         this.proven = this.seqs;
       }
+    }
+    if (this.framing === "1.1" && this.script.early11) {
+      // As the sidecar after an early close: attested at once, nothing more relayed.
+      if (this.closedEarly) return;
+      this.closedEarly = true;
+      for (const r of this.script.early11()) this.record(enc(r));
+      this.text({ type: "upstream_closed_early", n: 1, response_bytes: 100 });
+      this.later(() => {
+        this.attest({
+          sid: SID,
+          http: "1.1",
+          n: 1,
+          th_sh: TH_SH,
+          th_sf: TH_SF,
+          c_commit: hexOf(C_COMMIT),
+          server_records: this.serverRecs.length,
+          sha256_recv: this.sentBytes.copy().digest("hex"),
+          client_records: cur.recs.length,
+        });
+      });
+      return;
     }
     if (this.framing === "1.1") {
       const inner = rec.subarray(5, rec.length - 16);
@@ -666,6 +692,22 @@ describe("framing 2: requests on one connection", () => {
     expect(conn.idle).toBe(false);
   });
 
+  it("an error head before the body was released, then the provider's close: disclosed after the close and settled by its status", async () => {
+    const setting = (v: number) => frame(FRAME.SETTINGS, 0, 0, Uint8Array.from([0, 4, v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]));
+    const conn = await connection("2", {
+      settings: setting(0).subarray(9),
+      partialRelease: () => {
+        setTimeout(() => node.text({ type: "upstream_closed_early", n: 1, response_bytes: 30 }), 0);
+        return [headStatus(3, 429, true)];
+      },
+    });
+    const h = conn.request(chatRequest());
+    const r = await h.done;
+    expect(r.status).toBe(429);
+    expect(r.costMsats).toBe(FEE);
+    expect(node.log).toContain("disclose_head");
+  });
+
   it("SETTINGS_INITIAL_WINDOW_SIZE changes the open stream's window (RFC 9113 §6.9.2)", async () => {
     // The provider starts with a 100-byte stream window (the body does not fit) and raises it later.
     const setting = (v: number) => frame(FRAME.SETTINGS, 0, 0, Uint8Array.from([0, 4, v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]));
@@ -889,6 +931,22 @@ describe("framing 1.1: the connection's one request", () => {
     expect(r.status).toBe(429);
     expect(r.costMsats).toBe(FEE);
     expect(node.log).toContain("disclose_head");
+  });
+
+  it("an error head before the body was complete, then the provider's close: disclosed after the close and settled by its status", async () => {
+    const conn = await connection("1.1", { early11: () => ["HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n{}"] });
+    const r = await conn.request(chatRequest()).done;
+    expect(r.status).toBe(429);
+    expect(r.costMsats).toBe(FEE);
+    expect(node.log).toContain("disclose_head");
+    expect(proofs).not.toContain("pi_win");
+  });
+
+  it("an early close with no error head to disclose fails the request (the node settles an abandoned one)", async () => {
+    const conn = await connection("1.1", { early11: () => [] });
+    await expect(conn.request(chatRequest()).done).rejects.toBeInstanceOf(SessionRejectedError);
+    expect(node.log).not.toContain("disclose_head");
+    expect(node.log).not.toContain("disclose");
   });
 
   it("refuses a receipt without the deposit release", async () => {

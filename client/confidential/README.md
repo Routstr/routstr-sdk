@@ -205,6 +205,16 @@ not fall back. After a body was released nothing is retried. `"2"` or
   `ReservationAboveCeilingError`, and the connection is closed (the node's
   abort rules apply: the abandon fee, or the deposit on a connection with no
   settlement yet).
+- **The provider closes before the body is released.** The node cannot read
+  what the provider sent, and a client can make a provider close at will (a
+  record with a wrong GCM tag), so that close settles nothing by itself. When
+  the provider sent an error head first, the client discloses it after the
+  close (`disclose_head`, the node waits 60 s) and the request is settled by
+  its status (a 5xx then costs the abandon fee). With nothing to disclose (a
+  TLS alert only, a GOAWAY with an error code) the request costs what an
+  abandoned one costs: the abandon fee, or the deposit on a connection that
+  settled nothing yet. Nodes before 2026-11-24 kept only the session fee
+  (`request_outcome` reason `provider_refused`); the client accepts that too.
 - The session fee falls due once per connection, at its first settlement: the
   receipt checks bound request 1 by usage + fee and later requests by usage
   alone (`maxChargeMsats`, `verifyFlatReceipt`, `checkUpstreamErrorReceipt`).

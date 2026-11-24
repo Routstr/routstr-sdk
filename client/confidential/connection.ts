@@ -778,6 +778,8 @@ export class ConfidentialConnection {
   private rawLens: number[] = [];
   private rawTotal = 0;
   private tlsEnded = false;
+  /** The provider closed before the request in flight was written in full (`upstream_closed_early`). */
+  private closedEarly = false;
 
   // --- HTTP/2 state -----------------------------------------------------------
   /** `SETTINGS_HEADER_TABLE_SIZE` of the provider's SETTINGS so far (null: never sent). */
@@ -1132,8 +1134,13 @@ export class ConfidentialConnection {
         }
         return;
       case "upstream_closed_early":
-        // The provider closed before the request was fully written; the `error` follows.
+        // The provider closed before the request was fully written. Only a
+        // disclosed answer settles the request now (an error head, a
+        // refusal); without one the node's `error` follows and the request
+        // is an abandoned one (§12.10).
+        this.closedEarly = true;
         this.event({ ev: "upstream_closed_early", n: m.n, response_bytes: m.response_bytes });
+        this.kick();
         return;
       case "zk_params": {
         const key = `zk_params:${String(m.proof)}:${String(m.purpose ?? "")}`;
@@ -2291,7 +2298,9 @@ export class ConfidentialConnection {
       this.timeouts.released,
     );
     if (this.tlsEnded && !cur.released && !errored() && cur.reset === undefined && !gone()) {
-      throw new SessionRejectedError(`the provider closed the connection before request ${n} was complete (nothing billed)`);
+      throw new SessionRejectedError(
+        `the provider closed the connection before request ${n} was complete, with no answer to disclose (an abandoned request)`,
+      );
     }
     // An image response is silent until the image is done: wait as long as
     // the signed offer says the provider may take.
@@ -2520,21 +2529,34 @@ export class ConfidentialConnection {
     if (!finalRecord) throw new SessionProtocolError("no body record was written");
     this.event({ ev: "body_sent", len: body.length, records: this.bodyRecords.length });
 
-    const zp = (await this.wait(["zk_params:pi_win:records"], this.timeouts.zkParams)).msg;
-    const shape = checkPiWinFinalRecord(zp, { anchor: this.secrets().h1, seq: finalSeq, wire: finalRecord, suffix });
-    // From here the request may reach the provider: never run it again elsewhere.
-    cur.releaseSent = true;
-    const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.secrets().clientAp1) });
-    cur.proofs.push({ ...tw, purpose: "records", ...shape });
-    await this.until(() => cur.released, "body_released", this.timeouts.released);
+    // A provider that answers the head alone and closes first (a 401, a 429)
+    // makes the node attest at once (`upstream_closed_early`): the request
+    // then settles only by its disclosed error head (§12.8, §12.10).
+    let early: any;
+    const first = await this.wait(["zk_params:pi_win:records", "attestation"], this.timeouts.zkParams);
+    if (first.key === "attestation") {
+      early = first.msg;
+    } else {
+      const zp = first.msg;
+      const shape = checkPiWinFinalRecord(zp, { anchor: this.secrets().h1, seq: finalSeq, wire: finalRecord, suffix });
+      // From here the request may reach the provider: never run it again elsewhere.
+      cur.releaseSent = true;
+      const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.secrets().clientAp1) });
+      cur.proofs.push({ ...tw, purpose: "records", ...shape });
+      await this.until(() => cur.released || this.closedEarly, "body_released", this.timeouts.released);
+      if (!cur.released) early = (await this.wait(["attestation"], this.timeouts.attestation)).msg;
+    }
+    if (early !== undefined && !this.closedEarly) {
+      throw new SessionProtocolError("an attestation before body_released without upstream_closed_early");
+    }
 
     // The provider closes after its response; the node then attests on its
     // own. The wait lasts as long as the answer streams: only silence ends it.
     const idleMs = cur.image
       ? Math.max(this.timeouts.responseIdle, Math.max(1, cur.offer.images?.response_idle_s ?? 300) * 1000)
       : this.timeouts.responseIdle;
-    let attMsg: any;
-    for (;;) {
+    let attMsg: any = early;
+    while (attMsg === undefined) {
       const last = Math.max(cur.tLastData, cur.tReleased ?? 0, this.tLastWire);
       const left = last + idleMs + this.timeouts.attestation - Date.now();
       if (left <= 0) throw new ConfidentialTimeoutError("timeout waiting for the response and its attestation");
@@ -2545,11 +2567,18 @@ export class ConfidentialConnection {
         if (!(e instanceof ConfidentialTimeoutError)) throw e;
       }
     }
-    const att = await this.checkAttestation11(attMsg);
+    const att = await this.checkAttestation11(attMsg, early !== undefined);
     await this.drained();
     if (this.failure) throw this.failure;
 
     const status = cur.status ?? 0;
+    if (early !== undefined && status < 400) {
+      // Nothing of a closed connection can be disclosed but an error head:
+      // the node settles the request as an abandoned one.
+      throw new SessionRejectedError(
+        `the provider closed the connection before request 1 was complete, with no error head to disclose`,
+      );
+    }
     let receipt: ConfidentialReceipt;
     if (status >= 200 && status < 300 && cur.image) {
       this.sendText({ type: "accept", n: 1 });
@@ -2636,7 +2665,7 @@ export class ConfidentialConnection {
    * the head-record commitment π_NK proved, and counts and a hash we can
    * recompute from our own records. Returns the signed bytes.
    */
-  private async checkAttestation11(m: any): Promise<{ json: string; a: any }> {
+  private async checkAttestation11(m: any, early = false): Promise<{ json: string; a: any }> {
     const json: string = typeof m.a_json === "string" ? m.a_json : JSON.stringify(m.a);
     if (!verifySchnorrSignature(json, m.sig, this.ready.pubkey)) {
       throw new ReceiptVerificationError("attestation signature invalid");
@@ -2671,7 +2700,11 @@ export class ConfidentialConnection {
       bad(`counts ${String(a.server_records).slice(0, 16)} upstream records, we received ${this.recvRecords}`);
     }
     if (a.sha256_recv !== this.recvHash.copy().digest("hex")) bad("hashes different upstream bytes than we received");
-    if (a.client_records !== this.bodyRecords.length) {
+    // After an early close the node relayed only the body records that reached it before.
+    const recordsOk = early
+      ? Number.isSafeInteger(a.client_records) && a.client_records >= 0 && a.client_records <= this.bodyRecords.length
+      : a.client_records === this.bodyRecords.length;
+    if (!recordsOk) {
       bad(`counts ${String(a.client_records).slice(0, 16)} body records, we sent ${this.bodyRecords.length}`);
     }
     this.event({ ev: "attestation", n: 1, server_records: a.server_records });
