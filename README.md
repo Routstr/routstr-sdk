@@ -76,28 +76,37 @@ and serve an attestation bundle at
 against a trust policy **you pin**, so a request can be gated on "the host runs
 the image I admit" rather than on trust in the operator.
 
+This Node example assumes your request transport has already opened the TLS
+connection it will use for the request, but has not sent a prompt or payment:
+
 ```ts
+import { readFileSync } from "node:fs";
 import {
   attestEnclavaProvider,
-  /* or */ attestEnclavaProviderIfNeeded,
+  spkiSha256FromPeerCertificate,
 } from "@routstr/sdk/client";
-import ENCLAVA_POLICY from "./policies/routstr-core.json"; // bundled, never fetched
 
 const attestation = await attestEnclavaProvider({
-  baseUrl: providerUrl,          // https://<app>.<org>.enclava.run
-  policy: JSON.stringify(ENCLAVA_POLICY),
-  // Node only: SHA-256 of the SPKI of the socket that actually served the
-  // request. Required when the policy sets transport.require_tls_channel_spki.
-  channelSpkiSha256: await spkiSha256FromPeerCertificate(peerX509),
+  origin: PINNED_PROVIDER_ORIGIN, // caller-configured, not provider metadata
+  policy: readFileSync("./policies/routstr-core.json"), // exact pinned bytes
+  channelSpkiSha256: await spkiSha256FromPeerCertificate(requestPeerX509),
 });
-// attestation.bundleSha256 / .policySha256 are the audit trail for the request.
+// Only now send sensitive data on that connection. If it reconnects, verify
+// the new connection's peer SPKI before sending. Record the two appraisal hashes.
 ```
+
+A certificate from a separate `tls.connect()` probe does **not** bind a later
+`fetch()` or inference request. This helper does not own the request transport
+or automatically gate `RoutstrClient` requests. In browsers, JavaScript cannot
+observe the peer SPKI: a policy that requires it fails closed, and a policy that
+omits it does not establish request-channel binding.
 
 What the module does, and does not, do:
 
 - It builds a fresh 32-byte challenge nonce, fetches the bundle, memoises a
-  `PASS` per `(origin, policy)` for `ttlMs` (default 5 min, in-flight
-  de-duplicated), and throws `EnclavaAttestationError` for every verdict that is
+  `PASS` for the same origin, policy bytes, observed SPKI and appraiser for
+  `ttlMs` (default 5 min). It de-duplicates equivalent in-flight requests,
+  except with a caller-supplied nonce, and throws `EnclavaAttestationError` for every verdict that is
   not `PASS` (`FAIL` → `ENCLAVA_ATTESTATION_REJECTED`, `INCONCLUSIVE` →
   `ENCLAVA_ATTESTATION_INCONCLUSIVE`).
 - It refuses to attest a plaintext-`http` origin, an oversized or wrong-media-type
@@ -109,12 +118,15 @@ What the module does, and does not, do:
   `enclava-verifier-web` release asset of `enclava-labs/cap`) lazily, and never
   requires it at import time. `createModuleEnclavaAppraiser(module)` takes an
   already-loaded module for bundlers that reject runtime imports, and any
-  function matching `EnclavaAppraiser` works — for example a Node wrapper around
-  `enclava verify --policy <file> --json <origin>`.
+  function matching `EnclavaAppraiser` works, provided it verifies those exact
+  bytes against the supplied context. A CLI invocation that fetches its own
+  bundle and generates its own challenge is not a drop-in appraiser.
 - It does **not** choose the failure policy for you: attesting before a request
   and on failure (marking a provider unusable, failing over, or aborting) is the
-  caller's decision. `attestEnclavaProviderIfNeeded(info, baseUrl, options)` is a
-  no-op returning `undefined` for providers that are not Enclava-hosted.
+  caller's decision. `attestEnclavaProviderIfNeeded(info, baseUrl, options)` is
+  for discovery only: metadata is untrusted, and `undefined` means no
+  attestation was attempted. Call `attestEnclavaProvider` directly for any
+  caller-pinned provider that must pass attestation.
 
 Two traps when holding a policy in JavaScript:
 
@@ -126,8 +138,9 @@ Two traps when holding a policy in JavaScript:
   exact bytes or string you loaded — this module appraises bytes and only parses
   a copy to read `transport.require_tls_channel_spki`.
 - The proof endpoint is rate-limited. The memoised appraisal plus in-flight
-  de-duplication keeps normal traffic to one bundle fetch per `(origin, policy)`
-  per `ttlMs`; hammering it in a loop will start returning fetch errors.
+  de-duplication limit repeat fetches for equivalent inputs. Rejected,
+  inconclusive, and unavailable results are retried after a short backoff
+  (`failureTtlMs`, default 5 seconds; `0` disables it).
 
 Policies are the security boundary: pin `target.image_digests`,
 `amd.allowed_measurements`, `target.deployment_ids`, the Sigstore identity and

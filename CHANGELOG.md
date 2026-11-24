@@ -6,9 +6,9 @@
 
 - New `client/EnclavaAttest.ts` (exported from `@routstr/sdk/client`) appraises an
   Enclava-hosted provider's AMD SEV-SNP proof bundle against a caller-pinned
-  trust policy before a request is sent: fresh 32-byte challenge nonce, bundle
-  fetch and integrity checks, appraisal caching and in-flight de-duplication, and
-  fail-closed verdict handling via `EnclavaAttestationError`.
+  trust policy. The opt-in helper provides challenge nonces, bounded bundle
+  downloads, channel-scoped appraisal reuse, and fail-closed verdict handling
+  via `EnclavaAttestationError`. It does not gate SDK requests automatically.
 - `attestEnclavaProvider`, `attestEnclavaProviderIfNeeded`, `isEnclavaProvider`,
   `getCachedEnclavaAttestation`, `clearEnclavaAttestationCache`,
   `spkiSha256FromPeerCertificate`.
@@ -18,7 +18,6 @@
   `createModuleEnclavaAppraiser(module)` accepts an already-loaded verifier.
 - Browser-safe: no Node builtins, no new dependencies. A successful attestation
   exposes `bundleSha256` and `policySha256` for the caller's usage record.
-
 
 ## 0.5.2
 
