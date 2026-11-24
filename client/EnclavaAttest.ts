@@ -4,8 +4,8 @@
  * An Enclava app exposes an AMD SEV-SNP proof bundle at
  * `/.well-known/confidential/proof-bundle`. Appraised against a trust policy the
  * caller pins independently, that bundle proves the host serving a provider URL
- * runs exactly the image the policy admits, and that the TLS connection the
- * verifier opened belongs to that enclave.
+ * runs an image the policy admits. With a TLS-binding policy, it also binds
+ * the evidence to the observed peer SPKI supplied by the caller.
  *
  * This module owns the protocol half: challenge nonce, bundle fetch, appraisal
  * caching, and fail-closed verdict handling. The cryptographic appraisal is
@@ -18,8 +18,8 @@
  * - {@link createModuleEnclavaAppraiser} takes an already-loaded verifier module,
  *   for bundlers that refuse runtime imports.
  *
- * Node callers that already trust the `enclava` CLI can wrap
- * `enclava verify --policy <file> --json <origin>` in a custom appraiser instead.
+ * Custom appraisers must verify the exact supplied bundle and policy against
+ * the supplied context, not independently fetch a new bundle.
  *
  * The policy MUST be pinned by the caller (bundled constant, checked-in file, or
  * a channel the provider cannot influence). A policy fetched from the provider
@@ -46,6 +46,10 @@ export const DEFAULT_ENCLAVA_ATTESTATION_TTL_MS = 5 * 60_000;
 
 /** Default network budget for the bundle fetch. */
 export const DEFAULT_ENCLAVA_FETCH_TIMEOUT_MS = 15_000;
+
+/** Brief retry backoff for a rejected or unavailable attestation. */
+const DEFAULT_FAILURE_TTL_MS = 5_000;
+const MAX_CACHE_ENTRIES = 64;
 
 const NATIVE_VERIFIER_MODULE = "enclava-verifier-wasm";
 const ENCLAVA_VERIFIER_MODULE_ENV = "ROUTSTR_ENCLAVA_VERIFIER_MODULE";
@@ -185,7 +189,7 @@ export interface EnclavaAttestOptions extends EnclavaFetchOptions {
   baseUrl?: string;
   policy: EnclavaPolicy;
   appraiser?: EnclavaAppraiser;
-  /** SPKI hash of the observed TLS channel, when the runtime can see it. */
+  /** SPKI of the connection being verified. A separate TLS probe does not bind later requests. */
   channelSpkiSha256?: string | null;
   /** Override the challenge nonce (tests, or a caller-managed challenge). */
   nonce?: string;
@@ -193,7 +197,9 @@ export interface EnclavaAttestOptions extends EnclavaFetchOptions {
   now?: () => number;
   /** Reuse window for a passing appraisal. `0` disables reuse. */
   ttlMs?: number;
-  /** Skip the cache and attest again. */
+  /** Backoff for rejected, inconclusive or unavailable results (default 5 s). `0` disables it. */
+  failureTtlMs?: number;
+  /** Ignore the cached result and fetch again (may join an equivalent fetch in progress). */
   forceRefresh?: boolean;
 }
 
@@ -201,7 +207,7 @@ export interface EnclavaAttestation {
   provider: "enclava";
   origin: string;
   verdict: "PASS";
-  /** Full appraisal result, including per-check outcomes. */
+  /** Full JSON-compatible appraisal result, including per-check outcomes. */
   appraisal: EnclavaAppraisal;
   /** SHA-256 of the exact bundle bytes that passed. */
   bundleSha256: string;
@@ -212,21 +218,54 @@ export interface EnclavaAttestation {
   nonce: string;
   /** The same challenge as hex (the verifier context form). */
   challengeNonce: string;
+  /** SPKI used for appraisal, not a guarantee about subsequent sockets. */
+  channelSpkiSha256: string | null;
   fetchedAt: number;
   expiresAt: number;
 }
 
-interface CacheEntry {
-  attestation: EnclavaAttestation;
+type CacheEntry = {
+  storedAt: number;
   expiresAt: number;
-}
+} & ({ attestation: EnclavaAttestation } | { error: EnclavaAttestationError });
 
 const attestationCache = new Map<string, CacheEntry>();
 const inflightAttestations = new Map<string, Promise<EnclavaAttestation>>();
+const functionIds = new WeakMap<object, number>();
+let nextFunctionId = 0;
+let cacheGeneration = 0;
+
+function attestationKey(
+  origin: string,
+  policySha256: string,
+  spki: string | null,
+  appraiser: EnclavaAppraiser,
+  clock: () => number
+): string {
+  return JSON.stringify([origin, policySha256, spki, functionId(appraiser), functionId(clock)]);
+}
+
+function functionId(fn: object): number {
+  let id = functionIds.get(fn);
+  if (id === undefined) {
+    id = ++nextFunctionId;
+    functionIds.set(fn, id);
+  }
+  return id;
+}
+
+function storeAttestation(key: string, entry: CacheEntry): void {
+  attestationCache.delete(key);
+  attestationCache.set(key, entry);
+  if (attestationCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = attestationCache.keys().next().value;
+    if (oldest !== undefined) attestationCache.delete(oldest);
+  }
+}
 
 /**
- * True when a provider advertises Enclava confidential computing, by explicit
- * marker or by hosting hostname.
+ * Heuristic discovery only. Do not use provider metadata to decide if a
+ * pinned provider is required to pass attestation.
  */
 export function isEnclavaProvider(
   info: unknown,
@@ -239,7 +278,6 @@ export function isEnclavaProvider(
       | undefined;
     if (attestation) {
       if (attestation.type === "enclava-proof-bundle") return true;
-      if (typeof attestation.proof_bundle_url === "string") return true;
       if (attestation.provider === "enclava") return true;
     }
     const confidential = record.confidential as
@@ -255,18 +293,8 @@ export function isEnclavaProvider(
     ) {
       return true;
     }
-    const tee = record.tee as
-      | Record<string, unknown>
-      | string
-      | undefined;
-    if (
-      tee === "sev-snp" ||
-      (tee &&
-        typeof tee === "object" &&
-        (tee.type === "sev-snp" || tee.provider === "enclava"))
-    ) {
-      return true;
-    }
+    const tee = record.tee as Record<string, unknown> | undefined;
+    if (tee?.provider === "enclava") return true;
     for (const key of ["http_url", "url", "baseUrl", "base_url"]) {
       const candidate = record[key];
       if (typeof candidate === "string" && isEnclavaHostname(candidate)) {
@@ -279,12 +307,9 @@ export function isEnclavaProvider(
 
 function isEnclavaHostname(url: string): boolean {
   try {
-    const host = new URL(normalizeUrlInput(url)).hostname.toLowerCase();
-    return (
-      host.endsWith(".enclava.run") ||
-      host.endsWith(".enclava.work") ||
-      host === "enclava.run" ||
-      host.endsWith(".enclava.dev")
+    const host = new URL(normalizeUrlInput(url)).hostname.toLowerCase().replace(/\.$/, "");
+    return ["enclava.run", "enclava.work", "enclava.dev"].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`)
     );
   } catch {
     return false;
@@ -368,7 +393,7 @@ function base64UrlToBytes(value: string): Uint8Array | undefined {
     const binary =
       typeof globalThis.atob === "function"
         ? globalThis.atob(padded)
-        : BufferToBinary(padded);
+        : bufferToBinary(padded);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
     return bytes;
@@ -383,15 +408,15 @@ function base64UrlEncode(bytes: Uint8Array): string {
   const base64 =
     typeof globalThis.btoa === "function"
       ? globalThis.btoa(binary)
-      : BufferToBase64(binary);
+      : bufferToBase64(binary);
   return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function BufferToBase64(binary: string): string {
+function bufferToBase64(binary: string): string {
   return bufferImpl().from(binary, "binary").toString("base64");
 }
 
-function BufferToBinary(base64: string): string {
+function bufferToBinary(base64: string): string {
   return bufferImpl().from(base64, "base64").toString("binary");
 }
 
@@ -471,7 +496,7 @@ export async function fetchEnclavaProofBundle(
   bundle: Uint8Array;
 }> {
   const target = enclavaOrigin(origin);
-  const nonceBytes = options.nonce
+  const nonceBytes = options.nonce !== undefined
     ? nonceToBytes(options.nonce)
     : randomBytes(ENCLAVA_NONCE_BYTES);
   const nonce = base64UrlEncode(nonceBytes);
@@ -486,82 +511,46 @@ export async function fetchEnclavaProofBundle(
   }
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_ENCLAVA_FETCH_TIMEOUT_MS;
-  const controller =
-    typeof AbortController === "function" ? new AbortController() : undefined;
-  const timer = controller
-    ? setTimeout(() => controller.abort(), timeoutMs)
-    : undefined;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new EnclavaAttestationError(
+        "ENCLAVA_BUNDLE_UNAVAILABLE",
+        `Proof bundle request to ${target} timed out after ${timeoutMs} ms`,
+        { origin: target }
+      ));
+      controller.abort();
+    }, timeoutMs);
+  });
 
-  let response: Response;
+  let bytes: Uint8Array;
   try {
-    response = await fetchImpl(url, {
-      method: "GET",
-      headers: { Accept: ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE },
-      // Never let a proxy or service worker answer with a stale challenge.
-      cache: "no-store",
-      signal: controller?.signal,
-    });
+    const download = async () => {
+      const response = await fetchImpl(url, {
+        method: "GET",
+        headers: { Accept: ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE },
+        cache: "no-store",
+        redirect: "error",
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        void response.body?.cancel().catch(() => {});
+        throw controller.signal.reason;
+      }
+      return readProofBody(response, target, controller.signal);
+    };
+    bytes = await Promise.race([deadline, download()]);
   } catch (error) {
+    controller.abort();
+    if (error instanceof EnclavaAttestationError) throw error;
     throw new EnclavaAttestationError(
       "ENCLAVA_BUNDLE_UNAVAILABLE",
       `Proof bundle request to ${target} failed: ${describeError(error)}`,
       { origin: target, cause: error }
     );
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-
-  if (!response.ok) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_UNAVAILABLE",
-      `Proof bundle request to ${target} returned HTTP ${response.status}`,
-      { origin: target }
-    );
-  }
-
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().includes(ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE)) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_MALFORMED",
-      `Proof bundle has unexpected content type "${contentType || "(none)"}", ` +
-        `expected ${ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE}`,
-      { origin: target }
-    );
-  }
-
-  const declaredLength = Number(response.headers.get("content-length") ?? "");
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_ENCLAVA_PROOF_BUNDLE_BYTES) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_TOO_LARGE",
-      `Proof bundle declares ${declaredLength} bytes, limit is ${MAX_ENCLAVA_PROOF_BUNDLE_BYTES}`,
-      { origin: target }
-    );
-  }
-
-  let bytes: Uint8Array;
-  try {
-    bytes = new Uint8Array(await response.arrayBuffer());
-  } catch (error) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_UNAVAILABLE",
-      `Could not read the proof bundle body: ${describeError(error)}`,
-      { origin: target, cause: error }
-    );
-  }
-
-  if (bytes.byteLength === 0) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_MALFORMED",
-      "Proof bundle response was empty",
-      { origin: target }
-    );
-  }
-  if (bytes.byteLength > MAX_ENCLAVA_PROOF_BUNDLE_BYTES) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_BUNDLE_TOO_LARGE",
-      `Proof bundle is ${bytes.byteLength} bytes, limit is ${MAX_ENCLAVA_PROOF_BUNDLE_BYTES}`,
-      { origin: target }
-    );
+    clearTimeout(timer);
   }
 
   return {
@@ -572,49 +561,155 @@ export async function fetchEnclavaProofBundle(
   };
 }
 
+async function readProofBody(
+  response: Response,
+  origin: string,
+  signal: AbortSignal
+): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  const cancel = () => { void reader?.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    if (!response.ok) {
+      throw new EnclavaAttestationError(
+        "ENCLAVA_BUNDLE_UNAVAILABLE",
+        `Proof bundle request to ${origin} returned HTTP ${response.status}`,
+        { origin }
+      );
+    }
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.split(";", 1)[0].trim().toLowerCase() !== ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE) {
+      throw new EnclavaAttestationError(
+        "ENCLAVA_BUNDLE_MALFORMED",
+        `Unexpected proof bundle content type: ${contentType || "(none)"}`,
+        { origin }
+      );
+    }
+    const tooLarge = () => new EnclavaAttestationError(
+      "ENCLAVA_BUNDLE_TOO_LARGE",
+      `Proof bundle exceeds ${MAX_ENCLAVA_PROOF_BUNDLE_BYTES} bytes`,
+      { origin }
+    );
+    if (Number(response.headers.get("content-length")) > MAX_ENCLAVA_PROOF_BUNDLE_BYTES) {
+      throw tooLarge();
+    }
+    // Use a bounded buffer instead of retaining an arbitrary number of chunks.
+    let bytes = new Uint8Array(0);
+    let length = 0;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (signal.aborted) throw signal.reason;
+        if (done) break;
+        const nextLength = length + value.byteLength;
+        if (nextLength > MAX_ENCLAVA_PROOF_BUNDLE_BYTES) throw tooLarge();
+        if (nextLength > bytes.byteLength) {
+          const grown = new Uint8Array(Math.min(MAX_ENCLAVA_PROOF_BUNDLE_BYTES,
+            Math.max(bytes.byteLength * 2, nextLength, 4096)));
+          grown.set(bytes);
+          bytes = grown;
+        }
+        bytes.set(value, length);
+        length = nextLength;
+      }
+    }
+    if (length === 0) {
+      throw new EnclavaAttestationError("ENCLAVA_BUNDLE_MALFORMED", "Proof bundle response was empty", { origin });
+    }
+    return bytes.slice(0, length);
+  } catch (error) {
+    cancel();
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader?.releaseLock();
+  }
+}
+
 /**
  * Attest an Enclava provider against a pinned policy.
  *
- * Resolves only when the appraisal verdict is `PASS`; every other outcome throws
- * {@link EnclavaAttestationError}. Successful appraisals are memoised per
- * `(origin, policy)` for `ttlMs`, with in-flight de-duplication so concurrent
- * requests share one bundle fetch.
+ * Resolves only on `PASS`. Reuse is scoped to the origin, pinned policy,
+ * observed channel SPKI and appraiser. Caller-managed nonces are never reused.
  */
 export async function attestEnclavaProvider(
   options: EnclavaAttestOptions
 ): Promise<EnclavaAttestation> {
-  const origin = enclavaOrigin(
-    options.origin ?? options.baseUrl ?? missingOrigin()
-  );
+  options = { ...options };
+  const origin = enclavaOrigin(options.origin ?? options.baseUrl ?? missingOrigin());
   const policyBytes = toBytes(options.policy);
   const policyJson = toJsonText(policyBytes);
+  const observedSpki = validateChannelSpki(origin, policyJson, options.channelSpkiSha256);
   const policySha256 = await enclavaSha256Hex(policyBytes);
-  const cacheKey = `${origin}\u0000${policySha256}`;
-  const nowMs = (options.now ?? Date.now)();
+  const appraiser = options.appraiser ?? defaultAppraiser();
+  const clock = options.now ?? Date.now;
   const ttlMs = options.ttlMs ?? DEFAULT_ENCLAVA_ATTESTATION_TTL_MS;
-
-  if (!options.forceRefresh && ttlMs > 0) {
-    const cached = attestationCache.get(cacheKey);
-    if (cached && cached.expiresAt > nowMs) return cached.attestation;
-    if (cached) attestationCache.delete(cacheKey);
+  const failureTtlMs = options.failureTtlMs ?? (ttlMs > 0 ? DEFAULT_FAILURE_TTL_MS : 0);
+  const input = { origin, policyBytes, policyJson, policySha256, observedSpki, options, appraiser, ttlMs };
+  if (options.nonce !== undefined || (ttlMs <= 0 && failureTtlMs <= 0)) {
+    return runAttestation(input);
   }
 
-  const inflight = inflightAttestations.get(cacheKey);
-  if (inflight) return inflight;
+  const key = attestationKey(origin, policySha256, observedSpki, appraiser, clock);
+  const nowMs = clock();
+  const cached = attestationCache.get(key);
+  if (cached) {
+    if (options.forceRefresh || cached.expiresAt <= nowMs) {
+      attestationCache.delete(key);
+    } else if (!("error" in cached) && cached.storedAt + ttlMs > nowMs && ttlMs > 0) {
+      return structuredClone(cached.attestation);
+    } else if ("error" in cached && cached.storedAt + failureTtlMs > nowMs && failureTtlMs > 0) {
+      throw copyAttestationError(cached.error);
+    }
+  }
 
-  const pending = runAttestation({
-    origin,
-    policyBytes,
-    policyJson,
-    policySha256,
-    options,
-    ttlMs,
-  }).finally(() => {
-    inflightAttestations.delete(cacheKey);
+  const fetcher = options.fetchImpl ?? globalThis.fetch;
+  const inflightKey = JSON.stringify([
+    key, ttlMs, failureTtlMs, options.timeoutMs ?? DEFAULT_ENCLAVA_FETCH_TIMEOUT_MS,
+    fetcher ? functionId(fetcher) : null,
+  ]);
+  let pending = inflightAttestations.get(inflightKey);
+  if (!pending) {
+    const generation = cacheGeneration;
+    pending = runAttestation(input).then((attestation) => {
+      if (ttlMs > 0 && generation === cacheGeneration) {
+        storeAttestation(key, { attestation, storedAt: attestation.fetchedAt, expiresAt: attestation.expiresAt });
+      }
+      return attestation;
+    }, (error: unknown) => {
+      if (generation === cacheGeneration && failureTtlMs > 0 &&
+          error instanceof EnclavaAttestationError &&
+          ["ENCLAVA_ATTESTATION_REJECTED", "ENCLAVA_ATTESTATION_INCONCLUSIVE", "ENCLAVA_BUNDLE_UNAVAILABLE"].includes(error.code)) {
+        const storedAt = clock();
+        storeAttestation(key, { error: copyAttestationError(error), storedAt, expiresAt: storedAt + failureTtlMs });
+      }
+      throw error;
+    }).finally(() => {
+      if (inflightAttestations.get(inflightKey) === pending) inflightAttestations.delete(inflightKey);
+    });
+    inflightAttestations.set(inflightKey, pending);
+  }
+  return structuredClone(await pending);
+}
+
+function copyAttestationError(error: EnclavaAttestationError): EnclavaAttestationError {
+  return new EnclavaAttestationError(error.code, error.message, {
+    ...error,
+    reasonCodes: [...error.reasonCodes],
+    checks: error.checks && structuredClone(error.checks),
   });
+}
 
-  inflightAttestations.set(cacheKey, pending);
-  return pending;
+function validateChannelSpki(origin: string, policyJson: string, value?: string | null): string | null {
+  if (value != null) return assertHex32(value, "channelSpkiSha256", "ENCLAVA_SPKI_INVALID");
+  if (policyRequiresTlsChannel(policyJson)) {
+    throw new EnclavaAttestationError(
+      "ENCLAVA_TLS_CHANNEL_UNVERIFIED",
+      `Policy for ${origin} requires transport.require_tls_channel_spki, but no observed channel SPKI was supplied.`,
+      { origin }
+    );
+  }
+  return null;
 }
 
 async function runAttestation(input: {
@@ -622,43 +717,32 @@ async function runAttestation(input: {
   policyBytes: Uint8Array;
   policyJson: string;
   policySha256: string;
+  observedSpki: string | null;
   options: EnclavaAttestOptions;
+  appraiser: EnclavaAppraiser;
   ttlMs: number;
 }): Promise<EnclavaAttestation> {
-  const { origin, policyBytes, policyJson, policySha256, options, ttlMs } =
-    input;
+  const { origin, policyBytes, policyJson, policySha256, observedSpki, options, appraiser, ttlMs } = input;
 
-  const { bundle, nonce, challengeNonce } = await fetchEnclavaProofBundle(
-    origin,
-    {
-      fetchImpl: options.fetchImpl,
-      timeoutMs: options.timeoutMs,
-      nonce: options.nonce,
-    }
-  );
+  const { bundle, nonce, challengeNonce } = await fetchEnclavaProofBundle(origin, {
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+    nonce: options.nonce,
+  });
   const bundleSha256 = await enclavaSha256Hex(bundle);
-
-  const appraiser = options.appraiser ?? defaultAppraiser();
-  const observedSpki =
-    options.channelSpkiSha256 === undefined || options.channelSpkiSha256 === null
-      ? null
-      : assertHex32(
-          options.channelSpkiSha256,
-          "channelSpkiSha256",
-          "ENCLAVA_SPKI_INVALID"
-        );
+  const fetchedAt = (options.now ?? Date.now)();
   const context: EnclavaAppraiseContext = {
     challenge_nonce: challengeNonce,
     expected_target_origin: origin,
-    now_unix_seconds: Math.floor((options.now ?? Date.now)() / 1000),
+    now_unix_seconds: Math.floor(fetchedAt / 1000),
     observed_channel_spki_sha256: observedSpki,
   };
 
   let appraisal: EnclavaAppraisal;
   try {
     appraisal = await appraiser({
-      bundle,
-      policy: policyBytes,
+      bundle: bundle.slice(),
+      policy: policyBytes.slice(),
       policyJson,
       context,
     });
@@ -676,7 +760,9 @@ async function runAttestation(input: {
     );
   }
 
-  const checks = Array.isArray(appraisal?.checks) ? appraisal.checks : undefined;
+  const checks = Array.isArray(appraisal?.checks)
+    ? appraisal.checks.filter((check) => check && typeof check.id === "string")
+    : undefined;
   const reasonCodes = (checks ?? [])
     .filter((check) => check.outcome !== "PASS")
     .map((check) => check.reason_code ?? `${check.id}:${check.outcome}`);
@@ -690,8 +776,8 @@ async function runAttestation(input: {
   }
 
   if (
-    typeof appraisal.bundle_sha256 === "string" &&
-    appraisal.bundle_sha256.toLowerCase() !== bundleSha256
+    appraisal.bundle_sha256 !== undefined &&
+    (typeof appraisal.bundle_sha256 !== "string" || appraisal.bundle_sha256.toLowerCase() !== bundleSha256)
   ) {
     throw new EnclavaAttestationError(
       "ENCLAVA_BUNDLE_MALFORMED",
@@ -701,29 +787,13 @@ async function runAttestation(input: {
     );
   }
   if (
-    typeof appraisal.policy_sha256 === "string" &&
-    appraisal.policy_sha256.toLowerCase() !== policySha256
+    appraisal.policy_sha256 !== undefined &&
+    (typeof appraisal.policy_sha256 !== "string" || appraisal.policy_sha256.toLowerCase() !== policySha256)
   ) {
     throw new EnclavaAttestationError(
       "ENCLAVA_POLICY_INVALID",
       `Appraiser used a different policy (${appraisal.policy_sha256}) than the ` +
         `pinned one (${policySha256}) for ${origin}`,
-      { origin, bundleSha256, policySha256, checks, reasonCodes }
-    );
-  }
-
-  // A policy that requires TLS channel binding cannot be satisfied when the
-  // runtime cannot see the socket. Report that specifically: it is a caller
-  // configuration problem, not a misbehaving enclave.
-  if (
-    policyRequiresTlsChannel(policyJson) && observedSpki === null
-  ) {
-    throw new EnclavaAttestationError(
-      "ENCLAVA_TLS_CHANNEL_UNVERIFIED",
-      `Policy for ${origin} requires transport.require_tls_channel_spki, but no ` +
-        `observed_channel_spki_sha256 was supplied. Pass it from the socket that ` +
-        `served the request (Node: spkiSha256FromPeerCertificate), or use a ` +
-        `policy without that requirement in browsers.`,
       { origin, bundleSha256, policySha256, checks, reasonCodes }
     );
   }
@@ -740,27 +810,29 @@ async function runAttestation(input: {
     );
   }
 
-  const nowMs = (options.now ?? Date.now)();
-  const attestation: EnclavaAttestation = {
+  if ((appraisal.challenge_nonce !== undefined && appraisal.challenge_nonce !== challengeNonce) ||
+      (appraisal.target_origin !== undefined && appraisal.target_origin !== origin)) {
+    throw new EnclavaAttestationError(
+      "ENCLAVA_APPRAISER_FAILED",
+      `Appraiser returned a PASS for a different challenge or origin than requested`,
+      { origin, bundleSha256, policySha256, checks, reasonCodes }
+    );
+  }
+
+  return {
     provider: "enclava",
     origin,
     verdict: "PASS",
-    appraisal,
+    appraisal: structuredClone(appraisal),
     bundleSha256,
     policySha256,
     bundle,
     nonce,
     challengeNonce,
-    fetchedAt: nowMs,
-    expiresAt: nowMs + ttlMs,
+    channelSpkiSha256: observedSpki,
+    fetchedAt,
+    expiresAt: fetchedAt + ttlMs,
   };
-
-  if (ttlMs > 0) attestationCache.set(`${origin}\u0000${policySha256}`, {
-    attestation,
-    expiresAt: attestation.expiresAt,
-  });
-
-  return attestation;
 }
 
 function policyRequiresTlsChannel(policyJson: string): boolean {
@@ -775,62 +847,46 @@ function policyRequiresTlsChannel(policyJson: string): boolean {
   }
 }
 
-/** Prefix scan of the domain suffixes Enclava hands out, for provider filters. */
+/** Match Enclava hosting domain suffixes for discovery. */
 export function isEnclavaOrigin(url: string): boolean {
   return isEnclavaHostname(url);
 }
 
-/**
- * A previously passed attestation for `(origin, policy)`, if it is still inside
- * its reuse window. Amenable to logging and UI: the `bundleSha256` +
- * `policySha256` pair is the audit trail for a served request.
- */
+/** Look up a passing appraisal for audit, never as a substitute for attesting a request. */
 export async function getCachedEnclavaAttestation(
   originOrBaseUrl: string,
-  policy?: EnclavaPolicy
+  policy: EnclavaPolicy,
+  options: Pick<EnclavaAttestOptions, "channelSpkiSha256" | "appraiser" | "now"> = {}
 ): Promise<EnclavaAttestation | undefined> {
-  let origin: string;
+  let key: string;
+  const clock = options.now ?? Date.now;
   try {
-    origin = enclavaOrigin(originOrBaseUrl);
+    const origin = enclavaOrigin(originOrBaseUrl);
+    const bytes = toBytes(policy);
+    const spki = validateChannelSpki(origin, toJsonText(bytes), options.channelSpkiSha256);
+    key = attestationKey(
+      origin, await enclavaSha256Hex(bytes), spki, options.appraiser ?? defaultAppraiser(), clock
+    );
   } catch {
     return undefined;
   }
-  const expectedPolicySha256 = policy ? await enclavaSha256Hex(toBytes(policy)) : undefined;
-  const nowMs = Date.now();
-  for (const [key, entry] of attestationCache) {
-    if (entry.expiresAt <= nowMs) {
-      attestationCache.delete(key);
-      continue;
-    }
-    if (entry.attestation.origin !== origin) continue;
-    if (
-      expectedPolicySha256 === undefined ||
-      entry.attestation.policySha256 === expectedPolicySha256
-    ) {
-      return entry.attestation;
-    }
-  }
-  return undefined;
+  const entry = attestationCache.get(key);
+  if (!entry || !("attestation" in entry) || entry.expiresAt <= clock()) return undefined;
+  return structuredClone(entry.attestation);
 }
 
-/** Drop every memoised appraisal (tests, or after a policy change). */
+/** Drop all cache entries and prevent pending appraisals from repopulating them. */
 export function clearEnclavaAttestationCache(): void {
+  cacheGeneration++;
   attestationCache.clear();
   inflightAttestations.clear();
 }
 
 /**
  * SHA-256 of the SPKI of a peer certificate, for
- * `observed_channel_spki_sha256`. Node recipe:
- *
- * ```ts
- * import tls from "node:tls";
- * import { spkiSha256FromPeerCertificate } from "@routstr/sdk/client";
- *
- * const socket = tls.connect({ host, port: 443, servername: host });
- * await new Promise((resolve) => socket.once("secureConnect", resolve));
- * const spki = await spkiSha256FromPeerCertificate(socket.getPeerX509Certificate()!);
- * ```
+ * `observed_channel_spki_sha256`. Obtain the certificate from the connection
+ * you intend to authorize, not an independent probe.
+
  */
 export async function spkiSha256FromPeerCertificate(cert: {
   publicKey: { export(options: { type: "spki"; format: "der" }): unknown };
@@ -861,7 +917,7 @@ export interface EnclavaWasmVerifier {
 }
 
 /**
- * Apprais* using an already-loaded `enclava-verifier-wasm` module. Use this in
+ * Appraise using an already-loaded `enclava-verifier-wasm` module. Use this in
  * bundlers that reject runtime imports, or in React Native.
  */
 export function createModuleEnclavaAppraiser(
@@ -869,13 +925,16 @@ export function createModuleEnclavaAppraiser(
 ): EnclavaAppraiser {
   let initialised: Promise<unknown> | undefined;
   return async ({ bundle, policy, context }) => {
-    initialised ??= Promise.resolve(
+    initialised ??= Promise.resolve().then(() =>
       typeof verifier.default === "function"
         ? verifier.default()
         : typeof verifier.init === "function"
           ? verifier.init()
           : undefined
-    );
+    ).catch((error) => {
+      initialised = undefined;
+      throw error;
+    });
     await initialised;
     const raw = verifier.verify_bundle(
       bundle,
@@ -931,7 +990,10 @@ export function createWasmEnclavaAppraiser(
         );
       }
       return createModuleEnclavaAppraiser(imported);
-    })();
+    })().catch((error) => {
+      appraiseWithModule = undefined;
+      throw error;
+    });
     return appraiseWithModule;
   };
 
@@ -947,7 +1009,7 @@ function defaultAppraiser(): EnclavaAppraiser {
 
 function toBytes(policy: EnclavaPolicy): Uint8Array {
   if (typeof policy === "string") return new TextEncoder().encode(policy);
-  if (policy instanceof Uint8Array) return policy;
+  if (policy instanceof Uint8Array) return new Uint8Array(policy);
   throw new EnclavaAttestationError(
     "ENCLAVA_POLICY_INVALID",
     "Policy must be a JSON string or Uint8Array"
@@ -955,9 +1017,10 @@ function toBytes(policy: EnclavaPolicy): Uint8Array {
 }
 
 function toJsonText(policy: Uint8Array): string {
-  const text = new TextDecoder().decode(policy);
   try {
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(policy);
     JSON.parse(text);
+    return text;
   } catch (error) {
     throw new EnclavaAttestationError(
       "ENCLAVA_POLICY_INVALID",
@@ -965,7 +1028,6 @@ function toJsonText(policy: Uint8Array): string {
       { cause: error }
     );
   }
-  return text;
 }
 
 function readEnv(name: string): string | undefined {
@@ -994,22 +1056,9 @@ function describeError(error: unknown): string {
 }
 
 /**
- * Attest a provider only when it advertises Enclava confidential computing.
- *
- * Returns `undefined` for every other provider, so a caller can place this on
- * the request path without gating non-Enclava providers:
- *
- * ```ts
- * const attestation = await attestEnclavaProviderIfNeeded(
- *   info,
- *   providerBaseUrl,
- *   { policy: PINNED_ENCLAVA_POLICY, channelSpkiSha256: spki }
- * );
- * if (attestation) usage.attestation = {
- *   bundleSha256: attestation.bundleSha256,
- *   policySha256: attestation.policySha256,
- * };
- * ```
+ * Optional discovery helper. Metadata is untrusted, and `undefined` means no
+ * attestation was attempted. For a provider the caller requires to be attested,
+ * call `attestEnclavaProvider` directly using a caller-pinned origin and policy.
  */
 export async function attestEnclavaProviderIfNeeded(
   info: unknown,
@@ -1017,5 +1066,5 @@ export async function attestEnclavaProviderIfNeeded(
   options: Omit<EnclavaAttestOptions, "origin" | "baseUrl">
 ): Promise<EnclavaAttestation | undefined> {
   if (!isEnclavaProvider(info, baseUrl)) return undefined;
-  return attestEnclavaProvider({ ...options, baseUrl });
+  return attestEnclavaProvider({ ...options, origin: baseUrl });
 }

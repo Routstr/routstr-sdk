@@ -117,7 +117,9 @@ describe("isEnclavaProvider", () => {
       true
     );
     expect(isEnclavaProvider({ confidential: { provider: "enclava" } })).toBe(true);
-    expect(isEnclavaProvider({ tee: "sev-snp" })).toBe(true);
+    expect(isEnclavaProvider({ tee: { provider: "enclava" } })).toBe(true);
+    expect(isEnclavaProvider({ tee: "sev-snp" })).toBe(false);
+    expect(isEnclavaProvider({ tee: { type: "sev-snp" } })).toBe(false);
   });
 
   it("leaves ordinary providers alone", () => {
@@ -167,6 +169,36 @@ describe("fetchEnclavaProofBundle", () => {
     ).rejects.toMatchObject({ code: "ENCLAVA_BUNDLE_TOO_LARGE" });
   });
 
+  it("aborts and cancels a stalled body after headers arrive", async () => {
+    const cancel = vi.fn();
+    const fetchImpl = (async (_, init) => {
+      expect(init?.redirect).toBe("error");
+      return new Response(new ReadableStream({ cancel }), {
+        headers: { "content-type": ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE },
+      });
+    }) satisfies typeof fetch;
+    await expect(fetchEnclavaProofBundle(ORIGIN, { fetchImpl, timeoutMs: 20 })).rejects.toMatchObject({
+      code: "ENCLAVA_BUNDLE_UNAVAILABLE", message: expect.stringContaining("timed out"),
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("stops reading an oversized stream without a content length", async () => {
+    const cancel = vi.fn();
+    const fetchImpl = (async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(bundleBytes(MAX_ENCLAVA_PROOF_BUNDLE_BYTES));
+        controller.enqueue(bundleBytes(1));
+        // The stream deliberately never closes on its own.
+      },
+      cancel,
+    }), { headers: { "content-type": ENCLAVA_PROOF_BUNDLE_MEDIA_TYPE } })) satisfies typeof fetch;
+    await expect(fetchEnclavaProofBundle(ORIGIN, { fetchImpl, timeoutMs: 500 })).rejects.toMatchObject({
+      code: "ENCLAVA_BUNDLE_TOO_LARGE",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("reports HTTP failures", async () => {
     await expect(
       fetchEnclavaProofBundle(ORIGIN, { fetchImpl: bundleFetch({ status: 503 }) })
@@ -208,13 +240,14 @@ describe("attestEnclavaProvider", () => {
     const { appraiser } = countingAppraiser();
     const fetchImpl = bundleFetch();
     let nowMs = 1_000;
+    const now = () => nowMs;
 
     await attestEnclavaProvider({
       origin: ORIGIN,
       policy: POLICY,
       appraiser,
       fetchImpl,
-      now: () => nowMs,
+      now,
       ttlMs: 1_000,
     });
     await attestEnclavaProvider({
@@ -222,7 +255,7 @@ describe("attestEnclavaProvider", () => {
       policy: POLICY,
       appraiser,
       fetchImpl,
-      now: () => nowMs,
+      now,
       ttlMs: 1_000,
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -233,7 +266,7 @@ describe("attestEnclavaProvider", () => {
       policy: POLICY,
       appraiser,
       fetchImpl,
-      now: () => nowMs,
+      now,
       ttlMs: 1_000,
     });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -250,7 +283,7 @@ describe("attestEnclavaProvider", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("throws and does not cache a rejected appraisal", async () => {
+  it("backs off after a rejected appraisal, then retries without caching a PASS", async () => {
     const fetchImpl = bundleFetch();
     const { appraiser } = countingAppraiser({
       verdict: "FAIL",
@@ -258,19 +291,20 @@ describe("attestEnclavaProvider", () => {
         { id: "amd.measurement", outcome: "FAIL", reason_code: "SNP_MEASUREMENT_REJECTED" },
       ],
     });
-
-    await expect(
-      attestEnclavaProvider({ origin: ORIGIN, policy: POLICY, appraiser, fetchImpl })
-    ).rejects.toMatchObject({
-      code: "ENCLAVA_ATTESTATION_REJECTED",
-      reasonCodes: ["SNP_MEASUREMENT_REJECTED"],
-    });
-
-    await expect(
-      attestEnclavaProvider({ origin: ORIGIN, policy: POLICY, appraiser, fetchImpl })
-    ).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" });
+    let nowMs = 1_000;
+    const now = () => nowMs;
+    const options = { origin: ORIGIN, policy: POLICY, appraiser, fetchImpl, now, failureTtlMs: 100 };
+    for (let i = 0; i < 2; i++) {
+      await expect(attestEnclavaProvider(options)).rejects.toMatchObject({
+        code: "ENCLAVA_ATTESTATION_REJECTED",
+        reasonCodes: ["SNP_MEASUREMENT_REJECTED"],
+      });
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { appraiser, now })).resolves.toBeUndefined();
+    nowMs += 100;
+    await expect(attestEnclavaProvider(options)).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
-    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY)).resolves.toBeUndefined();
   });
 
   it("maps INCONCLUSIVE to its own error code", async () => {
@@ -385,17 +419,87 @@ describe("attestEnclavaProvider", () => {
     ).rejects.toMatchObject({ code: "ENCLAVA_ORIGIN_INVALID" });
   });
 
-  it("exposes the cached attestation for audit logging", async () => {
-    await attestEnclavaProvider({
-      origin: ORIGIN,
-      policy: POLICY,
-      appraiser: countingAppraiser().appraiser,
-      fetchImpl: bundleFetch(),
+  it("looks up the exact policy, channel, appraiser and clock for audit", async () => {
+    const { appraiser } = countingAppraiser();
+    let nowMs = 1_000;
+    const now = () => nowMs;
+    const channelSpkiSha256 = "a".repeat(64);
+    const context = { appraiser, now, channelSpkiSha256 };
+    const attestation = await attestEnclavaProvider({
+      origin: ORIGIN, policy: POLICY, fetchImpl: bundleFetch(), ...context,
     });
-    const cached = await getCachedEnclavaAttestation(ORIGIN, POLICY);
-    expect(cached?.bundleSha256).toMatch(/^[0-9a-f]{64}$/);
-    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY.replace("amd.measurement", "amd.tcb"))).resolves.toBeUndefined();
+    attestation.bundle.fill(255);
+    attestation.appraisal.verdict = "FAIL";
+    const cached = await getCachedEnclavaAttestation(ORIGIN, POLICY, context);
+    expect(cached?.bundle[0]).toBe(0);
+    expect(cached?.appraisal.verdict).toBe("PASS");
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { ...context, channelSpkiSha256: null })).resolves.toBeUndefined();
+    await expect(getCachedEnclavaAttestation(ORIGIN, "{}", context)).resolves.toBeUndefined();
+    nowMs += 300_000;
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, context)).resolves.toBeUndefined();
   });
+
+  it("never reuses a PASS or in-flight request across TLS channels", async () => {
+    const policy = POLICY.replace('"require_tls_channel_spki":false', '"require_tls_channel_spki":true');
+    const goodSpki = "a".repeat(64);
+    const appraiser: EnclavaAppraiser = ({ context }) => ({
+      verdict: context.observed_channel_spki_sha256 === goodSpki ? "PASS" : "FAIL",
+    });
+    const fetchImpl = bundleFetch();
+    const options = { origin: ORIGIN, policy, appraiser, fetchImpl };
+    const good = { ...options, channelSpkiSha256: goodSpki };
+    const bad = { ...options, channelSpkiSha256: "b".repeat(64) };
+    await Promise.all([
+      expect(attestEnclavaProvider(good)).resolves.toMatchObject({ verdict: "PASS" }),
+      expect(attestEnclavaProvider(bad)).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" }),
+    ]);
+    await expect(attestEnclavaProvider(good)).resolves.toMatchObject({ verdict: "PASS" });
+    await expect(attestEnclavaProvider(bad)).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" });
+    await expect(attestEnclavaProvider(options)).rejects.toMatchObject({ code: "ENCLAVA_TLS_CHANNEL_UNVERIFIED" });
+    await expect(attestEnclavaProvider({ ...options, channelSpkiSha256: "invalid" })).rejects.toMatchObject({ code: "ENCLAVA_SPKI_INVALID" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not share a PASS between different appraisers", async () => {
+    const fetchImpl = bundleFetch();
+    const options = { origin: ORIGIN, policy: POLICY, fetchImpl };
+    await attestEnclavaProvider({ ...options, appraiser: countingAppraiser().appraiser });
+    await expect(attestEnclavaProvider({
+      ...options, appraiser: countingAppraiser({ verdict: "FAIL" }).appraiser,
+    })).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves pinned u64 policy fields and snapshots caller-owned bytes", async () => {
+    const policyJson = '{"amd":{"guest_policy_mask":18446744073709551615}}';
+    const policy = new TextEncoder().encode(policyJson);
+    const { appraiser, calls } = countingAppraiser();
+    const pending = attestEnclavaProvider({ origin: ORIGIN, policy, appraiser, fetchImpl: bundleFetch() });
+    policy.fill(0);
+    await pending;
+    expect(calls[0].policyJson).toBe(policyJson);
+    expect(new TextDecoder().decode(calls[0].policy)).toBe(policyJson);
+  });
+
+  it("never reuses caller-managed challenges", async () => {
+    const { appraiser } = countingAppraiser();
+    const fetchImpl = bundleFetch();
+    const options = { origin: ORIGIN, policy: POLICY, appraiser, fetchImpl };
+    await attestEnclavaProvider(options);
+    const nonces = ["a".repeat(64), "b".repeat(64)];
+    const results = await Promise.all(nonces.map(nonce => attestEnclavaProvider({ ...options, nonce })));
+    expect(results.map(r => r.challengeNonce)).toEqual(nonces);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([{ challenge_nonce: "0".repeat(64) }, { target_origin: "https://different.example" }])(
+    "rejects a PASS echoing different context: %j", async (fields) => {
+      const { appraiser } = countingAppraiser(passingAppraisal(fields));
+      await expect(attestEnclavaProvider({
+        origin: ORIGIN, policy: POLICY, appraiser, fetchImpl: bundleFetch(), nonce: "1".repeat(64),
+      })).rejects.toMatchObject({ code: "ENCLAVA_APPRAISER_FAILED" });
+    }
+  );
 });
 
 describe("attestEnclavaProviderIfNeeded", () => {
@@ -423,6 +527,15 @@ describe("attestEnclavaProviderIfNeeded", () => {
 });
 
 describe("createModuleEnclavaAppraiser", () => {
+  it("can retry a failed initialisation", async () => {
+    const init = vi.fn().mockRejectedValueOnce(new Error("temporary failure")).mockResolvedValueOnce(undefined);
+    const appraiser = createModuleEnclavaAppraiser({ init, verify_bundle: () => passingAppraisal() });
+    const options = { origin: ORIGIN, policy: POLICY, fetchImpl: bundleFetch(), appraiser };
+    await expect(attestEnclavaProvider(options)).rejects.toMatchObject({ code: "ENCLAVA_APPRAISER_FAILED" });
+    await expect(attestEnclavaProvider(options)).resolves.toMatchObject({ verdict: "PASS" });
+    expect(init).toHaveBeenCalledTimes(2);
+  });
+
   it("initialises the module once and parses its JSON result", async () => {
     const verify_bundle = vi.fn(() => JSON.stringify(passingAppraisal()));
     const init = vi.fn(async () => undefined);
