@@ -331,6 +331,9 @@ export interface RoutstrResponse extends Response {
   requestId?: string;
   nodeRequestId?: string;
   upstreamResponseId?: string;
+  /** Reported usage, including cache counts when available. Await `finalize()`
+   *  when provided before reading the final usage. */
+  usage?: UsageTrackingData;
   /** Settles accounting for this reply (provider balance read, usage row) and
    *  returns the sats spent. In API-key mode this is the provider-reported
    *  request cost (0 when unavailable), not a shared-wallet balance delta.
@@ -857,7 +860,7 @@ export class RoutstrClient {
           clientApiKey: prepared.clientApiKey,
         });
         (prepared.response as any).satsSpent = satsSpent;
-        (prepared.response as any).usage = usage;
+        (prepared.response as RoutstrResponse).usage = usage;
         (prepared.response as any).requestId =
           requestId ?? (prepared.response as RoutstrResponse).upstreamResponseId;
         return satsSpent;
@@ -1306,7 +1309,7 @@ export class RoutstrClient {
           inspectStream,
           (usage) => {
             capturedUsage = usage;
-            (processedResponse as any).usage = usage;
+            (processedResponse as RoutstrResponse).usage = usage;
           },
           (responseId) => {
             capturedResponseId = responseId;
