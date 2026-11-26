@@ -561,7 +561,7 @@ export function confidentialImageRequiredSats(
   // The variant and count the request itself will ask for. A request the
   // offer cannot serve throws here, before a deposit is spent on it (the
   // session would refuse it after the spend, with the same error).
-    const chosen = chooseImageVariant({ ...body, model }, images);
+  const chosen = chooseImageVariant({ ...body, model }, images);
   const price = chosen.variant.msat_per_image;
   const count = chosen.count;
   const fee = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0);
@@ -1291,13 +1291,13 @@ export class RoutstrClient {
       }
 
       const runFinalize = async (): Promise<number> => {
-      // A confidential response settles on the node after its body ends
-      // (usage proof + charge); balance accounting must read it afterwards.
-      // A failed settlement check already errored the response stream; the
-      // balance is still re-read, since the node may have charged.
-      // A one-off bearer's change comes with the settlement (a stream's
-      // wrapper copied the headers before the transport could set it).
-      const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
+        // A confidential response settles on the node after its body ends
+        // (usage proof + charge); balance accounting must read it afterwards.
+        // A failed settlement check already errored the response stream; the
+        // balance is still re-read, since the node may have charged.
+        // A one-off bearer's change comes with the settlement (a stream's
+        // wrapper copied the headers before the transport could set it).
+        const settlement = (await (prepared.response as any).confidentialSettled?.catch((error: unknown) => {
           // The message only: the error may carry a one-off bearer's change
           // token (`cashuChange`), which must never reach a log.
           this._log(
@@ -1305,7 +1305,7 @@ export class RoutstrClient {
             "[RoutstrClient] confidential settlement check failed:",
             error instanceof Error ? `${error.name}: ${error.message}` : String(error)
           );
-        return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
+          return { change: (error as { cashuChange?: unknown } | undefined)?.cashuChange };
         })) as { change?: unknown; costMsats?: unknown } | undefined;
         // The node's charge from the verified receipt. A confidential chat
         // response carries no cost of its own (the provider's usage event
@@ -1338,8 +1338,8 @@ export class RoutstrClient {
           initialTokenBalance: prepared.tokenBalanceInSats,
           response: accountingResponse,
           responseBody: jsonBody,
-        refundToken:
-          typeof settlement?.change === "string" ? settlement.change : undefined,
+          refundToken:
+            typeof settlement?.change === "string" ? settlement.change : undefined,
           modelId: prepared.modelId,
           usage,
           requestId,
@@ -1420,14 +1420,14 @@ export class RoutstrClient {
           const pinnedSelector = this._findModelPathHeader(current.headers ?? {});
           let next: string | null = null;
           if (current.modelId && !current.pinnedProvider && !(pinnedSelector && !current.autoModelPath)) {
-          attempted.add(current.baseUrl);
+            attempted.add(current.baseUrl);
             next = this._findNextBestProvider(
-            current.modelId,
-            current.baseUrl,
-            attempted,
-            await this._fundedMintUrls(),
-            true
-          );
+              current.modelId,
+              current.baseUrl,
+              attempted,
+              await this._fundedMintUrls(),
+              true
+            );
             if (next && attempted.has(next)) next = null;
           }
           // Every candidate left is cooling: the one whose cooldown ends first.
@@ -1892,12 +1892,12 @@ export class RoutstrClient {
         const requestResponseLogId = (response as any).requestResponseLogId as
           | string
           | undefined;
-      // Raw logging is off for confidential responses unless the request
-      // opted in (see `_makeRequest`).
-      const logSink: RequestResponseLogSink | undefined = (response as any)
-        .requestResponseLogSuppressed
-        ? undefined
-        : this.requestResponseLogSink;
+        // Raw logging is off for confidential responses unless the request
+        // opted in (see `_makeRequest`).
+        const logSink: RequestResponseLogSink | undefined = (response as any)
+          .requestResponseLogSuppressed
+          ? undefined
+          : this.requestResponseLogSink;
 
         processedResponse = new Response(clientStream, {
           status: response.status,
@@ -1913,13 +1913,13 @@ export class RoutstrClient {
         (processedResponse as any).selectedMintUrl =
           (response as any).selectedMintUrl;
         (processedResponse as any).requestResponseLogId = requestResponseLogId;
-      (processedResponse as any).requestResponseLogSuppressed = (
-        response as any
-      ).requestResponseLogSuppressed;
-      // finalize() awaits a confidential response's settlement through this.
-      (processedResponse as any).confidentialSettled = (
-        response as any
-      ).confidentialSettled;
+        (processedResponse as any).requestResponseLogSuppressed = (
+          response as any
+        ).requestResponseLogSuppressed;
+        // finalize() awaits a confidential response's settlement through this.
+        (processedResponse as any).confidentialSettled = (
+          response as any
+        ).confidentialSettled;
 
         usagePromise = inspectSSEWebStream(
           inspectStream,
@@ -1934,7 +1934,7 @@ export class RoutstrClient {
           {
             onErrorEnvelope: () => { (processedResponse as any).streamError = true; },
             onRawChunk: (_chunk, sequence, text) => {
-            void logSink?.logResponseChunk?.(
+              void logSink?.logResponseChunk?.(
                 requestResponseLogId,
                 sequence,
                 text
@@ -1942,10 +1942,10 @@ export class RoutstrClient {
             },
           }
         ).then(async (result) => {
-        await logSink?.logResponseEnd?.(requestResponseLogId);
+          await logSink?.logResponseEnd?.(requestResponseLogId);
           return result;
         }).catch(async (error) => {
-        await logSink?.logResponseError?.(requestResponseLogId, error);
+          await logSink?.logResponseError?.(requestResponseLogId, error);
           throw error;
         });
 
