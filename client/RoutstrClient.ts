@@ -2128,7 +2128,7 @@ export class RoutstrClient {
         // provider's canonical API key while this response was in flight.
         const storedApiKey = this.storageAdapter.getApiKey(baseUrl);
         if (storedApiKey?.key === params.token) {
-          this.storageAdapter.removeApiKey(baseUrl);
+          this._removeApiKeyUnlessRefundPending(baseUrl);
         } else if (storedApiKey) {
           this._log(
             "DEBUG",
@@ -2567,7 +2567,7 @@ export class RoutstrClient {
         tryNextProvider = true;
       } else if (balance.value.isInvalidApiKey) {
         if (this.storageAdapter.getApiKey(baseUrl)?.key === token) {
-          this.storageAdapter.removeApiKey(baseUrl);
+          this._removeApiKeyUnlessRefundPending(baseUrl);
         }
         tryNextProvider = true;
       }
@@ -2661,6 +2661,18 @@ export class RoutstrClient {
               `[RoutstrClient] _handleErrorResponse: Refund skipped for ${baseUrl} (transient: ${refundResult.message}); failing over to next provider`
             );
             tryNextProvider = true;
+          } else if (
+            this.balanceManager.isApiKeyRefundPending(baseUrl, params.token)
+          ) {
+            // The refund may have paid out even though this attempt failed
+            // (a timeout or a lost response). The key is quarantined from
+            // funding and the sweep will reclaim the payout, so fail over
+            // instead of turning a recoverable refund into a hard error.
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: Refund outcome for ${baseUrl} is unresolved (${refundResult.message ?? "unknown"}); preserving key for sweep and failing over`
+            );
+            tryNextProvider = true;
           } else if (this._isRefundEndpointServerError(refundResult.status)) {
             // The upstream /v1/wallet/refund endpoint itself returned a server
             // error. The sats are still on the key and will be reclaimed by a
@@ -2710,7 +2722,7 @@ export class RoutstrClient {
         // key that failed, never a replacement key swapped in meanwhile.
         const storedApiKey = this.storageAdapter.getApiKey(baseUrl);
         if (storedApiKey?.key === params.token) {
-          this.storageAdapter.removeApiKey(baseUrl);
+          this._removeApiKeyUnlessRefundPending(baseUrl);
           this._log(
             "WARN",
             `[RoutstrClient] _handleErrorResponse: Removing unusable API key for ${baseUrl} (type=${parsedError.type} code=${parsedError.code})`
@@ -3885,24 +3897,40 @@ export class RoutstrClient {
       // again. Detect it via the provider's balance endpoint and recreate
       // instead of blindly reusing a dead key.
       if (parentApiKey && parentApiKey.key.startsWith("cashu")) {
+        let deadWithPendingRefund = false;
         try {
           const balanceInfo = await this.balanceManager.getTokenBalance(
             parentApiKey.key,
             baseUrl
           );
           if (balanceInfo.isInvalidApiKey) {
-            this._log(
-              "DEBUG",
-              `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
+            // A dead key is normally replaced with a fresh deposit. If a
+            // refund for it is unresolved, the node may already hold a payout
+            // tied to that key: replacing it would strand the funds, so stop
+            // here and let provider failover take over instead.
+            deadWithPendingRefund = this.balanceManager.isApiKeyRefundPending(
+              baseUrl,
+              parentApiKey.key
             );
-            this.storageAdapter.removeApiKey(baseUrl);
-            parentApiKey = null;
+            if (!deadWithPendingRefund) {
+              this._log(
+                "DEBUG",
+                `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
+              );
+              this.storageAdapter.removeApiKey(baseUrl);
+              parentApiKey = null;
+            }
           }
         } catch (e) {
           this._log(
             "WARN",
             "Could not validate existing API key before reuse, keeping it:",
             e
+          );
+        }
+        if (deadWithPendingRefund) {
+          throw new Error(
+            `[RoutstrClient] _spendToken: API key for ${baseUrl} is unusable but a refund for it is unresolved; refusing to replace it and strand the payout`
           );
         }
       }
@@ -4122,8 +4150,41 @@ export class RoutstrClient {
       this.storageAdapter.replaceApiKey(baseUrl, key);
       return;
     }
+    const previous = this.storageAdapter.getApiKey(baseUrl);
+    const refundPending = previous
+      ? previous.refundPendingAt !== undefined ||
+        this.balanceManager.isApiKeyRefundPending(baseUrl, previous.key)
+      : false;
     this.storageAdapter.removeApiKey(baseUrl);
     this.storageAdapter.setApiKey(baseUrl, key);
+    // The node resolves the bootstrap token and its canonical form to the same
+    // key row, so an unresolved refund must follow the credential swap.
+    if (refundPending) {
+      this.balanceManager.markApiKeyRefundPending(baseUrl, key);
+    }
+  }
+
+  /**
+   * Remove the stored key unless a refund claim for it is unresolved. The node
+   * ties a persisted refund payout to the key, so deleting the only credential
+   * that can claim it strands the funds until the node's sweep.
+   *
+   * Returns true when the key was removed.
+   */
+  private _removeApiKeyUnlessRefundPending(baseUrl: string): boolean {
+    const stored = this.storageAdapter.getApiKey(baseUrl);
+    if (
+      stored &&
+      this.balanceManager.isApiKeyRefundPending(baseUrl, stored.key)
+    ) {
+      this._log(
+        "WARN",
+        `[RoutstrClient] Keeping API key for ${baseUrl}: a refund for it is unresolved; removing it would strand the payout`
+      );
+      return false;
+    }
+    this.storageAdapter.removeApiKey(baseUrl);
+    return true;
   }
 
   /**

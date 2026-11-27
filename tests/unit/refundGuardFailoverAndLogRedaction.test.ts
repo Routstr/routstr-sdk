@@ -93,6 +93,27 @@ describe("500 refund guard and credential logging", () => {
     expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
   });
 
+  it("fails over when the refund outcome is unresolved instead of aborting the request", async () => {
+    const { client, refund, spend, retry, removeApiKey } = setup();
+    // The refund may already have paid out on the node (a timeout or lost
+    // response). The key is quarantined from funding and a sweep will reclaim
+    // the payout, so this request must fail over rather than surface a hard
+    // error and leave the caller without an answer.
+    client.getBalanceManager().markApiKeyRefundPending(baseUrl, credential);
+    refund.mockResolvedValue({
+      success: false,
+      message: "Request timed out after 30 seconds",
+    });
+
+    const response = await (client as any)._handleErrorResponse(
+      params, credential, 500, "req-500", undefined, upstreamError, 0);
+
+    expect(response.status).toBe(200);
+    expect(removeApiKey).not.toHaveBeenCalled();
+    expect(spend).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: nextUrl }));
+    expect(retry).toHaveBeenCalled();
+  });
+
   it("redacts credentials in error and spend logs, including balance debug output", async () => {
     const { client, refund, messages } = setup();
     refund.mockResolvedValue({ success: false,

@@ -69,6 +69,21 @@ export interface ApiKeyEntry {
    *  storage adapters and records created before this field. */
   reserved?: number;
   lastUsed: number | null;
+  /**
+   * When a refund claim for this key was started but its outcome is unknown
+   * (timeout, lost response, server error, an in-flight claim).
+   *
+   * While set, the key must not be funded again. A refund can pay out a token
+   * that the node re-serves only while the key's balance is zero; a top-up
+   * makes a later refund claim the new deposit instead, stranding the earlier
+   * payout until the node's sweep. Removing the key is equally unsafe: the
+   * node ties the persisted payout to it. Clear the marker only when the claim
+   * is resolved (token received) or the node proves nothing is owed.
+   *
+   * Optional for compatibility with existing custom storage adapters and
+   * records created before this field.
+   */
+  refundPendingAt?: number;
 }
 
 export interface ChildKeyEntry {
@@ -143,6 +158,13 @@ export interface StorageAdapter {
 
   /** Remove API key for a provider */
   removeApiKey(baseUrl: string): void;
+
+  /** Record that a refund claim for `key` started but its outcome is unknown.
+   *  Identity-guarded: does nothing when the stored key is no longer `key`. */
+  markApiKeyRefundPending?(baseUrl: string, key: string): void;
+
+  /** Clear the unresolved-refund marker for `key`. Identity-guarded. */
+  clearApiKeyRefundPending?(baseUrl: string, key: string): void;
 
   /** Get all stored API keys */
   getAllApiKeys(): ApiKeyEntry[];

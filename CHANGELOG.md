@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Unresolved refunds quarantine their API key
+
+- A refund that fails without a definitive answer (the 30 s timeout, a lost
+  response, a network error, a 5xx, or an in-flight/stuck claim) now marks its
+  API key as refund-pending. The node dispatches the payout before it answers,
+  and it re-serves that token on a later refund request only while the key's
+  balance is zero. Topping the key up made the next refund claim the new
+  deposit instead, stranding the earlier payout until the node's sweep.
+- While the marker is set, `topUp`/`ensureBalance` refuse to fund the key
+  (`TopUpResult.refundPending`), a dead bootstrap key is not replaced with a
+  fresh deposit, and the key is not removed. The scheduled refund sweep keeps
+  retrying with the same credential; the quarantine lifts when the payout token
+  is durably ours, or when the node proves nothing was dispatched (no balance,
+  balance too small, in-flight requests, a swept refund).
+- The marker is persisted on the key record (`refundPendingAt`) and survives a
+  restart and the bootstrap-token → canonical-key promotion, which the node
+  resolves to the same key row. Custom storage adapters without the new
+  optional methods still get the guard within one process.
+- A refund failure that leaves an unresolved claim no longer aborts the request
+  with `ProviderError`; it fails over, since the key is preserved and the sweep
+  will reclaim the payout.
+
 ## 0.5.2
 
 ### Provider session headers

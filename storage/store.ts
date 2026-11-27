@@ -972,17 +972,54 @@ export const createStorageAdapterFromStore = (
     store.getState().setApiKeys(next);
   },
 
+  markApiKeyRefundPending: (baseUrl, key) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const keys = store.getState().apiKeys;
+    const next = keys.map((entry) =>
+      entry.baseUrl === normalized && entry.key === key
+        ? { ...entry, refundPendingAt: entry.refundPendingAt ?? Date.now() }
+        : entry
+    );
+    store.getState().setApiKeys(next);
+  },
+
+  clearApiKeyRefundPending: (baseUrl, key) => {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const keys = store.getState().apiKeys;
+    let changed = false;
+    const next = keys.map((entry) => {
+      if (
+        entry.baseUrl !== normalized ||
+        entry.key !== key ||
+        entry.refundPendingAt === undefined
+      ) {
+        return entry;
+      }
+      changed = true;
+      const { refundPendingAt: _resolved, ...rest } = entry;
+      return rest;
+    });
+    if (changed) store.getState().setApiKeys(next);
+  },
+
   replaceApiKey: (baseUrl, key) => {
     const normalized = normalizeBaseUrl(baseUrl);
-    const next = store
-      .getState()
-      .apiKeys.filter((entry) => entry.baseUrl !== normalized);
+    const keys = store.getState().apiKeys;
+    // The node resolves the bootstrap Cashu token and its canonical `sk-` form
+    // to the same key row, so an unresolved refund follows the credential
+    // swap. Dropping the marker here would let the next top-up strand a payout
+    // the node already issued for this key.
+    const previous = keys.find((entry) => entry.baseUrl === normalized);
+    const next = keys.filter((entry) => entry.baseUrl !== normalized);
     next.push({
       baseUrl: normalized,
       key,
       balance: 0,
       reserved: 0,
       lastUsed: Date.now(),
+      ...(previous?.refundPendingAt !== undefined
+        ? { refundPendingAt: previous.refundPendingAt }
+        : {}),
     });
     store.getState().setApiKeys(next);
   },
@@ -994,6 +1031,9 @@ export const createStorageAdapterFromStore = (
       balance: entry.balance,
       reserved: entry.reserved ?? 0,
       lastUsed: entry.lastUsed,
+      ...(entry.refundPendingAt !== undefined
+        ? { refundPendingAt: entry.refundPendingAt }
+        : {}),
     }));
   },
 

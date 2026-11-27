@@ -228,6 +228,12 @@ export interface TopUpResult {
   requestId?: string;
   /** True only when the failed top-up token was actually received back. */
   recoveredToken?: boolean;
+  /**
+   * True when the top-up was refused because a refund claim for this key is
+   * unresolved. The key is quarantined from funding until the payout is
+   * reclaimed or the node proves nothing is owed.
+   */
+  refundPending?: boolean;
   /** Structured routstr-core error when the provider returned one. */
   parsedError?: import("./errorTypes").ParsedCoreError;
   /**
