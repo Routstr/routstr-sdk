@@ -54,6 +54,23 @@ describe("credential and token writes", () => {
     expect(await storedKey(disk)).toBe("cashu_bootstrap");
   });
 
+  it("only writes a refund marker for a matching key that is not already pending", async () => {
+    const driver = createMemoryDriver();
+    const { store, hydrate } = createSdkStore({ driver });
+    await hydrate;
+    const storage = createStorageAdapterFromStore(store);
+    storage.setApiKey(PROVIDER, "sk-current");
+    const writes = vi.spyOn(driver, "setItem");
+
+    storage.markApiKeyRefundPending!(PROVIDER, "sk-stale");
+    expect(writes).not.toHaveBeenCalled();
+    storage.markApiKeyRefundPending!(PROVIDER, "sk-current");
+    storage.markApiKeyRefundPending!(PROVIDER, "sk-current");
+    await storage.flush!();
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(storage.getApiKey(PROVIDER)?.refundPendingAt).toBeTypeOf("number");
+  });
+
   it("flush retries a failed write and rejects until storage works again", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const disk = createMemoryDriver();

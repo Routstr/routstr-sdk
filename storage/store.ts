@@ -39,6 +39,7 @@ export interface SdkStorageStore extends SdkStorageState {
           balance?: number;
           reserved?: number;
           lastUsed?: number | null;
+          refundPendingAt?: number;
         }>
       | ((current: SdkStorageStore["apiKeys"]) => SdkStorageStore["apiKeys"])
   ) => void;
@@ -975,11 +976,10 @@ export const createStorageAdapterFromStore = (
   markApiKeyRefundPending: (baseUrl, key) => {
     const normalized = normalizeBaseUrl(baseUrl);
     const keys = store.getState().apiKeys;
-    const next = keys.map((entry) =>
-      entry.baseUrl === normalized && entry.key === key
-        ? { ...entry, refundPendingAt: entry.refundPendingAt ?? Date.now() }
-        : entry
-    );
+    const index = keys.findIndex((entry) => entry.baseUrl === normalized && entry.key === key);
+    if (index < 0 || keys[index].refundPendingAt !== undefined) return;
+    const next = [...keys];
+    next[index] = { ...keys[index], refundPendingAt: Date.now() };
     store.getState().setApiKeys(next);
   },
 

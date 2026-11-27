@@ -183,6 +183,10 @@ function walletEndpointBaseUrl(baseUrl: string): string {
   return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 }
 
+function refundMarkerId(baseUrl: string, key: string): string {
+  return JSON.stringify([walletEndpointBaseUrl(baseUrl), refundKeyIdentity(key)]);
+}
+
 type ProviderWalletOperation = {
   type: "topup" | "refund";
   /** Last non-skipped completion, even if other calls are still active. */
@@ -199,6 +203,14 @@ const providerWalletOperations = new WeakMap<
   WalletAdapter,
   Map<string, ProviderWalletOperation>
 >();
+
+// Managers sharing a storage adapter see the same quarantine, including when
+// the adapter cannot persist a marker or the caller supplied an unstored key.
+interface RefundMarkers {
+  pending: Set<string>;
+  preparing: Map<string, { writers: number; rollback: boolean }>;
+}
+const refundMarkersByStorage = new WeakMap<StorageAdapter, RefundMarkers>();
 
 /**
  * BalanceManager handles token refunds and topups from providers
@@ -217,12 +229,7 @@ export class BalanceManager {
   private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
   /** Providers that have timed out during the current refund cascade. */
   private _refundTimedOutProviders: Set<string> = new Set();
-  /**
-   * Keys whose refund outcome is unresolved, keyed by
-   * provider URL and canonical credential identity when there is no stored
-   * key record or the adapter cannot persist the marker.
-   */
-  private _refundPendingKeys = new Set<string>();
+  private readonly refundMarkers: RefundMarkers;
   private readonly logger: SdkLogger;
 
   constructor(
@@ -232,6 +239,10 @@ export class BalanceManager {
     cashuSpender?: CashuSpender,
     logger?: SdkLogger
   ) {
+    this.refundMarkers = refundMarkersByStorage.get(storageAdapter) ?? {
+      pending: new Set(), preparing: new Map(),
+    };
+    refundMarkersByStorage.set(storageAdapter, this.refundMarkers);
     this.logger = (logger ?? consoleLogger).child("BalanceManager");
     if (cashuSpender) {
       this.cashuSpender = cashuSpender;
@@ -344,7 +355,7 @@ export class BalanceManager {
     if (stored?.refundPendingAt !== undefined) return true;
     // Explicitly supplied credentials and legacy adapters may have no
     // persisted marker. Those claims use the same identity in memory.
-    return this._refundPendingKeys.has(providerKey(baseUrl, refundKeyIdentity(key)));
+    return this.refundMarkers.pending.has(refundMarkerId(baseUrl, key));
   }
 
   /** Record that a refund claim for this key may have been dispatched. */
@@ -353,13 +364,13 @@ export class BalanceManager {
     if (stored && this.storageAdapter.markApiKeyRefundPending) {
       this.storageAdapter.markApiKeyRefundPending(baseUrl, stored.key);
     } else {
-      this._refundPendingKeys.add(providerKey(baseUrl, refundKeyIdentity(key)));
+      this.refundMarkers.pending.add(refundMarkerId(baseUrl, key));
     }
   }
 
   /** The claim resolved: a token was received, or the node proved nothing is owed. */
   clearApiKeyRefundPending(baseUrl: string, key: string): void {
-    this._refundPendingKeys.delete(providerKey(baseUrl, refundKeyIdentity(key)));
+    this.refundMarkers.pending.delete(refundMarkerId(baseUrl, key));
     const stored = this._storedRefundKey(baseUrl, key);
     if (stored) this.storageAdapter.clearApiKeyRefundPending?.(baseUrl, stored.key);
   }
@@ -470,11 +481,31 @@ export class BalanceManager {
       // and then re-serve that token only while the key's balance is zero.
       // Record the attempt before it leaves, so a timeout, a lost response or a
       // crash cannot be followed by a top-up that strands the payout.
-      this.markApiKeyRefundPending(baseUrl, apiKey);
       if (this.storageAdapter.markApiKeyRefundPending) {
-        // The store setter queues a write. Do not let the payout leave before
-        // a restart would restore its quarantine. A failed flush stops dispatch.
-        await this.storageAdapter.flush?.();
+        const id = refundMarkerId(baseUrl, apiKey);
+        const preparing = this.refundMarkers.preparing;
+        const batch = preparing.get(id) ?? {
+          writers: 0, rollback: !this.isApiKeyRefundPending(baseUrl, apiKey),
+        };
+        batch.writers++;
+        preparing.set(id, batch);
+        try {
+          this.markApiKeyRefundPending(baseUrl, apiKey);
+          await this.storageAdapter.flush?.();
+          // A sibling's failed write cannot undo a claim once any caller
+          // crosses the dispatch boundary, even if its response is lost.
+          batch.rollback = false;
+        } catch (error) {
+          this.logger.error("Could not persist refund quarantine", error);
+          return { ...this._handleRefundError(error, mintUrl), skipped: true };
+        } finally {
+          if (--batch.writers === 0) {
+            preparing.delete(id);
+            if (batch.rollback) this.clearApiKeyRefundPending(baseUrl, apiKey);
+          }
+        }
+      } else {
+        this.markApiKeyRefundPending(baseUrl, apiKey);
       }
       fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
@@ -674,6 +705,11 @@ export class BalanceManager {
   }): boolean {
     if (fetchResult.status === 410) return true;
     const code = fetchResult.parsedError?.code;
+    if (fetchResult.status === 400 && !code) {
+      const message = fetchResult.parsedError?.message;
+      return message === "Balance too small to refund" ||
+        message === "Cannot refund key. There are ongoing requests for this api key.";
+    }
     return (
       code === CoreErrorCode.NO_BALANCE_TO_REFUND ||
       code === CoreErrorCode.BALANCE_TOO_SMALL_TO_REFUND ||
@@ -888,6 +924,14 @@ export class BalanceManager {
     throwIfFundingAborted(options.signal);
     const { mintUrl, baseUrl, amount, token: providedToken } = options;
 
+    // Resolve before batching, and pin this destination even if storage changes
+    // while the top-up waits behind a wallet send.
+    const apiKey = providedToken || this.storageAdapter.getApiKey(baseUrl)?.key;
+    if (apiKey) {
+      const pending = this._refundPendingTopUp(baseUrl, apiKey);
+      if (pending) return pending;
+    }
+
     const guard = this._canRunProviderWalletOperation(baseUrl, "topup");
     if (!guard.allowed) {
       this.logger.log(`Skipping topup for ${baseUrl} - ${guard.reason}`);
@@ -898,18 +942,9 @@ export class BalanceManager {
       return { success: false, message: "Invalid top up amount" };
     }
 
-    // Resolve before batching, and pin this destination even if storage changes
-    // while the top-up waits behind a wallet send.
-    const apiKey = providedToken || this.storageAdapter.getApiKey(baseUrl)?.key;
     if (!apiKey) {
       return { success: false, message: "No API key available for top up" };
     }
-
-    // Hard stop: a refund claim that may already have paid out is only
-    // recoverable while the key's balance stays zero. Adding funds here makes
-    // the next refund claim the new deposit instead of re-serving that payout.
-    const refundPending = this._refundPendingTopUp(baseUrl, apiKey);
-    if (refundPending) return refundPending;
 
     const operationId = this._beginProviderWalletOperation(baseUrl, "topup");
 

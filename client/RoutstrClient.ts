@@ -158,6 +158,14 @@ const MAX_NETWORK_RETRIES_PER_PROVIDER = 1;
 /** Never put spendable credentials (including even a prefix) in SDK logs. */
 const REDACTED_CREDENTIAL = "[REDACTED]";
 
+/** This provider cannot be used without replacing its only refund credential. */
+class RefundPendingKeyError extends Error {
+  constructor(baseUrl: string) {
+    super(`API key for ${baseUrl} is unusable but its refund is unresolved; refusing to replace it`);
+    this.name = "RefundPendingKeyError";
+  }
+}
+
 interface RequestFailures {
   attemptedProviders: Set<string>;
   /** Nodes whose ingress rejected this body before choosing a model path. */
@@ -891,12 +899,8 @@ export class RoutstrClient {
   }
 
   /**
-   * Run the initial deposit, failing over to another provider when the
-   * wallet cannot fund any mint the selected provider accepts.
-   *
-   * The post-key 402 path already fails over; without this the very first
-   * deposit (no key yet) hard-failed with a 402 even though another provider
-   * accepted a funded mint.
+   * Try the next eligible provider when a mint shortfall or a dead key with
+   * an unresolved refund prevents funding this one.
    */
   private async _prepareRoutedRequestWithMintFailover(
     params: RouteRequestParams
@@ -912,8 +916,9 @@ export class RoutstrClient {
         previousPreflightBaseUrl = current.baseUrl;
         return await this._prepareRoutedRequest(current);
       } catch (error) {
-        if (!(error instanceof ProviderMintBalanceError)) throw error;
-        await current.lifecycle?.event("preflight_funding_failed", { reason: "provider_mint_balance" }, { baseUrl: current.baseUrl });
+        if (!(error instanceof ProviderMintBalanceError || error instanceof RefundPendingKeyError)) throw error;
+        const reason = error instanceof RefundPendingKeyError ? "refund_pending" : "provider_mint_balance";
+        await current.lifecycle?.event("preflight_funding_failed", { reason }, { baseUrl: current.baseUrl });
         const selector = this._findModelPathHeader(current.headers ?? {});
         if (current.pinnedProvider || (selector && !current.autoModelPath)) {
           throw error;
@@ -957,7 +962,7 @@ export class RoutstrClient {
             if (!fallback || attempted.has(fallback)) throw error;
             this._log(
               "WARN",
-              `[RoutstrClient] routeRequest: provider-mint shortfall on ${current.baseUrl} and no model-path route left; failing over unpinned to ${fallback}`
+              `[RoutstrClient] routeRequest: ${reason} on ${current.baseUrl} and no model-path route left; failing over unpinned to ${fallback}`
             );
             current = {
               ...current,
@@ -987,7 +992,7 @@ export class RoutstrClient {
         if (!nextProvider || attempted.has(nextProvider)) throw error;
         this._log(
           "WARN",
-          `[RoutstrClient] routeRequest: provider-mint shortfall on ${current.baseUrl}; failing over to ${nextProvider}`
+          `[RoutstrClient] routeRequest: ${reason} on ${current.baseUrl}; failing over to ${nextProvider}`
         );
         current = { ...current, baseUrl: nextProvider };
       }
@@ -2662,7 +2667,7 @@ export class RoutstrClient {
             );
             tryNextProvider = true;
           } else if (
-            this.balanceManager.isApiKeyRefundPending(baseUrl, params.token)
+            this.balanceManager.isApiKeyRefundPending(baseUrl, token)
           ) {
             // The refund may have paid out even though this attempt failed
             // (a timeout or a lost response). The key is quarantined from
@@ -2722,11 +2727,12 @@ export class RoutstrClient {
         // key that failed, never a replacement key swapped in meanwhile.
         const storedApiKey = this.storageAdapter.getApiKey(baseUrl);
         if (storedApiKey?.key === params.token) {
-          this._removeApiKeyUnlessRefundPending(baseUrl);
-          this._log(
-            "WARN",
-            `[RoutstrClient] _handleErrorResponse: Removing unusable API key for ${baseUrl} (type=${parsedError.type} code=${parsedError.code})`
-          );
+          if (this._removeApiKeyUnlessRefundPending(baseUrl)) {
+            this._log(
+              "WARN",
+              `[RoutstrClient] _handleErrorResponse: Removed unusable API key for ${baseUrl} (type=${parsedError.type} code=${parsedError.code})`
+            );
+          }
         } else if (storedApiKey) {
           this._log(
             "DEBUG",
@@ -3016,26 +3022,23 @@ export class RoutstrClient {
           });
           break;
         } catch (error) {
-          if (error instanceof ProviderMintBalanceError) {
-            // The wallet cannot fund any mint this provider accepts. Keep
-            // failing over to a provider that accepts a funded mint (fail
-            // open when its mint list is unknown). A caller-pinned request
-            // must not switch providers.
+          if (error instanceof ProviderMintBalanceError || error instanceof RefundPendingKeyError) {
+            // Neither another route on this provider nor a fresh deposit can
+            // resolve a quarantined key. Skip the node, just as for a mint shortfall.
             if (params.pinnedProvider || (pinnedModelPath && !params.autoModelPath)) {
               throw error;
             }
             this._log(
               "WARN",
-              `[RoutstrClient] _handleErrorResponse: provider-mint shortfall on ${nextProvider}; trying another provider`
+              `[RoutstrClient] _handleErrorResponse: ${error.name} on ${nextProvider}; trying another provider`
             );
-            providerMintBalance = providerMintBalance ?? error;
+            if (error instanceof ProviderMintBalanceError) providerMintBalance ??= error;
             attemptedForSpend.add(nextProvider);
             if (params.autoModelPath) {
               const tried = new Set(nextTriedModelPaths ?? []);
               if (nextModelPathSelector) {
                 tried.add(modelPathCandidateKey(nextProvider, nextModelPathSelector));
               }
-              // All routes on this node share its unfundable accepted mints.
               const [next] = await this.providerManager.getModelPathProviderRanking(
                 failoverModelId,
                 {
@@ -3897,30 +3900,11 @@ export class RoutstrClient {
       // again. Detect it via the provider's balance endpoint and recreate
       // instead of blindly reusing a dead key.
       if (parentApiKey && parentApiKey.key.startsWith("cashu")) {
-        let deadWithPendingRefund = false;
+        const probedKey = parentApiKey.key;
+        let invalid = false;
         try {
-          const balanceInfo = await this.balanceManager.getTokenBalance(
-            parentApiKey.key,
-            baseUrl
-          );
-          if (balanceInfo.isInvalidApiKey) {
-            // A dead key is normally replaced with a fresh deposit. If a
-            // refund for it is unresolved, the node may already hold a payout
-            // tied to that key: replacing it would strand the funds, so stop
-            // here and let provider failover take over instead.
-            deadWithPendingRefund = this.balanceManager.isApiKeyRefundPending(
-              baseUrl,
-              parentApiKey.key
-            );
-            if (!deadWithPendingRefund) {
-              this._log(
-                "DEBUG",
-                `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
-              );
-              this.storageAdapter.removeApiKey(baseUrl);
-              parentApiKey = null;
-            }
-          }
+          const balanceInfo = await this.balanceManager.getTokenBalance(probedKey, baseUrl);
+          invalid = balanceInfo.isInvalidApiKey === true;
         } catch (e) {
           this._log(
             "WARN",
@@ -3928,10 +3912,20 @@ export class RoutstrClient {
             e
           );
         }
-        if (deadWithPendingRefund) {
-          throw new Error(
-            `[RoutstrClient] _spendToken: API key for ${baseUrl} is unusable but a refund for it is unresolved; refusing to replace it and strand the payout`
-          );
+        if (invalid) {
+          // A stale probe cannot authorize removing a concurrently replaced key.
+          parentApiKey = this.storageAdapter.getApiKey(baseUrl);
+          if (parentApiKey?.key === probedKey) {
+            if (this.balanceManager.isApiKeyRefundPending(baseUrl, probedKey)) {
+              throw new RefundPendingKeyError(baseUrl);
+            }
+            this._log(
+              "DEBUG",
+              `[RoutstrClient] _spendToken: Stored bootstrap API key for ${baseUrl} is dead (proofs already spent), removing and recreating`
+            );
+            this.storageAdapter.removeApiKey(baseUrl);
+            parentApiKey = null;
+          }
         }
       }
 

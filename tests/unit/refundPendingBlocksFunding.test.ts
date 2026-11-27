@@ -150,7 +150,7 @@ describe("an unresolved refund blocks funding for its key", () => {
     expect(apiKeys.get(PROVIDER)?.key).toBe(KEY);
   });
 
-  it("refuses a direct top-up after the provider-wallet cooldown expires", async () => {
+  it.each([0, 11_000])("shares the quarantine with another manager %i ms after a refund", async (elapsed) => {
     vi.useFakeTimers({ now: Date.now() });
     const { adapter } = createStatefulStorage({
       apiKeys: {
@@ -170,11 +170,10 @@ describe("an unresolved refund blocks funding for its key", () => {
       apiKey: KEY,
       forceRefund: true,
     });
-    // Clear the 10s opposite-operation cooldown so the funding guard is what
-    // refuses the top-up, not the wallet-operation lock.
-    vi.setSystemTime(Date.now() + 11_000);
+    vi.setSystemTime(Date.now() + elapsed);
 
-    const topUp = await manager.topUp({
+    const peer = new BalanceManager(wallet, adapter);
+    const topUp = await peer.topUp({
       mintUrl: MINT,
       baseUrl: PROVIDER,
       amount: 100,
@@ -183,6 +182,11 @@ describe("an unresolved refund blocks funding for its key", () => {
     expect(topUp.success).toBe(false);
     expect(topUp.refundPending).toBe(true);
     expect(sendToken).not.toHaveBeenCalled();
+    expect(new BalanceManager(wallet, createStatefulStorage().adapter).isApiKeyRefundPending(PROVIDER, KEY)).toBe(false);
+    expect(peer.isApiKeyRefundPending(PROVIDER.slice(0, -1), KEY)).toBe(true);
+    expect(peer.isApiKeyRefundPending(PROVIDER + "/", KEY)).toBe(false);
+    peer.clearApiKeyRefundPending(PROVIDER, KEY);
+    expect(manager.isApiKeyRefundPending(PROVIDER, KEY)).toBe(false);
   });
 
   it("lifts the quarantine when the node proves no payout was dispatched", async () => {
@@ -215,6 +219,26 @@ describe("an unresolved refund blocks funding for its key", () => {
     expect(apiKeys.get(PROVIDER)?.key).toBe(KEY);
   });
 
+  const dust = "Balance too small to refund";
+  const ongoing = "Cannot refund key. There are ongoing requests for this api key.";
+  it.each([
+    { status: 400, body: { detail: dust }, pending: false },
+    { status: 400, body: { detail: ongoing }, pending: false },
+    { status: 400, body: { detail: `${ongoing} Retry later.` }, pending: true },
+    { status: 500, body: { detail: dust }, pending: true },
+    { status: 400, body: { error: { code: "refund_unresolved", message: dust } }, pending: true },
+  ])("classifies a legacy refusal by status and exact message: $status $body", async ({ status, body, pending }) => {
+    const { adapter } = createStatefulStorage();
+    adapter.setApiKey(PROVIDER, KEY);
+    const manager = new BalanceManager(createWallet().wallet, adapter);
+    globalThis.fetch = async () => refundResponse(status, body);
+
+    const result = await manager.refundApiKey({ mintUrl: MINT, baseUrl: PROVIDER, apiKey: KEY, forceRefund: true });
+    expect(result.success).toBe(false);
+    expect(manager.isApiKeyRefundPending(PROVIDER, KEY)).toBe(pending);
+    expect(adapter.getApiKey(PROVIDER)?.key).toBe(KEY);
+  });
+
   it("lifts the quarantine once the payout token is durably ours", async () => {
     const { adapter, apiKeys } = createStatefulStorage({
       apiKeys: {
@@ -241,12 +265,17 @@ describe("an unresolved refund blocks funding for its key", () => {
 });
 
 describe("the refund marker survives a restart", () => {
-  it.each([true, false])("waits for the quarantine write before dispatch (write succeeds: %s)", async (succeeds) => {
+  it.each([
+    { succeeds: true, wasPending: false },
+    { succeeds: false, wasPending: false },
+    { succeeds: false, wasPending: true },
+  ])("waits for the quarantine write before dispatch ($succeeds, previously pending: $wasPending)", async ({ succeeds, wasPending }) => {
     const first = createSdkStore({ driver: createMemoryDriver() });
     await first.hydrate;
     const storage = createStorageAdapterFromStore(first.store);
     storage.setApiKey(PROVIDER, KEY);
     const manager = new BalanceManager(createWallet().wallet, storage);
+    if (wasPending) manager.markApiKeyRefundPending(PROVIDER, KEY);
     let finishWrite!: () => void;
     const write = new Promise<void>((resolve, reject) => {
       finishWrite = succeeds ? resolve : () => reject(new Error("storage unavailable"));
@@ -258,8 +287,51 @@ describe("the refund marker survives a restart", () => {
     expect(storage.getApiKey(PROVIDER)?.refundPendingAt).toBeDefined();
     expect(request).not.toHaveBeenCalled();
     finishWrite();
-    await refund;
+    const result = await refund;
+    if (!succeeds) expect(result.skipped).toBe(true);
     expect(request).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+    expect(manager.isApiKeyRefundPending(PROVIDER, KEY)).toBe(succeeds || wasPending);
+  });
+
+  it.each(["not sent", "in flight", "ambiguous"] as const)("a failed write does not undo another manager's claim: %s", async (otherState) => {
+    const sdk = createSdkStore({ driver: createMemoryDriver() });
+    await sdk.hydrate;
+    const storage = createStorageAdapterFromStore(sdk.store);
+    storage.setApiKey(PROVIDER, KEY);
+    const wallet = createWallet().wallet;
+    const first = new BalanceManager(wallet, storage);
+    const second = new BalanceManager(wallet, storage);
+    const opts = { mintUrl: MINT, baseUrl: PROVIDER, apiKey: KEY, forceRefund: true };
+    let failFirst!: () => void;
+    const flush = vi.spyOn(storage, "flush").mockImplementationOnce(() => new Promise<void>((_, reject) => {
+      failFirst = () => reject(new Error("first write failed"));
+    }));
+    const firstRequest = vi.spyOn(first, "fetchRefundToken").mockResolvedValue({ success: false });
+    const a = first.refundApiKey(opts);
+
+    let finishSecond!: () => void;
+    const wait = new Promise<void>(resolve => { finishSecond = resolve; });
+    if (otherState === "not sent") {
+      flush.mockImplementationOnce(async () => { await wait; throw new Error("second write failed"); });
+    }
+    let dispatch!: () => void;
+    const dispatched = new Promise<void>(resolve => { dispatch = resolve; });
+    const secondRequest = vi.spyOn(second, "fetchRefundToken").mockImplementation(async () => {
+      dispatch();
+      await wait;
+      return { success: false, error: "response lost" };
+    });
+    const b = second.refundApiKey(opts);
+    if (otherState !== "not sent") await dispatched;
+    if (otherState === "ambiguous") { finishSecond(); await b; }
+    failFirst();
+    await a;
+    expect(firstRequest).not.toHaveBeenCalled();
+    expect(second.isApiKeyRefundPending(PROVIDER, KEY)).toBe(true);
+    finishSecond();
+    await b;
+    expect(secondRequest).toHaveBeenCalledTimes(otherState === "not sent" ? 0 : 1);
+    expect(first.isApiKeyRefundPending(PROVIDER, KEY)).toBe(otherState !== "not sent");
   });
 
   it("persists on the key record and follows a credential swap", async () => {
