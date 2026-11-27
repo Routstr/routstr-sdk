@@ -245,8 +245,13 @@ const fetchProviderInfo = async (
 export interface ModelProviderPrice {
   baseUrl: string;
   model: Model;
-  /** Sats the node would settle for the whole basket. */
+  /** Sats the node would settle for the whole basket, or for one picture
+   *  where `pictureSats` is set. */
   cost: number;
+  /** For a model that only makes pictures: sats for one picture at its
+   *  default size and quality, which is then `cost`. The basket fields still
+   *  describe tokens. */
+  pictureSats?: number;
   /** The rates the cost was computed from, with provenance. */
   rates: CostRates;
   /** Per-class sats for the basket, plus the same `rates` it used. */
@@ -835,11 +840,21 @@ function pictureHoldSats(
   if (PICTURE_REFERENCE_FIELDS.some((field) => body[field])) return undefined;
 
   let perPicture = ceiling;
+  let inputs = 0;
   const book = (model as any).image_pricing;
   if (book?.max_usd > 0) {
     const satsPerUsd = ceiling / book.max_usd;
-    if (book.unit === "image") {
+    if (book.unit === "image" || book.unit === "token") {
       perPicture = satsPerUsd * pictureTierUsd(book, body);
+      if (book.unit === "token") {
+        const text = ["prompt", "negative_prompt"]
+          .map((field) => (typeof body[field] === "string" ? body[field] : ""))
+          .join("");
+        inputs =
+          satsPerUsd *
+          new TextEncoder().encode(text).length *
+          (book.input_text_token_usd ?? 0);
+      }
     } else if (
       book.unit === "megapixel" &&
       book.megapixel_usd > 0 &&
@@ -856,8 +871,23 @@ function pictureHoldSats(
     }
   }
   return (
-    Math.max(1, Number(body.n) || 1, Number(body.variants) || 1) * perPicture
+    Math.max(1, Number(body.n) || 1, Number(body.variants) || 1) * perPicture +
+    inputs
   );
+}
+
+/**
+ * What one picture from a model that only makes pictures costs on a route,
+ * for ranking: its default step, else, on a route with no `image_output`, the
+ * per-picture price nodes listed as `sats_pricing.image` before image books.
+ * An unpriced route ranks last, not as free. Undefined for any other model.
+ */
+function pictureQuoteSats(model: Model): number | undefined {
+  const outputs = model.architecture?.output_modalities;
+  if (outputs?.length !== 1 || outputs[0] !== "image") return undefined;
+  const pricing = model.sats_pricing as any;
+  const listed = pricing?.image_output > 0 ? undefined : pricing?.image;
+  return pictureHoldSats(model, {}) ?? (listed > 0 ? listed : Infinity);
 }
 
 /**
@@ -1939,11 +1969,13 @@ export class ProviderManager {
       if (!hasUsableTokenRates(match.sats_pricing)) continue;
 
       const breakdown = estimateCost(match.sats_pricing, basket);
+      const pictureSats = pictureQuoteSats(match);
 
       results.push({
         baseUrl,
         model: match,
-        cost: breakdown.total,
+        cost: pictureSats ?? breakdown.total,
+        pictureSats,
         rates: breakdown.rates,
         breakdown,
         basket,
@@ -1961,7 +1993,7 @@ export class ProviderManager {
       const ranking = results
         .map(
           (r, i) =>
-            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats ` +
+            `  ${i + 1}. ${r.baseUrl} cost=${r.cost.toFixed(2)} sats${r.pictureSats !== undefined ? " for one picture" : ""} ` +
             `(fresh=${r.breakdown.freshInputSats.toFixed(2)} ` +
             `cache-read=${r.breakdown.cacheReadSats.toFixed(2)} ` +
             `cache-write=${r.breakdown.cacheWriteSats.toFixed(2)} ` +

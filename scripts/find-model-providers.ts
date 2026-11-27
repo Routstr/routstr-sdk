@@ -46,7 +46,7 @@ async function main(): Promise<void> {
   for (const entry of ranking) {
     const { breakdown, rates } = entry;
     console.log(
-      `${entry.baseUrl} cost=${entry.cost.toFixed(2)} sats ` +
+      `${entry.baseUrl} cost=${entry.cost.toFixed(2)} sats${entry.pictureSats !== undefined ? " for one picture" : ""} ` +
         `(fresh=${breakdown.freshInputSats.toFixed(2)} ` +
         `cache-read=${breakdown.cacheReadSats.toFixed(2)} ` +
         `cache-write=${breakdown.cacheWriteSats.toFixed(2)} ` +
