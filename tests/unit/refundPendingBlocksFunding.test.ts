@@ -241,6 +241,27 @@ describe("an unresolved refund blocks funding for its key", () => {
 });
 
 describe("the refund marker survives a restart", () => {
+  it.each([true, false])("waits for the quarantine write before dispatch (write succeeds: %s)", async (succeeds) => {
+    const first = createSdkStore({ driver: createMemoryDriver() });
+    await first.hydrate;
+    const storage = createStorageAdapterFromStore(first.store);
+    storage.setApiKey(PROVIDER, KEY);
+    const manager = new BalanceManager(createWallet().wallet, storage);
+    let finishWrite!: () => void;
+    const write = new Promise<void>((resolve, reject) => {
+      finishWrite = succeeds ? resolve : () => reject(new Error("storage unavailable"));
+    });
+    const flush = vi.spyOn(storage, "flush").mockImplementationOnce(() => write);
+    const request = vi.spyOn(manager, "fetchRefundToken").mockResolvedValue({ success: false });
+    const refund = manager.refundApiKey({ mintUrl: MINT, baseUrl: PROVIDER, apiKey: KEY, forceRefund: true });
+    expect(flush).toHaveBeenCalledOnce();
+    expect(storage.getApiKey(PROVIDER)?.refundPendingAt).toBeDefined();
+    expect(request).not.toHaveBeenCalled();
+    finishWrite();
+    await refund;
+    expect(request).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+  });
+
   it("persists on the key record and follows a credential swap", async () => {
     const driver = createMemoryDriver();
     const first = createSdkStore({ driver });

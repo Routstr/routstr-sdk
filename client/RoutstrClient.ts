@@ -2666,7 +2666,7 @@ export class RoutstrClient {
           ) {
             // The refund may have paid out even though this attempt failed
             // (a timeout or a lost response). The key is quarantined from
-            // funding and the sweep will reclaim the payout, so fail over
+            // funding and a later sweep can reclaim the payout, so fail over
             // instead of turning a recoverable refund into a hard error.
             this._log(
               "WARN",

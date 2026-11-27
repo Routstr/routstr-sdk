@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
 import { providerKey } from "../utils/providerKey";
 import { FundingCallers, throwIfFundingAborted } from "./fundingCancellation";
 /**
@@ -39,6 +41,13 @@ import {
   isNetworkErrorMessage,
   selectMintWithBalance,
 } from "./tokenUtils";
+
+// routstr-core's /v1/wallet/info returns `sk-` plus the SHA-256 of the
+// original Cashu bearer. Compare that row identity without storing proofs or
+// rewriting the credential sent on the wire.
+function refundKeyIdentity(key: string): string {
+  return key.startsWith("cashu") ? `sk-${bytesToHex(sha256(utf8ToBytes(key)))}` : key;
+}
 
 /**
  * Options for refunding API key balance
@@ -210,10 +219,10 @@ export class BalanceManager {
   private _refundTimedOutProviders: Set<string> = new Set();
   /**
    * Keys whose refund outcome is unresolved, keyed by
-   * `providerKey(baseUrl, key)`. Mirrors the persisted `refundPendingAt`
-   * marker for storage adapters that cannot persist it (custom adapters).
+   * provider URL and canonical credential identity when there is no stored
+   * key record or the adapter cannot persist the marker.
    */
-  private _refundPendingKeys: Map<string, number> = new Map();
+  private _refundPendingKeys = new Set<string>();
   private readonly logger: SdkLogger;
 
   constructor(
@@ -313,6 +322,12 @@ export class BalanceManager {
     }
   }
 
+  private _storedRefundKey(baseUrl: string, key: string) {
+    const stored = this.storageAdapter.getApiKey?.(baseUrl);
+    return stored && (stored.key === key || refundKeyIdentity(stored.key) === refundKeyIdentity(key))
+      ? stored : null;
+  }
+
   /**
    * Whether a refund claim for this key was started and has not resolved.
    *
@@ -325,26 +340,28 @@ export class BalanceManager {
    * in-memory map keeps custom adapters safe within one process.
    */
   isApiKeyRefundPending(baseUrl: string, key: string): boolean {
-    // Custom adapters in the wild (and test doubles) may implement only the
-    // surface their caller needed; the in-memory map still protects them.
-    const stored = this.storageAdapter.getApiKey?.(baseUrl);
-    if (stored && stored.key !== key) return false;
+    const stored = this._storedRefundKey(baseUrl, key);
     if (stored?.refundPendingAt !== undefined) return true;
-    // The persisted marker is authoritative where the adapter supports it.
-    if (this.storageAdapter.markApiKeyRefundPending) return false;
-    return this._refundPendingKeys.has(providerKey(baseUrl, key));
+    // Explicitly supplied credentials and legacy adapters may have no
+    // persisted marker. Those claims use the same identity in memory.
+    return this._refundPendingKeys.has(providerKey(baseUrl, refundKeyIdentity(key)));
   }
 
   /** Record that a refund claim for this key may have been dispatched. */
   markApiKeyRefundPending(baseUrl: string, key: string): void {
-    this._refundPendingKeys.set(providerKey(baseUrl, key), Date.now());
-    this.storageAdapter.markApiKeyRefundPending?.(baseUrl, key);
+    const stored = this._storedRefundKey(baseUrl, key);
+    if (stored && this.storageAdapter.markApiKeyRefundPending) {
+      this.storageAdapter.markApiKeyRefundPending(baseUrl, stored.key);
+    } else {
+      this._refundPendingKeys.add(providerKey(baseUrl, refundKeyIdentity(key)));
+    }
   }
 
   /** The claim resolved: a token was received, or the node proved nothing is owed. */
   clearApiKeyRefundPending(baseUrl: string, key: string): void {
-    this._refundPendingKeys.delete(providerKey(baseUrl, key));
-    this.storageAdapter.clearApiKeyRefundPending?.(baseUrl, key);
+    this._refundPendingKeys.delete(providerKey(baseUrl, refundKeyIdentity(key)));
+    const stored = this._storedRefundKey(baseUrl, key);
+    if (stored) this.storageAdapter.clearApiKeyRefundPending?.(baseUrl, stored.key);
   }
 
   /** Refuse to fund a key that has an unresolved refund claim. */
@@ -446,18 +463,7 @@ export class BalanceManager {
       }
     }
 
-    let fetchResult:
-      | {
-          success: boolean;
-          token?: string;
-          requestId?: string;
-          error?: string;
-          status?: number;
-          parsedError?: ParsedCoreError;
-          keyNotFound?: boolean;
-          noBalance?: boolean;
-        }
-      | undefined;
+    let fetchResult: Awaited<ReturnType<BalanceManager["fetchRefundToken"]>> | undefined;
 
     try {
       // A refund is a one-way door for this key: the node may dispatch a payout
@@ -465,6 +471,11 @@ export class BalanceManager {
       // Record the attempt before it leaves, so a timeout, a lost response or a
       // crash cannot be followed by a top-up that strands the payout.
       this.markApiKeyRefundPending(baseUrl, apiKey);
+      if (this.storageAdapter.markApiKeyRefundPending) {
+        // The store setter queues a write. Do not let the payout leave before
+        // a restart would restore its quarantine. A failed flush stops dispatch.
+        await this.storageAdapter.flush?.();
+      }
       fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
       // The provider proved this key holds nothing and that no payout was ever
@@ -477,7 +488,7 @@ export class BalanceManager {
         );
         // Never delete a key that replaced this one while the request was in
         // flight — same guard as the token_already_spent / key_not_found paths.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return { success: true, message: "No balance to refund, key cleaned up" };
@@ -492,7 +503,7 @@ export class BalanceManager {
         );
         // The refund response may belong to a key that was replaced while the
         // request was in flight. Never delete a newer key for the same provider.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return {
@@ -514,7 +525,7 @@ export class BalanceManager {
           `refundApiKey: key not found for ${baseUrl}; removing dead API key`
         );
         if (apiKey.startsWith("cashu")) this.cashuSpender.cacheReceiveToken(apiKey);
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return {
@@ -538,7 +549,7 @@ export class BalanceManager {
           const directReceive = await this.cashuSpender.receiveToken(apiKey);
           if (directReceive.success) {
             this.clearApiKeyRefundPending(baseUrl, apiKey);
-            if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+            if (this._storedRefundKey(baseUrl, apiKey)) {
               this.storageAdapter.removeApiKey(baseUrl);
             }
             const refundedAmount =
@@ -570,6 +581,20 @@ export class BalanceManager {
           requestId: fetchResult.requestId,
           status: fetchResult.status,
           parsedError: fetchResult.parsedError,
+        };
+      }
+
+      if (fetchResult.paidLightningReceipt) {
+        // The node paid the key's configured recipient. There are no Cashu
+        // proofs to receive, including when the node replays this receipt.
+        this.clearApiKeyRefundPending(baseUrl, apiKey);
+        if (this._storedRefundKey(baseUrl, apiKey)) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
+        return {
+          success: true,
+          refundedAmount: fetchResult.paidLightningReceipt.amountMsat,
+          requestId: fetchResult.requestId,
         };
       }
 
@@ -614,7 +639,7 @@ export class BalanceManager {
       }
       // The refunded key is spent; a replacement stored while the request
       // was in flight is not.
-      if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+      if (this._storedRefundKey(baseUrl, apiKey)) {
         this.storageAdapter.removeApiKey(baseUrl);
       }
 
@@ -670,6 +695,7 @@ export class BalanceManager {
     error?: string;
     status?: number;
     parsedError?: ParsedCoreError;
+    paidLightningReceipt?: { amountMsat?: number };
     /** True when the provider replied 401 key_not_found. */
     keyNotFound?: boolean;
     /**
@@ -762,6 +788,19 @@ export class BalanceManager {
       }
 
       const data = await response.json();
+      if (!xCashu && data.token == null && data.status === "paid" &&
+          typeof data.refund_id === "string" && data.refund_id.trim() &&
+          typeof data.recipient === "string" && data.recipient.trim()) {
+        const amount = data.msats ?? data.sats;
+        const msats = typeof amount === "string" && /^\d+$/.test(amount)
+          ? Number(amount) * (data.msats != null ? 1 : 1000)
+          : NaN;
+        return {
+          success: true,
+          paidLightningReceipt: { amountMsat: Number.isSafeInteger(msats) ? msats : undefined },
+          requestId,
+        };
+      }
       return {
         success: true,
         token: data.token,

@@ -11,6 +11,9 @@ importers:
       '@cashu/cashu-ts':
         specifier: ^4.11.0
         version: 4.11.0
+      '@noble/hashes':
+        specifier: ^2.4.0
+        version: 2.4.0
       applesauce-core:
         specifier: ^5.1.0
         version: 5.2.0(typescript@5.9.3)

@@ -871,37 +871,45 @@ export class CashuSpender {
           );
 
           if (balanceResult.isInvalidApiKey) {
-            // Key is invalid/expired on the provider side — clean it up
-            this.logger.warn(
-              `refundProviders: ${apiKeyEntry.baseUrl} returned invalid API key; removing local key and treating as success`
+            // A stale balance probe cannot authorize removal of a replacement.
+            if (this.storageAdapter.getApiKey(apiKeyEntry.baseUrl)?.key !== apiKeyEntryFull.key) {
+              results.push({ baseUrl: apiKeyEntry.baseUrl, success: false });
+              continue;
+            }
+            // Only the refund endpoint can settle an unresolved claim. Keep
+            // the credential and fall through to the refund retry below.
+            if (!this.balanceManager.isApiKeyRefundPending(apiKeyEntry.baseUrl, apiKeyEntryFull.key)) {
+              this.logger.warn(
+                `refundProviders: ${apiKeyEntry.baseUrl} returned invalid API key; removing local key and treating as success`
+              );
+              this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
+              results.push({
+                baseUrl: apiKeyEntry.baseUrl,
+                success: true,
+              });
+              continue;
+            }
+          } else {
+            const refreshedBalance = persistApiKeyBalance(
+              this.storageAdapter,
+              apiKeyEntry.baseUrl,
+              apiKeyEntryFull.key,
+              balanceResult
             );
-            this.storageAdapter.removeApiKey(apiKeyEntry.baseUrl);
-            results.push({
-              baseUrl: apiKeyEntry.baseUrl,
-              success: true,
-            });
-            continue;
-          }
-
-          const refreshedBalance = persistApiKeyBalance(
-            this.storageAdapter,
-            apiKeyEntry.baseUrl,
-            apiKeyEntryFull.key,
-            balanceResult
-          );
-          // `persistApiKeyBalance` refuses a negative available figure on
-          // purpose: it means the key is momentarily over-reserved, a state
-          // that clears as the in-flight holds settle. Keep the last
-          // non-negative snapshot and warn instead of writing a number that is
-          // stale by the time it lands.
-          if (
-            !refreshedBalance &&
-            !balanceResult.balanceUnknown &&
-            balanceResult.amount < 0
-          ) {
-            this.logger.warn(
-              `refundProviders: balance refresh for ${apiKeyEntry.baseUrl} returned negative amount; keeping stale local balance=${apiKeyEntryFull.balance}`
-            );
+            // `persistApiKeyBalance` refuses a negative available figure on
+            // purpose: it means the key is momentarily over-reserved, a state
+            // that clears as the in-flight holds settle. Keep the last
+            // non-negative snapshot and warn instead of writing a number that is
+            // stale by the time it lands.
+            if (
+              !refreshedBalance &&
+              !balanceResult.balanceUnknown &&
+              balanceResult.amount < 0
+            ) {
+              this.logger.warn(
+                `refundProviders: balance refresh for ${apiKeyEntry.baseUrl} returned negative amount; keeping stale local balance=${apiKeyEntryFull.balance}`
+              );
+            }
           }
         } catch (error) {
           // Balance check failed — proceed with stale local balance
@@ -923,7 +931,11 @@ export class CashuSpender {
           mintUrl,
           baseUrl: apiKeyEntry.baseUrl,
           apiKey: refreshedEntry.key,
-          forceRefund,
+          // A pending claim is a retry, not a new refund. A recent lastUsed
+          // (including one set by a previous sweep) must not suppress it.
+          forceRefund: forceRefund || this.balanceManager.isApiKeyRefundPending(
+            apiKeyEntry.baseUrl, refreshedEntry.key
+          ),
         });
 
         if (refundResult.success) {
