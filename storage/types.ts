@@ -27,6 +27,10 @@ export interface SdkStorageState {
      *  old persisted state. */
     reserved?: number;
     lastUsed: number | null;
+    /** A refund claim started for this key and its outcome is unknown; the key
+     *  must not be funded again until the claim resolves. Optional for old
+     *  persisted state. */
+    refundPendingAt?: number;
   }>;
   childKeys: Array<{
     parentBaseUrl: string;

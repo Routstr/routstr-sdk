@@ -71,6 +71,7 @@
   },
   "dependencies": {
     "@cashu/cashu-ts": "^4.11.0",
+    "@noble/hashes": "^2.4.0",
     "applesauce-core": "^5.1.0",
     "applesauce-relay": "^5.1.0",
     "applesauce-sqlite": "^6.0.0",

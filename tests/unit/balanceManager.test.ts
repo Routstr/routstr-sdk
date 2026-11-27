@@ -207,9 +207,14 @@ describe("BalanceManager provider wallet collision guard", () => {
       amount: 10,
     });
 
-    expect(topUpResult.success).toBe(false);
-    expect(topUpResult.message).toContain("locked");
-    expect(topUpResult.message).toContain("refund");
+    expect(topUpResult).toMatchObject({ success: false, refundPending: true });
+    // A different destination on the same provider is still protected by the
+    // operation lock, not misclassified as awaiting this key's payout.
+    const otherKey = await manager.topUp({
+      mintUrl: "https://mint.example.com", baseUrl: BASE_URL, token: "another-key", amount: 10,
+    });
+    expect(otherKey).toMatchObject({ success: false, message: expect.stringContaining("refund in progress") });
+    expect(otherKey.refundPending).toBeUndefined();
 
     refundResolve();
     await refundResultPromise;

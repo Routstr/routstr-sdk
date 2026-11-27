@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Unresolved refunds quarantine their API key
+
+- A refund that fails without a definitive answer (the 30 s timeout, a lost
+  response, a network error, a 5xx, or an in-flight/stuck claim) now marks its
+  API key as refund-pending. The node dispatches the payout before it answers,
+  and it re-serves that token on a later refund request only while the key's
+  balance is zero. Topping the key up made the next refund claim the new
+  deposit instead, stranding the earlier payout until the node's sweep.
+- While the marker is set, `topUp`/`ensureBalance` refuse to fund the key
+  (`TopUpResult.refundPending`), a dead bootstrap key is not replaced with a
+  fresh deposit, and the key is not removed. Unpinned requests skip a provider
+  whose bootstrap key is both invalid and refund-pending. To retry the refund, call
+  `CashuSpender.refundProviders(mintUrl)` or run `scripts/refund-all.ts`; the SDK does
+  not schedule API-key sweeps. The quarantine lifts when the payout token is
+  durably ours, the node confirms a paid Lightning refund, or it reports no
+  recoverable payout (no balance, balance too small, in-flight requests, or a
+  swept refund).
+- The marker is persisted on the key record (`refundPendingAt`) and survives a
+  restart and the bootstrap-token → canonical-key promotion, which the node
+  resolves to the same key row. Managers that share a custom storage adapter
+  without the optional persistence methods share the guard in memory.
+- A refund failure that leaves an unresolved claim no longer aborts the request
+  with `ProviderError`; it fails over, since the key is preserved and a later sweep
+  can reclaim the payout.
+
 ## 0.5.2
 
 ### Provider session headers

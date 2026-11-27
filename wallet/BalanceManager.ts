@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
 import { providerKey } from "../utils/providerKey";
 import { FundingCallers, throwIfFundingAborted } from "./fundingCancellation";
 /**
@@ -24,6 +26,7 @@ import { InsufficientBalanceError, ProviderMintBalanceError } from "../core/erro
 import {
   parseCoreError,
   CoreErrorType,
+  CoreErrorCode,
   isHandledRedemptionError,
   isKeyNotFoundError,
   isNoBalanceToRefundError,
@@ -38,6 +41,13 @@ import {
   isNetworkErrorMessage,
   selectMintWithBalance,
 } from "./tokenUtils";
+
+// routstr-core's /v1/wallet/info returns `sk-` plus the SHA-256 of the
+// original Cashu bearer. Compare that row identity without storing proofs or
+// rewriting the credential sent on the wire.
+function refundKeyIdentity(key: string): string {
+  return key.startsWith("cashu") ? `sk-${bytesToHex(sha256(utf8ToBytes(key)))}` : key;
+}
 
 /**
  * Options for refunding API key balance
@@ -173,6 +183,10 @@ function walletEndpointBaseUrl(baseUrl: string): string {
   return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 }
 
+function refundMarkerId(baseUrl: string, key: string): string {
+  return JSON.stringify([walletEndpointBaseUrl(baseUrl), refundKeyIdentity(key)]);
+}
+
 type ProviderWalletOperation = {
   type: "topup" | "refund";
   /** Last non-skipped completion, even if other calls are still active. */
@@ -189,6 +203,14 @@ const providerWalletOperations = new WeakMap<
   WalletAdapter,
   Map<string, ProviderWalletOperation>
 >();
+
+// Managers sharing a storage adapter see the same quarantine, including when
+// the adapter cannot persist a marker or the caller supplied an unstored key.
+interface RefundMarkers {
+  pending: Set<string>;
+  preparing: Map<string, { writers: number; rollback: boolean }>;
+}
+const refundMarkersByStorage = new WeakMap<StorageAdapter, RefundMarkers>();
 
 /**
  * BalanceManager handles token refunds and topups from providers
@@ -207,6 +229,7 @@ export class BalanceManager {
   private static readonly PROVIDER_WALLET_COOLDOWN_MS = 10_000;
   /** Providers that have timed out during the current refund cascade. */
   private _refundTimedOutProviders: Set<string> = new Set();
+  private readonly refundMarkers: RefundMarkers;
   private readonly logger: SdkLogger;
 
   constructor(
@@ -216,6 +239,10 @@ export class BalanceManager {
     cashuSpender?: CashuSpender,
     logger?: SdkLogger
   ) {
+    this.refundMarkers = refundMarkersByStorage.get(storageAdapter) ?? {
+      pending: new Set(), preparing: new Map(),
+    };
+    refundMarkersByStorage.set(storageAdapter, this.refundMarkers);
     this.logger = (logger ?? consoleLogger).child("BalanceManager");
     if (cashuSpender) {
       this.cashuSpender = cashuSpender;
@@ -306,6 +333,62 @@ export class BalanceManager {
     }
   }
 
+  private _storedRefundKey(baseUrl: string, key: string) {
+    const stored = this.storageAdapter.getApiKey?.(baseUrl);
+    return stored && (stored.key === key || refundKeyIdentity(stored.key) === refundKeyIdentity(key))
+      ? stored : null;
+  }
+
+  /**
+   * Whether a refund claim for this key was started and has not resolved.
+   *
+   * Such a key is quarantined from funding: the node may already have paid out
+   * a refund token tied to it, and it re-serves that token only while the key's
+   * balance is zero. A top-up (or a replacement key) would make the next refund
+   * claim the new deposit instead, stranding the earlier payout.
+   *
+   * The persisted marker is authoritative where the adapter supports it; the
+   * in-memory map keeps custom adapters safe within one process.
+   */
+  isApiKeyRefundPending(baseUrl: string, key: string): boolean {
+    const stored = this._storedRefundKey(baseUrl, key);
+    if (stored?.refundPendingAt !== undefined) return true;
+    // Explicitly supplied credentials and legacy adapters may have no
+    // persisted marker. Those claims use the same identity in memory.
+    return this.refundMarkers.pending.has(refundMarkerId(baseUrl, key));
+  }
+
+  /** Record that a refund claim for this key may have been dispatched. */
+  markApiKeyRefundPending(baseUrl: string, key: string): void {
+    const stored = this._storedRefundKey(baseUrl, key);
+    if (stored && this.storageAdapter.markApiKeyRefundPending) {
+      this.storageAdapter.markApiKeyRefundPending(baseUrl, stored.key);
+    } else {
+      this.refundMarkers.pending.add(refundMarkerId(baseUrl, key));
+    }
+  }
+
+  /** The claim resolved: a token was received, or the node proved nothing is owed. */
+  clearApiKeyRefundPending(baseUrl: string, key: string): void {
+    this.refundMarkers.pending.delete(refundMarkerId(baseUrl, key));
+    const stored = this._storedRefundKey(baseUrl, key);
+    if (stored) this.storageAdapter.clearApiKeyRefundPending?.(baseUrl, stored.key);
+  }
+
+  /** Refuse to fund a key that has an unresolved refund claim. */
+  private _refundPendingTopUp(baseUrl: string, apiKey: string): TopUpResult | undefined {
+    if (!this.isApiKeyRefundPending(baseUrl, apiKey)) return undefined;
+    this.logger.warn(
+      `Skipping topup for ${baseUrl} - unresolved refund for this key; funding it would strand the refund payout`
+    );
+    return {
+      success: false,
+      refundPending: true,
+      message:
+        "Refund outcome unresolved for this key; top-up refused until it is reclaimed",
+    };
+  }
+
   async getBalanceState(): Promise<BalanceState> {
     const mintBalances = await this.walletAdapter.getBalances();
     const units = this.walletAdapter.getMintUnits();
@@ -391,32 +474,52 @@ export class BalanceManager {
       }
     }
 
-    let fetchResult:
-      | {
-          success: boolean;
-          token?: string;
-          requestId?: string;
-          error?: string;
-          status?: number;
-          parsedError?: ParsedCoreError;
-          keyNotFound?: boolean;
-          noBalance?: boolean;
-        }
-      | undefined;
+    let fetchResult: Awaited<ReturnType<BalanceManager["fetchRefundToken"]>> | undefined;
 
     try {
+      // A refund is a one-way door for this key: the node may dispatch a payout
+      // and then re-serve that token only while the key's balance is zero.
+      // Record the attempt before it leaves, so a timeout, a lost response or a
+      // crash cannot be followed by a top-up that strands the payout.
+      if (this.storageAdapter.markApiKeyRefundPending) {
+        const id = refundMarkerId(baseUrl, apiKey);
+        const preparing = this.refundMarkers.preparing;
+        const batch = preparing.get(id) ?? {
+          writers: 0, rollback: !this.isApiKeyRefundPending(baseUrl, apiKey),
+        };
+        batch.writers++;
+        preparing.set(id, batch);
+        try {
+          this.markApiKeyRefundPending(baseUrl, apiKey);
+          await this.storageAdapter.flush?.();
+          // A sibling's failed write cannot undo a claim once any caller
+          // crosses the dispatch boundary, even if its response is lost.
+          batch.rollback = false;
+        } catch (error) {
+          this.logger.error("Could not persist refund quarantine", error);
+          return { ...this._handleRefundError(error, mintUrl), skipped: true };
+        } finally {
+          if (--batch.writers === 0) {
+            preparing.delete(id);
+            if (batch.rollback) this.clearApiKeyRefundPending(baseUrl, apiKey);
+          }
+        }
+      } else {
+        this.markApiKeyRefundPending(baseUrl, apiKey);
+      }
       fetchResult = await this.fetchRefundToken(baseUrl, apiKey);
 
       // The provider proved this key holds nothing and that no payout was ever
       // made for it, so the stored key is dead weight: keeping it means every
       // refund sweep re-reads the same 400 forever.
       if (fetchResult.noBalance) {
+        this.clearApiKeyRefundPending(baseUrl, apiKey);
         this.logger.log(
           `refundApiKey: provider says no balance for ${baseUrl}; removing API key`
         );
         // Never delete a key that replaced this one while the request was in
         // flight — same guard as the token_already_spent / key_not_found paths.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return { success: true, message: "No balance to refund, key cleaned up" };
@@ -425,12 +528,13 @@ export class BalanceManager {
       // If the token is already spent, clean up the key — there's nothing
       // to refund and keeping the key wastes future refund attempts.
       if (fetchResult.parsedError?.type === CoreErrorType.TOKEN_ALREADY_SPENT) {
+        this.clearApiKeyRefundPending(baseUrl, apiKey);
         this.logger.warn(
           `refundApiKey: token_already_spent for ${baseUrl}; removing API key if it is still current`
         );
         // The refund response may belong to a key that was replaced while the
         // request was in flight. Never delete a newer key for the same provider.
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return {
@@ -447,11 +551,12 @@ export class BalanceManager {
       // endless refund sweeps. Same "only if still current" guard as
       // token_already_spent above.
       if (fetchResult.keyNotFound) {
+        this.clearApiKeyRefundPending(baseUrl, apiKey);
         this.logger.warn(
           `refundApiKey: key not found for ${baseUrl}; removing dead API key`
         );
         if (apiKey.startsWith("cashu")) this.cashuSpender.cacheReceiveToken(apiKey);
-        if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+        if (this._storedRefundKey(baseUrl, apiKey)) {
           this.storageAdapter.removeApiKey(baseUrl);
         }
         return {
@@ -474,7 +579,8 @@ export class BalanceManager {
         ) {
           const directReceive = await this.cashuSpender.receiveToken(apiKey);
           if (directReceive.success) {
-            if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+            this.clearApiKeyRefundPending(baseUrl, apiKey);
+            if (this._storedRefundKey(baseUrl, apiKey)) {
               this.storageAdapter.removeApiKey(baseUrl);
             }
             const refundedAmount =
@@ -494,12 +600,32 @@ export class BalanceManager {
         this.logger.warn(
           `refundApiKey: fetch failed for ${baseUrl}: ${fetchResult.error || "API key refund failed"}`
         );
+        // Only a refusal that happened before any payout was dispatched lifts
+        // the quarantine. A timeout, a lost response, a server error or an
+        // open claim may already have paid out and must keep it.
+        if (this._isDefinitiveRefundRefusal(fetchResult)) {
+          this.clearApiKeyRefundPending(baseUrl, apiKey);
+        }
         return {
           success: false,
           message: fetchResult.error || "API key refund failed",
           requestId: fetchResult.requestId,
           status: fetchResult.status,
           parsedError: fetchResult.parsedError,
+        };
+      }
+
+      if (fetchResult.paidLightningReceipt) {
+        // The node paid the key's configured recipient. There are no Cashu
+        // proofs to receive, including when the node replays this receipt.
+        this.clearApiKeyRefundPending(baseUrl, apiKey);
+        if (this._storedRefundKey(baseUrl, apiKey)) {
+          this.storageAdapter.removeApiKey(baseUrl);
+        }
+        return {
+          success: true,
+          refundedAmount: fetchResult.paidLightningReceipt.amountMsat,
+          requestId: fetchResult.requestId,
         };
       }
 
@@ -519,6 +645,9 @@ export class BalanceManager {
       // The provider has paid out and the token may be the only recoverable
       // value. Do not receive or delete the key until this copy is durable.
       await this.storageAdapter.flush?.();
+      // The payout is now ours: the key no longer needs to be quarantined, and
+      // a receive failure is handled by the cached-token recovery path.
+      this.clearApiKeyRefundPending(baseUrl, apiKey);
       const receiveResult = await this.cashuSpender.receiveToken(
         refundToken,
         false
@@ -541,7 +670,7 @@ export class BalanceManager {
       }
       // The refunded key is spent; a replacement stored while the request
       // was in flight is not.
-      if (this.storageAdapter.getApiKey(baseUrl)?.key === apiKey) {
+      if (this._storedRefundKey(baseUrl, apiKey)) {
         this.storageAdapter.removeApiKey(baseUrl);
       }
 
@@ -554,8 +683,38 @@ export class BalanceManager {
       };
     } catch (error) {
       this.logger.error("API key refund error", error);
+      // Unknown outcome: the quarantine stays until a later claim resolves it.
       return this._handleRefundError(error, mintUrl, fetchResult?.requestId);
     }
+  }
+
+  /**
+   * Whether a failed refund response proves the node did not dispatch a payout,
+   * so the key is safe to fund again.
+   *
+   * A refusal raised before the claim is opened (no balance, balance too small,
+   * in-flight requests on the key) leaves the funds on the key. A swept refund
+   * is terminal: the node has already taken the token back and nothing is
+   * recoverable, so keeping the key quarantined forever would only brick the
+   * provider. Everything else — a timeout, a network error, a 5xx, an open or
+   * stuck claim — may have paid out and keeps the quarantine.
+   */
+  private _isDefinitiveRefundRefusal(fetchResult: {
+    status?: number;
+    parsedError?: ParsedCoreError;
+  }): boolean {
+    if (fetchResult.status === 410) return true;
+    const code = fetchResult.parsedError?.code;
+    if (fetchResult.status === 400 && !code) {
+      const message = fetchResult.parsedError?.message;
+      return message === "Balance too small to refund" ||
+        message === "Cannot refund key. There are ongoing requests for this api key.";
+    }
+    return (
+      code === CoreErrorCode.NO_BALANCE_TO_REFUND ||
+      code === CoreErrorCode.BALANCE_TOO_SMALL_TO_REFUND ||
+      code === CoreErrorCode.REFUND_ONGOING_REQUESTS
+    );
   }
 
   /**
@@ -572,6 +731,7 @@ export class BalanceManager {
     error?: string;
     status?: number;
     parsedError?: ParsedCoreError;
+    paidLightningReceipt?: { amountMsat?: number };
     /** True when the provider replied 401 key_not_found. */
     keyNotFound?: boolean;
     /**
@@ -664,6 +824,19 @@ export class BalanceManager {
       }
 
       const data = await response.json();
+      if (!xCashu && data.token == null && data.status === "paid" &&
+          typeof data.refund_id === "string" && data.refund_id.trim() &&
+          typeof data.recipient === "string" && data.recipient.trim()) {
+        const amount = data.msats ?? data.sats;
+        const msats = typeof amount === "string" && /^\d+$/.test(amount)
+          ? Number(amount) * (data.msats != null ? 1 : 1000)
+          : NaN;
+        return {
+          success: true,
+          paidLightningReceipt: { amountMsat: Number.isSafeInteger(msats) ? msats : undefined },
+          requestId,
+        };
+      }
       return {
         success: true,
         token: data.token,
@@ -696,6 +869,10 @@ export class BalanceManager {
   /** Ensure available balance for automatic inference funding. Manual topUp stays additive. */
   async ensureBalance(options: EnsureBalanceOptions): Promise<TopUpResult> {
     throwIfFundingAborted(options.signal);
+    // Hard stop: funding a key with an unresolved refund claim strands the
+    // payout the node may already have issued for it.
+    const refundPending = this._refundPendingTopUp(options.baseUrl, options.token);
+    if (refundPending) return refundPending;
     if (![options.requiredSats, options.targetSats, options.minimumDeposit,
       options.minimumFraction, options.shortfallMultiplier ?? 1].every(Number.isFinite) ||
       options.requiredSats <= 0 || options.targetSats < options.requiredSats ||
@@ -747,6 +924,14 @@ export class BalanceManager {
     throwIfFundingAborted(options.signal);
     const { mintUrl, baseUrl, amount, token: providedToken } = options;
 
+    // Resolve before batching, and pin this destination even if storage changes
+    // while the top-up waits behind a wallet send.
+    const apiKey = providedToken || this.storageAdapter.getApiKey(baseUrl)?.key;
+    if (apiKey) {
+      const pending = this._refundPendingTopUp(baseUrl, apiKey);
+      if (pending) return pending;
+    }
+
     const guard = this._canRunProviderWalletOperation(baseUrl, "topup");
     if (!guard.allowed) {
       this.logger.log(`Skipping topup for ${baseUrl} - ${guard.reason}`);
@@ -757,9 +942,6 @@ export class BalanceManager {
       return { success: false, message: "Invalid top up amount" };
     }
 
-    // Resolve before batching, and pin this destination even if storage changes
-    // while the top-up waits behind a wallet send.
-    const apiKey = providedToken || this.storageAdapter.getApiKey(baseUrl)?.key;
     if (!apiKey) {
       return { success: false, message: "No API key available for top up" };
     }
@@ -845,6 +1027,11 @@ export class BalanceManager {
   ): Promise<TopUpResult> {
     throwIfFundingAborted(options.signal);
     const { mintUrl, baseUrl, amount, token: apiKey } = options;
+
+    // Re-checked here because a queued or retried batch can reach this point
+    // after the key was quarantined by a concurrent refund.
+    const refundPending = this._refundPendingTopUp(baseUrl, apiKey);
+    if (refundPending) return refundPending;
 
     let cashuToken: string | null = null;
     let requestId: string | undefined;

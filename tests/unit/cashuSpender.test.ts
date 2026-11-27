@@ -1,5 +1,5 @@
 import { getEncodedToken } from "@cashu/cashu-ts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CashuSpender } from "../../wallet/CashuSpender";
 import { BalanceManager } from "../../wallet/BalanceManager";
 import { InsufficientBalanceError } from "../../core";
@@ -146,9 +146,36 @@ describe("cached receive recovery", () => {
 describe("CashuSpender refund sweep", () => {
   const Provider = "https://llm.satsandsports.cash/";
 
-  it("drops a key the provider proves empty instead of re-sweeping it forever", async () => {
+  it.each([true, false])("handles an invalid balance probe with refundPending=%s", async (pending) => {
+    const key = "cashu-bootstrap";
+    const entry = { baseUrl: Provider, key, balance: 0, lastUsed: null };
+    const storage = createStorage({
+      getApiKeyDistribution: () => [{ baseUrl: Provider, amount: 0 }],
+      getApiKey: () => entry,
+      removeApiKey: vi.fn(),
+    });
+    const manager = new BalanceManager(createWallet(), storage);
+    if (pending) manager.markApiKeyRefundPending(Provider, key);
+    vi.spyOn(manager, "getTokenBalance").mockResolvedValue({
+      amount: 0, reserved: 0, unit: "sat", apiKey: key, isInvalidApiKey: true, readSeq: 1,
+    });
+    const refund = vi.spyOn(manager, "refundApiKey").mockResolvedValue({ success: false });
+    const spender = new CashuSpender(createWallet(), storage, undefined, manager);
+    const mintUrl = "https://mint.example.com";
+
+    expect(await spender.refundProviders(mintUrl, true)).toEqual([{ baseUrl: Provider, success: !pending }]);
+    if (pending) {
+      expect(refund).toHaveBeenCalledWith({ baseUrl: Provider, apiKey: key, mintUrl, forceRefund: true });
+      expect(storage.removeApiKey).not.toHaveBeenCalled();
+    } else {
+      expect(refund).not.toHaveBeenCalled();
+      expect(storage.removeApiKey).toHaveBeenCalledWith(Provider);
+    }
+  });
+
+  it.each([false, true])("non-forced sweep drops a proven-empty key (recently touched pending claim: %s)", async (pending) => {
     const apiKeys = new Map([
-      [Provider, { key: "sk-empty", balance: 0, lastUsed: null as number | null }],
+      [Provider, { key: "sk-empty", balance: 0, lastUsed: pending ? Date.now() : null }],
     ]);
     const touched: string[] = [];
     const storage = createStorage({
@@ -166,6 +193,7 @@ describe("CashuSpender refund sweep", () => {
       },
     });
     const balanceManager = new BalanceManager(createWallet(), storage);
+    if (pending) balanceManager.markApiKeyRefundPending(Provider, "sk-empty");
     const spender = new CashuSpender(
       createWallet(),
       storage,

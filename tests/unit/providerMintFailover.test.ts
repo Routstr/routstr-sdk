@@ -84,7 +84,11 @@ const createDiscovery = (): DiscoveryAdapter =>
     setRoutstr21ModelsLastUpdate: () => {},
   }) as unknown as DiscoveryAdapter;
 
-function createClient(findNext: (current: string) => string | null) {
+function createClient(
+  findNext: (current: string) => string | null,
+  storage = createStorage(),
+  wallet = createWallet()
+) {
   const providerManager = {
     markFailed: vi.fn(),
     getFailedProviders: () => new Set([BASE_URL]),
@@ -99,8 +103,8 @@ function createClient(findNext: (current: string) => string | null) {
     isOnCooldown: () => false,
   } as any;
   const client = new RoutstrClient(
-    createWallet(),
-    createStorage(),
+    wallet,
+    storage,
     createDiscovery(),
     "ERROR",
     "apikeys",
@@ -298,4 +302,95 @@ describe("RoutstrClient initial-deposit provider-mint failover", () => {
     } as any)).rejects.toBeInstanceOf(ProviderMintBalanceError);
   });
 
+});
+
+// Use the real _spendToken and both routing loops. Only the balance probe and
+// inference transport are simulated; no provider is contacted or wallet funded.
+describe("routing around a dead bootstrap key with a pending refund", () => {
+  const third = "https://third.example/";
+  const bootstrap = "cashu-quarantined";
+
+  function setup(quarantined: string) {
+    const storage = createStorage();
+    const key = (baseUrl: string) => baseUrl === quarantined ? bootstrap : "sk-working";
+    vi.spyOn(storage, "getApiKey").mockImplementation(baseUrl => ({
+      key: key(baseUrl), balance: 500, lastUsed: null,
+      refundPendingAt: baseUrl === quarantined ? 1 : undefined,
+    }));
+    vi.spyOn(storage, "getApiKeyDistribution").mockReturnValue(
+      [BASE_URL, NEXT_URL, third].map(baseUrl => ({baseUrl, amount: 500}))
+    );
+    const remove = vi.spyOn(storage, "removeApiKey");
+    const wallet = createWallet();
+    const send = vi.spyOn(wallet, "sendToken");
+    const { client, providerManager } = createClient(() => null, storage, wallet);
+    providerManager.recordSuccess = vi.fn();
+    providerManager.findNextBestProvider.mockImplementation(
+      (_model: string, _current: string, excluded: Set<string>) =>
+        [BASE_URL, NEXT_URL, third].find(url => !excluded.has(url)) ?? null
+    );
+    const probe = vi.spyOn(client.getBalanceManager(), "getTokenBalance").mockResolvedValue({
+      amount: 0, reserved: 0, unit: "sat", apiKey: bootstrap, isInvalidApiKey: true, readSeq: 1,
+    });
+    vi.spyOn(client as any, "_handlePostResponseBalanceUpdate").mockResolvedValue(0);
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async url => {
+      if (String(url).startsWith(BASE_URL) && quarantined === NEXT_URL) {
+        return Response.json({error: {message: "Body too large"}}, {status: 413});
+      }
+      return Response.json({ok: true});
+    });
+    return { client, providerManager, storage, fetch, probe, remove, send };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([BASE_URL, NEXT_URL])("skips a quarantined candidate (%s) without spending or deleting its key", async url => {
+    const { client, fetch, remove, send } = setup(url);
+    const response = await client.routeRequest(routeParams as any);
+    expect(response.status).toBe(200);
+    const requests = fetch.mock.calls.map(([input]) => new URL(String(input)).origin + "/");
+    expect(requests).toEqual(url === BASE_URL ? [NEXT_URL] : [BASE_URL, third]);
+    expect(remove).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("replaces an SDK-selected path when its provider is quarantined", async () => {
+    const { client, providerManager, fetch } = setup(BASE_URL);
+    providerManager.getModelPathProviderRanking = vi.fn(async () => [{
+      baseUrl: NEXT_URL, model, selector: "next-selector",
+    }]);
+    await client.routeRequest({ ...routeParams,
+      headers: { "X-Routstr-Model-Path": "old-selector" },
+      autoModelPath: { selector: "old-selector" },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(new URL(routeParams.path, NEXT_URL).href,
+      expect.objectContaining({ headers: expect.objectContaining({ "x-routstr-model-path": "next-selector" }) }));
+  });
+
+  it.each([{pinnedProvider: true}, {headers: {"X-Routstr-Model-Path": "caller-selector"}}])(
+    "respects caller pin %j", async pin => {
+      const { client, providerManager, fetch, remove, send } = setup(BASE_URL);
+      await expect(client.routeRequest({...routeParams, ...pin} as any)).rejects.toMatchObject({
+        name: "RefundPendingKeyError",
+      });
+      expect(providerManager.findNextBestProvider).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    }
+  );
+
+  it("preserves the replacement when an old bootstrap probe reports invalid", async () => {
+    const { client, storage, probe, fetch, remove, send } = setup(BASE_URL);
+    vi.mocked(storage.getApiKey).mockReturnValue({key: "cashu-old", balance: 500, lastUsed: null});
+    probe.mockImplementationOnce(async apiKey => {
+      vi.mocked(storage.getApiKey).mockReturnValue({key: "sk-replacement", balance: 500, lastUsed: null, refundPendingAt: 1});
+      return {amount: 0, reserved: 0, unit: "sat", apiKey, isInvalidApiKey: true, readSeq: 1};
+    });
+    await client.routeRequest(routeParams as any);
+    expect(fetch.mock.calls[0]?.[1]?.headers).toMatchObject({Authorization: "Bearer sk-replacement"});
+    expect(remove).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
 });
