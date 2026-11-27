@@ -91,7 +91,13 @@ vi.mock("../../client/confidential/params", async (orig) => ({
   checkPiC3SParams: () => {},
 }));
 
-import { ConfidentialConnection, depositProblems, missingLastFrameProblem, type ConnectionRequestOptions } from "../../client/confidential/connection";
+import {
+  ConfidentialConnection,
+  depositProblems,
+  missingLastFrameProblem,
+  refusalMarksNodeFailure,
+  type ConnectionRequestOptions,
+} from "../../client/confidential/connection";
 import { FLAG, FRAME, frame } from "../../client/confidential/h2";
 import { canonicalSuffix } from "../../client/confidential/suffix";
 import {
@@ -156,6 +162,8 @@ interface Script {
   receipt?: (s: Settle, honest: Receipt) => Receipt;
   /** The provider's SETTINGS payload after the head. */
   settings?: Uint8Array;
+  /** Framing "2": frames that follow the SETTINGS in the same record. */
+  withSettings?: Uint8Array[];
   /** Framing "2": provider records sent when request n arrives, before `request_ok`. */
   beforeRequestOk?: (n: number, stream: number) => Uint8Array[];
   /** Framing "2": provider records sent (once) when a `release` does not cover every record yet. */
@@ -242,7 +250,7 @@ class FakeNode {
       case "release_head":
         this.headWritten = true;
         this.text({ type: "head_written" });
-        if (this.framing === "2") this.record(frame(FRAME.SETTINGS, 0, 0, this.script.settings ?? new Uint8Array(0)));
+        if (this.framing === "2") this.record(cat(frame(FRAME.SETTINGS, 0, 0, this.script.settings ?? new Uint8Array(0)), ...(this.script.withSettings ?? [])));
         return;
       case "request": {
         const refused = this.script.refuse?.(m.n);
@@ -486,6 +494,7 @@ const HTTP11_OK =
   `${enc(SSE_11).length.toString(16)}\r\n${SSE_11}\r\n0\r\n\r\n`;
 
 let node: FakeNode;
+let wsSilent = false;
 const realWs = (globalThis as any).WebSocket;
 
 class FakeWs {
@@ -497,7 +506,8 @@ class FakeWs {
   private closed = false;
   constructor(readonly url: string) {
     node.ws = this;
-    setTimeout(() => this.onopen?.(), 0);
+    // A node that accepts the connection and never answers the upgrade.
+    if (!wsSilent) setTimeout(() => this.onopen?.(), 0);
   }
   send(d: Uint8Array | string): void {
     if (this.closed) return;
@@ -517,7 +527,7 @@ class FakeWs {
 }
 
 const proofs: string[] = [];
-function newConnection(framing: "2" | "1.1", script: Script = {}): ConfidentialConnection {
+function newConnection(framing: "2" | "1.1", script: Script = {}, timeouts: Record<string, number> = {}): ConfidentialConnection {
   node = new FakeNode(script);
   const offer = v3OfferFields({
     ...(framing === "2" ? BOTH : ONLY_11),
@@ -567,7 +577,7 @@ function newConnection(framing: "2" | "1.1", script: Script = {}): ConfidentialC
         },
         close() {},
       }) as never,
-    timeouts: { probe: 0, errorBody: 10_000, closed: 200 },
+    timeouts: { probe: 0, errorBody: 10_000, closed: 200, ...timeouts },
   });
 }
 
@@ -586,6 +596,7 @@ function chatRequest(maxTokens = 20): ConnectionRequestOptions {
 }
 
 beforeEach(() => {
+  wsSilent = false;
   (globalThis as any).WebSocket = FakeWs;
   tlsFake.state.certs = true;
   proofs.length = 0;
@@ -745,6 +756,21 @@ describe("framing 2: requests on one connection", () => {
     expect(err.receipt?.usage).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1, choices: [] });
     expect(node.log).not.toContain("release");
     expect(node.msgs.find((x) => x.type === "disclose_reset")).toMatchObject({ record: 1, r: hexOf(goaway) });
+  });
+
+  it("GOAWAY(NO_ERROR) below the stream while an armed connection opens for the request: kept, disclosed from its record", async () => {
+    // §5.4.1: a GOAWAY that reached the node shortly before `request_ok`
+    // refuses the request. It arrives in the record of the provider's
+    // SETTINGS, before the request's records start: R starts at that record.
+    const goaway = frame(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0]));
+    const settings = frame(FRAME.SETTINGS, 0, 0, new Uint8Array(0));
+    const conn = newConnection("2", { withSettings: [goaway] });
+    await conn.arm();
+    const err = await conn.request(chatRequest()).done.catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(err.receipt?.usage).toEqual({ refused: "goaway", error_code: 0, last_stream_id: 1, choices: [] });
+    expect(node.log).not.toContain("release");
+    expect(node.msgs.find((x) => x.type === "disclose_reset")).toMatchObject({ n: 1, record: 0, r: hexOf(cat(settings, goaway)) });
   });
 
   it("GOAWAY with an error code is not disclosed and does not count as not processed (the client's frames may have caused it)", async () => {
@@ -965,9 +991,12 @@ describe("framing 1.1: the connection's one request", () => {
   });
 });
 
+/** A deposit outcome as the node signs it: `cost_msats` is the deposit when charged, 0 when released. */
+const withCost = (d: Record<string, unknown>) => ("cost_msats" in d ? d : { ...d, cost_msats: d.outcome === "charged" ? d.msat : 0 });
+
 describe("the deposit outcome in the connection's last frame", () => {
   const lastFrame = (type: "closed" | "error", deposit: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
-    const json = JSON.stringify({ sid: SID, ...deposit });
+    const json = JSON.stringify({ sid: SID, ...withCost(deposit) });
     return JSON.stringify({ type, reason: "x", ...extra, deposit: JSON.parse(json), deposit_json: json, deposit_sig: sign(json) });
   };
   const fresh = (warnings: string[]) => {
@@ -1112,7 +1141,7 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
   const signedFrame = (frame: Record<string, unknown>, deposit?: Record<string, unknown>, outcome?: Record<string, unknown>) => {
     const out: Record<string, unknown> = { ...frame };
     if (deposit) {
-      const json = JSON.stringify({ sid: SID, ...deposit });
+      const json = JSON.stringify({ sid: SID, ...withCost(deposit) });
       Object.assign(out, { deposit: JSON.parse(json), deposit_json: json, deposit_sig: sign(json) });
     }
     if (outcome) {
@@ -1172,6 +1201,31 @@ describe("an eviction under slot pressure and the signed request outcome", () =>
     old.offer = { ...old.offer, evict_unused_after_s: 60 };
     old.onText(signedFrame(evicted, chargedEvicted));
     expect(w5).toEqual([]);
+  });
+
+  it("a settlement without a receipt is held to what the client disclosed", () => {
+    // The deposit could not be released after the first settlement: the node
+    // sends no receipt, and its outcome may cost only what our disclosure implies.
+    const cur = { n: 1, accepted: true, released: true, first: true, reservedMsat: 9000, disclosed: true };
+    const frame = { type: "error", status: 500, reason: "settlement failed", fault: "node" };
+    const deposit = { msat: DEPOSIT, outcome: "released", reason: "node_failure" };
+    const out = (cost: number) => ({ n: 1, outcome: "charged", reason: "settled_without_receipt", cost_msats: cost, reserved_msats: 9000 });
+    const offer = (fresh([]) as any).offer;
+    const fee = Number(offer.session_fee_msat ?? 0);
+    expect(fee).toBeGreaterThan(0);
+    for (const [disclosure, ok, bad] of [
+      [{ kind: "refusal" }, fee, fee + 1],
+      [{ kind: "error_head", status: 429 }, fee, fee + 1],
+      [{ kind: "error_head", status: 502 }, 9000, 9001],
+      [{ kind: "usage", usageMsat: 1000 }, 1000 + fee, 1001 + fee],
+    ] as const) {
+      const w1: string[] = [];
+      fresh(w1, { framing: "2", cur: { ...cur, offer, disclosure } }).onText(signedFrame(frame, deposit, out(ok)));
+      expect(w1, JSON.stringify(disclosure)).toEqual([]);
+      const w2: string[] = [];
+      fresh(w2, { framing: "2", cur: { ...cur, offer, disclosure } }).onText(signedFrame(frame, deposit, out(bad)));
+      expect(w2.join("\n"), JSON.stringify(disclosure)).toMatch(/with reason "settled_without_receipt" \(at most/);
+    }
   });
 
   it("a framing-1.1 request without a ClientHello may be evicted with it", () => {
@@ -1255,7 +1309,7 @@ describe("missingLastFrameProblem", () => {
 describe("the eviction of an unused connection", () => {
   const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
   const frame = { type: "closed", reason: "evicted", unused: true };
-  const out = { msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 1 } } as const;
+  const out = { msat: 1000, outcome: "charged", reason: "evicted", cost_msats: 1000, evicted: { unused_at_address: 1 } } as const;
   it("is always charged, also for a lone spare", () => {
     expect(depositProblems(frame, out, true, ctx)).toEqual([]);
     expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 60 })).toEqual([]);
@@ -1268,8 +1322,8 @@ describe("the eviction of an unused connection", () => {
 
 describe("depositProblems", () => {
   const ctx = { sid: SID, depositMsat: DEPOSIT, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
-  const charged = { msat: DEPOSIT, outcome: "charged", reason: "unused" } as const;
-  const released = { msat: DEPOSIT, outcome: "released", reason: "provider_closed" } as const;
+  const charged = { msat: DEPOSIT, outcome: "charged", reason: "unused", cost_msats: DEPOSIT } as const;
+  const released = { msat: DEPOSIT, outcome: "released", reason: "provider_closed", cost_msats: 0 } as const;
 
   it("honest outcomes have none", () => {
     expect(depositProblems({ type: "closed", reason: "upstream_closed" }, released, true, ctx)).toEqual([]);
@@ -1291,6 +1345,49 @@ describe("depositProblems", () => {
     expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, releasedByReceipt: true })).toEqual([
       "charged, though a receipt of this connection released it",
     ]);
+  });
+
+  it("holds the cost to the outcome: the deposit when charged, nothing when released", () => {
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...charged, cost_msats: DEPOSIT - 1 }, true, ctx).join()).toMatch(
+      new RegExp(`charged at a cost of ${DEPOSIT - 1} msat, the deposit is ${DEPOSIT} msat`),
+    );
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...charged, cost_msats: undefined }, true, ctx).join()).toMatch(
+      /charged at a cost of null msat/,
+    );
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, { ...released, cost_msats: DEPOSIT }, true, ctx)).toEqual([
+      `released at a cost of ${DEPOSIT} msat (a released deposit costs nothing)`,
+    ]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, { ...released, cost_msats: undefined }, true, ctx).join()).toMatch(
+      /released at a cost of null msat/,
+    );
+  });
+
+  it("row 6: a charge after a 5xx refusal of the node's own with no request accepted after it", () => {
+    const marked = { ...ctx, refused5xx: true };
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, marked)).toEqual([
+      "charged though the node refused a request with a 5xx and accepted none after it (released by §12.10 row 6)",
+    ]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...released, reason: "node_failure" }, true, marked)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, refused5xx: false })).toEqual([]);
+  });
+
+  it("which refusals mark row 6: a 5xx of a request that named an API key, not a Cashu token, and not wallet_busy", () => {
+    expect(refusalMarksNodeFailure({ status: 500, reason: "reservation failed" }, "sk-abc")).toBe(true);
+    expect(refusalMarksNodeFailure({ status: 503, detail: { error: { type: "wallet_busy" } } }, "sk-abc")).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 500 }, "cashuBo2F0gaJhaUgA")).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 500 }, undefined)).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 402 }, "sk-abc")).toBe(false);
+  });
+
+  it("a connection tracks the row 6 mark: set by such a refusal, cleared by request_ok", () => {
+    const conn = newConnection("2") as any;
+    conn.cur = { n: 1, auth: "sk-abc" };
+    conn.onText(JSON.stringify({ type: "request_refused", n: 1, status: 500, reason: "reservation failed" }));
+    expect(conn.refused5xx).toBe(true);
+    conn.onText(JSON.stringify({ type: "request_ok", n: 1 }));
+    expect(conn.refused5xx).toBe(false);
+    conn.onText(JSON.stringify({ type: "request_refused", n: 2, status: 503, reason: "busy", detail: { error: { type: "wallet_busy" } } }));
+    expect(conn.refused5xx).toBe(false);
   });
 });
 
@@ -1445,6 +1542,21 @@ describe("the node's last frame never came", () => {
   });
 });
 
+describe("the control websocket", () => {
+  it("a node that never answers the upgrade fails the connection at the open deadline", async () => {
+    wsSilent = true;
+    for (const framing of ["1.1", "2"] as const) {
+      const conn = newConnection(framing, {}, { socketOpen: 30 });
+      const t0 = Date.now();
+      await expect(framing === "2" ? conn.connect() : conn.arm()).rejects.toThrow(/control websocket to open/);
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(conn.usable).toBe(false);
+      // Nothing was sent: the setup (with the credential) never left the outbox.
+      expect(node.log).toEqual([]);
+    }
+  });
+});
+
 describe("SETTINGS acknowledgements", () => {
   const SETTINGS = 0x4;
   const PING = 0x6;
@@ -1472,7 +1584,7 @@ describe("SETTINGS acknowledgements", () => {
     const sent = acks(conn);
     conn.settingsAckSent = true;
     conn.requestOpen = true;
-    conn.cur = { n: 1, stream: 3, released: false, accepted: true, first: true, dataLens: [] };
+    conn.cur = { n: 1, stream: 3, released: false, releaseSent: true, accepted: true, first: true, dataLens: [] };
     conn.onFrame(settings);
     conn.onFrame({ type: PING, flags: 0, stream: 0, payload: new Uint8Array(8), off: 0 });
     expect(sent).toEqual(["ping_ack"]);
@@ -1480,5 +1592,22 @@ describe("SETTINGS acknowledgements", () => {
     expect(sent).toEqual(["ping_ack", "settings_ack"]);
     conn.onFrame(settings);
     expect(sent).toEqual(["ping_ack", "settings_ack", "settings_ack"]);
+  });
+  it("a body_released for a request we have not released changes nothing", () => {
+    const conn = newConnection("2") as any;
+    const sent = acks(conn);
+    conn.settingsAckSent = true;
+    conn.requestOpen = true;
+    conn.cur = { n: 1, stream: 3, released: false, releaseSent: false, accepted: true, first: true, dataLens: [] };
+    conn.onFrame(settings);
+    conn.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    // Still unreleased: the 5xx and request_outcome ceilings stay at the
+    // abandon fee, and the held acknowledgement stays held.
+    expect(conn.cur.released).toBe(false);
+    expect(sent).toEqual([]);
+    conn.cur.releaseSent = true;
+    conn.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    expect(conn.cur.released).toBe(true);
+    expect(sent).toEqual(["settings_ack"]);
   });
 });

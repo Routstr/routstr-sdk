@@ -908,6 +908,86 @@ describe("http 2: the connection pool", () => {
     await expect(pool.acquire("k", "2", () => new FakeConn(), ac.signal)).rejects.toThrow(/gone/);
   });
 
+  it("a caller that leaves while its connection opens is not held, and the connection keeps no slot of it", async () => {
+    const pool = new ConnectionPool<FakeConn>({ ...quiet, maxConnections: 1, acquireTimeoutMs: 40 });
+    let finishOpen!: (ok: boolean) => void;
+    const stalled = new FakeConn();
+    // A node that accepts the connection and does not answer yet.
+    stalled.connect = () =>
+      new Promise<void>((res, rej) => {
+        finishOpen = (ok) => {
+          if (!ok) {
+            stalled.close("open failed");
+            return rej(new Error("open failed"));
+          }
+          stalled.isArmed = true;
+          stalled.tOpen = stalled.tLastSettled = Date.now();
+          res();
+        };
+      });
+    const ac = new AbortController();
+    const p = pool.acquire("k", "2", () => stalled, ac.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    ac.abort(new Error("caller left"));
+    const outcome = await Promise.race([
+      p.then(
+        () => "resolved",
+        (e: Error) => e.message,
+      ),
+      new Promise((r) => setTimeout(() => r("still waiting"), 50)),
+    ]);
+    expect(outcome).toBe("caller left");
+    expect(pool.snapshot().map((s) => s.state)).toEqual(["connecting"]);
+    // It opens after all: kept for the next request, as any connection whose request is over.
+    finishOpen(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pool.snapshot().map((s) => s.state)).toEqual(["idle"]);
+    const next = await pool.acquire("k", "2", () => new FakeConn());
+    expect(next.conn).toBe(stalled);
+    next.release();
+    pool.close();
+
+    // One that fails after its caller left is forgotten: its slot is free again.
+    const pool2 = new ConnectionPool<FakeConn>({ ...quiet, maxConnections: 1, acquireTimeoutMs: 40 });
+    const stalled2 = new FakeConn();
+    let fail2!: () => void;
+    stalled2.connect = () =>
+      new Promise<void>((_, rej) => {
+        fail2 = () => {
+          stalled2.close("open failed");
+          rej(new Error("open failed"));
+        };
+      });
+    const ac2 = new AbortController();
+    const p2 = pool2.acquire("k", "2", () => stalled2, ac2.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    ac2.abort(new Error("caller left"));
+    await expect(p2).rejects.toThrow(/caller left/);
+    fail2();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pool2.snapshot()).toEqual([]);
+    const fresh = await pool2.acquire("other", "2", () => new FakeConn());
+    expect(fresh.conn).not.toBe(stalled2);
+    pool2.close();
+  });
+
+  it("a connection a request opened and the node then evicted unused marks the node full", async () => {
+    const pool = new ConnectionPool<FakeConn>(quiet);
+    const conns: FakeConn[] = [];
+    const open = (f: "2" | "1.1") => (conns.push(new FakeConn(f)), conns[conns.length - 1]!);
+    const traffic = pool.noteRequest("k", { baseUrl: "https://n/", framing: "1.1", depositMsat: 1000, prewarmable: true }, open);
+    const refused = await pool.acquire("k", "1.1", open);
+    // Request 1 refused before the handshake: the connection stays as an armed spare.
+    refused.release();
+    traffic.done();
+    expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+    conns[0]!.evictedUnused = true;
+    conns[0]!.close("connection closed by the node: evicted");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pool.isFull("https://n")).toBe(true);
+    pool.close();
+  });
+
   describe("armed spares (§9.2)", () => {
     const prewarm = { log: () => {}, backoffBaseMs: 20 };
     const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));

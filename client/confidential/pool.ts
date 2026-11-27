@@ -234,6 +234,8 @@ interface Entry<C extends ConnLike> {
   /** Resolves when a spare's arm ended (either way). */
   armed?: Promise<boolean>;
   timer?: ReturnType<typeof setTimeout>;
+  /** Its caller left while it opened: the pool finishes the open and keeps or forgets it. */
+  adopted?: boolean;
 }
 
 /** What the pool knows of a key's traffic. */
@@ -407,8 +409,9 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         const wasArmed = spare.state === "armed";
         spare.state = "connecting";
         try {
-          await spare.conn.connect();
+          await this.connectOrAbort(spare, signal, reuse);
         } catch (error) {
+          if (spare.adopted) throw error;
           this.remove(spare);
           if (signal?.aborted) throw signal.reason ?? error;
           this.log(`armed sid=${spare.conn.sid.slice(0, 8)} failed when claimed (${errorText(error)})`);
@@ -452,12 +455,14 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
           if (victim) this.retire(victim, "making room for another key");
         }
         if (this.entries.length < this.opt("maxConnections")) {
-          const entry: Entry<C> = { key, node: "", conn: open(framing), state: "connecting" };
+          // The key's node (from `noteRequest`): a connection opened here can
+          // become a spare (`park`), and the node-full rule needs its node.
+          const entry: Entry<C> = { key, node: this.keys.get(key)?.node ?? "", conn: open(framing), state: "connecting" };
           this.track(entry);
           try {
-            await entry.conn.connect();
+            await this.connectOrAbort(entry, signal, reuse);
           } catch (error) {
-            this.remove(entry);
+            if (!entry.adopted) this.remove(entry);
             throw error;
           }
           entry.state = "busy";
@@ -474,6 +479,52 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         });
       });
     }
+  }
+
+  /**
+   * `entry.conn.connect()`, or the caller's abort, whichever comes first. An
+   * aborted caller leaves the connection to finish opening on its own: it is
+   * then parked like any connection whose request is over (closing it would
+   * charge its deposit), or forgotten if it fails. Its slot is never held by
+   * a caller that left.
+   */
+  private connectOrAbort(entry: Entry<C>, signal: AbortSignal | undefined, reuse: "shared" | "none"): Promise<void> {
+    const connecting = entry.conn.connect();
+    if (!signal) return connecting;
+    if (signal.aborted) {
+      this.adopt(entry, connecting, reuse);
+      return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+    }
+    return new Promise<void>((res, rej) => {
+      const onAbort = () => {
+        this.adopt(entry, connecting, reuse);
+        rej(signal.reason ?? new DOMException("aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      connecting.then(
+        () => {
+          signal.removeEventListener("abort", onAbort);
+          res();
+        },
+        (error) => {
+          signal.removeEventListener("abort", onAbort);
+          rej(error);
+        },
+      );
+    });
+  }
+
+  /** A connection whose caller left while it opened: parked once it opens, removed if it fails. */
+  private adopt(entry: Entry<C>, connecting: Promise<void>, reuse: "shared" | "none"): void {
+    entry.adopted = true;
+    connecting.then(
+      () => {
+        if (!this.entries.includes(entry) || entry.state !== "connecting") return;
+        this.park(entry, reuse);
+        this.replenish();
+      },
+      () => this.remove(entry),
+    );
   }
 
   private track(entry: Entry<C>): void {
@@ -560,7 +611,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
 
   /**
    * A request of `key` arrived: remember the traffic and how to open a spare
-   * for it. `prewarmable`: the credential is stable (never a one-off token).
+   * for it. `prewarmable`: the credential is stable (never a one-off token)
+   * and this request's caller asked for pre-warming (the pool is shared: the
+   * pool-wide options are the latest caller's, and a spare costs its key's
+   * credential a deposit).
    */
   noteRequest(
     key: string,

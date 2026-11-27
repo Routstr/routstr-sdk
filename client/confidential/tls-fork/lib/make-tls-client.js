@@ -33,6 +33,9 @@ const TLS13_SERVER_FLIGHT_TYPES = [
     SUPPORTED_RECORD_TYPE_MAP.CERTIFICATE_VERIFY,
     SUPPORTED_RECORD_TYPE_MAP.FINISHED,
 ];
+/** The longest record fragment: 2^14 + 256 bytes in TLS 1.3 (RFC 8446 §5.2), 2^14 + 2048 in TLS 1.2 (RFC 5246 §6.2.3). */
+const MAX_RECORD_LENGTH_TLS13 = 16384 + 256;
+const MAX_RECORD_LENGTH_TLS12 = 16384 + 2048;
 export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, logger: _logger, cipherSuites, namedCurves = SUPPORTED_NAMED_CURVES, supportedProtocolVersions, signatureAlgorithms, applicationLayerProtocols, fetchCertificateBytes, write, onRead, onApplicationData, onSessionTicket, onTlsEnd, onHandshake, onRecvCertificates, external }) {
     const logger = _logger || LOGGER;
     // FORK PATCH (v2): external (two-party) key schedule. The client holds
@@ -100,6 +103,21 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
     const processPacketInner = async ({ type, packet: { content, header } }) => {
         let contentType;
         let ctx = { type: 'plaintext' };
+        // FORK PATCH (TLS-22): a record longer than 2^14 + 256 bytes is a
+        // record_overflow (RFC 8446 §5.2), and an outer type other than
+        // change_cipher_spec, alert, handshake or application_data an
+        // unexpected_message (§5): each ends the client. Such a record was
+        // logged and skipped, and the length was not bounded.
+        const maxRecordLength = connTlsVersion === 'TLS1_2' ? MAX_RECORD_LENGTH_TLS12 : MAX_RECORD_LENGTH_TLS13;
+        if (content.length > maxRecordLength) {
+            throw new Error(`TLS record of ${content.length} bytes, above the limit of ${maxRecordLength}`);
+        }
+        if (type !== PACKET_TYPE.HELLO
+            && type !== PACKET_TYPE.WRAPPED_RECORD
+            && type !== PACKET_TYPE.CHANGE_CIPHER_SPEC
+            && type !== PACKET_TYPE.ALERT) {
+            throw new Error(`TLS record of unknown outer type ${type}`);
+        }
         // if the cipher spec has changed,
         // the data will be encrypted, so
         // we need to decrypt the packet

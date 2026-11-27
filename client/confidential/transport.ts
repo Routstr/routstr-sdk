@@ -818,7 +818,14 @@ async function runOnPool(
       http2OpenFailure(error);
     const traffic = pool.noteRequest(
       key,
-      { baseUrl, framing, depositMsat: offerConnectionDepositMsat(offer), prewarmable: !oneOff },
+      {
+        baseUrl,
+        framing,
+        depositMsat: offerConnectionDepositMsat(offer),
+        // Spares cost deposits: only for a caller that asked for pre-warming
+        // itself, whatever another caller of the shared pool set.
+        prewarmable: !oneOff && options.prewarm !== undefined && options.prewarm.enabled !== false,
+      },
       open,
     );
     const tAcquire = Date.now();

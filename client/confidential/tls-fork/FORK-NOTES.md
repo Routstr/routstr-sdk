@@ -104,7 +104,7 @@ terminal path. Best effort only: JavaScript cannot erase copies the runtime
 or the caller made (WebCrypto's key material, garbage-collected buffers, the
 hex strings passed to `cu-2pc`/`cu-prover`).
 
-## Security patches (TLS-01 … TLS-21)
+## Security patches (TLS-01 … TLS-22)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -292,6 +292,19 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   names in a disclosure (`server_records`, `epoch_start`, the error head's
   record) and the request could not be settled. Such a record now fails the
   connection, as OpenSSL refuses it.
+- **TLS-22, the record layer; no SHA-1 certificate signatures**
+  (`utils/packets.js` `makeMessageProcessor`; `make-tls-client.js`
+  `processPacketInner`; `utils/x509.js` `getSigAlgorithm`). A record of outer
+  type 0 was taken for "no record in progress", so when its body arrived in
+  a later read the body was parsed as the next record header, and the
+  client's records no longer matched the ones the connection counts on the
+  wire. A record of an outer type other than 20 to 23 was logged and skipped;
+  it now ends the client (unexpected_message, RFC 8446 §5), and so does a
+  record longer than 2^14 + 256 bytes (record_overflow, §5.2). A certificate
+  signed with SHA-1 is refused (webpki, the sidecar's verifier, refuses it
+  too); trust anchors are not checked by their own signature, so a root
+  self-signed with SHA-1 still anchors a path. None of the three is in the
+  transcript, and an honest provider sends none of them.
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider

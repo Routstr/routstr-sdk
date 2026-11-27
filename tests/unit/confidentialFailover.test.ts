@@ -49,13 +49,15 @@ function setup(
     offer?: unknown;
     /** What the transport throws for node A (default: a fetch failure). */
     errorOnA?: () => unknown;
+    /** No other confidential node: only the plaintext one is left after A. */
+    withoutC?: boolean;
   } = {},
 ) {
   const models: Record<string, Model[]> = {
     [A]: [entry(1, { confidential_upstream: cu, ...(opts.nativeIdOnA ? { id: opts.nativeIdOnA } : {}) })],
     // Cheaper than C but serves the model in plaintext only.
     [PLAIN]: [entry(2)],
-    [C]: [entry(3, { confidential_upstream: cu })],
+    ...(opts.withoutC ? {} : { [C]: [entry(3, { confidential_upstream: cu })] }),
   };
   const registry = {
     getCachedModels: () => models,
@@ -149,6 +151,24 @@ describe("confidential failover", () => {
     expect(sessions).toEqual([A]);
     expect(spent.map((s) => s.baseUrl)).toEqual([A]);
     expect(markFailed).not.toHaveBeenCalled();
+  });
+
+  it("never sends a confidential request in plaintext, also when only a plaintext node is left", async () => {
+    const plainFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (/\/(chat\/completions|images?\/gener)/.test(url)) throw new Error(`plaintext request to ${url}`);
+      return new Response("{}", { status: 404 });
+    });
+    const { client, spent, sessions } = setup({ withoutC: true });
+    // The request fails (an error or an error response), it is not answered by the plaintext node.
+    const outcome = await route(client).catch((e: unknown) => e);
+    if (outcome instanceof Response) expect(outcome.ok).toBe(false);
+    expect(sessions).toEqual([A]);
+    expect(spent.some((s) => s.baseUrl === PLAIN)).toBe(false);
+    const inference = plainFetch.mock.calls
+      .map(([input]) => String(input instanceof Request ? input.url : input))
+      .filter((u) => /\/(chat\/completions|images?\/gener)/.test(u));
+    expect(inference).toEqual([]);
   });
 
   it("skips nodes without confidential sessions and qualifies before spending", async () => {

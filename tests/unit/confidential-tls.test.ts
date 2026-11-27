@@ -1339,3 +1339,60 @@ describe("tls-fork application data and plaintext records (TLS-15, TLS-16)", () 
     session.close();
   });
 });
+
+describe("tls-fork record layer and certificate hashes (TLS-22)", () => {
+  let root: Issued;
+  const plain = (type: number, body: Uint8Array | number[]) =>
+    new Uint8Array([type, 0x03, 0x03, ...u16(body.length), ...Array.from(body)]);
+
+  beforeAll(async () => {
+    root = await issue({ subject: "CN=Test Root", ca: true, keyUsage: keyCertSign | cRLSign });
+  });
+
+  it("reads a record of outer type 0 as a record, also when its body arrives later, and refuses it", async () => {
+    const { client, ended } = await externalClient(root);
+    // The header alone, then a body that itself looks like a record header.
+    const body = plain(0x17, [0, 0, 0, 0, 0]);
+    await client.handleReceivedBytes(new Uint8Array([0x00, 0x03, 0x03, ...u16(body.length)]));
+    await expect(client.handleReceivedBytes(body)).rejects.toThrow(/unknown outer type 0/);
+    expect(client.hasEnded()).toBe(true);
+    expect(ended.length).toBe(1);
+  });
+
+  it("refuses a record of an outer type TLS does not define (unexpected_message)", async () => {
+    const { client } = await externalClient(root);
+    await expect(client.handleReceivedBytes(plain(0x18, [1, 0, 0]))).rejects.toThrow(/unknown outer type 24/);
+    expect(client.hasEnded()).toBe(true);
+  });
+
+  it("refuses a record longer than 2^14 + 256 bytes (record_overflow)", async () => {
+    const { client } = await externalClient(root);
+    await expect(client.handleReceivedBytes(plain(0x17, new Uint8Array(16384 + 257)))).rejects.toThrow(
+      /above the limit of 16640/,
+    );
+    expect(client.hasEnded()).toBe(true);
+  });
+
+  it("refuses a certificate signed with SHA-1, accepts the same chain signed with SHA-256", async () => {
+    // A WebCrypto RSA key is bound to one hash: one root per hash.
+    const chain = async (hash: string) => {
+      const keyAlg = { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash };
+      const rsaRoot = await issue({ subject: "CN=Test RSA Root", ca: true, keyUsage: keyCertSign | cRLSign, keyAlg });
+      const leaf = await issue({
+        subject: `CN=${HOST}`,
+        issuer: rsaRoot,
+        ca: false,
+        keyUsage: digitalSignature,
+        eku: [SERVER_AUTH],
+        san: [HOST],
+        signAlg: { name: "RSASSA-PKCS1-v1_5", hash },
+      });
+      return { rsaRoot, leaf };
+    };
+    const good = await chain("SHA-256");
+    await expect(verify([good.leaf], good.rsaRoot)).resolves.toBeUndefined();
+    const sha1 = await chain("SHA-1");
+    expect((sha1.leaf.cert.signatureAlgorithm as { hash?: { name?: string } }).hash?.name).toBe("SHA-1");
+    await expect(verify([sha1.leaf], sha1.rsaRoot)).rejects.toThrow(/Unsupported hash algorithm: SHA-1/);
+  });
+});

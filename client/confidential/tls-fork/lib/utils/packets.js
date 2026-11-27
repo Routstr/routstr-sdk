@@ -95,7 +95,10 @@ export function makeMessageProcessor(logger) {
             while (buffer.length) {
                 // if we already aren't processing a packet
                 // this is the first byte
-                if (!currentMessageType) {
+                // FORK PATCH (TLS-22): a record of outer type 0 is a record
+                // too; it was taken for "no record in progress", so its body
+                // was read as the next record header.
+                if (currentMessageType === undefined) {
                     if (buffer.length < 5) {
                         // we don't have enough bytes to process the header
                         // wait for more bytes

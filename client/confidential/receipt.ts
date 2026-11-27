@@ -544,16 +544,18 @@ export function checkAttestationBinding(
  * `after`: one did. `null`: the node never names that reason then.
  * `zero` nothing; `session_fee` the offer's session fee if still due (none
  * once the connection settled a request); `abandon_fee` max(the abandon fee,
- * the session fee if still due); `reservation` the announced reservation.
- * `disclosed`: only after the client disclosed (or accepted) the request's
- * answer. The same table is in `tests/unit/fixtures/request-outcome-vectors.json`
+ * the session fee if still due); `reservation` the announced reservation;
+ * `disclosure` what the client's own disclosure implies (`disclosureCeiling`;
+ * when the client tracks none, the abandon fee before `body_released` and
+ * the reservation after it). `disclosed`: only after the client disclosed
+ * (or accepted) the request's answer. The same table is in `tests/unit/fixtures/request-outcome-vectors.json`
  * (a copy of routstr-confidential `crypto/conformance`).
  */
-export type Ceiling = "zero" | "session_fee" | "abandon_fee" | "reservation" | null;
+export type Ceiling = "zero" | "session_fee" | "abandon_fee" | "reservation" | "disclosure" | null;
 export const REQUEST_OUTCOME_RULES: Record<string, { before: Ceiling; after: Ceiling; disclosed?: boolean }> = {
   request_received: { before: null, after: "reservation" },
   settlement_failed: { before: "zero", after: "reservation" },
-  settled_without_receipt: { before: "abandon_fee", after: "reservation", disclosed: true },
+  settled_without_receipt: { before: "disclosure", after: "disclosure", disclosed: true },
   unattested: { before: "zero", after: "zero" },
   provider_refused: { before: "session_fee", after: null },
   provider_unreachable: { before: "zero", after: null },
@@ -566,6 +568,58 @@ export const REQUEST_OUTCOME_RULES: Record<string, { before: Ceiling; after: Cei
 /** The reasons a node names in a `request_outcome` (PROTOCOL-V3.md §12.10). */
 export const REQUEST_OUTCOME_REASONS = new Set(Object.keys(REQUEST_OUTCOME_RULES));
 
+/**
+ * What the client disclosed (or accepted) for a request, as it saw it
+ * itself. `refusal`: a `disclose_reset`; `error_head`: a `disclose_head` of
+ * that status (`imagesMsat`: an image request's `msat_per_image × count`);
+ * `usage`: the `disclose` of a chat 2xx, `usageMsat` its usage priced at the
+ * frozen rates, no fee (`maxChargeMsats`); `images`: the `accept` of an image
+ * 2xx, `imagesMsat` its `msat_per_image × count`.
+ */
+export type Disclosure =
+  | { kind: "refusal" }
+  | { kind: "error_head"; status: number; imagesMsat?: number }
+  | { kind: "usage"; usageMsat: number }
+  | { kind: "images"; imagesMsat: number };
+
+/**
+ * The most a settlement of the request may cost after the client's own
+ * disclosure, by §12.10's table: a refusal the session fee if still due; an
+ * error head 429/503/401/402/403 the session fee if still due, any other 4xx
+ * the abandon fee, a 5xx the announced reservation (none announced: the
+ * session fee if still due), the abandon fee before `body_released` (an image
+ * request never more than its images and the abandon fee); a chat 2xx its
+ * usage at the frozen rates, an image 2xx its images, each plus the session
+ * fee if still due. Never above the abandon fee before `body_released`.
+ * Undefined for a disclosure the client cannot price (the caller falls back).
+ */
+export function disclosureCeiling(
+  d: Disclosure,
+  bodyReleased: boolean,
+  reservedMsats: number | undefined,
+  sessionFeeMsat: number,
+  abandonFeeMsat: number,
+): number | undefined {
+  const amount = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  let max: number;
+  if (d.kind === "refusal") max = sessionFeeMsat;
+  else if (d.kind === "error_head") {
+    const s = d.status;
+    if (!Number.isSafeInteger(s) || s < 400 || s > 599) return undefined;
+    if ([401, 402, 403, 429, 503].includes(s)) max = sessionFeeMsat;
+    else if (s < 500 || !bodyReleased) max = abandonFeeMsat;
+    else max = reservedMsats ?? sessionFeeMsat;
+    if (amount(d.imagesMsat)) max = Math.min(max, Math.ceil(d.imagesMsat + abandonFeeMsat));
+  } else if (d.kind === "usage") {
+    if (!amount(d.usageMsat)) return undefined;
+    max = d.usageMsat + sessionFeeMsat;
+  } else if (d.kind === "images") {
+    if (!amount(d.imagesMsat)) return undefined;
+    max = Math.ceil(d.imagesMsat + sessionFeeMsat);
+  } else return undefined;
+  return bodyReleased ? max : Math.min(max, abandonFeeMsat);
+}
+
 /** The request a client had open (neither refused nor settled) when the connection's last frame arrived. */
 export interface OpenRequestView {
   n: number;
@@ -577,6 +631,8 @@ export interface OpenRequestView {
   bodyReleased: boolean;
   /** The client sent `disclose`, `disclose_head`, `disclose_reset` or `accept` for it (undefined: not tracked). */
   disclosed?: boolean;
+  /** What it disclosed (undefined: not tracked). */
+  disclosure?: Disclosure;
 }
 
 export interface RequestOutcomeContext {
@@ -638,8 +694,18 @@ export function requestOutcomeProblems(o: any, signed: boolean, c: RequestOutcom
     if (ceiling === null) {
       p.push(open.bodyReleased ? `reason ${shown(o.reason)} after body_released` : `reason ${shown(o.reason)}, though no body_released arrived`);
     } else {
-      const max =
-        ceiling === "zero" ? 0 : ceiling === "session_fee" ? c.sessionFeeMsat : ceiling === "abandon_fee" ? c.abandonFeeMsat : reserved;
+      let max: number | undefined;
+      if (ceiling === "zero") max = 0;
+      else if (ceiling === "session_fee") max = c.sessionFeeMsat;
+      else if (ceiling === "abandon_fee") max = c.abandonFeeMsat;
+      else if (ceiling === "reservation") max = reserved;
+      else {
+        // What the client's own disclosure implies; untracked, the outer bound.
+        max = open.disclosure
+          ? disclosureCeiling(open.disclosure, open.bodyReleased, open.reservedMsats, c.sessionFeeMsat, c.abandonFeeMsat)
+          : undefined;
+        if (max === undefined) max = open.bodyReleased ? reserved : c.abandonFeeMsat;
+      }
       if (max !== undefined && cost > max) p.push(`a cost of ${cost} msat with reason ${shown(o.reason)} (at most ${max} msat)`);
     }
     if (rule.disclosed && open.disclosed === false) p.push(`reason ${shown(o.reason)}, though the client disclosed nothing for request ${open.n}`);

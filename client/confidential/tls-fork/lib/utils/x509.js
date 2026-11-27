@@ -253,9 +253,8 @@ function getSigAlgorithm(key, { signatureAlgorithm }) {
         case 'SHA-512':
             hashName = 'SHA512';
             break;
-        case 'SHA-1':
-            hashName = 'SHA1';
-            break;
+        // FORK PATCH (TLS-22): no SHA-1 certificate signatures (the
+        // sidecar's webpki refuses them too). They were verified.
         default:
             throw new Error(`Unsupported hash algorithm: ${hash.name}`);
     }
@@ -264,7 +263,7 @@ function getSigAlgorithm(key, { signatureAlgorithm }) {
         case 'RSA-PKCS1-SHA1':
             return `RSA-PKCS1-${hashName}`;
         case 'ECDSA':
-            if (hashName === 'SHA512' || hashName === 'SHA1') {
+            if (hashName === 'SHA512') {
                 throw new Error(`Unsupported hash algorithm for ECDSA: ${hashName}`);
             }
             switch (keyAlg.namedCurve) {

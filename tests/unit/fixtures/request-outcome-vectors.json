@@ -1,5 +1,5 @@
 {
- "about": "The node's signed request_outcome (PROTOCOL-V3.md \u00a712.9, \u00a712.10) against what the client saw. rules: per reason, the most the node charges before body_released ('before') and after it ('after'); null: the node never names that reason then; zero / session_fee (if still due) / abandon_fee (max of the abandon fee and the session fee if still due) / reservation (the announced one); disclosed: only after the client disclosed the request's answer. Each case: requestOutcomeProblems(outcome, signed, ctx) is empty when ok, else one problem contains match. Shared by crypto/client, routstr-sdk and routstr-confidential-web (byte-identical copies).",
+ "about": "The node's signed request_outcome (PROTOCOL-V3.md \u00a712.9, \u00a712.10) against what the client saw. rules: per reason, the most the node charges before body_released ('before') and after it ('after'); null: the node never names that reason then; zero / session_fee (if still due) / abandon_fee (max of the abandon fee and the session fee if still due) / reservation (the announced one) / disclosure (what the client's own disclosure in ctx.open.disclosure implies: refusal the session fee; error_head 429/503/401/402/403 the session fee, other 4xx the abandon fee, 5xx the announced reservation, or the session fee when none was announced, never more than imagesMsat plus the abandon fee; usage usageMsat plus the session fee; images imagesMsat plus the session fee; before body_released never above the abandon fee; with no disclosure tracked the abandon fee before body_released and the reservation after it); disclosed: only after the client disclosed the request's answer. Each case: requestOutcomeProblems(outcome, signed, ctx) is empty when ok, else one problem contains match. Shared by crypto/client, routstr-sdk and routstr-confidential-web (byte-identical copies).",
  "rules": {
   "request_received": {
    "before": null,
@@ -10,8 +10,8 @@
    "after": "reservation"
   },
   "settled_without_receipt": {
-   "before": "abandon_fee",
-   "after": "reservation",
+   "before": "disclosure",
+   "after": "disclosure",
    "disclosed": true
   },
   "unattested": {
@@ -1230,6 +1230,660 @@
    },
    "ok": false,
    "match": "above the announced reservation"
+  },
+  {
+   "name": "settled without receipt of a usage at its frozen rates and the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 1300,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "usage",
+      "usageMsat": 1000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of a refusal at the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 300,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "refusal"
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of a 429 at the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 300,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 429
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of a 400 at the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 500,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 400
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of a 500 after release at the reservation",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 9000,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 500
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of a 500 before release at the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 500,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": false,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 500
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt of accepted images at their price and the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 4300,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "images",
+      "imagesMsat": 4000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": true
+  },
+  {
+   "name": "settled without receipt above the usage at the frozen rates",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 1301,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "usage",
+      "usageMsat": 1000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 1300 msat"
+  },
+  {
+   "name": "settled without receipt of a usage, the session fee already paid",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 1001,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "usage",
+      "usageMsat": 1000
+     }
+    },
+    "sessionFeeMsat": 0,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 1000 msat"
+  },
+  {
+   "name": "settled without receipt of a refusal above the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 301,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "refusal"
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 300 msat"
+  },
+  {
+   "name": "settled without receipt of a 503 above the session fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 500,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 503
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 300 msat"
+  },
+  {
+   "name": "settled without receipt of a 404 above the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 501,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 404
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 500 msat"
+  },
+  {
+   "name": "settled without receipt of a 500 before release above the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 9000,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": false,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 500
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 500 msat"
+  },
+  {
+   "name": "settled without receipt of a 500 with no reservation announced",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 400,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 500
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 300 msat"
+  },
+  {
+   "name": "settled without receipt of an image 500 above its images and the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 4501,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "error_head",
+      "status": 500,
+      "imagesMsat": 4000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 4500 msat"
+  },
+  {
+   "name": "settled without receipt of accepted images above their price",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 4301,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": true,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "images",
+      "imagesMsat": 4000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 4300 msat"
+  },
+  {
+   "name": "settled without receipt of a usage before release above the abandon fee",
+   "outcome": {
+    "v": 1,
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "http": "2",
+    "n": 2,
+    "outcome": "charged",
+    "reason": "settled_without_receipt",
+    "cost_msats": 600,
+    "reserved_msats": 9000,
+    "balance_msats": 1,
+    "time": 1
+   },
+   "signed": true,
+   "ctx": {
+    "sid": "abababababababababababababababababababababababababababababababab",
+    "framing": "2",
+    "open": {
+     "n": 2,
+     "accepted": true,
+     "reservedMsats": 9000,
+     "bodyReleased": false,
+     "disclosed": true,
+     "disclosure": {
+      "kind": "usage",
+      "usageMsat": 1000
+     }
+    },
+    "sessionFeeMsat": 300,
+    "abandonFeeMsat": 500,
+    "frame": {
+     "type": "error",
+     "fault": "node"
+    }
+   },
+   "ok": false,
+   "match": "at most 500 msat"
   },
   {
    "name": "request charged on the frame of a charged deposit",
