@@ -196,6 +196,28 @@ describe("TEE-required Node transport", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("refuses to send when a synchronous appraisal overruns the budget", async () => {
+    const policySha = await enclavaSha256Hex(new TextEncoder().encode(policy));
+    const bundleSha = await enclavaSha256Hex(new TextEncoder().encode("proof fixture"));
+    const opts = options();
+    opts.timeoutMs = 500;
+    opts.appraiser = input => {
+      const spki = input.context.observed_channel_spki_sha256!;
+      // A synchronous WASM verifier blocks the loop, so the abort timer cannot
+      // fire until it returns.
+      const until = performance.now() + 600;
+      while (performance.now() < until) { /* block */ }
+      return { verdict: "PASS" as const, bundle_sha256: bundleSha, policy_sha256: policySha,
+        challenge_nonce: input.context.challenge_nonce, target_origin: input.context.expected_target_origin,
+        checks: [...checks.map(id => ({ id, outcome: "PASS" as const })),
+          { id: "transport.tls_channel_spki", outcome: "PASS" as const, observed: spki, expected: spki }] };
+    };
+    await expect(createEnclavaRequiredTransport(opts)(sensitive)).rejects.toThrow(/budget/);
+    expect(bytes.get(connections[0])).toBeUndefined();
+    expect(requests).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("requires the configured CA and checks the certificate hostname", async () => {
     await expect(createEnclavaRequiredTransport({ ...options(), ca: undefined })(sensitive)).rejects.toThrow();
     origin = origin.replace("127.0.0.1", "localhost");

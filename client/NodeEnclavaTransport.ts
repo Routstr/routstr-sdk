@@ -189,6 +189,7 @@ export function createEnclavaRequiredTransport(options: EnclavaRequiredOptions) 
     const body = args.body instanceof Uint8Array ? new Uint8Array(args.body) : args.body;
     if (args.method === "GET" && body !== undefined) throw new Error("GET cannot have a body");
     const { method } = args;
+    const startedAt = performance.now();
     const deadline = AbortSignal.timeout(timeoutMs);
     const signal = args.signal ? AbortSignal.any([deadline, args.signal]) : deadline;
     signal.throwIfAborted();
@@ -232,6 +233,12 @@ export function createEnclavaRequiredTransport(options: EnclavaRequiredOptions) 
             return found.length !== 1 || found[0].outcome !== "PASS" ||
               (id === "transport.tls_channel_spki" && (found[0].observed !== spki || found[0].expected !== spki));
           })) throw new Error("Enclava appraisal lacks the required bindings or passing checks");
+      // A timer cannot preempt synchronous work: a WASM verifier that overruns
+      // the budget blocks the abort callback until the loop yields, so the
+      // request could otherwise still be written. Re-check the budget here.
+      if (performance.now() - startedAt >= timeoutMs) {
+        throw new Error(`TEE-required request exceeded its ${timeoutMs} ms budget before send`);
+      }
       return await send(socket, url, { path: url.pathname, headers, method, body }, signal);
     } finally {
       socket.destroy();

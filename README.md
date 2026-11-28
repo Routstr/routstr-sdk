@@ -125,8 +125,10 @@ The transport downloads a public proof over HTTPS with a fresh nonce, checks
 it against the pending request socket's peer key, then writes the request
 **on that exact socket**. Both connections verify the hostname and use the
 same trust roots (including optional `enclava.ca` for private PKI). It does not
-redirect, reconnect, or fall back to ordinary fetch. It requests uncompressed
-responses and rejects encoded bodies. A separate TLS probe cannot authorize a
+redirect, reconnect, or fall back to ordinary fetch. It enforces its request
+budget immediately before writing, so a slow synchronous appraisal cannot spend
+the timeout and still send. It requests uncompressed responses and rejects
+encoded bodies. A separate TLS probe cannot authorize a
 later ordinary `fetch()`.
 
 This first version supports **non-streaming chat completions only**, with the
