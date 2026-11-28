@@ -7,6 +7,7 @@
  */
 
 import { modelPathPolicyFor } from "../core/modelPathWhitelist";
+import { ConfidentialError } from "./confidential/errors";
 import type { Model, SdkLogger } from "../core/types";
 import type { DiscoveryAdapter } from "../discovery/interfaces";
 import type {
@@ -55,6 +56,8 @@ export interface ResolveContextInput {
    * it covers. A model with no policy entry routes as before.
    */
   autoModelPath?: boolean;
+  /** Only providers advertising `confidential_upstream` for the model. */
+  requireConfidential?: boolean;
   /** Wallet adapter for Cashu operations. */
   walletAdapter: WalletAdapter;
   /** Storage adapter for caching. */
@@ -139,6 +142,7 @@ export async function resolveRequestContext(
     forcedProvider,
     inputHeaders,
     autoModelPath = false,
+    requireConfidential = false,
     walletAdapter,
     storageAdapter,
     discoveryAdapter,
@@ -250,9 +254,18 @@ export async function resolveRequestContext(
     // Match by native id or a mapped variant/alias of it, so a
     // forced provider also serves requests using the canonical id.
     const match = findModelForId(models, modelId, discoveryAdapter.getModelIdMappings?.() ?? undefined);
+    // A confidential request the pinned provider cannot serve is the
+    // caller's error (`no_confidential_provider`), never a failover.
     if (!match) {
-      throw new Error(
-        `Provider ${normalizedProvider} does not offer model: ${modelId}`
+      const message = `Provider ${normalizedProvider} does not offer model: ${modelId}`;
+      throw requireConfidential
+        ? new ConfidentialError("no_confidential_provider", message)
+        : new Error(message);
+    }
+    if (requireConfidential && !match.confidential_upstream) {
+      throw new ConfidentialError(
+        "no_confidential_provider",
+        `Provider ${normalizedProvider} does not offer model ${modelId} confidentially`
       );
     }
     baseUrl = normalizedProvider;
@@ -310,6 +323,7 @@ export async function resolveRequestContext(
       }
     }
   } else if (
+    !requireConfidential &&
     autoModelPath === true &&
     !hasModelPathHeader(inputHeaders) &&
     typeof modelId === "string" &&
@@ -349,12 +363,20 @@ export async function resolveRequestContext(
   } else {
     // Ranked on a warm basket: a continuing session is billed mostly at the
     // cache rate, which is what the route should be chosen on.
-    const ranking = providerManager.getProviderPriceRankingForModel(modelId, {
+    const ranking = providerManager
+      .getProviderPriceRankingForModel(modelId, {
       torMode,
       includeDisabled: false,
       basket: WARM_COST_BASKET,
-    });
+      })
+      .filter((p) => !requireConfidential || Boolean(p.model.confidential_upstream));
     if (ranking.length === 0) {
+      if (requireConfidential) {
+        throw new ConfidentialError(
+          "no_confidential_provider",
+          `No provider offers model ${modelId} confidentially`
+        );
+      }
       throw new Error(`No providers found for model: ${modelId}`);
     }
     // Cheapest-first among providers that accept a funded mint (fail open
