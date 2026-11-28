@@ -44,6 +44,8 @@ export type { ResolveContextInput, ResolvedContext } from "./resolveRequestConte
  *    resolves a mint, and builds a RoutstrClient internally.
  */
 export interface FetchOptions {
+  /** TEE-required streaming is not supported. */
+  teeRequired?: never;
   requestLifecycleDriver?: RequestLifecycleDriver;
   lifecycle?: RequestLifecycleContext;
   trackLifecycle?: boolean;
@@ -169,6 +171,7 @@ export async function fetchAIResponse(
   callbacks: StreamingCallbacks,
   deps: FetchAIResponseDeps
 ): Promise<void> {
+  if (options.teeRequired !== undefined) throw new Error("TEE-required routing does not support fetchAIResponse streaming");
   const {
     messageHistory,
     maxTokens,

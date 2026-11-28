@@ -40,6 +40,8 @@ function hasModelPathHeader(headers?: Record<string, string>): boolean {
 }
 
 export interface ResolveContextInput {
+  /** TEE-required requests bypass this ordinary bootstrap pipeline. */
+  teeRequired?: never;
   /** The model ID to route (e.g., "gpt-4o"). Required for auto-discovery. */
   modelId: string;
   /** Optional: force a specific provider base URL (skips ranking). */
@@ -134,6 +136,7 @@ export interface ResolvedContext {
 export async function resolveRequestContext(
   input: ResolveContextInput
 ): Promise<ResolvedContext> {
+  if (input.teeRequired !== undefined) throw new Error("TEE-required routing bypasses ordinary request context resolution");
   const {
     modelId,
     forcedProvider,

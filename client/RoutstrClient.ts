@@ -410,7 +410,14 @@ function rewrapRoutstrResponse(
   return target;
 }
 
+export interface TeeRequiredRequest {
+  /** Caller-provisioned provider credential. Never a local SDK attribution key. */
+  providerApiKey: string;
+}
+
 export interface RouteRequestParams {
+  /** Node-only: fail closed rather than using the ordinary routing or wallet paths. */
+  teeRequired?: TeeRequiredRequest;
   lifecycle?: RequestLifecycleContext;
   requestLifecycleDriver?: RequestLifecycleDriver;
   trackLifecycle?: boolean;
@@ -645,6 +652,7 @@ export class RoutstrClient {
    * Accounting runs behind the response (`finalize()`), never in front of it.
    */
   async routeRequest(params: RouteRequestParams): Promise<RoutstrResponse> {
+    if (params.teeRequired !== undefined) return this.routeTeeRequired(params);
     const eligible = shouldTrackRequestLifecycle(params.method, params.path);
     const lifecycle = params.lifecycle ?? (params.trackLifecycle !== false && eligible
       ? await beginRequestLifecycle({ driver: params.requestLifecycleDriver ?? this.requestLifecycleDriver,
@@ -776,6 +784,10 @@ export class RoutstrClient {
       }
       throw error;
     }
+  }
+
+  protected async routeTeeRequired(_params: RouteRequestParams): Promise<RoutstrResponse> {
+    throw new Error("TEE-required routing needs a configured RoutstrClient from @routstr/sdk/node");
   }
 
   private async _routeRequest(params: RouteRequestParams): Promise<Response> {

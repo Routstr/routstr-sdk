@@ -34,6 +34,11 @@
   trust policy. The opt-in helper provides challenge nonces, bounded bundle
   downloads, channel-scoped appraisal reuse, and fail-closed verdict handling
   via `EnclavaAttestationError`. It does not gate SDK requests automatically.
+- Node `RoutstrClient.routeRequest()` and `routeRequests()` can opt into
+  `teeRequired` for pinned, non-streaming chat with a caller-provisioned
+  provider API key. The path checks kind 38425 review admission, the signed
+  38421 listing and 8428 release, and a fresh Enclava proof bound to the
+  request socket. No ambient fetch, wallet funding, retries, or failover.
 - `attestEnclavaProvider`, `attestEnclavaProviderIfNeeded`, `isEnclavaProvider`,
   `getCachedEnclavaAttestation`, `clearEnclavaAttestationCache`,
   `spkiSha256FromPeerCertificate`.

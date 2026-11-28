@@ -31,6 +31,8 @@ import {
 } from "applesauce-core/helpers";
 import type { Filter, NostrEvent } from "applesauce-core/helpers";
 
+import { ENCLAVA_RELEASE_KIND } from "../client/EnclavaRelease";
+
 type SqliteStatement = {
   run?: (...params: any[]) => unknown;
   get?: (...params: any[]) => any;
@@ -948,6 +950,41 @@ export class ModelManager {
     return true;
   }
 
+  /** Fetch the current signed listing for an explicitly selected Routstr coordinate. */
+  async getEnclavaAnnouncement(coordinate: string): Promise<NostrEvent | undefined> {
+    const parts = /^38421:([0-9a-f]{64}):(.+)$/.exec(coordinate);
+    if (!parts) throw new Error("Invalid provider announcement coordinate");
+    const [, author, identifier] = parts;
+    const [event] = await this.getNostrEvents({ kinds: [38421], authors: [author], "#d": [identifier] }, true,
+      undefined, event => event.kind === 38421 && event.pubkey === author &&
+        event.tags.some(tag => tag[0] === "d" && tag[1] === identifier));
+    return event;
+  }
+
+  /** Strict pinned routing still requires this node's own positive review. */
+  async assertEnclavaProviderReviewed(coordinate: string, origin: string): Promise<void> {
+    const node = /^38421:([0-9a-f]{64}):.+$/.exec(coordinate)?.[1];
+    const url = this.normalizeUrl(origin);
+    const isDisabled = () => this.adapter.getDisabledProviders().some(base => this.normalizeUrl(base) === url) ||
+      this.adapter.getManuallyDisabledProviders?.().some(base => this.normalizeUrl(base) === url);
+    if (!node || !this.reachable(origin) || isDisabled()) throw new Error("TEE provider is disabled or unavailable");
+    const index = await this.getProviderReviewIndex(true);
+    const label = index.latestLabelByNode.get(node);
+    if (isDisabled() || !label || !this.getEnabledReviewLabels().includes(label) || NEGATIVE_REVIEW_LABELS.has(label) ||
+        [...(index.providerNodes.get(url) ?? [])].some(alias =>
+          NEGATIVE_REVIEW_LABELS.has(index.latestLabelByNode.get(alias) ?? ""))) {
+      throw new Error("TEE provider is missing an enabled review or has a negative review");
+    }
+  }
+
+  /** Look up the immutable release by its exact ID; clients must still verify it. */
+  async getEnclavaRelease(id: string): Promise<NostrEvent | undefined> {
+    if (!/^[0-9a-f]{64}$/.test(id)) throw new Error("Invalid Enclava release event ID");
+    const [event] = await this.getNostrEvents({ kinds: [ENCLAVA_RELEASE_KIND], ids: [id], limit: 1 }, false,
+      undefined, event => event.id === id && event.kind === ENCLAVA_RELEASE_KIND);
+    return event;
+  }
+
   /**
    * Collect events for a one-shot query. Resolves once every relay has sent
    * EOSE (connection failures count as EOSE) or after timeoutMs, whichever
@@ -956,6 +993,7 @@ export class ModelManager {
   private async collectNostrEvents(
     filter: {
       kinds?: number[];
+      ids?: string[];
       authors?: string[];
       "#t"?: string[];
       "#d"?: string[];

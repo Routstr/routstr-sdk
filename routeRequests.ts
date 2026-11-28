@@ -18,6 +18,7 @@ import { ProviderManager } from "./client/ProviderManager";
 import {
   RoutstrClient,
   type RoutstrResponse,
+  type TeeRequiredRequest,
   type DebugLevel,
   type RequestResponseLogSink,
 } from "./client/RoutstrClient";
@@ -40,6 +41,8 @@ export type { ResolveContextInput, ResolvedContext };
  * Options for routeRequests function
  */
 export interface RouteRequestOptions {
+  /** Requires a preconfigured Node client, forcedProvider, and non-streaming API-key mode. */
+  teeRequired?: TeeRequiredRequest;
   requestLifecycleDriver?: RequestLifecycleDriver;
   lifecycle?: RequestLifecycleContext;
   /** Optional: abort the in-flight request and stream consumption. */
@@ -260,6 +263,19 @@ async function resolveRouteRequestContext(options: RouteRequestOptions): Promise
 export async function routeRequests(
   options: RouteRequestOptions
 ): Promise<RoutstrResponse> {
+  if (options.teeRequired !== undefined) {
+    const { client, forcedProvider, modelManager, routstrPubkey, teeRequired } = options;
+    if (!client || !forcedProvider || (options.mode !== undefined && options.mode !== "apikeys") ||
+        options.torMode || options.autoModelPath || options.userCacheSecret !== undefined ||
+        modelManager !== undefined || routstrPubkey !== undefined || options.filterLocalNetworkUrls ||
+        options.requestLifecycleDriver || options.lifecycle || options.trackLifecycle === true ||
+        options.deadlines || options.reservedBalanceWaitMs !== undefined) {
+      throw new Error("TEE-required routing needs a preconfigured Node client and explicit origin; configure review policy on the client");
+    }
+    return client.routeRequest({ teeRequired, baseUrl: forcedProvider, pinnedProvider: true,
+      path: options.path ?? "/v1/chat/completions", method: "POST", mintUrl: "",
+      body: options.requestBody, modelId: options.modelId, headers: options.headers, signal: options.signal });
+  }
   const lifecycle = options.lifecycle ?? (options.trackLifecycle !== false && shouldTrackRequestLifecycle("POST", options.path ?? "/v1/chat/completions")
     ? await beginRequestLifecycle({ driver: options.requestLifecycleDriver ?? options.client?.getRequestLifecycleDriver(), method: "POST", path: options.path ?? "/v1/chat/completions", modelId: options.modelId, stream: extractStream(options.requestBody), mode: options.mode, logger: options.logger })
     : undefined);

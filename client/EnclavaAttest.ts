@@ -180,6 +180,7 @@ export class EnclavaAttestationError extends Error {
 export interface EnclavaFetchOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface EnclavaAttestOptions extends EnclavaFetchOptions {
@@ -510,10 +511,17 @@ export async function fetchEnclavaProofBundle(
     );
   }
 
+  options.signal?.throwIfAborted();
   const timeoutMs = options.timeoutMs ?? DEFAULT_ENCLAVA_FETCH_TIMEOUT_MS;
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelDeadline: (() => void) | undefined;
   const deadline = new Promise<never>((_, reject) => {
+    cancelDeadline = () => {
+      reject(options.signal?.reason);
+      controller.abort();
+    };
+    options.signal?.addEventListener("abort", cancelDeadline, { once: true });
     timer = setTimeout(() => {
       reject(new EnclavaAttestationError(
         "ENCLAVA_BUNDLE_UNAVAILABLE",
@@ -551,6 +559,7 @@ export async function fetchEnclavaProofBundle(
     );
   } finally {
     clearTimeout(timer);
+    if (cancelDeadline) options.signal?.removeEventListener("abort", cancelDeadline);
   }
 
   return {
@@ -635,6 +644,7 @@ async function readProofBody(
 export async function attestEnclavaProvider(
   options: EnclavaAttestOptions
 ): Promise<EnclavaAttestation> {
+  const generation = cacheGeneration;
   options = { ...options };
   const origin = enclavaOrigin(options.origin ?? options.baseUrl ?? missingOrigin());
   const policyBytes = toBytes(options.policy);
@@ -646,7 +656,7 @@ export async function attestEnclavaProvider(
   const ttlMs = options.ttlMs ?? DEFAULT_ENCLAVA_ATTESTATION_TTL_MS;
   const failureTtlMs = options.failureTtlMs ?? (ttlMs > 0 ? DEFAULT_FAILURE_TTL_MS : 0);
   const input = { origin, policyBytes, policyJson, policySha256, observedSpki, options, appraiser, ttlMs };
-  if (options.nonce !== undefined || (ttlMs <= 0 && failureTtlMs <= 0)) {
+  if (generation !== cacheGeneration || options.nonce !== undefined || options.signal || (ttlMs <= 0 && failureTtlMs <= 0)) {
     return runAttestation(input);
   }
 
@@ -657,7 +667,9 @@ export async function attestEnclavaProvider(
     if (options.forceRefresh || cached.expiresAt <= nowMs) {
       attestationCache.delete(key);
     } else if (!("error" in cached) && cached.storedAt + ttlMs > nowMs && ttlMs > 0) {
-      return structuredClone(cached.attestation);
+      return structuredClone({ ...cached.attestation,
+        expiresAt: Math.min(cached.expiresAt, cached.storedAt + ttlMs),
+      });
     } else if ("error" in cached && cached.storedAt + failureTtlMs > nowMs && failureTtlMs > 0) {
       throw copyAttestationError(cached.error);
     }
@@ -670,7 +682,6 @@ export async function attestEnclavaProvider(
   ]);
   let pending = inflightAttestations.get(inflightKey);
   if (!pending) {
-    const generation = cacheGeneration;
     pending = runAttestation(input).then((attestation) => {
       if (ttlMs > 0 && generation === cacheGeneration) {
         storeAttestation(key, { attestation, storedAt: attestation.fetchedAt, expiresAt: attestation.expiresAt });
@@ -727,9 +738,11 @@ async function runAttestation(input: {
   const { bundle, nonce, challengeNonce } = await fetchEnclavaProofBundle(origin, {
     fetchImpl: options.fetchImpl,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
     nonce: options.nonce,
   });
   const bundleSha256 = await enclavaSha256Hex(bundle);
+  options.signal?.throwIfAborted();
   const fetchedAt = (options.now ?? Date.now)();
   const context: EnclavaAppraiseContext = {
     challenge_nonce: challengeNonce,
@@ -760,6 +773,7 @@ async function runAttestation(input: {
     );
   }
 
+  options.signal?.throwIfAborted();
   const checks = Array.isArray(appraisal?.checks)
     ? appraisal.checks.filter((check) => check && typeof check.id === "string")
     : undefined;
