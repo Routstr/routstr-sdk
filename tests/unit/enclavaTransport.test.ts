@@ -1,6 +1,8 @@
 import { createServer } from "node:https";
 import { of } from "rxjs";
-import { readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { X509Certificate } from "node:crypto";
 import type { TLSSocket } from "node:tls";
 import { finalizeEvent, getPublicKey, type NostrEvent } from "applesauce-core/helpers";
@@ -14,6 +16,7 @@ import { fetchAIResponse } from "../../client/fetchAIResponse";
 import { routeRequests } from "../../routeRequests";
 import { createDiscoveryAdapterFromStore, createMemoryDriver, createSdkStore } from "../../storage";
 import type { StorageAdapter, WalletAdapter } from "../../wallet/interfaces";
+import { ENCLAVA_TEST_TLS_CERT, ENCLAVA_TEST_TLS_KEY } from "../fixtures/enclavaTls";
 
 const relay = vi.hoisted(() => ({ events: [] as NostrEvent[] }));
 vi.mock("applesauce-relay", () => ({
@@ -24,9 +27,11 @@ vi.mock("applesauce-relay", () => ({
   },
 }));
 
-// Public fixture key, exclusively for this loopback TLS server.
-const key = readFileSync(new URL("../fixtures/enclava-test.key", import.meta.url));
-const cert = readFileSync(new URL("../fixtures/enclava-test.pem", import.meta.url), "utf8");
+// Public test-only keypair/certificate, exclusively for this loopback TLS server.
+// Kept as a committed module (not .pem/.key files) so the pair cannot be lost to
+// .gitignore and the suite loads on a clean checkout.
+const key = ENCLAVA_TEST_TLS_KEY;
+const cert = ENCLAVA_TEST_TLS_CERT;
 const nodeKey = new Uint8Array(32).fill(1);
 const teamKey = new Uint8Array(32).fill(2);
 const coordinate = `38421:${getPublicKey(nodeKey)}:test`;
@@ -324,13 +329,20 @@ describe("TEE-required Node transport", () => {
 });
 
 it("supplies local bytes to the web WASM initializer, without file: fetch", async () => {
-  const init = vi.fn(async ({ module_or_path }) => expect(module_or_path).toEqual(key));
-  const appraise = createNodeEnclavaAppraiser({ default: init, verify_bundle: () => '{"verdict":"PASS"}' },
-    new URL("../fixtures/enclava-test.key", import.meta.url));
-  const input = { bundle: new Uint8Array(), policy: new Uint8Array(), policyJson: "{}", context: {
-    challenge_nonce: "0".repeat(64), expected_target_origin: "https://example.com", now_unix_seconds: 1, observed_channel_spki_sha256: null,
-  } };
-  await expect(appraise(input)).resolves.toEqual({ verdict: "PASS" });
-  await appraise(input);
-  expect(init).toHaveBeenCalledTimes(1);
+  const wasmBytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const dir = await mkdtemp(join(tmpdir(), "enclava-verifier-"));
+  const wasmFile = join(dir, "enclava_verifier_wasm_bg.wasm");
+  await writeFile(wasmFile, wasmBytes);
+  try {
+    const init = vi.fn(async ({ module_or_path }) => expect(new Uint8Array(module_or_path)).toEqual(wasmBytes));
+    const appraise = createNodeEnclavaAppraiser({ default: init, verify_bundle: () => '{"verdict":"PASS"}' }, wasmFile);
+    const input = { bundle: new Uint8Array(), policy: new Uint8Array(), policyJson: "{}", context: {
+      challenge_nonce: "0".repeat(64), expected_target_origin: "https://example.com", now_unix_seconds: 1, observed_channel_spki_sha256: null,
+    } };
+    await expect(appraise(input)).resolves.toEqual({ verdict: "PASS" });
+    await appraise(input);
+    expect(init).toHaveBeenCalledTimes(1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
