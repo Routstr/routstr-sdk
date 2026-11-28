@@ -314,6 +314,9 @@ certificate is accepted by both, until it expires.
 
 Installed via `client/package.json`: `@noble/{ciphers,curves,hashes}`,
 `@peculiar/{asn1-cms,asn1-ecc,asn1-rsa,asn1-schema,asn1-x509,x509}`, `micro-rsa-dsa-dh`.
+`lib/crypto/pure-js.js` imports `@noble/hashes` subpaths with the `.js` suffix
+(`@noble/hashes/sha2.js`): version 2, which the SDK depends on, exports only those,
+and version 1.8 exports both.
 The webcrypto provider is selected explicitly:
 
 ```ts

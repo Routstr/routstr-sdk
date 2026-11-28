@@ -7,8 +7,8 @@
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
-import { sha256 } from "@noble/hashes/sha2";
-import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils.js";
 import { VENICE_CHAT } from "./fixtures/chat";
 import { canonicalJson } from "../../client/confidential/canonical";
 import { chatSuffixKeys } from "../../client/confidential/suffix";

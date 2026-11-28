@@ -11,8 +11,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { VENICE_CHAT } from "./fixtures/chat";
 import { schnorr } from "@noble/curves/secp256k1";
-import { sha256 } from "@noble/hashes/sha2";
-import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { utf8ToBytes, bytesToHex } from "@noble/hashes/utils.js";
 
 import {
   canonicalJson,

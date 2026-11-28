@@ -39,8 +39,8 @@ import {
   type ConfidentialRequestStats,
 } from "../client/confidential/index";
 import { schnorr } from "@noble/curves/secp256k1";
-import { sha256 } from "@noble/hashes/sha2";
-import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
 
 // Runs under Bun (its HTTP and WebSocket server play the fake nodes).
 declare const Bun: any;
