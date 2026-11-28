@@ -442,14 +442,15 @@ describe("attestEnclavaProvider", () => {
     ).rejects.toMatchObject({ code: "ENCLAVA_ORIGIN_INVALID" });
   });
 
-  it("looks up the exact policy, channel, appraiser and clock for audit", async () => {
+  it("looks up the exact policy, channel, appraiser, fetcher and clock for audit", async () => {
     const { appraiser } = countingAppraiser();
     let nowMs = 1_000;
     const now = () => nowMs;
     const channelSpkiSha256 = "a".repeat(64);
-    const context = { appraiser, now, channelSpkiSha256 };
+    const fetchImpl = bundleFetch();
+    const context = { appraiser, now, channelSpkiSha256, fetchImpl };
     const attestation = await attestEnclavaProvider({
-      origin: ORIGIN, policy: POLICY, fetchImpl: bundleFetch(), ...context,
+      origin: ORIGIN, policy: POLICY, ...context,
     });
     attestation.bundle.fill(255);
     attestation.appraisal.verdict = "FAIL";
@@ -457,6 +458,7 @@ describe("attestEnclavaProvider", () => {
     expect(cached?.bundle[0]).toBe(0);
     expect(cached?.appraisal.verdict).toBe("PASS");
     await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { ...context, channelSpkiSha256: null })).resolves.toBeUndefined();
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { ...context, fetchImpl: bundleFetch() })).resolves.toBeUndefined();
     await expect(getCachedEnclavaAttestation(ORIGIN, "{}", context)).resolves.toBeUndefined();
     nowMs += 300_000;
     await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, context)).resolves.toBeUndefined();
@@ -491,6 +493,30 @@ describe("attestEnclavaProvider", () => {
       ...options, appraiser: countingAppraiser({ verdict: "FAIL" }).appraiser,
     })).rejects.toMatchObject({ code: "ENCLAVA_ATTESTATION_REJECTED" });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not share a cached PASS across fetch implementations", async () => {
+    const { appraiser } = countingAppraiser();
+    const first = bundleFetch();
+    const second = bundleFetch();
+    const options = { origin: ORIGIN, policy: POLICY, appraiser };
+    await attestEnclavaProvider({ ...options, fetchImpl: first });
+    await attestEnclavaProvider({ ...options, fetchImpl: second });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    // The same fetcher still reuses its own entry.
+    await attestEnclavaProvider({ ...options, fetchImpl: second });
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes the audit lookup to the fetch implementation", async () => {
+    const { appraiser } = countingAppraiser();
+    const fetchImpl = bundleFetch();
+    await attestEnclavaProvider({ origin: ORIGIN, policy: POLICY, appraiser, fetchImpl });
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { appraiser, fetchImpl }))
+      .resolves.toMatchObject({ verdict: "PASS" });
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { appraiser, fetchImpl: bundleFetch() }))
+      .resolves.toBeUndefined();
   });
 
   it("preserves pinned u64 policy fields and snapshots caller-owned bytes", async () => {

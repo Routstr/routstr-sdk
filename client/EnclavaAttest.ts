@@ -241,9 +241,15 @@ function attestationKey(
   policySha256: string,
   spki: string | null,
   appraiser: EnclavaAppraiser,
-  clock: () => number
+  clock: () => number,
+  fetcher: typeof fetch | undefined
 ): string {
-  return JSON.stringify([origin, policySha256, spki, functionId(appraiser), functionId(clock)]);
+  // The fetcher is part of the identity: a caller that pins its own transport
+  // must not be satisfied by bytes another transport fetched.
+  return JSON.stringify([
+    origin, policySha256, spki, functionId(appraiser), functionId(clock),
+    fetcher ? functionId(fetcher) : null,
+  ]);
 }
 
 function functionId(fn: object): number {
@@ -639,7 +645,8 @@ async function readProofBody(
  * Attest an Enclava provider against a pinned policy.
  *
  * Resolves only on `PASS`. Reuse is scoped to the origin, pinned policy,
- * observed channel SPKI and appraiser. Caller-managed nonces are never reused.
+ * observed channel SPKI, appraiser and fetch implementation. Caller-managed
+ * nonces are never reused.
  */
 export async function attestEnclavaProvider(
   options: EnclavaAttestOptions
@@ -655,12 +662,13 @@ export async function attestEnclavaProvider(
   const clock = options.now ?? Date.now;
   const ttlMs = options.ttlMs ?? DEFAULT_ENCLAVA_ATTESTATION_TTL_MS;
   const failureTtlMs = options.failureTtlMs ?? (ttlMs > 0 ? DEFAULT_FAILURE_TTL_MS : 0);
+  const fetcher = options.fetchImpl ?? globalThis.fetch;
   const input = { origin, policyBytes, policyJson, policySha256, observedSpki, options, appraiser, ttlMs };
   if (generation !== cacheGeneration || options.nonce !== undefined || options.signal || (ttlMs <= 0 && failureTtlMs <= 0)) {
     return runAttestation(input);
   }
 
-  const key = attestationKey(origin, policySha256, observedSpki, appraiser, clock);
+  const key = attestationKey(origin, policySha256, observedSpki, appraiser, clock, fetcher);
   const nowMs = clock();
   const cached = attestationCache.get(key);
   if (cached) {
@@ -675,10 +683,8 @@ export async function attestEnclavaProvider(
     }
   }
 
-  const fetcher = options.fetchImpl ?? globalThis.fetch;
   const inflightKey = JSON.stringify([
     key, ttlMs, failureTtlMs, options.timeoutMs ?? DEFAULT_ENCLAVA_FETCH_TIMEOUT_MS,
-    fetcher ? functionId(fetcher) : null,
   ]);
   let pending = inflightAttestations.get(inflightKey);
   if (!pending) {
@@ -866,11 +872,15 @@ export function isEnclavaOrigin(url: string): boolean {
   return isEnclavaHostname(url);
 }
 
-/** Look up a passing appraisal for audit, never as a substitute for attesting a request. */
+/**
+ * Look up a passing appraisal for audit, never as a substitute for attesting a
+ * request. Pass the same `fetchImpl` the appraisal was made with; entries are
+ * scoped to it, and the lookup defaults to `globalThis.fetch`.
+ */
 export async function getCachedEnclavaAttestation(
   originOrBaseUrl: string,
   policy: EnclavaPolicy,
-  options: Pick<EnclavaAttestOptions, "channelSpkiSha256" | "appraiser" | "now"> = {}
+  options: Pick<EnclavaAttestOptions, "channelSpkiSha256" | "appraiser" | "now" | "fetchImpl"> = {}
 ): Promise<EnclavaAttestation | undefined> {
   let key: string;
   const clock = options.now ?? Date.now;
@@ -879,7 +889,8 @@ export async function getCachedEnclavaAttestation(
     const bytes = toBytes(policy);
     const spki = validateChannelSpki(origin, toJsonText(bytes), options.channelSpkiSha256);
     key = attestationKey(
-      origin, await enclavaSha256Hex(bytes), spki, options.appraiser ?? defaultAppraiser(), clock
+      origin, await enclavaSha256Hex(bytes), spki, options.appraiser ?? defaultAppraiser(), clock,
+      options.fetchImpl ?? globalThis.fetch
     );
   } catch {
     return undefined;

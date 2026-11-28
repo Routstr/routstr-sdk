@@ -32,7 +32,7 @@
 - New `client/EnclavaAttest.ts` (exported from `@routstr/sdk/client`) appraises an
   Enclava-hosted provider's AMD SEV-SNP proof bundle against a caller-pinned
   trust policy. The opt-in helper provides challenge nonces, bounded bundle
-  downloads, channel-scoped appraisal reuse, and fail-closed verdict handling
+  downloads, channel- and fetch-scoped appraisal reuse, and fail-closed verdict handling
   via `EnclavaAttestationError`. It does not gate SDK requests automatically.
 - Node `RoutstrClient.routeRequest()` and `routeRequests()` can opt into
   `teeRequired` for pinned, non-streaming chat with a caller-provisioned

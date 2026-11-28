@@ -148,10 +148,12 @@ web loader to fetch a `file:` URL.
 What the module does, and does not, do:
 
 - It builds a fresh 32-byte challenge nonce, fetches the bundle, memoises a
-  `PASS` for the same origin, policy bytes, observed SPKI and appraiser for
-  `ttlMs` (default 5 min). It de-duplicates equivalent in-flight requests,
-  except with a caller-supplied nonce, and throws `EnclavaAttestationError` for every verdict that is
-  not `PASS` (`FAIL` → `ENCLAVA_ATTESTATION_REJECTED`, `INCONCLUSIVE` →
+  `PASS` for the same origin, policy bytes, observed SPKI, appraiser and fetch
+  implementation for `ttlMs` (default 5 min); `getCachedEnclavaAttestation`
+  takes the same `fetchImpl` to find that entry. It de-duplicates equivalent
+  in-flight requests, except with a caller-supplied nonce, and throws
+  `EnclavaAttestationError` for every verdict that is not `PASS` (`FAIL` →
+  `ENCLAVA_ATTESTATION_REJECTED`, `INCONCLUSIVE` →
   `ENCLAVA_ATTESTATION_INCONCLUSIVE`).
 - It refuses to attest a plaintext-`http` origin, an oversized or wrong-media-type
   bundle, an appraisal whose `bundle_sha256` / `policy_sha256` do not match what
