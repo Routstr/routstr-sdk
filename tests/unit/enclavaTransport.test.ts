@@ -30,7 +30,7 @@ const cert = readFileSync(new URL("../fixtures/enclava-test.pem", import.meta.ur
 const nodeKey = new Uint8Array(32).fill(1);
 const teamKey = new Uint8Array(32).fill(2);
 const coordinate = `38421:${getPublicKey(nodeKey)}:test`;
-const imageRepository = "ghcr.io/sh1ftred/core";
+const imageRepository = "ghcr.io/routstr/core-enclava";
 const digest = `sha256:${"a".repeat(64)}`;
 const checks = [
   "binding.challenge_nonce", "binding.target_origin", "binding.tls_leaf_certificate", "binding.report_data",

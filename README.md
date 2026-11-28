@@ -93,7 +93,7 @@ const client = new RoutstrClient(walletAdapter, storageAdapter, discoveryAdapter
     coordinate: PINNED_38421_COORDINATE, // 38421:<node-pubkey>:<d-tag>
     origin: PINNED_HTTPS_ORIGIN,         // canonical HTTPS origin, no trailing slash
     releasePubkey: PINNED_RELEASE_PUBKEY,
-    imageRepository: "ghcr.io/sh1ftred/core",
+    imageRepository: "ghcr.io/routstr/core-enclava",
     policy: readFileSync("./policies/routstr-core.json"),
     appraiser: createNodeEnclavaAppraiser(verifier, "/path/to/trusted/enclava_verifier_wasm_bg.wasm"),
     discovery: { routstrPubkey: PINNED_REVIEWER_PUBKEY }, // omit to use the SDK default
