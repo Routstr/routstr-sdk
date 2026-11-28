@@ -272,6 +272,29 @@ describe("attestEnclavaProvider", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it("reports the current caller's shorter expiration on a cache hit", async () => {
+    const { appraiser } = countingAppraiser();
+    const fetchImpl = bundleFetch();
+    const now = () => 1000;
+    const options = { origin: ORIGIN, policy: POLICY, appraiser, fetchImpl, now };
+    await attestEnclavaProvider({ ...options, ttlMs: 5000 });
+    const cached = await attestEnclavaProvider({ ...options, ttlMs: 100 });
+    expect(cached.expiresAt).toBe(1100);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not coalesce or repopulate after clear during the policy hash", async () => {
+    const { appraiser } = countingAppraiser();
+    const fetchImpl = bundleFetch();
+    const options = { origin: ORIGIN, policy: POLICY, appraiser, fetchImpl };
+    const preClear = attestEnclavaProvider(options);
+    clearEnclavaAttestationCache();
+    await preClear;
+    await expect(getCachedEnclavaAttestation(ORIGIN, POLICY, { appraiser })).resolves.toBeUndefined();
+    await attestEnclavaProvider(options);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("de-duplicates concurrent attestations", async () => {
     const { appraiser } = countingAppraiser();
     const fetchImpl = bundleFetch();

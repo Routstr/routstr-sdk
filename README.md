@@ -76,30 +76,74 @@ and serve an attestation bundle at
 against a trust policy **you pin**, so a request can be gated on "the host runs
 the image I admit" rather than on trust in the operator.
 
-This Node example assumes your request transport has already opened the TLS
-connection it will use for the request, but has not sent a prompt or payment:
+### TEE-required requests (Node only)
+
+Opt in per request on the `RoutstrClient` from `@routstr/sdk/node`. This mode
+requires a pinned provider and a caller-provisioned provider API key. It uses
+your configured kind `38425` reviewer and enabled labels. A missing or negative
+review cannot be bypassed by manually enabling the provider.
 
 ```ts
 import { readFileSync } from "node:fs";
-import {
-  attestEnclavaProvider,
-  spkiSha256FromPeerCertificate,
-} from "@routstr/sdk/client";
+import * as verifier from "/path/to/trusted/enclava_verifier_wasm.js";
+import { RoutstrClient, createNodeEnclavaAppraiser } from "@routstr/sdk/node";
 
-const attestation = await attestEnclavaProvider({
-  origin: PINNED_PROVIDER_ORIGIN, // caller-configured, not provider metadata
-  policy: readFileSync("./policies/routstr-core.json"), // exact pinned bytes
-  channelSpkiSha256: await spkiSha256FromPeerCertificate(requestPeerX509),
+const client = new RoutstrClient(walletAdapter, storageAdapter, discoveryAdapter, "min", "apikeys", {
+  enclava: {
+    coordinate: PINNED_38421_COORDINATE, // 38421:<node-pubkey>:<d-tag>
+    origin: PINNED_HTTPS_ORIGIN,         // canonical HTTPS origin, no trailing slash
+    releasePubkey: PINNED_RELEASE_PUBKEY,
+    imageRepository: "ghcr.io/sh1ftred/core",
+    policy: readFileSync("./policies/routstr-core.json"),
+    appraiser: createNodeEnclavaAppraiser(verifier, "/path/to/trusted/enclava_verifier_wasm_bg.wasm"),
+    discovery: { routstrPubkey: PINNED_REVIEWER_PUBKEY }, // omit to use the SDK default
+  },
 });
-// Only now send sensitive data on that connection. If it reconnects, verify
-// the new connection's peer SPKI before sending. Record the two appraisal hashes.
+const response = await client.routeRequest({
+  teeRequired: { providerApiKey },
+  pinnedProvider: true,
+  baseUrl: PINNED_HTTPS_ORIGIN,
+  mintUrl: "", // unused in this mode
+  path: "/v1/chat/completions",
+  method: "POST",
+  body: { model: nativeModelId, messages, stream: false },
+});
 ```
 
-A certificate from a separate `tls.connect()` probe does **not** bind a later
-`fetch()` or inference request. This helper does not own the request transport
-or automatically gate `RoutstrClient` requests. In browsers, JavaScript cannot
-observe the peer SPKI: a policy that requires it fails closed, and a policy that
-omits it does not establish request-channel binding.
+`routeRequests()` also accepts `teeRequired` with the configured `client` and
+`forcedProvider: PINNED_HTTPS_ORIGIN`. Set review and relay options under
+`enclava.discovery` on that client, not in `routeRequests()`.
+
+Before opening a provider connection the client checks the review, the signed
+kind `38421` listing for the selected coordinate and origin, and the exact kind
+`8428` it references. The release must name the approved GHCR image and verify
+under your pinned release key. Kind `8428` does not carry a trust policy: pin
+its exact bytes separately. The policy must admit exactly the release image
+digest and require TLS binding and the verifier's evidence checks.
+
+The transport downloads a public proof over HTTPS with a fresh nonce, checks
+it against the pending request socket's peer key, then writes the request
+**on that exact socket**. Both connections verify the hostname and use the
+same trust roots (including optional `enclava.ca` for private PKI). It does not
+redirect, reconnect, or fall back to ordinary fetch. It requests uncompressed
+responses and rejects encoded bodies. A separate TLS probe cannot authorize a
+later ordinary `fetch()`.
+
+This first version supports **non-streaming chat completions only**, with the
+provider's native model ID. It does not use wallet state or automatically issue
+credentials, fund, retry, refund, account for usage, or fail over. Check the
+returned HTTP status yourself (e.g. `402` is returned without topping up).
+Replies are buffered (16 MiB cap). Browser/default `RoutstrClient` and the
+streaming `fetchAIResponse()` reject TEE-required requests. Calls without
+`teeRequired` keep the ordinary routing behavior even on a configured client.
+The lower-level `createEnclavaRequiredTransport()` remains available for
+caller-managed requests; it does not enforce `38425` reviews by itself.
+
+Use a trusted appraiser and verified WASM module/binary.
+`createNodeEnclavaAppraiser()` reads local WASM bytes rather than asking the
+web loader to fetch a `file:` URL.
+
+### Low-level proof helpers
 
 What the module does, and does not, do:
 

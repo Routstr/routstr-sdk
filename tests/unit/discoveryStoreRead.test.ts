@@ -181,6 +181,23 @@ describe("discovery store reads", () => {
     vi.unstubAllGlobals();
   });
 
+  it("looks up the newest selected provider coordinate and the exact immutable release ID", async () => {
+    const { manager } = await openManager();
+    const author = key(4);
+    const pubkey = getPublicKey(author);
+    const coordinate = `38421:${pubkey}:${pubkey.slice(0, 12)}`;
+    const older = announcement("https://older.example", author, now() - 10);
+    const newer = announcement("https://newer.example", author);
+    const release = finalizeEvent({ kind: 8428, created_at: now(), tags: [], content: "target" }, reviewer);
+    const unrelatedRelease = finalizeEvent({ kind: 8428, created_at: now(), tags: [], content: "other" }, reviewer);
+    relay.events = [older, announcement("https://other.example", key(5)), newer, unrelatedRelease, release];
+    expect((await manager.getEnclavaAnnouncement(coordinate))?.id).toBe(newer.id);
+    expect((await manager.getEnclavaRelease(release.id))?.id).toBe(release.id);
+    expect((await manager.getEnclavaRelease(release.id))?.id).toBe(release.id);
+    expect(relay.requests).toEqual([38421, 8428]);
+  });
+
+
   it("keeps providers discoverable behind a wall of foreign kind-38421 events", async () => {
     const providerKeys = Array.from({ length: 30 }, (_, i) => key(i + 2));
     const urls = providerKeys.map((_, i) => `https://provider-${i}.example/`);

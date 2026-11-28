@@ -40,3 +40,6 @@ export const createNodeModelManager = (
 ): NodeModelManager => new NodeModelManager(adapter, config);
 
 export { createSqliteRequestLifecycleDriver, type SqliteRequestLifecycleDriverOptions } from "./storage/requestLifecycle/sqlite";
+
+export * from "./client/NodeEnclavaTransport";
+export { NodeRoutstrClient, NodeRoutstrClient as RoutstrClient, type NodeRoutstrClientConfig } from "./client/NodeRoutstrClient";
