@@ -374,12 +374,17 @@ function numericObject(v: unknown, depth: number): boolean {
  * The usage event's JSON text parsed, refusing a key repeated in any object
  * (throws). A parser keeps one of the values (JavaScript the last), but the
  * raw text is what the node receives: a shadowed member would reach it
- * unchecked. Vectors: the `raw` cases of usage-event-vectors.json.
+ * unchecked. It also refuses an unsigned integer of the rule (`created`, a
+ * choice's `index`, `usage.prompt_tokens`, `usage.completion_tokens`) written
+ * other than as digits alone (`5.0`, `1e1`, `-0`): JavaScript reads those as
+ * integers, the sidecar (serde_json `as_u64`) does not.
+ * Vectors: the `raw` cases of usage-event-vectors.json.
  */
 export function parseUsageEvent(text: string): unknown {
   const ev: unknown = JSON.parse(text);
-  // A walk over valid JSON: each object's keys, decoded, at most once.
-  const stack: { keys: Set<string> | null; wantKey: boolean }[] = [];
+  // A walk over valid JSON: each object's keys, decoded, at most once; the
+  // last key of each object, for the path of a number.
+  const stack: { keys: Set<string> | null; wantKey: boolean; key: string | null }[] = [];
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     const top = stack[stack.length - 1];
@@ -390,15 +395,33 @@ export function parseUsageEvent(text: string): unknown {
         const key = JSON.parse(text.slice(i, j + 1)) as string;
         if (top.keys.has(key)) throw new Error(`the usage event repeats the key ${JSON.stringify(key)}`);
         top.keys.add(key);
+        top.key = key;
         top.wantKey = false;
       }
       i = j;
-    } else if (c === "{") stack.push({ keys: new Set(), wantKey: true });
-    else if (c === "[") stack.push({ keys: null, wantKey: false });
+    } else if (c === "{") stack.push({ keys: new Set(), wantKey: true, key: null });
+    else if (c === "[") stack.push({ keys: null, wantKey: false, key: null });
     else if (c === "}" || c === "]") stack.pop();
     else if (c === "," && top?.keys) top.wantKey = true;
+    else if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i;
+      while (j < text.length && /[0-9eE.+-]/.test(text[j])) j++;
+      const token = text.slice(i, j);
+      if (!/^[0-9]+$/.test(token) && atUintPath(stack.map((f) => f.key))) {
+        throw new Error(`the usage event writes the integer ${JSON.stringify(stack[stack.length - 1].key)} as ${token}`);
+      }
+      i = j - 1;
+    }
   }
   return ev;
+}
+
+/** Whether a value under these keys (one per open object or array, null for an array) is one of the rule's unsigned integers. */
+function atUintPath(p: (string | null)[]): boolean {
+  if (p.length === 1) return p[0] === "created";
+  if (p.length === 2) return p[0] === "usage" && (p[1] === "prompt_tokens" || p[1] === "completion_tokens");
+  if (p.length === 3) return p[0] === "choices" && p[1] === null && p[2] === "index";
+  return false;
 }
 
 /** Why `ev` is not a usage event, or null. */
