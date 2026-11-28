@@ -123,6 +123,8 @@
     {"name": "raw: created written as 1.0", "ok": false, "raw": "{\"model\":\"m\",\"created\":1.0,\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}"},
     {"name": "raw: created written as 1e1", "ok": false, "raw": "{\"model\":\"m\",\"created\":1e1,\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}"},
     {"name": "raw: a choice index written as 0.0", "ok": false, "raw": "{\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0.0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}"},
+    {"name": "raw: prompt_tokens written as -0", "ok": false, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":-0,\"completion_tokens\":2}}"},
+    {"name": "raw: other usage numbers may be -0", "ok": true, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"cost\":-0}}"},
     {"name": "raw: the unsigned integers written as digits", "ok": true, "raw": "{\"model\":\"m\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10}}"},
     {"name": "raw: other usage numbers may be written as 5.0 or 1e1", "ok": true, "raw": "{\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"cost\":5.0,\"prompt_tokens_details\":{\"cached_tokens\":1e1}},\"cost\":{\"prompt_tokens\":5.0}}"}
   ]
